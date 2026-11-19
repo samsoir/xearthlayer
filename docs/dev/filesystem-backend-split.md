@@ -413,6 +413,12 @@ pub trait UnionFilesystem: Send + Sync {
         name: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Entry, FsError>> + Send + 'a>>;
 
+    /// Attributes of `node`.  The attributes one operation answers for a
+    /// node must agree with what another answers later: `lookup`'s
+    /// `Entry.attrs` against a subsequent `attrs(node)`, field-for-field
+    /// for source-backed nodes.  Virtual textures have no source to date
+    /// them — they stamp fresh timestamps per construction — so their
+    /// agreement is on kind, size, permissions, and link count.
     fn attrs<'a>(
         &'a self,
         node: &'a FsNode,
