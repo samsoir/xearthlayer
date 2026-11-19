@@ -407,6 +407,24 @@ pub struct Entry {
 }
 
 pub trait UnionFilesystem: Send + Sync {
+    /// Resolve `name` inside `node` to a child and its attributes.
+    /// Resolution is ordered: (1) a union-index hit — real file or
+    /// directory — stat'ed once for its attributes (that stat also
+    /// decides which variant the node takes); (2) a directory of the
+    /// union view, answered with template attributes; (3) lazy
+    /// resolution under the lazily-scanned directories (`terrain/`,
+    /// `textures/`), which consults the sources' filesystems on demand
+    /// instead of an index; (4) a generatable `.dds` name, subject to
+    /// the water-mask guard's deliberate NotFound (see the core's
+    /// geo/water-mask filtering).
+    ///
+    /// Step (3) has a reachability consequence worth stating: a
+    /// lazily-scanned parent is itself resolved by steps (1)–(2), so
+    /// `terrain/` and `textures/` must exist on some source's
+    /// filesystem for their children to be reachable at all. Shipped
+    /// worlds always satisfy this; unit and conformance tests name
+    /// nodes directly and cannot observe the requirement — only a live
+    /// mount walks root → textures → child.
     fn lookup<'a>(
         &'a self,
         node: &'a FsNode,
