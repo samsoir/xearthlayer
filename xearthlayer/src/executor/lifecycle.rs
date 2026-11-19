@@ -313,7 +313,24 @@ impl JobExecutor {
         }
 
         let mut jobs = self.active_jobs.lock().await;
-        jobs.remove(&job_id);
+        if jobs.remove(&job_id).is_some() {
+            self.report_job_finished();
+        }
+    }
+
+    /// Every job that enters `active_jobs` reports its start here and its
+    /// finish when it leaves, so the metrics' `jobs_active` is the number of
+    /// jobs this executor is running (#368).
+    fn report_job_started(&self) {
+        if let Some(ref metrics) = self.metrics_client {
+            metrics.job_started();
+        }
+    }
+
+    fn report_job_finished(&self) {
+        if let Some(ref metrics) = self.metrics_client {
+            metrics.job_finished();
+        }
     }
 
     /// Logs job completion at appropriate level.
@@ -429,6 +446,7 @@ impl JobExecutor {
         self.telemetry.emit(TelemetryEvent::JobStarted {
             job_id: job_id.clone(),
         });
+        self.report_job_started();
 
         let total_tasks = active.pending_tasks.len();
         debug!(job_id = %job_id, task_count = total_tasks, "Job started");
@@ -515,6 +533,7 @@ impl JobExecutor {
         self.telemetry.emit(TelemetryEvent::JobStarted {
             job_id: child_id.clone(),
         });
+        self.report_job_started();
 
         {
             let mut queue = self.task_queue.lock().await;
@@ -544,6 +563,7 @@ impl JobExecutor {
                 children_succeeded: job.succeeded_children.len(),
                 children_failed: job.failed_children.len(),
             });
+            self.report_job_finished();
         }
         jobs.clear();
 

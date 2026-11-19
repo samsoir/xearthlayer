@@ -28,7 +28,7 @@ pub fn format_duration(d: Duration) -> String {
 /// (only one path emits chunk events, so aggregate == FUSE there). See #171.
 pub fn format_simple_status(snapshot: &TelemetrySnapshot) -> String {
     format!(
-        "[{}] Tiles: {} completed, {} active | Throughput: {} | Cache: {:.0}% mem, {:.0}% dds, {:.0}% chunks",
+        "[{}] Tiles: {} completed, {} running | Throughput: {} | Cache: {:.0}% mem, {:.0}% dds, {:.0}% chunks",
         snapshot.uptime_human(),
         snapshot.jobs_completed,
         snapshot.jobs_active,

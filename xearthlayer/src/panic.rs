@@ -144,7 +144,7 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
                 let _ = writeln!(stderr, "━━━ Telemetry State ━━━");
                 let snapshot = callback();
                 let _ = writeln!(stderr, "Uptime:           {:?}", snapshot.uptime);
-                let _ = writeln!(stderr, "Jobs active:      {}", snapshot.jobs_active);
+                let _ = writeln!(stderr, "Jobs running:     {}", snapshot.jobs_active);
                 let _ = writeln!(stderr, "Jobs completed:   {}", snapshot.jobs_completed);
                 let _ = writeln!(stderr, "Jobs failed:      {}", snapshot.jobs_failed);
                 let _ = writeln!(stderr, "Jobs timed out:   {}", snapshot.jobs_timed_out);

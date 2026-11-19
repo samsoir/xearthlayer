@@ -212,7 +212,8 @@ pub struct AggregatedState {
     pub jobs_failed: u64,
     /// Jobs that timed out.
     pub jobs_timed_out: u64,
-    /// Currently active jobs.
+    /// Jobs the executors are running now, both lanes: up on `JobStarted`,
+    /// down on `JobFinished` (#368).
     pub jobs_active: u64,
     /// Jobs that were coalesced.
     pub jobs_coalesced: u64,
