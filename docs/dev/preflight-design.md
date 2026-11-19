@@ -85,7 +85,7 @@ xearthlayer-cli/src/preflight/
     config.rs     FirstRun, LoadConfig, ConfigUpgradeWarning
     paths.rs      PackagesInstalled, ResolveCustomScenery, CustomSceneryExists
     system.rs     LogStartup, FdLimit, AirportIcao, MacFuseAvailable,
-                  NoRunningInstance
+                  MountVolumeOwnership, NoRunningInstance
 ```
 
 The trait is public and unsealed in the library crate. A trait declared in a
@@ -256,7 +256,8 @@ Prefer this wherever the cost is a branch rather than a genuinely absent API.
 Every check that touches the environment takes its source as a constructor
 parameter: `FirstRun::with_paths`, `LoadConfig::with_path`,
 `ResolveCustomScenery::with_detector`, `FdLimit::with_limits`,
-`MacFuseAvailable::with_probe`, `NoRunningInstance::with_liveness`.
+`MacFuseAvailable::with_probe`, `MountVolumeOwnership::with_probe`,
+`NoRunningInstance::with_liveness`.
 
 No test reads a real `$HOME`, probes for a real X-Plane installation, or
 depends on which PIDs happen to exist on the machine running it. Two of these
@@ -284,7 +285,8 @@ constraints described above.
 | 10 | `xworld-pro-setup` | Setting on: warnings only (ortho library, mesh variants, install links, broken entries); reads the detection |
 | 11 | `airport-icao` | Validates `--airport`, only when one was given |
 | 12 | `macfuse-available` | Requires macFUSE, macOS only |
-| 13 | `no-running-instance` | Refuses a second concurrent instance |
+| 13 | `mount-volume-ownership` | Refuses a Custom Scenery drive that ignores ownership, where fskitd cannot mount; macOS only (#369) |
+| 14 | `no-running-instance` | Refuses a second concurrent instance |
 
 Two positions are themselves load-bearing.
 

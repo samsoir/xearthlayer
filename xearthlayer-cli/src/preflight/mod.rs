@@ -37,6 +37,7 @@ pub mod names {
     pub const XWORLD_PRO_SETUP: &str = "xworld-pro-setup";
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
+    pub const MOUNT_VOLUME_OWNERSHIP: &str = "mount-volume-ownership";
     pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
 }
 
@@ -153,6 +154,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     runner.register(Box::new(system::MacFuseAvailable::with_probe(
         macfuse_probe,
     )));
+    runner.register(Box::new(system::MountVolumeOwnership::default()));
 
     // Last: the lock is claimed only for a run that will actually proceed.
     // Claiming it earlier would leave a lock behind for a run rejected by a
@@ -456,6 +458,7 @@ mod tests {
                 names::XWORLD_PRO_SETUP,
                 names::AIRPORT_ICAO,
                 names::MACFUSE_AVAILABLE,
+                names::MOUNT_VOLUME_OWNERSHIP,
                 names::NO_RUNNING_INSTANCE,
             ]
         );
@@ -532,6 +535,7 @@ mod tests {
             names::XWORLD_PRO_SETUP,
             names::AIRPORT_ICAO,
             names::MACFUSE_AVAILABLE,
+            names::MOUNT_VOLUME_OWNERSHIP,
             names::NO_RUNNING_INSTANCE,
         ];
         let mut seen: Vec<&str> = all.to_vec();
