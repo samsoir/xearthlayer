@@ -30,6 +30,7 @@ pub mod encoder_policy;
 pub mod filesystem;
 pub mod gpu;
 mod hardware;
+pub mod macfuse;
 mod mount_folder;
 pub mod process;
 mod recommendations;
@@ -45,6 +46,10 @@ pub use gpu::{
     find_adapter as find_gpu, GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
+pub use macfuse::{
+    installed_macfuse_version, macfuse_version_in, MACFUSE_BUNDLE, MACFUSE_INFO_PLIST,
+    MACFUSE_MFMOUNT,
+};
 pub use mount_folder::{
     external_volume_root, ignores_ownership, prepare_mount_folder, volume_ignores_ownership,
     MountFolder, MNT_IGNORE_OWNERSHIP,
@@ -53,4 +58,7 @@ pub use recommendations::{
     recommended_disk_cache, recommended_memory_cache, RecommendedSettings, MIN_DISK_CACHE_BYTES,
     MIN_MEMORY_CACHE_BYTES,
 };
-pub use unmount::{is_path_mounted, is_stale_fuse_mount, recover_stale_fuse_mount, unmount_fuse};
+pub use unmount::{
+    is_path_mounted, is_stale_fuse_mount, macfuse_mount_in, macfuse_mounts_in, macos_mount_table,
+    recover_stale_fuse_mount, unmount_fuse, wait_for_macfuse_mount, MacfuseMount,
+};

@@ -69,7 +69,9 @@ pub use error::{ManagerError, ManagerResult};
 pub use extractor::TarGzExtractor;
 pub use installer::{InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore};
-pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
+pub use mounts::{
+    ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder, ORTHO_MOUNT_FOLDER,
+};
 pub use queue::{
     CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
     JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,

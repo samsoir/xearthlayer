@@ -31,6 +31,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
+   - macFUSE readout (#362, diagnostics and log only): the volume is looked up in the mount table (`system::macfuse_mounts_in`, the `fskit` flag on the `mount(8)` line), never asked of fuse3, so `xearthlayer diagnostics` gets the same answer from its own process. After mounting on macOS, `MountManager` waits up to 2 s for the volume and logs `macFUSE FSKit volume mounted` with the macFUSE version (`system::macfuse`, `CFBundleShortVersionString` from the bundle's `Info.plist`), warning when it is missing or lacks `fskit`. The mount folder name is `manager::ORTHO_MOUNT_FOLDER`. The macFUSE smoke tests assert FSKit through the same parser
    - Virtual DDS files open with `FOPEN_DIRECT_IO` on Linux so every read reaches the handler. macOS serves them through the kernel page cache (direct I/O crashes X-Plane's `mmap` texture loader under macFUSE), so the FUSE read counters under-report there; nothing functional depends on per-read visibility (#204). See `docs/dev/fuse-filesystem.md`
 
 2. **Tile Generation** (`xearthlayer/src/tile/`)

@@ -30,6 +30,41 @@ use xearthlayer_package::{
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
 
+/// The folder in Custom Scenery the consolidated ortho volume mounts on.
+pub const ORTHO_MOUNT_FOLDER: &str = "zzXEL_ortho";
+
+/// How long the ortho volume may take to appear in the mount table after
+/// fuse3 returns from the mount, before the log says it never did.
+const MOUNT_TABLE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Logs the macFUSE volume serving the ortho mount and the macFUSE version,
+/// once after mounting, so a flight log says what it was flown on (#362).
+/// Read from the mount table, with a bounded wait because fuse3 can return
+/// before the volume is listed. Warns when the volume never appears, or
+/// appears without the `fskit` flag: XEarthLayer mounts through FSKit only.
+fn log_macfuse_mount(mountpoint: &Path) {
+    let version = crate::system::installed_macfuse_version();
+    let version = version.as_deref().unwrap_or("unknown");
+    match crate::system::wait_for_macfuse_mount(mountpoint, MOUNT_TABLE_DEADLINE) {
+        Some(mount) if mount.fskit => tracing::info!(
+            mountpoint = %mount.path,
+            macfuse = version,
+            "macFUSE FSKit volume mounted"
+        ),
+        Some(mount) => tracing::warn!(
+            mountpoint = %mount.path,
+            macfuse = version,
+            "macFUSE volume mounted, but not served by FSKit: no fskit flag in the mount table"
+        ),
+        None => tracing::warn!(
+            mountpoint = %mountpoint.display(),
+            macfuse = version,
+            timeout = ?MOUNT_TABLE_DEADLINE,
+            "macFUSE volume not in the mount table after mounting"
+        ),
+    }
+}
+
 /// Information about an active mount.
 #[derive(Debug)]
 pub struct ActiveMount {
@@ -384,7 +419,7 @@ impl MountManager {
 
         // Determine mountpoint
         let mountpoint = if let Some(ref scenery_path) = self.scenery_path {
-            scenery_path.join("zzXEL_ortho")
+            scenery_path.join(ORTHO_MOUNT_FOLDER)
         } else {
             return ConsolidatedOrthoMountResult::failure(
                 PathBuf::new(),
@@ -641,6 +676,10 @@ impl MountManager {
                     files = file_count,
                     "Consolidated ortho union filesystem mounted"
                 );
+
+                if cfg!(target_os = "macos") {
+                    log_macfuse_mount(&mountpoint);
+                }
 
                 ConsolidatedOrthoMountResult::success(
                     mountpoint,

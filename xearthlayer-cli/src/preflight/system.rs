@@ -202,9 +202,9 @@ pub struct MacFuseAvailable {
 }
 
 /// The `MFMount` library inside macFUSE's filesystem bundle, which the FSKit
-/// mount loads (macFUSE 5.3.3 or later).
-pub const MACFUSE_MFMOUNT: &str =
-    "/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework/MFMount";
+/// mount loads (macFUSE 5.3.3 or later). Defined beside the macFUSE version
+/// reader, because `xearthlayer diagnostics` reports it too.
+pub use xearthlayer::system::MACFUSE_MFMOUNT;
 
 impl Default for MacFuseAvailable {
     fn default() -> Self {

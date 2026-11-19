@@ -23,6 +23,8 @@ pub struct SystemReport {
     pub network: NetworkInfo,
     /// XEarthLayer configuration (with secrets redacted)
     pub config: ConfigInfo,
+    /// macFUSE installation and XEarthLayer's volume (macOS only)
+    pub macfuse: Option<MacfuseInfo>,
 }
 
 /// Operating system information.
@@ -88,6 +90,91 @@ pub struct NetworkInfo {
     pub default_interface: Option<String>,
 }
 
+/// macFUSE (#362): the installed version, whether the `MFMount` framework
+/// the FSKit mount loads is present and, while `xearthlayer run` is up, the
+/// macFUSE volume serving its ortho mount. The volume is read from the mount
+/// table, because diagnostics runs in its own process and cannot ask the
+/// service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacfuseInfo {
+    /// Whether macFUSE's filesystem bundle is installed.
+    pub installed: bool,
+    /// The installed version, when its `Info.plist` could be read.
+    pub version: Option<String>,
+    /// Whether `MFMount.framework` is present (macFUSE 5.3.3 or later).
+    pub mfmount: bool,
+    /// Each macFUSE volume mounted on an ortho mount folder.
+    pub volumes: Vec<crate::system::MacfuseMount>,
+}
+
+impl MacfuseInfo {
+    fn collect() -> Self {
+        Self::from_parts(
+            Path::new(crate::system::MACFUSE_BUNDLE).exists(),
+            crate::system::installed_macfuse_version(),
+            Path::new(crate::system::MACFUSE_MFMOUNT).exists(),
+            &crate::system::macos_mount_table().unwrap_or_default(),
+        )
+    }
+
+    /// From what was found on disk and `mount(8)` output, keeping only the
+    /// macFUSE volumes mounted on an ortho mount folder.
+    fn from_parts(
+        installed: bool,
+        version: Option<String>,
+        mfmount: bool,
+        mount_table: &str,
+    ) -> Self {
+        let volumes = crate::system::macfuse_mounts_in(mount_table)
+            .into_iter()
+            .filter(|mount| {
+                Path::new(&mount.path).file_name()
+                    == Some(crate::manager::ORTHO_MOUNT_FOLDER.as_ref())
+            })
+            .collect();
+        Self {
+            installed,
+            version,
+            mfmount,
+            volumes,
+        }
+    }
+}
+
+impl fmt::Display for MacfuseInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "## macFUSE")?;
+        match (self.installed, &self.version) {
+            (false, _) => writeln!(f, "Version: not installed")?,
+            (true, Some(version)) => writeln!(f, "Version: {}", version)?,
+            (true, None) => writeln!(f, "Version: unknown (Info.plist unreadable)")?,
+        }
+        writeln!(
+            f,
+            "MFMount framework: {}",
+            if self.mfmount { "yes" } else { "no" }
+        )?;
+        if self.volumes.is_empty() {
+            writeln!(
+                f,
+                "Mounted: no XEarthLayer volume (is xearthlayer run running?)"
+            )?;
+        }
+        for volume in &self.volumes {
+            if volume.fskit {
+                writeln!(f, "Mounted: FSKit, {}", volume.path)?;
+            } else {
+                writeln!(
+                    f,
+                    "Mounted: {}, not served by FSKit (no fskit flag in the mount table)",
+                    volume.path
+                )?;
+            }
+        }
+        writeln!(f)
+    }
+}
+
 /// XEarthLayer configuration (secrets redacted).
 #[derive(Debug, Clone, Default)]
 pub struct ConfigInfo {
@@ -106,6 +193,7 @@ impl SystemReport {
             disk: DiskInfo::collect(),
             network: NetworkInfo::collect(),
             config: ConfigInfo::collect(),
+            macfuse: cfg!(target_os = "macos").then(MacfuseInfo::collect),
         }
     }
 }
@@ -714,6 +802,10 @@ impl fmt::Display for SystemReport {
         )?;
         writeln!(f)?;
 
+        if let Some(ref macfuse) = self.macfuse {
+            write!(f, "{}", macfuse)?;
+        }
+
         // Network
         writeln!(f, "## Network")?;
         if let Some(ref iface) = self.network.default_interface {
@@ -740,6 +832,107 @@ impl fmt::Display for SystemReport {
         writeln!(f, "Copy the above output into your GitHub issue.")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod macfuse_tests {
+    use super::*;
+    use crate::system::MacfuseMount;
+
+    const TABLE: &str = "\
+/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+macfuse://8F0C2D51 on /Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho (macfuse, nodev, nosuid, noowners, noatime, fskit, mounted by me)
+vault@macfuse0 on /Volumes/Vault (macfuse, nodev, nosuid, synchronous, mounted by me)
+";
+
+    const ORTHO: &str = "/Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho";
+
+    fn installed(table: &str) -> MacfuseInfo {
+        MacfuseInfo::from_parts(true, Some("5.5.0".to_string()), true, table)
+    }
+
+    #[test]
+    fn only_the_ortho_volume_is_reported() {
+        assert_eq!(
+            installed(TABLE).volumes,
+            vec![MacfuseMount {
+                path: ORTHO.to_string(),
+                fskit: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_section_names_the_version_the_framework_and_the_fskit_volume() {
+        assert_eq!(
+            installed(TABLE).to_string(),
+            "## macFUSE\n\
+             Version: 5.5.0\n\
+             MFMount framework: yes\n\
+             Mounted: FSKit, /Users/me/X-Plane 12/Custom Scenery/zzXEL_ortho\n\n"
+        );
+    }
+
+    #[test]
+    fn the_section_flags_an_ortho_volume_without_fskit() {
+        let table = "x@macfuse0 on /Users/me/Custom Scenery/zzXEL_ortho (macfuse, nodev)\n";
+        assert_eq!(
+            installed(table).to_string(),
+            "## macFUSE\n\
+             Version: 5.5.0\n\
+             MFMount framework: yes\n\
+             Mounted: /Users/me/Custom Scenery/zzXEL_ortho, not served by FSKit \
+             (no fskit flag in the mount table)\n\n"
+        );
+    }
+
+    #[test]
+    fn the_section_says_when_nothing_is_mounted() {
+        assert!(installed("")
+            .to_string()
+            .ends_with("Mounted: no XEarthLayer volume (is xearthlayer run running?)\n\n"));
+    }
+
+    #[test]
+    fn the_section_says_when_macfuse_is_not_installed() {
+        let text = MacfuseInfo::from_parts(false, None, false, "").to_string();
+        assert_eq!(
+            text,
+            "## macFUSE\n\
+             Version: not installed\n\
+             MFMount framework: no\n\
+             Mounted: no XEarthLayer volume (is xearthlayer run running?)\n\n"
+        );
+    }
+
+    #[test]
+    fn the_section_says_when_the_version_cannot_be_read() {
+        let text = MacfuseInfo::from_parts(true, None, true, "").to_string();
+        assert!(
+            text.contains("Version: unknown (Info.plist unreadable)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_section_is_printed_before_network() {
+        let mut report = SystemReport {
+            xearthlayer_version: "0.0.0".to_string(),
+            os: OsInfo::default(),
+            hardware: HardwareInfo::default(),
+            gpu: GpuInfo::default(),
+            disk: DiskInfo::default(),
+            network: NetworkInfo::default(),
+            config: ConfigInfo::default(),
+            macfuse: None,
+        };
+        assert!(!report.to_string().contains("## macFUSE"));
+
+        report.macfuse = Some(installed(TABLE));
+        let text = report.to_string();
+        let macfuse = text.find("## macFUSE").expect("a macFUSE section");
+        assert!(macfuse < text.find("## Network").unwrap());
     }
 }
 
@@ -1049,6 +1242,7 @@ google_api_key = THIS_IS_NOT_A_REAL_KEY_AND_NOT_SENSITIVE
             disk,
             network: NetworkInfo::default(),
             config: ConfigInfo::default(),
+            macfuse: None,
         }
         .to_string()
     }
