@@ -214,6 +214,11 @@ lint-fix: ## Run clippy and automatically fix issues
 verify: format-check lint test-strict test-scripts ## Run all verification checks (format, lint, test)
 	@echo "$(GREEN)All verification checks passed!$(NC)"
 
+.PHONY: glibc-floor
+glibc-floor: ## Build the Linux release in ubuntu:22.04 and check the glibc floor (run before tagging)
+	@echo "$(BLUE)Building in ubuntu:22.04 to check the glibc floor...$(NC)"
+	@scripts/linux/check-glibc-floor.sh
+
 .PHONY: test-scripts
 test-scripts: ## Run the release script tests (bash, against fake macOS tools)
 	@echo "$(BLUE)Running release script tests...$(NC)"

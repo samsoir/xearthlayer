@@ -118,6 +118,10 @@ git pull origin main
 
 # Verify everything passes
 make pre-commit
+
+# Build the Linux release the way release.yml does (ubuntu:22.04 container)
+# and check its glibc floor. PR CI builds on a newer glibc and never runs this.
+make glibc-floor
 ```
 
 ### Step 2: Update Version, Changelog, and version.json
@@ -402,8 +406,11 @@ user-facing surface: the update checker and the website both read the copy on
 # 4. Write the tester-facing notes for this exact tag
 #    .github/release-notes/v0.6.0-alpha.N.md
 
-# 5. Verify, commit, and push on develop
+# 5. Verify, commit, and push on develop. make glibc-floor builds the Linux
+#    release in release.yml's ubuntu:22.04 container and applies its glibc floor
+#    check, which no PR check runs; 0.5.1-beta.1 failed there (hypot@GLIBC_2.35).
 make pre-commit
+make glibc-floor
 git add Cargo.toml Cargo.lock version.json CHANGELOG.md .github/release-notes/
 git commit -m "chore(release): 0.6.0-alpha.N"
 git push origin develop/0.6.0
@@ -772,6 +779,7 @@ Update the comparison links at the bottom of CHANGELOG.md:
 
 - [ ] Working tree clean, on `main`, up to date
 - [ ] `make pre-commit` passes
+- [ ] `make glibc-floor` passes (Linux release build in ubuntu:22.04, glibc floor 2.34)
 - [ ] `make bump-version VERSION=X.Y.Z` run — updates `Cargo.toml`, `Cargo.lock`, `version.json`, `pkg/rpm/xearthlayer.spec`, `pkg/arch/PKGBUILD`
 - [ ] `version.json` `release_date` set by hand (`bump-version` deliberately leaves it)
 - [ ] CHANGELOG.md updated with all changes

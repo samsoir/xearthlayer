@@ -1,0 +1,8 @@
+# Methods that compile to a glibc call whose newest symbol version is above
+# the Linux release's glibc floor (GLIBC_FLOOR in release.yml, 2.34 for
+# Ubuntu 22.04, Debian 12 and RHEL 9). PR CI builds on a newer glibc, so only
+# this lint catches them before a release does.
+disallowed-methods = [
+    { path = "f64::hypot", reason = "needs hypot@GLIBC_2.35, above the release glibc floor 2.34; use (dx * dx + dy * dy).sqrt()" },
+    { path = "f32::hypot", reason = "needs hypotf@GLIBC_2.35, above the release glibc floor 2.34; use (dx * dx + dy * dy).sqrt()" },
+]
