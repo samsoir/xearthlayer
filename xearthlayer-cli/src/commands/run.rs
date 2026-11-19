@@ -97,7 +97,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     let use_tui = atty::is(atty::Stream::Stdout);
 
     let control_plane_settings = ControlPlaneSettings {
-        max_concurrent_jobs: config.control_plane.max_concurrent_jobs,
         stall_threshold_secs: config.control_plane.stall_threshold_secs,
         health_check_interval_secs: config.control_plane.health_check_interval_secs,
         semaphore_timeout_secs: config.control_plane.semaphore_timeout_secs,

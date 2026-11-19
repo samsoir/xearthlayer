@@ -61,9 +61,6 @@ pub struct ServiceOrchestrator {
     /// Tile progress tracker for active tile display.
     pub(super) tile_progress_tracker: Option<SharedTileProgressTracker>,
 
-    /// Maximum concurrent jobs (for UI display).
-    pub(super) max_concurrent_jobs: usize,
-
     /// FUSE request analyzer for position inference.
     pub(super) fuse_analyzer: Option<Arc<FuseRequestAnalyzer>>,
 
@@ -152,7 +149,6 @@ impl ServiceOrchestrator {
             service_builder: Some(service_builder),
             runtime_health: None,
             tile_progress_tracker: None,
-            max_concurrent_jobs: 0,
             fuse_analyzer,
             scenery_index,
             sim_state,
@@ -521,7 +517,6 @@ impl ServiceOrchestrator {
         if let Some(service) = self.mount_manager.get_service() {
             self.runtime_health = service.runtime_health();
             self.tile_progress_tracker = service.tile_progress_tracker();
-            self.max_concurrent_jobs = service.max_concurrent_jobs();
         }
     }
 
@@ -557,11 +552,6 @@ impl ServiceOrchestrator {
     /// Get tile progress tracker for active tile display in TUI.
     pub fn tile_progress_tracker(&self) -> Option<SharedTileProgressTracker> {
         self.tile_progress_tracker.clone()
-    }
-
-    /// Get maximum concurrent jobs for UI display.
-    pub fn max_concurrent_jobs(&self) -> usize {
-        self.max_concurrent_jobs
     }
 
     /// Get aggregated telemetry snapshot for UI display.

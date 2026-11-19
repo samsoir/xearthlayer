@@ -40,7 +40,6 @@ mod writer;
 pub use file::{
     config_directory,
     config_file_path,
-    default_max_concurrent_jobs,
     num_cpus,
     CacheSettings,
     ConfigFile,

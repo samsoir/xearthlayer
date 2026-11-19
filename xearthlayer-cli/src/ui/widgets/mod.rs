@@ -15,7 +15,6 @@
 
 mod aircraft_position;
 mod cache;
-mod control_plane;
 mod feature_status;
 mod fuse_latency;
 mod input_output;
@@ -35,7 +34,3 @@ pub use fuse_latency::FuseLatencyWidget;
 pub use input_output::{DiskHistory, InputOutputWidget};
 pub use prefetch_system::{LaneHistory, LaneView, PrefetchSystemWidget};
 pub use scenery_system::{SceneryHistory, ScenerySystemWidget};
-
-// Legacy widgets (deprecated in v0.3.0, still used in render_sections.rs)
-#[deprecated(since = "0.3.0", note = "Use ScenerySystemWidget instead")]
-pub use control_plane::ControlPlaneWidget;

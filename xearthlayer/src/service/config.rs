@@ -174,7 +174,7 @@ impl ServiceConfig {
 impl Default for ServiceConfig {
     fn default() -> Self {
         use crate::config::{
-            default_max_concurrent_jobs, DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
             DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
             DEFAULT_PREFETCH_CAPACITY_SHARE, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -193,7 +193,6 @@ impl Default for ServiceConfig {
             quiet_mode: false,
             night_enabled: false,
             control_plane: ControlPlaneSettings {
-                max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
@@ -328,7 +327,7 @@ impl ServiceConfigBuilder {
     /// Build the configuration with defaults for unset values.
     pub fn build(self) -> ServiceConfig {
         use crate::config::{
-            default_max_concurrent_jobs, DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
+            DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
             DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,
             DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS, DEFAULT_MAX_RETRIES,
             DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -349,7 +348,6 @@ impl ServiceConfigBuilder {
             quiet_mode: self.quiet_mode.unwrap_or(false),
             night_enabled: self.night_enabled.unwrap_or(false),
             control_plane: self.control_plane.unwrap_or(ControlPlaneSettings {
-                max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
                 health_check_interval_secs: DEFAULT_CONTROL_PLANE_HEALTH_CHECK_INTERVAL_SECS,
                 semaphore_timeout_secs: DEFAULT_CONTROL_PLANE_SEMAPHORE_TIMEOUT_SECS,

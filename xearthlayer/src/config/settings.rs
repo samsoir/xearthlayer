@@ -211,9 +211,6 @@ pub struct PrefetchSettings {
 /// Control plane configuration for job management and health monitoring.
 #[derive(Debug, Clone)]
 pub struct ControlPlaneSettings {
-    /// Maximum concurrent jobs (DDS requests) allowed.
-    /// Default: num_cpus × 2
-    pub max_concurrent_jobs: usize,
     /// Time threshold in seconds for considering a job stalled.
     /// Jobs in the same stage longer than this are recovered.
     /// Default: 60 seconds
