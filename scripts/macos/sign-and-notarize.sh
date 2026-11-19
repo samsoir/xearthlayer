@@ -68,10 +68,17 @@ for bin in "$@"; do
     echo "==> codesign $bin"
     # --force replaces the ad-hoc, linker-generated signature every Rust build
     # carries on Apple Silicon. --options runtime (hardened runtime) and
-    # --timestamp are both notarization requirements. No entitlements: the
-    # binaries link only Apple frameworks. macFUSE's MFMount.framework is
-    # dlopen'd at mount time; see docs/dev/macos-signing-runbook.md.
-    codesign --force --timestamp --options runtime --sign "$identity" "$bin"
+    # --timestamp are both notarization requirements. The runtime is signed
+    # with pkg/macos/xearthlayer.entitlements (disable-library-validation),
+    # because it dlopens macFUSE's MFMount.framework, signed by another team,
+    # when it mounts; the publisher needs no entitlements (entitlements_for in
+    # lib.sh, docs/dev/macos-signing-runbook.md).
+    entitlements=$(entitlements_for "$bin")
+    if [ -n "$entitlements" ]; then
+        codesign --force --timestamp --options runtime --entitlements "$entitlements" --sign "$identity" "$bin"
+    else
+        codesign --force --timestamp --options runtime --sign "$identity" "$bin"
+    fi
     codesign --verify --strict --verbose=2 "$bin"
     codesign --display --verbose=2 "$bin" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|CodeDirectory)' || true
 done

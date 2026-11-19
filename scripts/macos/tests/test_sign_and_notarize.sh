@@ -14,7 +14,7 @@ test_signs_with_the_one_application_identity() {
     make_exe "$FAKE_DIR/bin/xearthlayer"
     FAKE_IDENTITIES="$APP_ID" MACOS_SKIP_NOTARIZE=1 "$SCRIPT" "$FAKE_DIR/bin/xearthlayer" >/dev/null 2>&1 \
         || fail "signing failed"
-    assert_contains "$(cat "$FAKE_LOG")" "codesign --force --timestamp --options runtime --sign 1111111111111111111111111111111111111111 $FAKE_DIR/bin/xearthlayer"
+    assert_contains "$(cat "$FAKE_LOG")" "--sign 1111111111111111111111111111111111111111 $FAKE_DIR/bin/xearthlayer"
 }
 
 test_refuses_two_application_identities() {
@@ -53,4 +53,20 @@ test_refuses_without_notary_credentials() {
     local rc=0
     FAKE_IDENTITIES="$APP_ID" "$SCRIPT" "$FAKE_DIR/bin/xearthlayer" >/dev/null 2>&1 || rc=$?
     assert_eq "$rc" 1
+}
+
+test_signs_the_runtime_with_its_entitlements() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer"
+    FAKE_IDENTITIES="$APP_ID" MACOS_SKIP_NOTARIZE=1 "$SCRIPT" "$FAKE_DIR/bin/xearthlayer" >/dev/null 2>&1 \
+        || fail "signing failed"
+    assert_contains "$(cat "$FAKE_LOG")" "codesign --force --timestamp --options runtime --entitlements $(cd "$SCRIPTS_DIR/../.." && pwd)/pkg/macos/xearthlayer.entitlements --sign 1111111111111111111111111111111111111111 $FAKE_DIR/bin/xearthlayer"
+}
+
+test_signs_the_publisher_without_entitlements() {
+    setup_fakes
+    make_exe "$FAKE_DIR/bin/xearthlayer-publish"
+    FAKE_IDENTITIES="$APP_ID" MACOS_SKIP_NOTARIZE=1 "$SCRIPT" "$FAKE_DIR/bin/xearthlayer-publish" >/dev/null 2>&1 \
+        || fail "signing failed"
+    assert_contains "$(cat "$FAKE_LOG")" "codesign --force --timestamp --options runtime --sign 1111111111111111111111111111111111111111 $FAKE_DIR/bin/xearthlayer-publish"
 }

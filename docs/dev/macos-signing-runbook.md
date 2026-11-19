@@ -81,20 +81,31 @@ for autumn 2027. The Installer certificate has its own expiry, **25 November
 ## What the Signature Looks Like
 
 ```bash
-codesign --force --timestamp --options runtime --sign "Developer ID Application: ..." xearthlayer
+codesign --force --timestamp --options runtime \
+    --entitlements pkg/macos/xearthlayer.entitlements \
+    --sign "Developer ID Application: ..." xearthlayer
+codesign --force --timestamp --options runtime --sign "Developer ID Application: ..." xearthlayer-publish
 ```
 
 - `--force` replaces the ad-hoc, linker-generated signature every Rust build
   carries on Apple Silicon.
 - `--options runtime` turns on the hardened runtime, which notarization
-  requires. The binaries carry **no entitlements**: they link only Apple
-  frameworks (Metal, Foundation, CoreGraphics and libSystem). The pinned
-  `fuse3` fork reaches macFUSE's FSKit backend by `dlopen`ing
+  requires. Both binaries link only Apple frameworks (Metal, Foundation,
+  CoreGraphics and libSystem), but the runtime also loads one at run time: the
+  pinned `fuse3` fork reaches macFUSE's FSKit backend by `dlopen`ing
   `/Library/Filesystems/macfuse.fs/Contents/Frameworks/MFMount.framework` when
-  it mounts. The hardened runtime's library validation applies to that load,
-  and macFUSE is signed by another team: if a signed build fails to mount with
-  a library-validation error, that is the moment to add an entitlements file
-  (`com.apple.security.cs.disable-library-validation`).
+  it mounts. The hardened runtime's library validation refuses that load,
+  because macFUSE is signed by another team (`3T5GSNBU6W`): a signed
+  `xearthlayer` without entitlements fails every mount with `MFMount.framework
+  could not be loaded (... not valid for use in process: mapping process and
+  mapped file (non-platform) have different Team IDs)`, verified with a
+  Developer ID signature on 2026-11-18. So `xearthlayer` is signed with
+  `pkg/macos/xearthlayer.entitlements`, which holds the single entitlement
+  `com.apple.security.cs.disable-library-validation`, and it mounts.
+  `xearthlayer-publish` never mounts and is signed without entitlements, so it
+  keeps library validation. `entitlements_for` in `scripts/macos/lib.sh`
+  chooses the file per binary. Grant nothing else: every further hardened
+  runtime exception widens what can be injected into the process.
 - `--timestamp` attaches a secure timestamp from Apple's server. It is what
   keeps a signature valid after the certificate expires, so a build signed
   today still runs in six years.
