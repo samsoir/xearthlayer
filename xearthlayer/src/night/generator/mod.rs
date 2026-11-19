@@ -100,16 +100,6 @@ pub const SRGB_GAMMA: f32 = 2.2;
 /// gave 9% of the light) and before road lights covered the hand-off.
 pub const FADE_RAMP: [f32; 2] = [0.5325, 0.7297];
 
-/// Scale of the stored values of the top level X-Plane uploads (twice the
-/// first visible level's size, generated on its own): a twelfth of the
-/// light, `(1/12) ^ (1/2.2)`. X-Plane loads that level only for the textures
-/// nearest the aircraft and shows it over the whole texture, under its 3D
-/// scenery. Built from the first visible level it gave a quarter of the
-/// light in 2 x 2 copies of 7.5 m texels, and in flight 7 (KCCR,
-/// 2026-11-14) that near field was too bright and too coarse; generated on
-/// its own at an eighth it was still too bright in flight 8 (the same day).
-pub const TOP_GAIN: f32 = 0.32319;
-
 /// The largest stored R, G or B below which a texel is encoded black. BC1
 /// stores colours as RGB565: below about 4 in stored value red and blue
 /// round to 0 while green keeps a 4, so very dim texels decode green or
@@ -137,14 +127,6 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
         dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
     }
     bc1_levels(&chain)
-}
-
-/// BC1-encode `image` as the top level X-Plane uploads: one level, no
-/// chain and no header, at [`TOP_GAIN`], floored at [`BC1_FLOOR`] and
-/// repaired where BC1 tints it ([`bc1_repair`]).
-pub fn encode_top(mut image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    dim(&mut image, TOP_GAIN);
-    bc1_levels(std::slice::from_ref(&image))
 }
 
 /// The BC1 blocks of `levels`, in order, without the DDS header, each level
@@ -371,36 +353,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_top_gives_a_twelfth_of_the_light() {
-        assert!((TOP_GAIN.powf(SRGB_GAMMA) - 1.0 / 12.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn the_encoded_top_is_one_level_at_a_twelfth_of_the_light() {
-        let top = encode_top(solid(64, [240; 3])).unwrap();
-        assert_eq!(top.len(), 64 * 64 / 2, "one BC1 level, no header, no chain");
-        let rgb = level_rgbs(&top, 64)[0];
-        let want = 240.0 * (1.0f32 / 12.0).powf(1.0 / SRGB_GAMMA);
-        assert!(
-            rgb.iter().all(|&c| (f32::from(c) - want).abs() <= 8.0),
-            "{rgb:?} against {want}"
-        );
-    }
-
-    #[test]
-    fn the_encoded_top_is_black_below_the_floor_after_its_dimming() {
-        // 22 dims to 7, 25 to 8.
-        assert_eq!(
-            level_rgbs(&encode_top(solid(64, [22; 3])).unwrap(), 64)[0],
-            [0; 3]
-        );
-        assert_ne!(
-            level_rgbs(&encode_top(solid(64, [25; 3])).unwrap(), 64)[0],
-            [0; 3]
-        );
-    }
-
     /// A one-texel checkerboard of `lit` and black.
     fn checker(size: u32, lit: [u8; 3]) -> RgbaImage {
         RgbaImage::from_fn(size, size, |x, y| {
@@ -498,18 +450,17 @@ mod tests {
     }
 
     #[test]
-    fn the_encoded_top_has_no_introduced_tint_on_dim_lamps() {
-        // The top's dimming turns these into the probe's lamp.
+    fn an_encoded_level_has_no_introduced_tint_on_dim_lamps() {
+        // A twelfth of the light, `(1/12) ^ (1/2.2)` in stored value, turns
+        // these into the lamp of flight 9's probe.
         let img = lamps(64, [28, 22, 15], [25, 19, 15], [25, 22, 15]);
         let mut level = img.clone();
-        dim(&mut level, TOP_GAIN);
+        dim(&mut level, 0.32319);
         assert_eq!(level.get_pixel(0, 0).0, [9, 7, 5, 255]);
         assert_eq!(level.get_pixel(3, 0).0, [8, 6, 5, 255]);
         assert!(bc1_repair::tests::introduced_tints(&unrepaired(&level), &level) > 0);
-        assert_eq!(
-            bc1_repair::tests::introduced_tints(&encode_top(img).unwrap(), &level),
-            0
-        );
+        let encoded = bc1_levels(std::slice::from_ref(&level)).unwrap();
+        assert_eq!(bc1_repair::tests::introduced_tints(&encoded, &level), 0);
     }
 
     #[test]
