@@ -8,7 +8,7 @@
 //! - `state` - State enums and data structs (no rendering dependencies)
 //! - `render` - Main layout orchestration
 //! - `render_loading` - Loading state rendering
-//! - `render_sections` - Section-specific rendering (prefetch, control plane)
+//! - `render_sections` - Shared layout helpers
 //! - `utils` - Formatting and non-TUI output
 
 mod render;
@@ -42,7 +42,7 @@ use crate::ui::widgets::{
 
 // Re-export public types from state module
 pub use state::{
-    DashboardConfig, DashboardEvent, DashboardState, JobRates, LoadingPhase, LoadingProgress,
+    DashboardConfig, DashboardEvent, DashboardState, LoadingPhase, LoadingProgress,
     PrefetchLaneConfig, PrewarmProgress, QUIT_CONFIRM_TIMEOUT, SPINNER_FRAMES,
 };
 

@@ -27,8 +27,8 @@ so that a single unattended flight discriminates between them:
    write, one DDS disk cache write — each holding its own clone of the encoded
    tile (~11.2 MB for BC1 with a full mipmap chain). The disk write reaches
    storage through `tokio::fs`, which queues on the tokio blocking pool. Neither
-   spawn is gated by the executor's `max_concurrent_jobs` or by any
-   `ResourcePool` permit, so if the blocking pool saturates the queue and its
+   spawn is gated by the executor's `tile_generation` concurrency group or by
+   any `ResourcePool` permit, so if the blocking pool saturates the queue and its
    buffers grow without limit. The two spawns are independently observable as
    `disk_writes_active` and `mem_cache_writes_active` respectively — a backlog
    in either one is this candidate.
@@ -594,7 +594,7 @@ reproducible workload.
 
 - [Memory Profiling](memory-profiling.md) — heaptrack guide
 - [Cache Service Design](cache-service-design.md) — `CacheLayer`, GC daemons, the tiers behind `mem_cache_mb` / `dds_disk_mb` / `chunk_disk_mb`
-- [Job Executor Design](job-executor-design.md) — resource pools and `max_concurrent_jobs`, which the fire-and-forget cache writes bypass
+- [Job Executor Design](job-executor-design.md) — resource pools and the `tile_generation` concurrency group, which the fire-and-forget cache writes bypass
 - [Configuration](../configuration.md) — `logging.file`, `cache.memory_size`, `cache.disk_size`
 - Issue [#209](https://github.com/samsoir/xearthlayer/issues/209) — the OOM kill this telemetry was added to diagnose
 - Issue [#180](https://github.com/samsoir/xearthlayer/issues/180) — why `chunks_failed` suppresses cache writes
