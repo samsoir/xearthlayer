@@ -27,9 +27,11 @@ tracing-appender = "0.2"
 # Temporary fork: samsoir/fuse3 `master` = upstream master (0.10.0, which carries
 # our configurable max_background/congestion_threshold) plus macOS changes:
 # reply resilience (upstream PR #137), comma-joined mount options, reply drops
-# logged at debug, the MFMount (FSKit) channel transport, and the retry of an
-# interrupted FSKit receive (samsoir/fuse3#4). Required for 0.5.x (macOS support) until these ship on crates.io;
-# revert to the published fuse3 release then. See #155.
+# logged at debug, the MFMount (FSKit) channel transport, the retry of an
+# interrupted FSKit receive (samsoir/fuse3#4), and a library-validation hint
+# when MFMount cannot be loaded (samsoir/fuse3#5). Required for 0.5.x (macOS
+# support) until these ship on crates.io; revert to the published fuse3
+# release then. See #155.
 # Never rewrite that branch's history: released Cargo.lock files pin its commits.
 fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "master", features = ["tokio-runtime", "unprivileged"] }
 libc = "0.2"
