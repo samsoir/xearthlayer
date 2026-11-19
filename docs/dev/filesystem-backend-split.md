@@ -515,6 +515,13 @@ pub struct FileAttributes {
 
 pub struct DirEntry {
     pub name: OsString,
+    /// Node plus attributes for the child.  For virtual children these
+    /// attrs are authoritative — the templates those nodes always answer
+    /// with.  For source-backed children they are provisional: listing
+    /// resolves the union index, not the filesystem.  A backend that
+    /// publishes attributes in its directory replies must upgrade each
+    /// source-backed child with `attrs(&node)` — as fuse3's readdirplus
+    /// does; name-and-kind-only replies may use the node as-is.
     pub entry: Entry,
 }
 
