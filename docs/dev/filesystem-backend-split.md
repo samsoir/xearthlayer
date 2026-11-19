@@ -392,6 +392,14 @@ never `async-trait` or an owned `node`; the signature is the contract.
 Implementations may spell the boxed return `BoxFuture<'a, T>`, the alias
 `common/union.rs` exports.
 
+Every operation here reads; the union is read-only by design. That
+omission holds because each backend must establish its mount read-only —
+the fuse3 backend passes the kernel's `read_only` mount option, so writes
+are refused in-kernel and never dispatched — and a backend that cannot
+enforce read-only at mount establishment must refuse writes itself.
+Reopening this omission (a write-through story of any kind) changes the
+contract's core shape, not just its surface.
+
 ```rust
 /// A node *and* its attributes, as one answer.  A kernel's lookup reply
 /// carries an attribute template, so attributes are needed at lookup time
