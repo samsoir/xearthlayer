@@ -442,7 +442,11 @@ pub enum FsError {
     NotFound,
 
     /// The requested node is not a directory (e.g. a directory listing was
-    /// asked for a file).
+    /// asked for a file).  A neutral invariant, held by the conformance
+    /// suite's direct calls.  Whether a kernel path ever reaches it is a
+    /// backend fact: one that reconstructs path identities as directories
+    /// and lets resolution answer ENOENT may never trigger it from its
+    /// kernel; kinds-carrying backends will.
     #[error("not a directory")]
     NotADirectory,
 
