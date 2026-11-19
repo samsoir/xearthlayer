@@ -99,6 +99,7 @@ xearthlayer/src/vfs
 |  |── ortho_union_fs.rs
 |  |── shared.rs
 |  |── types.rs
+|  |── unmount.rs               # Backend mount-table operations (moved from system/)
 |── common/
 |  |── attrs.rs                 # Neutral file attribute types (refactor)
 |  |── conformance.rs           # Neutral one contract test suite
