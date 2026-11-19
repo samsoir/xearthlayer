@@ -354,13 +354,14 @@ limiting to prevent resource exhaustion under heavy load. Each resource type has
 tuned concurrency limits. The figures below are the **demand lane's**. The prefetch
 lane has its own pools, sized by `LaneSizing` (`executor/lane_sizing.rs`) as
 `ceil(demand x prefetch.capacity_share)` per pool (default 0.35, range 0.05 to 0.50,
-the only user-facing sizing setting), `tile_generation = 2 x (prefetch cpu + prefetch network)`
-and its own unscaled 1024 HTTP permits (connections cost X-Plane no CPU, and prefetch
+the only user-facing sizing setting besides `network.connections`), `tile_generation = 2 x (prefetch cpu + prefetch network)`
+and its own 1024 HTTP permits, not scaled by the share (connections cost X-Plane no CPU, and prefetch
 downloads are bound by connections in flight). The old shared-pool prefetch quota
 (`max_prefetch_fraction`, `prefetch_in_flight`) was removed in #296:
 
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool
 - **HTTP semaphore (chunk connections)**: 1024 shared across the demand lane's download tasks
+- **`network.connections`** (#367, `config/network.rs` `NetworkLevel`): `max`, `high`, `low` scale every network connection limit to all, `ceil(2n/3)` or `ceil(n/3)` (never below 1): both lanes' HTTP permits (`ServiceConfig::chunk_download_config`, `LaneSizing::at_network_level`), the imagery client's idle pool (`AsyncReqwestClient::at_network_level`) and package part downloads (`ConfigFile::package_downloads()`, the only reader of `packages.concurrent_downloads` for downloading). For home routers that drop the network when their connection table fills (#353). The default is `high` (`NetworkLevel::default()`), so the 1024 figures above are `max`. A level, never a number; pools that bound host CPU and disk are not scaled
 - **CPU-bound work** (assemble + encode): `max(num_cpus * 1.25, num_cpus + 2)` shared limiter
 - **Disk I/O pool**: `DEFAULT_DISK_IO_CAPACITY` = 64, flat
 - **Tokio blocking pool**: `LaneSizing::blocking_threads_required()` = demand
@@ -531,6 +532,7 @@ Key sections:
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold). No macOS backend setting: macOS mounts through macFUSE's FSKit backend only (`fuse.macos_backend` is in `DEPRECATED_KEYS`)
 - `[night]` - Night lighting (enabled, default true)
 - `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
+- `[network]` - `connections` = max/high/low, default high (#367): scales every network connection limit, imagery and packages; asked by `xearthlayer setup` (step 4, which warns on max)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10). `library_url` defaults to library generation v2, `DEFAULT_LIBRARY_URL` (#334); the pre-0.5 root URL (`LEGACY_LIBRARY_URL`) and the alpha staging URL are retired values (`DEPRECATED_VALUES`) the parser reads as v2, and the layout migration keeps the legacy copy of the config on the old URL for a 0.4.x rollback
 
 See `docs/configuration.md` for full reference.

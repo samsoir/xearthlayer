@@ -124,12 +124,24 @@ impl XEarthLayerService {
         let metrics_system = MetricsSystem::new(&runtime_handle);
         let metrics_client = metrics_system.client();
 
+        // State the network level once, so a support log says how hard this
+        // run pushes the user's router (#367). The prefetch lane's permits are
+        // logged when the runtime starts.
+        let network_level = config.network_level();
+        tracing::info!(
+            network_connections = %network_level,
+            demand_http_permits = config.chunk_download_config().http_capacity(),
+            idle_connections_per_host =
+                crate::provider::pool_max_idle_per_host(network_level),
+            "Network connections"
+        );
+
         // 2. Create async provider (no sync provider needed - legacy pipeline removed)
         let AsyncProviderComponents {
             async_provider,
             name: provider_name,
             max_zoom,
-        } = builder::create_async_provider(&provider_config).await?;
+        } = builder::create_async_provider(&provider_config, config.network_level()).await?;
 
         // 3. Create CacheLayer WITH metrics for GC reporting
         let cache_layer = CacheLayer::new(&config, &provider_name, metrics_client.clone()).await?;
@@ -165,6 +177,7 @@ impl XEarthLayerService {
         .with_metrics_client(metrics_client)
         .with_download_config(config.chunk_download_config())
         .with_capacity_share(config.prefetch_capacity_share())
+        .with_network_level(config.network_level())
         .build_with_cache_service(
             cache_layer.memory_bridge(),
             cache_layer.dds_disk_bridge(),

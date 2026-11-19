@@ -255,6 +255,10 @@ brightness = {}
 ; Status pane symbols: auto, emoji or plain (default: auto).
 ; auto uses emoji when the terminal can draw them and plain symbols otherwise.
 symbols = {}
+
+[network]
+{help_network_connections}
+connections = {}
 "#,
         update_check,
         config.general.layout_version,
@@ -313,7 +317,10 @@ symbols = {}
         config.night.brightness,
         // Terminal dashboard settings
         config.tui.symbols,
+        // Network settings
+        config.network.connections,
         help_library_url = ini_comment(ConfigKey::PackagesLibraryUrl),
+        help_network_connections = ini_comment(ConfigKey::NetworkConnections),
         help_install_location = ini_comment(ConfigKey::PackagesInstallLocation),
         help_custom_scenery_path = ini_comment(ConfigKey::PackagesCustomSceneryPath),
         help_auto_install_overlays = ini_comment(ConfigKey::PackagesAutoInstallOverlays),

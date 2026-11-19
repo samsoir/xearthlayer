@@ -23,7 +23,8 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use xearthlayer::config::{
-    config_file_path, detect_scenery_dir, format_size, ConfigFile, SceneryDetectionResult, GB, MB,
+    config_file_path, detect_scenery_dir, format_size, ConfigFile, NetworkLevel,
+    SceneryDetectionResult, GB, MB,
 };
 use xearthlayer::provider::catalog::{find as find_provider, PROVIDERS};
 use xearthlayer::system::{
@@ -61,6 +62,8 @@ pub struct SetupConfig {
     pub mapbox_access_token: Option<String>,
     /// Give SimHeaven X-World Pro priority over XEarthLayer overlays.
     pub xworld_pro: bool,
+    /// How many network connections to open (`network.connections`, #367).
+    pub network_connections: NetworkLevel,
 }
 
 /// Output of the provider step.
@@ -112,17 +115,21 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 3: Imagery Provider");
     let provider = step_provider(&theme)?;
 
-    // Step 4: Cache Configuration (directory + budgets)
-    print_step_header("Step 4: Cache Configuration");
+    // Step 4: Network Connections. Beside the provider, the other choice about
+    // downloading (#367).
+    print_step_header("Step 4: Network Connections");
+    let network_connections = step_network(&theme)?;
+
+    // Step 5: Cache Configuration (directory + budgets)
+    print_step_header("Step 5: Cache Configuration");
     let cache_settings = step_cache(&theme)?;
 
-    // Step 5: DDS Encoding (GPU selection if multi-GPU)
-    print_step_header("Step 5: DDS Encoding");
+    // Step 6: DDS Encoding (GPU selection if multi-GPU)
+    print_step_header("Step 6: DDS Encoding");
     let (texture_compressor, texture_gpu_device) = step_encoding(&theme)?;
 
-    // Step 6: Third-party Scenery. Last, so the other step numbers are unchanged,
-    // and it needs Step 1's Custom Scenery folder.
-    print_step_header("Step 6: Third-party Scenery");
+    // Step 7: Third-party Scenery. Last: it needs Step 1's Custom Scenery folder.
+    print_step_header("Step 7: Third-party Scenery");
     let xworld_pro = super::xworld::step_xworld(&theme, xplane_scenery_dir.as_deref())?;
 
     // Build setup config
@@ -139,6 +146,7 @@ pub fn run_wizard() -> Result<(), CliError> {
         google_api_key: provider.google_api_key,
         mapbox_access_token: provider.mapbox_access_token,
         xworld_pro,
+        network_connections,
     };
 
     let written = write_config(&setup_config)?;
@@ -556,7 +564,102 @@ fn step_provider(theme: &ColorfulTheme) -> Result<ProviderSelection, CliError> {
     })
 }
 
-/// Output of Step 4, the consolidated cache configuration.
+/// A level's name as the wizard shows it.
+fn network_level_title(level: NetworkLevel) -> &'static str {
+    match level {
+        NetworkLevel::Max => "Max",
+        NetworkLevel::High => "High",
+        NetworkLevel::Low => "Low",
+    }
+}
+
+/// Step 4's choices, in the order of [`NetworkLevel::ALL`].
+fn network_menu_labels() -> Vec<String> {
+    NetworkLevel::ALL
+        .iter()
+        .map(|&level| {
+            let guidance = match level {
+                NetworkLevel::Max => {
+                    "maximum number of connections, requires prosumer or enterprise hardware \
+                     (Ubiquiti, Cisco, Juniper, QNAP etc)"
+                }
+                NetworkLevel::High => {
+                    "optimized for capable home routers (TP-Link, Netgear, Asus, Eero, Google, \
+                     Wyze etc)"
+                }
+                NetworkLevel::Low => {
+                    "optimized for older or low spec home routers with limited bandwidth"
+                }
+            };
+            let default = if level == NetworkLevel::default() {
+                " (default)"
+            } else {
+                ""
+            };
+            format!("{}{default}: {guidance}", network_level_title(level))
+        })
+        .collect()
+}
+
+/// The warning shown after a choice, if it needs one: Max can take a home
+/// router's network down (#353).
+fn network_level_warning(level: NetworkLevel) -> Option<&'static str> {
+    match level {
+        NetworkLevel::Max => Some(
+            "Max opens up to 1,024 connections at once for scenery X-Plane is waiting on, and as \
+             many again for prefetch. Most home routers cannot track that many and can drop the \
+             whole network while XEarthLayer is downloading. Choose Max only with prosumer or \
+             enterprise network hardware; you can change it later with \
+             `xearthlayer config set network.connections high`.",
+        ),
+        NetworkLevel::High | NetworkLevel::Low => None,
+    }
+}
+
+/// The menu entry for the configured level, so re-running setup keeps it.
+fn default_network_index(configured: NetworkLevel) -> usize {
+    NetworkLevel::ALL
+        .iter()
+        .position(|level| *level == configured)
+        .unwrap_or(0)
+}
+
+/// Step 4: how many network connections XEarthLayer opens (#367).
+fn step_network(theme: &ColorfulTheme) -> Result<NetworkLevel, CliError> {
+    let existing = ConfigFile::load().unwrap_or_default();
+
+    println!("XEarthLayer downloads scenery over many connections at once.");
+    println!(
+        "{}",
+        style("Choose the level that matches your router. High suits most home networks.").cyan()
+    );
+    println!();
+
+    let selection = Select::with_theme(theme)
+        .with_prompt("Network connections")
+        .items(&network_menu_labels())
+        .default(default_network_index(existing.network.connections))
+        .interact()
+        .map_err(|e| CliError::Config(format!("Network selection failed: {}", e)))?;
+
+    let level = NetworkLevel::ALL[selection];
+    println!();
+    if let Some(warning) = network_level_warning(level) {
+        println!("{}", style(format!("Warning: {warning}")).yellow());
+        println!();
+    }
+    println!(
+        "{}",
+        style(format!(
+            "Network connections: {}",
+            network_level_title(level)
+        ))
+        .green()
+    );
+    Ok(level)
+}
+
+/// Output of Step 5, the consolidated cache configuration.
 struct CacheSettings {
     cache_dir: PathBuf,
     memory_cache_size: usize,
@@ -564,7 +667,7 @@ struct CacheSettings {
     dds_disk_ratio: f64,
 }
 
-/// Step 4: Cache directory + disk budget + memory budget.
+/// Step 5: Cache directory + disk budget + memory budget.
 ///
 /// This step absorbs what used to be split between "cache location" and
 /// "system configuration" — the budgets are derived from system info, so
@@ -749,7 +852,7 @@ fn prompt_memory_cache_size(
     Ok(clamped_mb * MB)
 }
 
-/// Step 5: DDS encoding backend (and GPU device selection if applicable).
+/// Step 6: DDS encoding backend (and GPU device selection if applicable).
 ///
 /// Returns `(compressor, gpu_device)` ready to write to config. The
 /// `gpu_device` is always populated even when ISPC is selected so that
@@ -865,6 +968,7 @@ fn write_config(setup: &SetupConfig) -> Result<ConfigFile, CliError> {
 
     config.packages.install_location = Some(setup.package_dir.clone());
     config.packages.xworld_pro = setup.xworld_pro;
+    config.network.connections = setup.network_connections;
 
     config.cache.directory = setup.cache_dir.clone();
     config.cache.memory_size = setup.memory_cache_size;
@@ -901,6 +1005,43 @@ fn write_config(setup: &SetupConfig) -> Result<ConfigFile, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_network_menu_offers_every_level_fastest_first() {
+        let labels = network_menu_labels();
+        assert_eq!(
+            labels,
+            vec![
+                "Max: maximum number of connections, requires prosumer or enterprise hardware \
+                 (Ubiquiti, Cisco, Juniper, QNAP etc)",
+                "High (default): optimized for capable home routers (TP-Link, Netgear, Asus, \
+                 Eero, Google, Wyze etc)",
+                "Low: optimized for older or low spec home routers with limited bandwidth",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_max_is_warned_about() {
+        let warning = network_level_warning(NetworkLevel::Max).expect("Max warns");
+        assert!(warning.contains("drop the"), "{warning}");
+        assert!(
+            warning.contains("xearthlayer config set network.connections high"),
+            "{warning}"
+        );
+        assert_eq!(network_level_warning(NetworkLevel::High), None);
+        assert_eq!(network_level_warning(NetworkLevel::Low), None);
+    }
+
+    #[test]
+    fn the_network_menu_defaults_to_the_configured_level() {
+        assert_eq!(default_network_index(NetworkLevel::Max), 0);
+        assert_eq!(default_network_index(NetworkLevel::High), 1);
+        assert_eq!(default_network_index(NetworkLevel::Low), 2);
+        for level in NetworkLevel::ALL {
+            assert_eq!(NetworkLevel::ALL[default_network_index(level)], level);
+        }
+    }
 
     #[test]
     fn provider_menu_offers_every_provider_in_catalog_order() {

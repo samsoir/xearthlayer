@@ -135,8 +135,10 @@ The wizard will guide you through:
 1. **X-Plane Custom Scenery** - Auto-detects your X-Plane 12 installation or lets you specify the path
 2. **Package Location** - Where to store scenery packages (default: `~/.local/share/xearthlayer/packages`)
 3. **Imagery Provider** - Which satellite imagery to stream. Most options need no account; the wizard prompts for a key or token only for Google Maps and Mapbox
-4. **Cache Configuration** - Where to store cached tiles, with storage type detection (NVMe/SSD/HDD), and recommended memory and disk cache sizes based on your hardware
-5. **DDS Encoding** - Chooses the texture encoder, and which GPU to use if you have more than one
+4. **Network Connections** - How many connections to open at once: High (the default) for capable home routers, Max only for prosumer or enterprise network hardware, Low for older or low spec routers
+5. **Cache Configuration** - Where to store cached tiles, with storage type detection (NVMe/SSD/HDD), and recommended memory and disk cache sizes based on your hardware
+6. **DDS Encoding** - Chooses the texture encoder, and which GPU to use if you have more than one
+7. **Third-party Scenery** - Whether SimHeaven X-World Pro takes priority over XEarthLayer's overlays, when it is installed
 
 The wizard detects your system's CPU, memory, and storage type to recommend the best settings.
 

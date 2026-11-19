@@ -35,10 +35,11 @@ pub struct AsyncProviderComponents {
 /// is not needed.
 pub async fn create_async_provider(
     config: &ProviderConfig,
+    network_level: crate::config::NetworkLevel,
 ) -> Result<AsyncProviderComponents, ServiceError> {
-    // Create async HTTP client
-    let async_http_client =
-        AsyncReqwestClient::new().map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
+    // Create async HTTP client, its idle pool sized by network.connections (#367)
+    let async_http_client = AsyncReqwestClient::at_network_level(network_level)
+        .map_err(|e| ServiceError::HttpClientError(e.to_string()))?;
 
     // Create async provider
     let async_factory = AsyncProviderFactory::new(async_http_client);

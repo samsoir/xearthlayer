@@ -31,6 +31,7 @@ pub(crate) mod defaults;
 mod file;
 pub mod help;
 mod keys;
+mod network;
 mod parser;
 mod settings;
 mod size;
@@ -48,6 +49,7 @@ pub use file::{
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
+    NetworkSettings,
     NightSettings,
     PackagesSettings,
     PatchesSettings,
@@ -82,6 +84,7 @@ pub use file::{
     LEGACY_LIBRARY_URL,
 };
 pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
+pub use network::{NetworkLevel, NETWORK_CONNECTIONS_VALUES};
 pub use size::{format_size, parse_size, Size, SizeParseError, GB, KB, MB};
 pub use texture::TextureConfig;
 pub use upgrade::{

@@ -66,6 +66,10 @@ pub struct ServiceConfig {
     ///
     /// From `prefetch.capacity_share`.
     prefetch_capacity_share: f64,
+    /// How many of the usual network connections to open.
+    ///
+    /// From `network.connections` (#367).
+    network_level: crate::config::NetworkLevel,
 }
 
 impl ServiceConfig {
@@ -82,6 +86,11 @@ impl ServiceConfig {
     /// Prefetch lane capacity as a fraction of the demand lane's.
     pub fn prefetch_capacity_share(&self) -> f64 {
         self.prefetch_capacity_share
+    }
+
+    /// How many of the usual network connections to open (#367).
+    pub fn network_level(&self) -> crate::config::NetworkLevel {
+        self.network_level
     }
 
     /// Per-chunk HTTP request timeout in seconds.
@@ -101,12 +110,16 @@ impl ServiceConfig {
     /// keys were parsed and displayed, but the executor took
     /// `DownloadConfig::default()` and no configured value ever reached it.
     ///
-    /// The HTTP semaphore is left at its default capacity. Concurrency is not
-    /// user-configurable; it is derived from the host by `ResourcePoolConfig`.
+    /// The HTTP semaphore holds the demand lane's connection permits:
+    /// `DEFAULT_MAX_CONCURRENT_HTTP` at the `network.connections` level (#367).
     pub fn chunk_download_config(&self) -> crate::executor::DownloadConfig {
-        crate::executor::DownloadConfig::new(
+        crate::executor::DownloadConfig::with_semaphore(
             std::time::Duration::from_secs(self.chunk_request_timeout_secs),
             self.chunk_max_retries,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(
+                self.network_level
+                    .scale(crate::executor::DEFAULT_MAX_CONCURRENT_HTTP),
+            )),
         )
     }
 
@@ -200,6 +213,7 @@ impl Default for ServiceConfig {
             chunk_request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             chunk_max_retries: DEFAULT_MAX_RETRIES,
             prefetch_capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
+            network_level: crate::config::NetworkLevel::default(),
         }
     }
 }
@@ -224,6 +238,7 @@ pub struct ServiceConfigBuilder {
     chunk_request_timeout_secs: Option<u64>,
     chunk_max_retries: Option<u32>,
     prefetch_capacity_share: Option<f64>,
+    network_level: Option<crate::config::NetworkLevel>,
     control_plane: Option<ControlPlaneSettings>,
 }
 
@@ -243,6 +258,12 @@ impl ServiceConfigBuilder {
     /// Set the prefetch lane capacity as a fraction of the demand lane's.
     pub fn prefetch_capacity_share(mut self, share: f64) -> Self {
         self.prefetch_capacity_share = Some(share);
+        self
+    }
+
+    /// Set how many of the usual network connections to open (#367).
+    pub fn network_level(mut self, level: crate::config::NetworkLevel) -> Self {
+        self.network_level = Some(level);
         self
     }
 
@@ -359,6 +380,7 @@ impl ServiceConfigBuilder {
             prefetch_capacity_share: self
                 .prefetch_capacity_share
                 .unwrap_or(crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE),
+            network_level: self.network_level.unwrap_or_default(),
         }
     }
 }
@@ -399,6 +421,22 @@ mod tests {
 
         assert_eq!(download.request_timeout, std::time::Duration::from_secs(45));
         assert_eq!(download.max_retries, 7);
+    }
+
+    #[test]
+    fn chunk_download_config_permits_follow_the_network_level() {
+        use crate::config::NetworkLevel;
+        use crate::executor::DEFAULT_MAX_CONCURRENT_HTTP;
+        assert_eq!(ServiceConfig::default().network_level(), NetworkLevel::High);
+        for (level, permits) in [
+            (NetworkLevel::Max, DEFAULT_MAX_CONCURRENT_HTTP),
+            (NetworkLevel::High, 683),
+            (NetworkLevel::Low, 342),
+        ] {
+            let config = ServiceConfig::builder().network_level(level).build();
+            assert_eq!(config.network_level(), level);
+            assert_eq!(config.chunk_download_config().http_capacity(), permits);
+        }
     }
 
     #[test]

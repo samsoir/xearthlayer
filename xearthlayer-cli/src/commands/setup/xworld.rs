@@ -1,4 +1,4 @@
-//! Setup Step 6: SimHeaven X-World Pro (#213). The text comes from pure
+//! Setup Step 7: SimHeaven X-World Pro (#213). The text comes from pure
 //! functions of the detection; the prompt is a thin layer over them.
 
 use std::path::Path;
@@ -96,7 +96,7 @@ pub(super) fn guidance(
     out
 }
 
-/// Step 6. Returns the value for `packages.xworld_pro`.
+/// Step 7. Returns the value for `packages.xworld_pro`.
 pub(super) fn step_xworld(
     theme: &ColorfulTheme,
     custom_scenery: Option<&Path>,

@@ -58,9 +58,19 @@ fn paragraphs(key: ConfigKey) -> &'static [&'static str] {
             "Default: {default}",
             "Large packages are downloaded here before extraction.",
         ],
-        ConfigKey::PackagesConcurrentDownloads => {
-            &["Number of concurrent part downloads (1-10, default: 5)."]
-        }
+        ConfigKey::PackagesConcurrentDownloads => &[
+            "Number of concurrent part downloads (1-10, default: 5). network.connections \
+             scales it: high uses two thirds, low one third.",
+        ],
+        ConfigKey::NetworkConnections => &[
+            "How many network connections XEarthLayer opens: max, high or low \
+             (default: high). max opens the most connections and needs prosumer or \
+             enterprise network hardware (Ubiquiti, Cisco, Juniper, QNAP etc). high opens two \
+             thirds as many, optimized for capable home routers (TP-Link, Netgear, Asus, Eero, \
+             Google, Wyze etc). low opens one third as many, for older or low spec home routers \
+             with limited bandwidth. Covers imagery downloads and package downloads. Set by \
+             `xearthlayer setup`.",
+        ],
         _ => &[],
     }
 }

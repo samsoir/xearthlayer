@@ -86,6 +86,14 @@ impl LaneSizing {
         Self::derive(ResourcePoolConfig::default(), clamp_capacity_share(share))
     }
 
+    /// The prefetch lane's HTTP permits at a `network.connections` level
+    /// (#367). Only the connections scale: the CPU, network and disk pools
+    /// bound work on this host, not load on the user's router.
+    pub fn at_network_level(mut self, level: crate::config::NetworkLevel) -> Self {
+        self.prefetch_http_permits = level.scale(self.prefetch_http_permits);
+        self
+    }
+
     /// Both lanes dispatch CPU and disk work through `spawn_blocking`, so the
     /// blocking pool must cover their sum (#227).
     pub fn blocking_threads_required(&self) -> usize {
@@ -100,6 +108,28 @@ impl LaneSizing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_network_level_scales_only_the_prefetch_connections() {
+        use crate::config::NetworkLevel;
+        let base = LaneSizing::from_configured_share(0.35);
+        for (level, permits) in [
+            (NetworkLevel::Max, DEFAULT_MAX_CONCURRENT_HTTP),
+            (NetworkLevel::High, 683),
+            (NetworkLevel::Low, 342),
+        ] {
+            let sizing = base.clone().at_network_level(level);
+            assert_eq!(sizing.prefetch_http_permits, permits, "{level}");
+            assert_eq!(
+                sizing.prefetch_tile_generation,
+                base.prefetch_tile_generation
+            );
+            assert_eq!(
+                sizing.blocking_threads_required(),
+                base.blocking_threads_required()
+            );
+        }
+    }
 
     #[test]
     fn reference_machine_at_default_share() {
