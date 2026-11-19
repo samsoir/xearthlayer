@@ -84,7 +84,16 @@ impl CliError {
                          System Settings > General > Login Items & Extensions > \
                          File System Extensions"
                     );
-                    eprintln!("  3. Stale mount from a previous run: umount \"<mountpoint>\"");
+                    eprintln!(
+                        "  3. X-Plane on an external drive: give /usr/libexec/fskitd \
+                         Full Disk Access under System Settings > Privacy & Security"
+                    );
+                    eprintln!(
+                        "  4. The drive ignores ownership (\"Owners: Disabled\" in \
+                         diskutil info): sudo diskutil enableOwnership \"/Volumes/<drive>\""
+                    );
+                    eprintln!("  5. Stale mount from a previous run: umount \"<mountpoint>\"");
+                    eprintln!("  See docs/macos.md for each step.");
                 }
                 #[cfg(not(target_os = "macos"))]
                 {

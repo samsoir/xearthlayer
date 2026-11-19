@@ -28,7 +28,8 @@ brew install --cask macfuse
 3. Turn on **macFUSE (local)**. System Settings may list both **macFUSE** and
    **macFUSE (local)**; XEarthLayer's FSKit mount needs **macFUSE (local)**.
 
-That is all macFUSE needs, unless X-Plane is on an external drive (step 2a).
+That is all macFUSE needs, unless X-Plane is on an external drive (steps 2a
+and 2b).
 If the extension is off, the mount fails and the error says so.
 
 ### 2a. X-Plane on an external drive: give `fskitd` Full Disk Access
@@ -44,6 +45,24 @@ disk does not need this.
    and enter `/usr/libexec/fskitd`.
 3. Make sure the new **fskitd** entry is switched on, then start XEarthLayer
    again.
+
+### 2b. X-Plane on an external drive: ownership must be on
+
+`fskitd` only mounts on a folder owned by the user starting XEarthLayer.
+Drives formatted for sharing between Macs often have ownership turned off
+("Ignore ownership on this volume" in the drive's Get Info window), and on
+such a drive every file belongs to user 99, whatever `ls` shows. XEarthLayer
+checks this at startup and stops with the command to fix it:
+
+```bash
+diskutil info "/Volumes/<drive>" | grep Owners   # "Disabled" means off
+sudo diskutil enableOwnership "/Volumes/<drive>"
+```
+
+A mount folder made while ownership was off keeps user 99 on disk after
+ownership is turned on. XEarthLayer deletes and recreates its mount folder
+(`zzXEL_ortho`) before every mount whenever the folder is empty, so this needs
+no action.
 
 ### 3. Install XEarthLayer
 
@@ -261,6 +280,8 @@ Extensions first.
 | `the macFUSE file system extension needs approval` | Turn on macFUSE (local) under File System Extensions (step 2 above) |
 | `MFMount.framework has no MF...` or `MFMount.framework could not be loaded` | macFUSE is older than 5.3.3, or missing; update it from [macfuse.io](https://macfuse.io) |
 | FSKit fails to mount with X-Plane on an external drive | Give `/usr/libexec/fskitd` Full Disk Access (step 2a above) |
+| `The drive holding Custom Scenery ignores ownership` at startup, or fskitd logs `not authorized to mount on ... (owner 99)` | Turn ownership on for the drive (step 2b above) |
+| Mount fails with `mount(8) returned 69` or `Resource temporarily unavailable (os error 35)` | macFUSE's generic mount failure; fskitd's log has the cause: `log show --last 5m --predicate 'process == "fskitd"'`. Usually step 2, 2a or 2b |
 | FSKit volume mounts but `ls` or reads hang | FSKit's state is stuck (seen once during testing, macFUSE's own samples hung too). Re-register with `/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/MacOS/macfuse install --force` and restart the Mac |
 | "Device not configured (os error 6)" on mount | Stale mount from a previous run — recovered automatically at startup; manual fix: `umount <mountpoint>` |
 | macFUSE stops working after a macOS upgrade | Re-run the macFUSE installer and check macFUSE (local) is still on under File System Extensions |

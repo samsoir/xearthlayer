@@ -498,9 +498,15 @@ impl MountManager {
         // check below.
         crate::system::recover_stale_fuse_mount(&mountpoint);
 
-        // Create mountpoint directory
-        if !mountpoint.exists() {
-            if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+        // Create the mountpoint directory. On macOS an empty one is recreated
+        // first: fskitd refuses a folder made while its drive ignored
+        // ownership, even after ownership is turned back on (#369).
+        match crate::system::prepare_mount_folder(&mountpoint, cfg!(target_os = "macos")) {
+            Ok(crate::system::MountFolder::Recreated) => {
+                tracing::info!(mountpoint = %mountpoint.display(), "Recreated the empty mount folder");
+            }
+            Ok(_) => {}
+            Err(e) => {
                 return ConsolidatedOrthoMountResult::failure(
                     mountpoint,
                     format!("Failed to create mountpoint directory: {}", e),
