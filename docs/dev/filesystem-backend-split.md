@@ -354,6 +354,13 @@ exception for `crtime`.  `select_backend()` can use `cfg!`. `Session::mount` and
 `mount_with_unprivledged` both compile on Linux and macOS, meaning that
 LinuxFuse and MacFuse can both build in CI.
 
+The mount-table operations that move into the backend with `system/unmount.rs`
+(`fusermount3 -uz` vs `umount -f`, `/proc/mounts` vs `mount(8)`) keep their
+`#[cfg(target_os)]` as written: those arms are the module's platform substance,
+and rewriting them would change tested teardown behavior, not platform-ness.
+They too are transitional — every one of their cfgs names a fact that belongs to
+exactly one future backend.
+
 ### Union Filesystem
 
 The backend-neutral contract shared by every mount backend. The asynchronous
@@ -518,6 +525,11 @@ In addition:
   - `manager/mounts.rs` contains no `cfg` and names no backend
   - `common` module contains no `fuse3::`, inode or kernel-flag symbols
   - no `cfg(target_os)` remains in `vfs/` outside `fuse_platform.rs`
+    - exception, transitional: `fuse3/unmount.rs` keeps the cfgs it was born with
+      when it moves in from `system/` — its platform-shaped mount-table operations
+      are the module's substance, and rewriting them would change tested behavior.
+      The Linux/macOS backend split (below) folds each cfg into the single backend
+      it names; when that lands, delete this bullet.
   - no `crate::vfs::fuse3::` import outside `vfs/`
   - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
   - Expect `night/*` and `runtime/request.rs` to churn on the rename: they import `DdsFilename`, `TextureKind` and `DdsResponse` from crate::fuse.
@@ -525,5 +537,17 @@ In addition:
 The design should be further validated by the addition of any new backends,
 which are expected to follow shortly after this lands.
 Actually adding a new backend is a true test.
+
+The first follow-up should be the macOS backend split: lift the MacFuse
+backend out of the shared `fuse3/` module into a backend of its own, leaving
+`fuse3/` Linux-only. It adds no behavior — the
+per-OS facts relocate (mount call, `volname`, open flags, `FileAttr` fields,
+mount-table operations) and the transitional `cfg(target_os)` sites are deleted
+rather than duplicated. It is the smallest true second-backend test — one backend
+becoming two, on hardware the project already owns — so it validates the seam's
+structure before WinFSP tests it against a foreign kernel. It should ship as its
+own change with its own `make verify-macos` and regression flights: the split's
+"no new backends, no behavior change" non-goal is what makes the split reviewable,
+and this follow-up earns its keep by carrying a change of its own.
 
 Landing this at the start of a new development branch will also provide a lot of exercise.
