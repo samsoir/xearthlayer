@@ -503,9 +503,12 @@ pub struct FileAttributes {
     pub perm: u16,
     /// Link count.
     pub nlink: u32,
-    /// Owner user id (the serving process for virtual nodes; metadata for real files).
+    /// Owner user id — for virtual nodes the serving process (`getuid()`
+    /// on unix; 0 elsewhere, where a non-unix backend supplies the
+    /// launching user's identity in its own reply translation); for real
+    /// files, from the source's metadata.
     pub uid: u32,
-    /// Owner group id.
+    /// Owner group id, same sources as `uid`.
     pub gid: u32,
     /// Device number (0 for non-device files).
     pub rdev: u32,
