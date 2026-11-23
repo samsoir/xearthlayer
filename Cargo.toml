@@ -6,6 +6,7 @@ members = [
     "xearthlayer-package",
     "xearthlayer-publisher",
     "xearthlayer-publish",
+    "xearthlayer-gui/src-tauri",
 ]
 
 [workspace.package]

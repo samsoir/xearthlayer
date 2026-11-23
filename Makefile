@@ -69,7 +69,7 @@ check: ## Fast compilation check (no codegen)
 	$(CARGO) check $(CARGO_FLAGS)
 
 .PHONY: build
-build: ## Build debug version
+build: gui-frontend ## Build debug version (CLI, publisher and GUI)
 	@echo "$(BLUE)Building debug version...$(NC)"
 	$(CARGO) build $(CARGO_FLAGS)
 
@@ -81,10 +81,42 @@ build: ## Build debug version
 # in ci.yml, release.yml and release-test.yml, and contributors run
 # `make pre-commit`, so nothing loses coverage here.
 .PHONY: release
-release: ## Build optimized release version
+release: gui-frontend ## Build optimized release version (CLI, publisher and GUI)
 	@echo "$(BLUE)Building release version...$(NC)"
 	$(CARGO) build --release $(CARGO_FLAGS)
 	@echo "$(GREEN)Release build complete!$(NC)"
+
+##@ GUI (Tauri + React)
+
+# The GUI is the `xearthlayer-gui` workspace crate (xearthlayer-gui/src-tauri)
+# with a React/Vite/TypeScript frontend in xearthlayer-gui/src. Cargo embeds
+# the built frontend (xearthlayer-gui/dist) into the binary, so the frontend is
+# built first. A cargo build without it still compiles: build.rs writes a
+# placeholder page, which keeps `cargo test` and clippy free of a Node step.
+GUI_DIR := xearthlayer-gui
+NPM ?= npm
+
+$(GUI_DIR)/node_modules/.package-lock.json: $(GUI_DIR)/package.json $(GUI_DIR)/package-lock.json
+	@command -v $(NPM) >/dev/null 2>&1 || { echo "$(RED)Error: npm not found. Install Node.js 20.19+ to build the GUI$(NC)"; exit 1; }
+	@echo "$(BLUE)Installing GUI frontend dependencies...$(NC)"
+	cd $(GUI_DIR) && $(NPM) ci
+
+.PHONY: gui-deps
+gui-deps: $(GUI_DIR)/node_modules/.package-lock.json ## Install the GUI frontend's npm dependencies
+
+.PHONY: gui-frontend
+gui-frontend: gui-deps ## Type-check and build the GUI frontend into xearthlayer-gui/dist
+	@echo "$(BLUE)Building GUI frontend...$(NC)"
+	cd $(GUI_DIR) && $(NPM) run build
+
+.PHONY: gui-dev
+gui-dev: gui-deps ## Run the GUI with hot reload (Vite dev server + debug app)
+	cd $(GUI_DIR) && $(NPM) run tauri -- dev -- --no-default-features
+
+.PHONY: gui-bundle
+gui-bundle: gui-deps ## Bundle the GUI as an installable app (.app/.dmg on macOS, .deb/.AppImage on Linux)
+	cd $(GUI_DIR) && $(NPM) run tauri -- build
+	@echo "$(GREEN)Bundles in target/release/bundle/$(NC)"
 
 .PHONY: release-profiling
 release-profiling: ## Build release version with profiling support
@@ -115,7 +147,7 @@ install-profiling: release-profiling ## Install runtime binary with profiling su
 clean: ## Remove build artifacts
 	@echo "$(BLUE)Cleaning build artifacts...$(NC)"
 	$(CARGO) clean
-	@rm -rf target/
+	@rm -rf target/ $(GUI_DIR)/dist
 	@echo "$(GREEN)Clean complete!$(NC)"
 
 ##@ Testing
@@ -310,14 +342,17 @@ BINDIR ?= $(PREFIX)/bin
 # The per-binary release, install and uninstall targets below are generated
 # from this list, and `install`/`uninstall` walk it, so a new binary (the
 # daemon and TUI are coming in 0.5.0) is one line here and one CRATE_ entry.
-BINARIES := xearthlayer xearthlayer-publish
+BINARIES := xearthlayer xearthlayer-publish xearthlayer-gui
 CRATE_xearthlayer := xearthlayer-cli
 CRATE_xearthlayer-publish := xearthlayer-publish
+CRATE_xearthlayer-gui := xearthlayer-gui
+# What a binary needs built before cargo runs: the GUI embeds its frontend.
+PREREQ_xearthlayer-gui := gui-frontend
 
 # release-<binary>, install-<binary>, uninstall-<binary>
 define BINARY_TARGETS
 .PHONY: release-$(1) install-$(1) uninstall-$(1)
-release-$(1):
+release-$(1): $(PREREQ_$(1))
 	@echo "$(BLUE)Building $(1) (release)...$(NC)"
 	$$(CARGO) build --release -p $$(CRATE_$(1)) $$(CARGO_FLAGS)
 
@@ -577,7 +612,7 @@ release-checklist: ## Show release checklist
 clean-all: clean ## Deep clean (including cargo cache)
 	@echo "$(BLUE)Performing deep clean...$(NC)"
 	$(CARGO) clean
-	@rm -rf target/
+	@rm -rf target/ $(GUI_DIR)/dist
 	@rm -rf Cargo.lock
 	@rm -rf dist/
 	@rm -rf $(AUR_DIR)/

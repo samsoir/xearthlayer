@@ -204,6 +204,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `runner.rs`: 50 ms key poll, 1 s tick, every signal handled so the terminal is restored; first external SIGINT quits as a confirmed `q`, a later one or SIGTERM abandons, SIGHUP abandons and stops drawing (exit 130, 143, 129)
     - See `docs/package-management.md` (user) and `docs/dev/package-manager-design.md` (design)
 
+14c. **Desktop App** (`xearthlayer-gui/`, Tauri 2 + React/Vite/TypeScript)
+    - Workspace crate `xearthlayer-gui/src-tauri` (binary `xearthlayer-gui`) links core directly, as the CLI does; front-end rules the CLI owns (Custom Scenery precedence, provider resolution, overlay rebuild) are repeated in it until they move into core
+    - Pages: Dashboard (`run`), Packages (install/update/remove through `InstallQueue` with a polling observer), Setup, Settings (`ConfigKey`), Maintenance (cache, scenery index, patches, diagnostics). No `migrate` yet
+    - The `ServiceOrchestrator` lives on one `xel-service` thread; commands raise flags and read a published `ServiceStatus`. App exit and SIGINT/SIGTERM/SIGHUP unmount first. Logs to `xearthlayer-gui.log` (state dir), never the flight log
+    - `make build`/`release` build the frontend first (`gui-frontend`); `build.rs` writes a placeholder `dist/` so plain cargo, clippy and tests need no Node. Feature `custom-protocol` is default; `make gui-dev` drops it to load Vite. Linux builds need `libwebkit2gtk-4.1-dev librsvg2-dev`. See `xearthlayer-gui/README.md`
+
 15. **Version Update Checker** (`xearthlayer/src/update/`)
     - `VersionManifest` - Serde model for remote `version.json`
     - `UpdateInfo` - Update notification data (current version, latest version, homepage)

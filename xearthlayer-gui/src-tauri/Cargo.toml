@@ -1,0 +1,38 @@
+[package]
+name = "xearthlayer-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop app for XEarthLayer: satellite imagery for X-Plane, streamed on demand"
+publish = false
+
+[[bin]]
+name = "xearthlayer-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The GUI links the core library directly, as the CLI does. Shared front-end
+# logic still lives in the CLI crate for now; moving it into core so both
+# clients use one copy is planned.
+xearthlayer = { path = "../../xearthlayer" }
+xearthlayer-package = { path = "../../xearthlayer-package" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+tracing.workspace = true
+signal-hook = "0.3"
+
+[features]
+# On by default so a plain `cargo build` produces an app that serves the
+# bundled frontend from `xearthlayer-gui/dist`. `make gui-dev` builds with
+# `--no-default-features`, which makes the app load Vite's dev server instead.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

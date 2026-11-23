@@ -41,7 +41,7 @@ git -C "$repo_root" ls-files -z --cached --others --exclude-standard \
         export DEBIAN_FRONTEND=noninteractive PATH=/cache/cargo/bin:$PATH
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
-            build-essential pkg-config libfuse3-dev curl ca-certificates git binutils >/dev/null
+            build-essential pkg-config libfuse3-dev libwebkit2gtk-4.1-dev librsvg2-dev curl ca-certificates git binutils >/dev/null
         command -v rustup >/dev/null || \
             curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none >/dev/null
         mkdir -p /build && tar -xf /src/source.tar -C /build
