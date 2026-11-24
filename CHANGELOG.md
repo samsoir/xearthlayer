@@ -68,6 +68,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The macFUSE kernel extension backend and `fuse.macos_backend`** ([#369](https://github.com/samsoir/xearthlayer/issues/369)): macOS mounts the scenery through macFUSE's FSKit backend only. XEarthLayer no longer uses macFUSE's kernel extension, so an existing install whose kext is approved but whose file system extension is off no longer mounts: it needs macOS 15.4 or later, macFUSE 5.3.3 or later, and "macFUSE (local)" turned on under System Settings → General → Login Items & Extensions → File System Extensions (see [macOS](docs/macos.md#installing-macfuse)). With nothing left to choose, the `fuse.macos_backend` setting is gone: a config file that still has it loads as before, and `xearthlayer config upgrade` removes the line. The installer package and the Homebrew cask now refuse a Mac older than macOS 15.4 (the cask, which states major versions only, asks for Sequoia); the publishing tools still install on macOS 12 or later.
 
+#### Textures
+
+- **BC3 texture compression, `texture.format` and `run --dds-format`** ([#395](https://github.com/samsoir/xearthlayer/issues/395)): XEarthLayer now encodes BC1 textures only. Choosing BC3 never produced usable scenery: XEarthLayer checks every tile against the BC1 size before serving it, so each BC3 tile was replaced by the magenta placeholder, while the imagery was still downloaded and encoded at full cost. No working installation changes. Making BC3 work is not worth it: a BC3 tile is twice the size of a BC1 tile for an alpha channel that opaque satellite imagery does not use, and video memory is what runs out first. With nothing left to choose, the `texture.format` setting is gone: a config file that still has a `format` line under `[texture]` loads as before and the line is ignored, and `xearthlayer config upgrade` removes it. The `--dds-format` option of `xearthlayer run` is removed.
+
 ## [0.5.0] - 2026-11-01
 
 ### Added

@@ -47,8 +47,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300)
 
 4. **DDS Compression** (`xearthlayer/src/dds/`)
-   - BC1/BC3 (DXT1/DXT5) compression
-   - 5-level mipmap chain generation
+   - BC1 (DXT1) only (#395): the encoder interfaces keep their `format: DdsFormat` parameter as the extension point; any other format (`DdsFormat::BC3` stays as a named, unsupported value) is rejected with `DdsError::UnsupportedFormat` at `create_encoder`, `DdsEncoder::encode` and every backend entry point, `DdsFormat::is_supported()` being the one statement of what is supported. `texture.format` and `run --dds-format` are retired. What adding a format takes: `docs/dev/dds-implementation.md` "Supported formats"
+   - Full mipmap chain generation (13 levels for a 4096×4096 tile, 11,184,952 bytes)
    - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
@@ -525,7 +525,7 @@ Key sections:
 - `[provider]` - Imagery source (bing/google)
 - `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
-- `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
+- `[texture]` - Compressor backend (software/ispc/gpu), GPU device selection. No format key: BC1 only, `texture.format` retired and in `DEPRECATED_KEYS` (#395)
 - `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`

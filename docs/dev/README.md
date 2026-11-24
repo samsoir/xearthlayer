@@ -18,7 +18,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Preflight Design](preflight-design.md) | Startup prerequisite registry, bootstrap context, adding a check (v0.5.0+) |
 | [FUSE Filesystem](fuse-filesystem.md) | Virtual filesystem, consolidated mounting, Direct I/O for DDS |
 | [Coordinate System](coordinate-system.md) | Web Mercator projection, tile math, zoom levels |
-| [DDS Implementation](dds-implementation.md) | BC1/BC3 texture compression, mipmap generation |
+| [DDS Implementation](dds-implementation.md) | BC1 texture compression (the only supported format), mipmap generation |
 | [GPU Encoding](gpu-encoding-design.md) | wgpu compute shader encoding, channel worker, memory optimization |
 | [Night Lighting Design](night-lighting-design.md) | Lit textures generated from OXO night recipes and Laminar art (proposed, v0.5.0) |
 | [GeoIndex Design](geo-index-design.md) | Geospatial reference database, patch region ownership |

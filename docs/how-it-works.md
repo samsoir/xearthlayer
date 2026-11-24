@@ -49,7 +49,7 @@ XEarthLayer solves this by separating the **metadata** (DSF/TER files) from the 
 │  3. If not cached:                                                  │
 │     a. Download 256 satellite image chunks (16×16 grid)             │
 │     b. Composite into 4096×4096 image                               │
-│     c. Encode as BC1/BC3 DDS with mipmaps                           │
+│     c. Encode as BC1 DDS with mipmaps                               │
 │     d. Cache result                                                 │
 │  4. Return DDS data to X-Plane                                      │
 └─────────────────────────────────────────────────────────────────────┘

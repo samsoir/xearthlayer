@@ -1,6 +1,6 @@
 # GPU-Accelerated DDS Encoding
 
-This document describes XEarthLayer's GPU encoding pipeline for offloading BC1/BC3 DDS texture compression to a GPU via wgpu compute shaders.
+This document describes XEarthLayer's GPU encoding pipeline for offloading BC1 DDS texture compression to a GPU via wgpu compute shaders.
 
 ## Motivation
 
@@ -20,7 +20,6 @@ Two keys in the `[texture]` section:
 
 ```ini
 [texture]
-format = bc1
 compressor = ispc           # software | ispc | gpu
 gpu_device = integrated     # integrated | discrete | <name substring>
 ```
@@ -62,6 +61,8 @@ pub trait MipmapCompressor: Send + Sync {
 
 - `SoftwareCompressor` and `IspcCompressor` implement `ImageCompressor`
 - `GpuEncoderChannel` implements `MipmapCompressor`
+
+The `format` parameter is the extension point for future formats. Only BC1 is implemented: every backend rejects any other format with `DdsError::UnsupportedFormat`, and `GpuEncoderChannel` does so before the request is sent to the worker, so the worker maps BC1 only. See [Supported formats](dds-implementation.md#supported-formats).
 
 `DdsEncoder` dispatches via a `CompressorBackend` enum:
 
@@ -109,7 +110,7 @@ The worker uses an adaptive overlap strategy for inter-tile pipelining:
 - When more requests are queued: defer readback to overlap with the next upload (pipeline depth 2)
 - When queue is empty: complete immediately to avoid deadlock on single/last request
 
-VRAM budget: pipeline depth 2 with 4096x4096 tiles ~ 160MB (BC1) / 176MB (BC3) peak.
+VRAM budget: pipeline depth 2 with 4096x4096 tiles ~ 160MB peak.
 
 ### Shared Resource Factory
 

@@ -77,7 +77,7 @@ XEarthLayer implements a two-tier caching system to minimize expensive satellite
 ```
 <cache_dir>/               # Default: ~/.cache/xearthlayer
   <provider>/              # "bing", "google", etc.
-    <format>/              # "BC1" or "BC3"
+    <format>/              # "BC1", the only format encoded (#395)
       <zoom>/              # Zoom level (e.g., "15")
         <row>/             # Tile row (e.g., "12754")
           <format>_<zoom>_<row>_<col>.dds
@@ -145,7 +145,6 @@ enum EvictionPolicy {
 |--------|-------|-------|
 | **Default Size** | 2 GB | Configurable via `--memory-cache-size` |
 | **Max Tiles (BC1)** | ~180 tiles | 11 MB per tile |
-| **Max Tiles (BC3)** | ~90 tiles | 22 MB per tile |
 | **Eviction** | LRU | Evict oldest on size limit |
 | **Hit Time** | <1 ms | Direct memory access |
 | **Miss Penalty** | 10-2000 ms | Depends on disk/network |
@@ -176,7 +175,7 @@ Persistent storage of DDS tiles across sessions to avoid re-downloading and re-e
 ```
 <cache_dir>/               # Default: ~/.cache/xearthlayer
   bing/                    # Provider name
-    BC1/                   # DDS format (BC1 or BC3)
+    BC1/                   # DDS format (always BC1, #395)
       15/                  # Zoom level
         12754/             # Tile row
           BC1_15_12754_5279.dds    # Format_Zoom_Row_Col.dds
@@ -188,11 +187,6 @@ Persistent storage of DDS tiles across sessions to avoid re-downloading and re-e
       16/
         25508/
           BC1_16_25508_10376.dds
-          ...
-    BC3/                   # Separate tree for BC3 format
-      15/
-        12754/
-          BC3_15_12754_5279.dds
           ...
   google/                  # Separate tree for Google provider
     BC1/
@@ -208,7 +202,7 @@ Persistent storage of DDS tiles across sessions to avoid re-downloading and re-e
 
 **Examples**:
 - `BC1_15_12754_5279.dds` - BC1, zoom 15, row 12754, col 5279
-- `BC3_16_25508_10376.dds` - BC3, zoom 16, row 25508, col 10376
+- `BC1_16_25508_10376.dds` - BC1, zoom 16, row 25508, col 10376
 
 **Benefits**:
 - Self-documenting (format, zoom, coordinates visible in filename)
@@ -283,7 +277,6 @@ struct DiskWriteRequest {
 |--------|-------|-------|
 | **Default Size** | 20 GB | Configurable via `--disk-cache-size` |
 | **Max Tiles (BC1)** | ~1,800 tiles/provider | 11 MB per tile |
-| **Max Tiles (BC3)** | ~900 tiles/provider | 22 MB per tile |
 | **Eviction** | LRU + Age | Oldest files first |
 | **Hit Time** | 10-50 ms | SSD: ~10ms, HDD: ~50ms |
 | **Miss Penalty** | ~2 seconds | Network + encode |
@@ -560,13 +553,11 @@ XEARTHLAYER_CACHE_DIR=~/.cache/xearthlayer
 
 ### Scenario: Format Change
 
-**Problem**: User switches from BC1 to BC3
+**Problem**: A second DDS format would produce tiles that must never be served in place of BC1 ones
 
-**Solution**: Separate directory trees
-- BC1 tiles cached in `cache/<provider>/BC1/`
-- BC3 tiles cached in `cache/<provider>/BC3/`
-- Both can coexist
-- No conflicts
+**Today**: The case does not arise. XEarthLayer encodes BC1 only and has no format setting (#395).
+- The memory cache key (`CacheKey`) includes the format
+- The DDS disk cache (`<cache_dir>/<provider>/dds/<region>/tile_<zoom>_<row>_<col>.cache`) does not, so a second format would need the format in that layout too
 
 ### Scenario: Provider Change
 
@@ -702,7 +693,6 @@ rm -rf ~/.cache/xearthlayer/bing/
 - At zoom 15, 1° ≈ 512 tiles (equator)
 - Bay Area: ~500 tiles needed
 - BC1 size: 500 × 11 MB = 5.5 GB
-- BC3 size: 500 × 22 MB = 11 GB
 
 **Cache Requirements**:
 - Memory (2GB): Holds ~180 tiles (enough for active flying area)
@@ -716,7 +706,6 @@ rm -rf ~/.cache/xearthlayer/bing/
 **Calculation**:
 - ~20,000 tiles
 - BC1 size: 20,000 × 11 MB = 220 GB
-- BC3 size: 20,000 × 22 MB = 440 GB
 
 **Cache Requirements**:
 - Needs larger disk cache (configure with `--disk-cache-size 250G`)

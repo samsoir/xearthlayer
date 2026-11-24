@@ -318,14 +318,13 @@ identical forever, and so logs say which one actually happened.
 
 ## Known Limitations
 
-- **`EXPECTED_DDS_SIZE` is BC1-only.** It's computed from
-  `full_chain_bc1_dds_size(4096, 4096)`, but `texture.format` also accepts
-  `bc3`, which has a different (larger) per-block size. Whether a BC3-sized
-  tile can currently reach the DDS disk cache tier in practice has **not**
-  been verified — see the `TODO(#253)` at the constant's definition. Until
-  that's checked, a BC3 deployment could see every DDS disk entry rejected
-  by `WrongSize`, degrading (safely, but silently) to full re-encoding on
-  every read.
+- **`EXPECTED_DDS_SIZE` is BC1-only, by construction.** It's computed from
+  `full_chain_bc1_dds_size(4096, 4096)`. BC3 was retired (#395) and the
+  encoder rejects every format other than BC1, so every tile that can reach
+  the DDS disk tier has this size and the check is correct. A future format
+  needs a format-aware expected size here, in the FUSE read gate and for
+  FUSE `st_size`; see
+  [Supported formats](dds-implementation.md#supported-formats).
 - **A scenery cache rebuild that finds zero tiles is neither overwritten nor
   deleted.** `service/orchestrator/core.rs` only calls `save_cache` when
   `total_tiles > 0`, so a corrupt-on-disk scenery cache whose rebuild

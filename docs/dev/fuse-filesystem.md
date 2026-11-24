@@ -11,7 +11,7 @@ The following features are **implemented and working**:
 | PassthroughFS | ✅ Complete | FUSE filesystem that overlays existing scenery packs |
 | UnionFS | ✅ Complete | Union filesystem for consolidated multi-source mounting |
 | X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
-| On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1/BC3 DDS |
+| On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1 DDS |
 | Multi-provider Support | ✅ Complete | Bing Maps, Google GO2, Google Maps API |
 | Three-tier Caching | ✅ Complete | Memory, DDS disk, and chunk disk caches for generated textures |
 | Async Pipeline | ✅ Complete | Request coalescing, parallel downloads, async encoding |
