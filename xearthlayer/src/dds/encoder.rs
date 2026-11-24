@@ -2,13 +2,14 @@
 //!
 //! The encoder delegates compression to a backend via [`CompressorBackend`]:
 //! - [`ImageCompressor`] backends (ISPC, Software) compress one level at a time
-//!   through [`compress_level`]; the encoder manages mipmap iteration via
+//!   through [`compress_level_into`], each straight into its place in one
+//!   buffer of the file's exact size; the encoder manages mipmap iteration via
 //!   [`MipmapStream`].
 //! - [`MipmapCompressor`] backends (GPU channel) own the full mipmap pipeline;
 //!   the encoder only handles DDS header assembly.
 
 use crate::dds::compressor::{
-    compress_level, default_compressor, ImageCompressor, MipmapCompressor,
+    compress_level_into, default_compressor, ImageCompressor, MipmapCompressor,
 };
 use crate::dds::layout;
 use crate::dds::mipmap::MipmapStream;
@@ -100,7 +101,9 @@ impl DdsEncoder {
     ///
     /// # Returns
     ///
-    /// Complete DDS file as bytes (header + compressed data)
+    /// Complete DDS file as bytes (header + compressed data). From an
+    /// [`ImageCompressor`] backend the `Vec` has no spare capacity, so
+    /// `Bytes::from` adopts exactly the file (#393).
     ///
     /// # Errors
     ///
@@ -115,55 +118,32 @@ impl DdsEncoder {
             return Err(DdsError::InvalidDimensions(width, height));
         }
 
+        let count = if self.generate_mipmaps {
+            self.resolve_mipmap_count(width, height)
+        } else {
+            1
+        };
         match &self.backend {
             CompressorBackend::Mipmap(compressor) => {
-                let count = if self.generate_mipmaps {
-                    self.resolve_mipmap_count(width, height)
-                } else {
-                    1
-                };
                 self.encode_with_mipmap_compressor(compressor, image, width, height, count)
             }
             CompressorBackend::Image(compressor) => {
-                if self.generate_mipmaps {
-                    let count = self.resolve_mipmap_count(width, height);
-                    self.encode_mipmap_stream(compressor.as_ref(), image, width, height, count)
-                } else {
-                    self.encode_single_level(compressor.as_ref(), image, width, height)
-                }
+                self.encode_mipmap_stream(compressor.as_ref(), image, width, height, count)
             }
         }
     }
 
-    /// Compress a single image (no mipmaps) into a DDS file.
-    fn encode_single_level(
-        &self,
-        compressor: &dyn ImageCompressor,
-        image: RgbaImage,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, DdsError> {
-        let header = DdsHeader::new(width, height, 1, self.format);
-        let mut output = header.to_bytes();
-
-        let uncompressed_bytes = (width * height * 4) as usize;
-        let compressed = compress_level(compressor, &image, self.format)?;
-
-        debug!(
-            width,
-            height,
-            format = ?self.format,
-            uncompressed_bytes,
-            compressed_bytes = compressed.len(),
-            total_dds_bytes = output.len() + compressed.len(),
-            "Single-level encode complete (no mipmaps)"
-        );
-
-        output.extend_from_slice(&compressed);
-        Ok(output)
-    }
-
-    /// Compress an image with its mipmap chain using a streaming pipeline.
+    /// Compress an image with its first `count` mipmap levels (1 without
+    /// mipmaps) using a streaming pipeline, into one buffer.
+    ///
+    /// The file's size is known before the first level is compressed
+    /// ([`layout::file_len`]), so the output is allocated once at exactly
+    /// that size, the header written into its first [`layout::HEADER_LEN`]
+    /// bytes and each level compressed straight into its own slice. The
+    /// returned `Vec`'s capacity is its length: `Bytes::from` adopts the
+    /// allocation whole, so spare capacity would be cached with the tile
+    /// (#393: grown by appending, a 4096 tile held 16 MiB for 10.67 MiB,
+    /// and every level was compressed to a buffer of its own and copied).
     ///
     /// Each mipmap level is generated, compressed, and dropped before the
     /// next is produced — only one uncompressed level lives in memory at a time.
@@ -175,8 +155,11 @@ impl DdsEncoder {
         height: u32,
         count: usize,
     ) -> Result<Vec<u8>, DdsError> {
-        let header = DdsHeader::new(width, height, count as u32, self.format);
-        let mut output = header.to_bytes();
+        // `count` is a level count `layout::chain_levels` resolved, a u32.
+        let levels = count as u32;
+        let mut output = vec![0; layout::file_len(width, height, levels, self.format)];
+        let (header, payload) = output.split_at_mut(layout::HEADER_LEN);
+        header.copy_from_slice(&DdsHeader::new(width, height, levels, self.format).to_bytes());
 
         debug!(
             width,
@@ -186,22 +169,12 @@ impl DdsEncoder {
             "Starting fused mipmap encode pipeline"
         );
 
-        for (level_idx, level) in MipmapStream::new(image, count).enumerate() {
-            let level_bytes = (level.width() * level.height() * 4) as usize;
-            let compressed = compress_level(compressor, &level, self.format)?;
-
-            debug!(
-                level = level_idx,
-                level_width = level.width(),
-                level_height = level.height(),
-                uncompressed_bytes = level_bytes,
-                compressed_bytes = compressed.len(),
-                "Compressed mipmap level"
-            );
-
-            output.extend_from_slice(&compressed);
-            // `level` dropped here — memory reclaimed before next iteration
-        }
+        compress_chain_into(
+            compressor,
+            MipmapStream::new(image, count),
+            self.format,
+            payload,
+        )?;
 
         debug!(
             total_dds_bytes = output.len(),
@@ -265,10 +238,59 @@ impl DdsEncoder {
     }
 }
 
+/// Compress `levels`, largest first, back to back into `payload` with
+/// [`compress_level_into`]; together they must fill it exactly.
+///
+/// The encoder sizes `payload` with [`layout`] and takes its levels from
+/// [`MipmapStream`], which agree for any count [`layout::chain_levels`]
+/// resolves. Should they ever disagree, this is an error: never a panic, and
+/// never a file whose header declares a level its payload holds only as
+/// zeros.
+fn compress_chain_into(
+    compressor: &dyn ImageCompressor,
+    levels: impl Iterator<Item = RgbaImage>,
+    format: DdsFormat,
+    payload: &mut [u8],
+) -> Result<(), DdsError> {
+    let total = payload.len();
+    let mut offset = 0;
+    for (index, level) in levels.enumerate() {
+        let (width, height) = level.dimensions();
+        let len = layout::level_len(width, height, format);
+        let slot = payload.get_mut(offset..offset + len).ok_or_else(|| {
+            DdsError::CompressionFailed(format!(
+                "level {index} ({width}x{height}) runs past the {total}-byte payload at {offset}"
+            ))
+        })?;
+        compress_level_into(compressor, &level, format, slot)?;
+
+        debug!(
+            level = index,
+            level_width = width,
+            level_height = height,
+            uncompressed_bytes = width as usize * height as usize * 4,
+            compressed_bytes = len,
+            "Compressed mipmap level"
+        );
+
+        offset += len;
+        // `level` dropped here — memory reclaimed before next iteration
+    }
+
+    if offset != total {
+        return Err(DdsError::CompressionFailed(format!(
+            "the mipmap chain filled {offset} of the {total}-byte payload"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dds::compressor::tests::varied;
     use crate::dds::mipmap::MipmapGenerator;
+    use crate::dds::{compress_level, IspcCompressor, SoftwareCompressor};
 
     #[test]
     fn test_encoder_new() {
@@ -716,5 +738,260 @@ mod tests {
 
         assert_eq!(u32::from_le_bytes(dds[28..32].try_into().unwrap()), 3);
         assert_eq!(walk_payload(&dds, 4096, 4096, 8).len(), 3);
+    }
+
+    // =========================================================================
+    // One buffer of the file's exact size, each level compressed into its
+    // place (#393)
+    // =========================================================================
+
+    /// The encoder as it was before #393, kept as the reference the in-place
+    /// encode must match byte for byte: the header, then each level
+    /// compressed to a buffer of its own and appended to a growing one.
+    fn encode_by_appending(
+        kernel: &dyn ImageCompressor,
+        image: RgbaImage,
+        requested: Option<u32>,
+    ) -> Vec<u8> {
+        let (width, height) = image.dimensions();
+        let count = layout::chain_levels(width, height, requested);
+        let mut output = DdsHeader::new(width, height, count, DdsFormat::BC1).to_bytes();
+        for level in MipmapStream::new(image, count as usize) {
+            output.extend_from_slice(&compress_level(kernel, &level, DdsFormat::BC1).unwrap());
+        }
+        output
+    }
+
+    /// An encoder on `kernel` asked for `requested` levels, `None` being the
+    /// full chain.
+    fn encoder_for(kernel: &Arc<dyn ImageCompressor>, requested: Option<u32>) -> DdsEncoder {
+        let encoder = DdsEncoder::new(DdsFormat::BC1).with_compressor(Arc::clone(kernel));
+        match requested {
+            None => encoder,
+            Some(count) => encoder.with_mipmap_count(count as usize),
+        }
+    }
+
+    fn cpu_kernels() -> [Arc<dyn ImageCompressor>; 2] {
+        [Arc::new(IspcCompressor), Arc::new(SoftwareCompressor)]
+    }
+
+    /// Tiny, odd, non-square and block-aligned sizes: every way a chain can
+    /// end (at 1 x 1, at 4 x 1, below a block) and levels that need padding.
+    const SHAPES: [(u32, u32); 11] = [
+        (1, 1),
+        (2, 2),
+        (3, 5),
+        (4, 4),
+        (7, 3),
+        (8, 2),
+        (5, 5),
+        (33, 17),
+        (64, 16),
+        (100, 100),
+        (256, 256),
+    ];
+
+    /// Full chain, one level, a short chain and a request past the chain.
+    const REQUESTS: [Option<u32>; 5] = [None, Some(1), Some(2), Some(3), Some(99)];
+
+    #[test]
+    fn encode_is_the_appended_levels_byte_for_byte() {
+        for kernel in cpu_kernels() {
+            for (w, h) in SHAPES {
+                for requested in REQUESTS {
+                    let image = varied(w, h);
+                    let expected = encode_by_appending(kernel.as_ref(), image.clone(), requested);
+                    let dds = encoder_for(&kernel, requested).encode(image).unwrap();
+                    assert_eq!(dds, expected, "{} {w}x{h} {requested:?}", kernel.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_without_mipmaps_is_the_first_level_byte_for_byte() {
+        for kernel in cpu_kernels() {
+            for (w, h) in SHAPES {
+                let image = varied(w, h);
+                let expected = encode_by_appending(kernel.as_ref(), image.clone(), Some(1));
+                let dds = DdsEncoder::new(DdsFormat::BC1)
+                    .with_compressor(Arc::clone(&kernel))
+                    .without_mipmaps()
+                    .encode(image)
+                    .unwrap();
+                assert_eq!(dds, expected, "{} {w}x{h}", kernel.name());
+            }
+        }
+    }
+
+    #[test]
+    fn a_4096_tile_is_the_appended_levels_byte_for_byte() {
+        // The production tile, full chain and an explicit count, through ISPC.
+        let ispc: Arc<dyn ImageCompressor> = Arc::new(IspcCompressor);
+        let image = varied(4096, 4096);
+        for requested in [None, Some(5)] {
+            let expected = encode_by_appending(ispc.as_ref(), image.clone(), requested);
+            let dds = encoder_for(&ispc, requested).encode(image.clone()).unwrap();
+            assert_eq!(dds.len(), expected.len(), "{requested:?}");
+            assert!(dds == expected, "{requested:?}: the bytes differ");
+        }
+    }
+
+    /// The levels of a `size` x `size` chain, largest first.
+    fn chain(size: u32, count: usize) -> MipmapStream {
+        MipmapStream::new(varied(size, size), count)
+    }
+
+    #[test]
+    fn a_chain_that_ends_before_the_payload_is_an_error() {
+        // Sized for three levels, given two: the header would declare a
+        // level the payload holds only as zeros.
+        let mut payload = vec![0; layout::chain_len(16, 16, 3, DdsFormat::BC1)];
+        let result =
+            compress_chain_into(&IspcCompressor, chain(16, 2), DdsFormat::BC1, &mut payload);
+        assert!(
+            matches!(result, Err(DdsError::CompressionFailed(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_chain_past_the_payload_is_an_error_not_a_panic() {
+        for given in [2, 3] {
+            let mut payload = vec![0; layout::chain_len(16, 16, 1, DdsFormat::BC1)];
+            let result = compress_chain_into(
+                &IspcCompressor,
+                chain(16, given),
+                DdsFormat::BC1,
+                &mut payload,
+            );
+            assert!(
+                matches!(result, Err(DdsError::CompressionFailed(_))),
+                "{given} levels: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_that_fills_the_payload_is_its_levels_in_order() {
+        let mut payload = vec![0; layout::chain_len(16, 16, 3, DdsFormat::BC1)];
+        compress_chain_into(&IspcCompressor, chain(16, 3), DdsFormat::BC1, &mut payload).unwrap();
+        let expected: Vec<u8> = chain(16, 3)
+            .flat_map(|level| compress_level(&IspcCompressor, &level, DdsFormat::BC1).unwrap())
+            .collect();
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn an_encoded_tile_has_no_spare_capacity() {
+        // `Bytes::from` adopts a Vec's whole allocation, so spare capacity
+        // stays with the tile in the memory cache and on its way to the DDS
+        // disk cache and FUSE, and counts in the `mmap_mb` telemetry: a
+        // full 4096 tile grown by appending held 16,777,472 bytes for
+        // 11,184,952.
+        let ispc: Arc<dyn ImageCompressor> = Arc::new(IspcCompressor);
+        let tile = encoder_for(&ispc, None).encode(varied(4096, 4096)).unwrap();
+        assert_eq!(tile.len(), 11_184_952);
+        assert_eq!(tile.capacity(), tile.len());
+
+        for kernel in cpu_kernels() {
+            for (w, h) in SHAPES {
+                for requested in REQUESTS {
+                    let dds = encoder_for(&kernel, requested)
+                        .encode(varied(w, h))
+                        .unwrap();
+                    assert_eq!(
+                        dds.capacity(),
+                        dds.len(),
+                        "{} {w}x{h} {requested:?}",
+                        kernel.name()
+                    );
+                }
+                let single = DdsEncoder::new(DdsFormat::BC1)
+                    .with_compressor(Arc::clone(&kernel))
+                    .without_mipmaps()
+                    .encode(varied(w, h))
+                    .unwrap();
+                assert_eq!(single.capacity(), single.len(), "{} {w}x{h}", kernel.name());
+            }
+        }
+    }
+
+    /// Minor page faults this thread has taken so far; 0 off Linux.
+    fn minor_faults() -> i64 {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: getrusage only writes the rusage it is given, and an
+            // all-zero rusage is a valid value of that plain C struct.
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+            usage.ru_minflt
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
+    }
+
+    /// Release-build timing of a 4096 x 4096 noise tile, full chain, through
+    /// `DdsEncoder` with ISPC, against the encoder before #393
+    /// (`encode_by_appending`, which takes the same page faults as that
+    /// encoder did), single thread. The two alternate run by run so both see
+    /// the same machine load; the source is cloned outside the timed region
+    /// and the output dropped outside it. Page faults per encode are the
+    /// deterministic part of the difference.
+    ///
+    /// Run it with glibc pinned as the service pins it (#227), or every
+    /// buffer is recycled from an arena and the difference hides: `env
+    /// MALLOC_MMAP_THRESHOLD_=1048576 MALLOC_ARENA_MAX=4 cargo test --release
+    /// -p xearthlayer --lib time_a_4096_tile_encode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_a_4096_tile_encode() {
+        const RUNS: usize = 41;
+        let source = varied(4096, 4096);
+        let ispc: Arc<dyn ImageCompressor> = Arc::new(IspcCompressor);
+        let encoder = encoder_for(&ispc, None);
+
+        let run = |encode: &dyn Fn(RgbaImage) -> Vec<u8>| {
+            let image = source.clone();
+            let faults = minor_faults();
+            let started = std::time::Instant::now();
+            let dds = encode(image);
+            let elapsed = started.elapsed();
+            let faults = minor_faults() - faults;
+            let capacity = dds.capacity();
+            drop(std::hint::black_box(dds));
+            (elapsed, faults, capacity)
+        };
+        let appending = |image: RgbaImage| encode_by_appending(ispc.as_ref(), image, None);
+        let in_place = |image: RgbaImage| encoder.encode(image).unwrap();
+
+        let mut before = Vec::with_capacity(RUNS);
+        let mut after = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            before.push(run(&appending));
+            after.push(run(&in_place));
+        }
+        let summary = |runs: &[(std::time::Duration, i64, usize)]| {
+            let mut times: Vec<_> = runs.iter().map(|r| r.0).collect();
+            let mut faults: Vec<_> = runs.iter().map(|r| r.1).collect();
+            times.sort();
+            faults.sort();
+            format!(
+                "median {:.2?} (min {:.2?}, max {:.2?}), {} page faults, capacity {} bytes",
+                times[RUNS / 2],
+                times[0],
+                times[RUNS - 1],
+                faults[RUNS / 2],
+                runs[0].2
+            )
+        };
+        println!(
+            "4096 tile, ISPC, full chain, {RUNS} runs each: appending {}; DdsEncoder {}",
+            summary(&before),
+            summary(&after)
+        );
     }
 }
