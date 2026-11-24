@@ -584,6 +584,15 @@ impl ConfigKey {
             })
     }
 
+    /// Whether this key's value must lie in a numeric range. Such a key is
+    /// held to its range when `config.ini` is read, by the same rule
+    /// [`ConfigKey::validate`] applies to `config set`, because the code that
+    /// uses it assumes the range (#401: a `cache.dds_disk_ratio` above 1.0
+    /// overflowed the disk budgets).
+    pub fn is_range_checked(&self) -> bool {
+        self.specification().is_range()
+    }
+
     /// Get the validation specification for this key.
     fn specification(&self) -> Box<dyn ValueSpecification> {
         match self {
@@ -727,6 +736,12 @@ trait ValueSpecification {
     /// Check if the value satisfies this specification.
     /// Returns Ok(()) if valid, Err(reason) if invalid.
     fn is_satisfied_by(&self, value: &str) -> Result<(), String>;
+
+    /// Whether this is a numeric range, which the parser also enforces when
+    /// it reads `config.ini` (see [`ConfigKey::is_range_checked`]).
+    fn is_range(&self) -> bool {
+        false
+    }
 }
 
 /// Specification that accepts any string value.
@@ -809,6 +824,10 @@ impl IntegerRangeSpec {
 }
 
 impl ValueSpecification for IntegerRangeSpec {
+    fn is_range(&self) -> bool {
+        true
+    }
+
     fn is_satisfied_by(&self, value: &str) -> Result<(), String> {
         value
             .parse::<u64>()
@@ -839,6 +858,10 @@ impl FloatRangeSpec {
 }
 
 impl ValueSpecification for FloatRangeSpec {
+    fn is_range(&self) -> bool {
+        true
+    }
+
     fn is_satisfied_by(&self, value: &str) -> Result<(), String> {
         value
             .parse::<f64>()

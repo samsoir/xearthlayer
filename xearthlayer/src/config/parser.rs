@@ -17,6 +17,7 @@ use super::upgrade::{deprecated_value, folded_value};
 ///
 /// Starts from `ConfigFile::default()` and overlays any values found in the INI.
 pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
+    check_ranges(ini)?;
     let mut config = ConfigFile::default();
 
     // [general] section
@@ -89,18 +90,15 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
             })?;
         }
         if let Some(v) = section.get("dds_disk_ratio") {
-            // The rule `config set` enforces, so a hand-edited file cannot
-            // hold a ratio the disk budgets cannot split (#401).
-            let invalid = || ConfigFileError::InvalidValue {
-                section: "cache".to_string(),
-                key: "dds_disk_ratio".to_string(),
-                value: v.to_string(),
-                reason: "expected a number between 0.0 and 1.0".to_string(),
-            };
-            ConfigKey::CacheDdsDiskRatio
-                .validate(v)
-                .map_err(|_| invalid())?;
-            config.cache.dds_disk_ratio = v.parse::<f64>().map_err(|_| invalid())?;
+            // In 0.0..=1.0 already: `check_ranges` (#401).
+            config.cache.dds_disk_ratio =
+                v.parse::<f64>()
+                    .map_err(|_| ConfigFileError::InvalidValue {
+                        section: "cache".to_string(),
+                        key: "dds_disk_ratio".to_string(),
+                        value: v.to_string(),
+                        reason: "expected a number between 0.0 and 1.0".to_string(),
+                    })?;
         }
     }
 
@@ -313,6 +311,7 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         // config file (use 'xearthlayer config upgrade').
         // Sliding prefetch box settings
         if let Some(v) = section.get("box_extent") {
+            let v = current_value("prefetch.box_extent", v);
             config.prefetch.box_extent = v.parse().map_err(|_| ConfigFileError::InvalidValue {
                 section: "prefetch".to_string(),
                 key: "box_extent".to_string(),
@@ -525,6 +524,40 @@ pub(super) fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// `value` as the program reads it: a retired value ([`deprecated_value`])
+/// becomes its replacement.
+fn current_value<'a>(key: &str, value: &'a str) -> &'a str {
+    deprecated_value(key, value).map_or(value, |retired| retired.replacement)
+}
+
+/// Hold every range-checked key ([`ConfigKey::is_range_checked`]) present in
+/// `ini` to the range `config set` enforces, before anything is parsed: a
+/// hand-edited value outside it is refused with the setting named, never
+/// passed to code that assumes the range (#401).
+fn check_ranges(ini: &Ini) -> Result<(), ConfigFileError> {
+    for key in ConfigKey::all().iter().filter(|k| k.is_range_checked()) {
+        let (section, name) = key
+            .name()
+            .split_once('.')
+            .expect("a config key is named section.key");
+        let Some(value) = ini.section(Some(section)).and_then(|s| s.get(name)) else {
+            continue;
+        };
+        // A retired value is read as its replacement, so it is the
+        // replacement that must be in range.
+        let value = current_value(key.name(), value);
+        if let Err(ConfigKeyError::ValidationFailed { reason, .. }) = key.validate(value) {
+            return Err(ConfigFileError::InvalidValue {
+                section: section.to_string(),
+                key: name.to_string(),
+                value: value.to_string(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -641,7 +674,8 @@ mod tests {
             match ConfigFile::load_from(&path) {
                 Err(ConfigFileError::InvalidValue { key, reason, .. }) => {
                     assert_eq!(key, "dds_disk_ratio");
-                    assert_eq!(reason, "expected a number between 0.0 and 1.0");
+                    // The rule `config set` reports, word for word.
+                    assert_eq!(reason, "must be a number between 0 and 1");
                 }
                 other => panic!("{bad} must be rejected, got {other:?}"),
             }
@@ -843,6 +877,92 @@ disk_size = 50GB
             let config = ConfigFile::load_from(&config_path)
                 .unwrap_or_else(|e| panic!("format = {value} must not fail the load: {e}"));
             assert_eq!(config.texture.compressor, "software");
+        }
+    }
+
+    /// Every key whose `config set` rule is a range is held to it when the
+    /// file is read too, so a hand-edited value cannot reach code that
+    /// assumes the range (#401 for `cache.dds_disk_ratio`, then every such
+    /// key).
+    #[test]
+    fn every_range_checked_key_refuses_an_out_of_range_value_on_load() {
+        let keys: Vec<_> = ConfigKey::all()
+            .iter()
+            .filter(|k| k.is_range_checked())
+            .collect();
+        assert!(!keys.is_empty());
+        for key in keys {
+            let (section, name) = key.name().split_once('.').unwrap();
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("config.ini");
+            // Below the minimum of every range in use (all are at least 0).
+            std::fs::write(&path, format!("[{section}]\n{name} = -1000000\n")).unwrap();
+
+            match ConfigFile::load_from(&path) {
+                Err(ConfigFileError::InvalidValue {
+                    section: s, key: k, ..
+                }) => assert_eq!((s.as_str(), k.as_str()), (section, name)),
+                other => panic!("{}: expected InvalidValue, got {other:?}", key.name()),
+            }
+        }
+    }
+
+    #[test]
+    fn every_range_checked_key_accepts_its_default_on_load() {
+        let defaults = ConfigFile::default();
+        for key in ConfigKey::all().iter().filter(|k| k.is_range_checked()) {
+            let (section, name) = key.name().split_once('.').unwrap();
+            let value = key.get(&defaults);
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("config.ini");
+            std::fs::write(&path, format!("[{section}]\n{name} = {value}\n")).unwrap();
+            ConfigFile::load_from(&path)
+                .unwrap_or_else(|e| panic!("{} = {value} must load: {e}", key.name()));
+        }
+    }
+
+    /// 6.5 was the default from #98 until #125 raised it to 7.0, below the
+    /// range `config set` always enforced, so configuration files written in
+    /// between carry it. It is read as 7.0, not refused.
+    #[test]
+    fn the_former_default_box_extent_loads_as_the_current_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[prefetch]\nbox_extent = 6.5\n").unwrap();
+
+        let config = ConfigFile::load_from(&path).expect("a former default must load");
+        assert_eq!(config.prefetch.box_extent, 7.0);
+    }
+
+    #[test]
+    fn a_box_extent_below_the_range_that_was_never_a_default_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[prefetch]\nbox_extent = 6.0\n").unwrap();
+        assert!(matches!(
+            ConfigFile::load_from(&path),
+            Err(ConfigFileError::InvalidValue { .. })
+        ));
+    }
+
+    #[test]
+    fn the_settings_that_were_only_checked_by_config_set_are_range_checked() {
+        for key in [
+            ConfigKey::CacheDdsDiskRatio,
+            ConfigKey::PrefetchTakeoffClimbFt,
+            ConfigKey::PrefetchRampStartFraction,
+            ConfigKey::PrefetchBoxExtent,
+            ConfigKey::PrefetchBoxMaxBias,
+            ConfigKey::PrefetchCapacityShare,
+            ConfigKey::PrefetchTakeoffTimeoutSecs,
+            ConfigKey::PrefetchLandingHysteresisSecs,
+            ConfigKey::PrefetchRampDurationSecs,
+            ConfigKey::PrefetchWindowBuffer,
+            ConfigKey::PrefetchStaleRegionTimeout,
+            ConfigKey::FuseMaxBackground,
+            ConfigKey::FuseCongestionThreshold,
+        ] {
+            assert!(key.is_range_checked(), "{}", key.name());
         }
     }
 
