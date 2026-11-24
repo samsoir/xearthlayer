@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use xearthlayer::config::{detect_scenery_dir, ConfigFile, SceneryDetectionResult};
+use xearthlayer::config::{detect_scenery_dir, SceneryDetectionResult};
 
 use crate::error::CliError;
 
@@ -31,7 +31,7 @@ pub fn run() -> Result<(), CliError> {
     };
 
     // Load existing config or create default, then update scenery_dir
-    let mut config = ConfigFile::load().unwrap_or_default();
+    let mut config = super::common::load_config()?;
     if config.xplane.scenery_dir.is_none() {
         config.xplane.scenery_dir = scenery_dir;
     }

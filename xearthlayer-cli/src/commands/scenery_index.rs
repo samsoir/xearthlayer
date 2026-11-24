@@ -65,7 +65,7 @@ fn discover_ortho_packages(config: &ConfigFile) -> Result<Vec<(String, PathBuf)>
 
 /// Rebuild the scenery index from installed packages.
 fn run_update() -> Result<(), CliError> {
-    let config = ConfigFile::load().unwrap_or_default();
+    let config = super::common::load_config()?;
     let packages = discover_ortho_packages(&config)?;
 
     if packages.is_empty() {

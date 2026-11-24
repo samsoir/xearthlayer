@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use xearthlayer::cache::{clear_disk_cache, disk_cache_stats, DiskCacheUsage};
-use xearthlayer::config::{format_size, ConfigFile};
+use xearthlayer::config::format_size;
 use xearthlayer::manager::{queue_in_use, queue_lock_file};
 
 use crate::commands::packages::actions::{check_removal, RunActive};
@@ -28,7 +28,7 @@ pub enum CacheAction {
 
 /// Run a cache subcommand.
 pub fn run(action: CacheAction) -> Result<(), CliError> {
-    let config = ConfigFile::load().unwrap_or_default();
+    let config = super::common::load_config()?;
     let cache_dir = &config.cache.directory;
 
     match action {
