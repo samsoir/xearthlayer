@@ -10,7 +10,7 @@ impl DdsHeader {
     /// * `width` - Texture width in pixels
     /// * `height` - Texture height in pixels
     /// * `mipmap_count` - Number of mipmap levels (1 = no mipmaps)
-    /// * `format` - Compression format (BC1 or BC3)
+    /// * `format` - Compression format (only BC1 is supported, #395)
     pub fn new(width: u32, height: u32, mipmap_count: u32, format: DdsFormat) -> Self {
         let fourcc = match format {
             DdsFormat::BC1 => *b"DXT1",

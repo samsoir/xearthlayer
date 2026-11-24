@@ -45,7 +45,7 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// This task combines three sequential operations:
 /// 1. Assemble chunks into a 4096×4096 RGBA image
-/// 2. Encode the image to DDS format with BC1/BC3 compression
+/// 2. Encode the image to DDS format with BC1 compression
 /// 3. Spawn fire-and-forget cache write (non-blocking)
 ///
 /// # Inputs

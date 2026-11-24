@@ -119,7 +119,10 @@ pub(crate) const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
 /// `fuse::placeholder::tests::test_generate_default_placeholder` asserts both
 /// agree, through the real `DdsEncoder`.
 ///
-// TODO(#253): BC1-only; texture.format also accepts bc3
+/// It is BC1-only by construction, which is correct because BC1 is the only
+/// format the encoder accepts (#395). A second format would need a
+/// format-aware size here, for FUSE `st_size` and for the DDS disk validator:
+/// see `docs/dev/dds-implementation.md`, "Supported formats".
 pub const EXPECTED_DDS_SIZE: usize = full_chain_bc1_dds_size(4096, 4096);
 
 #[cfg(test)]

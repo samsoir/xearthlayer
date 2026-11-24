@@ -84,7 +84,7 @@ impl RuntimeBuilder {
     /// # Arguments
     ///
     /// * `provider_name` - Provider name (e.g., "bing", "go2")
-    /// * `format` - DDS format (BC1 or BC3)
+    /// * `format` - DDS format (only BC1 is supported, #395)
     /// * `encoder` - Texture encoder for DDS compression
     pub fn new(
         provider_name: impl Into<String>,

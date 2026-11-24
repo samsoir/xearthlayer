@@ -29,7 +29,7 @@ static DEFAULT_PLACEHOLDER: OnceLock<Bytes> = OnceLock::new();
 ///
 /// * `width` - Texture width in pixels (typically 4096)
 /// * `height` - Texture height in pixels (typically 4096)
-/// * `format` - DDS compression format (BC1 or BC3)
+/// * `format` - DDS compression format (only BC1 is supported, #395)
 /// * `mipmap_count` - Number of mipmap levels; pass
 ///   `MipmapGenerator::full_chain_count(width, height)` for the full chain
 ///
@@ -250,14 +250,9 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_magenta_placeholder_bc3() {
+    fn test_generate_magenta_placeholder_rejects_unsupported_format() {
         let result = generate_magenta_placeholder(256, 256, DdsFormat::BC3, 3);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // BC3 is 16 bytes per block (vs 8 for BC1)
-        assert!(dds.len() > 128);
-        assert_eq!(&dds[0..4], b"DDS ");
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
     }
 
     #[test]
@@ -366,16 +361,6 @@ mod tests {
 
         // FourCC at offset 84
         assert_eq!(&dds[84..88], b"DXT1");
-    }
-
-    #[test]
-    fn test_placeholder_bc3_fourcc() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC3, 1);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // FourCC at offset 84
-        assert_eq!(&dds[84..88], b"DXT5");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! DDS texture encoder implementation.
 //!
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
-//! to DirectDraw Surface (DDS) format with BC1/BC3 compression.
+//! to DirectDraw Surface (DDS) format with BC1 compression.
 
 use crate::dds::{
     default_compressor, DdsEncoder, DdsFormat, DdsHeader, ImageCompressor, MipmapGenerator,
@@ -76,7 +76,7 @@ impl DdsTextureEncoder {
     ///
     /// # Arguments
     ///
-    /// * `format` - DDS compression format (BC1 or BC3)
+    /// * `format` - DDS compression format (only BC1 is supported, #395)
     pub fn new(format: DdsFormat) -> Self {
         Self {
             format,

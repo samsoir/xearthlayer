@@ -57,7 +57,7 @@ impl ExecutorCacheAdapter {
     ///
     /// * `cache` - The memory cache to wrap
     /// * `provider` - Provider name (e.g., "bing", "go2")
-    /// * `format` - DDS format (BC1 or BC3)
+    /// * `format` - DDS format (only BC1 is supported, #395)
     pub fn new(cache: Arc<MemoryCache>, provider: impl Into<String>, format: DdsFormat) -> Self {
         Self {
             cache,

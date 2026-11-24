@@ -30,14 +30,14 @@ use crate::dds::DdsFormat;
 /// assert_eq!(config.mipmap_count(), None);
 ///
 /// // Custom configuration
-/// let config = TextureConfig::new(DdsFormat::BC3)
+/// let config = TextureConfig::new(DdsFormat::BC1)
 ///     .with_mipmap_count(3);
-/// assert_eq!(config.format(), DdsFormat::BC3);
+/// assert_eq!(config.format(), DdsFormat::BC1);
 /// assert_eq!(config.mipmap_count(), Some(3));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureConfig {
-    /// DDS compression format (BC1 or BC3)
+    /// DDS compression format (only BC1 is supported, #395)
     format: DdsFormat,
     /// Mipmap levels to emit; `None` means the full chain for the texture size
     mipmap_count: Option<usize>,

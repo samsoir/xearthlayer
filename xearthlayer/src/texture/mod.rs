@@ -51,7 +51,7 @@
 //!
 //! # Available Encoders
 //!
-//! - [`DdsTextureEncoder`] - Encodes to DDS format with BC1/BC3 compression
+//! - [`DdsTextureEncoder`] - Encodes to DDS format with BC1 compression
 //!
 //! # Future Encoders
 //!

@@ -91,7 +91,9 @@ pub trait ImageCompressor: Send + Sync {
     /// # Arguments
     ///
     /// * `image` - Source RGBA image (dimensions should be multiples of 4)
-    /// * `format` - Target compression format (BC1 or BC3)
+    /// * `format` - Target compression format. Only BC1 is supported; any
+    ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
+    ///   (see [`DdsFormat`]).
     ///
     /// # Returns
     ///
@@ -126,7 +128,9 @@ pub trait MipmapCompressor: Send + Sync {
     /// # Arguments
     ///
     /// * `image` - Source RGBA image (ownership transferred, no clones)
-    /// * `format` - Target compression format (BC1 or BC3)
+    /// * `format` - Target compression format. Only BC1 is supported; any
+    ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
+    ///   before any work is done (see [`DdsFormat`]).
     /// * `mipmap_count` - Number of mipmap levels to generate (including original)
     fn compress_mipmap_chain(
         &self,
@@ -155,6 +159,7 @@ pub struct IspcCompressor;
 
 impl ImageCompressor for IspcCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+        format.ensure_supported()?;
         let width = image.width();
         let height = image.height();
 
@@ -172,12 +177,8 @@ impl ImageCompressor for IspcCompressor {
             stride,
         };
 
-        let compressed = match format {
-            DdsFormat::BC1 => intel_tex_2::bc1::compress_blocks(&surface),
-            DdsFormat::BC3 => intel_tex_2::bc3::compress_blocks(&surface),
-        };
-
-        Ok(compressed)
+        // BC1 is the only supported format (checked above).
+        Ok(intel_tex_2::bc1::compress_blocks(&surface))
     }
 
     fn name(&self) -> &str {
@@ -189,7 +190,7 @@ impl ImageCompressor for IspcCompressor {
 // Software compressor (pure Rust fallback)
 // =============================================================================
 
-/// Pure-Rust block compressor using hand-rolled BC1/BC3 encoding.
+/// Pure-Rust block compressor using hand-rolled BC1 encoding.
 ///
 /// This compressor processes blocks one at a time without SIMD acceleration.
 /// It exists as a fallback for platforms where ISPC prebuilt kernels are not
@@ -198,6 +199,7 @@ pub struct SoftwareCompressor;
 
 impl ImageCompressor for SoftwareCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+        format.ensure_supported()?;
         let width = image.width();
         let height = image.height();
 
@@ -208,20 +210,14 @@ impl ImageCompressor for SoftwareCompressor {
         let blocks_wide = width.div_ceil(4);
         let blocks_high = height.div_ceil(4);
 
-        let block_size: u32 = match format {
-            DdsFormat::BC1 => 8,
-            DdsFormat::BC3 => 16,
-        };
-
-        let mut output = Vec::with_capacity((blocks_wide * blocks_high * block_size) as usize);
+        // BC1 is the only supported format (checked above): 8 bytes a block.
+        const BC1_BLOCK_BYTES: u32 = 8;
+        let mut output = Vec::with_capacity((blocks_wide * blocks_high * BC1_BLOCK_BYTES) as usize);
 
         for block_y in 0..blocks_high {
             for block_x in 0..blocks_wide {
                 let block = extract_block(image, block_x, block_y);
-                let compressed = match format {
-                    DdsFormat::BC1 => super::bc1::Bc1Encoder::compress_block(&block).to_vec(),
-                    DdsFormat::BC3 => super::bc3::Bc3Encoder::compress_block(&block).to_vec(),
-                };
+                let compressed = super::bc1::Bc1Encoder::compress_block(&block).to_vec();
                 output.extend_from_slice(&compressed);
             }
         }
@@ -354,12 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ispc_compress_4x4_bc3() {
-        let image = RgbaImage::new(4, 4);
-        let compressor = IspcCompressor;
-        let result = compressor.compress(&image, DdsFormat::BC3).unwrap();
-        // 1 block × 16 bytes
-        assert_eq!(result.len(), 16);
+    fn ispc_rejects_unsupported_format() {
+        let result = IspcCompressor.compress(&RgbaImage::new(4, 4), DdsFormat::BC3);
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
+    }
+
+    #[test]
+    fn software_rejects_unsupported_format() {
+        let result = SoftwareCompressor.compress(&RgbaImage::new(4, 4), DdsFormat::BC3);
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
     }
 
     #[test]
@@ -369,15 +368,6 @@ mod tests {
         let result = compressor.compress(&image, DdsFormat::BC1).unwrap();
         // 64×64 blocks × 8 bytes
         assert_eq!(result.len(), 32768);
-    }
-
-    #[test]
-    fn test_ispc_compress_256x256_bc3() {
-        let image = RgbaImage::new(256, 256);
-        let compressor = IspcCompressor;
-        let result = compressor.compress(&image, DdsFormat::BC3).unwrap();
-        // 64×64 blocks × 16 bytes
-        assert_eq!(result.len(), 65536);
     }
 
     #[test]

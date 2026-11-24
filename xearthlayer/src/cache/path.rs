@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// * `cache_dir` - Root cache directory
 /// * `provider` - Provider name (e.g., "bing", "google")
 /// * `tile` - Tile coordinates
-/// * `format` - DDS compression format (BC1 or BC3)
+/// * `format` - DDS compression format (only BC1 is supported, #395)
 ///
 /// # Example
 ///

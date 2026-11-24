@@ -104,6 +104,8 @@ impl DdsEncoder {
     ///
     /// Returns error if image dimensions are invalid or compression fails.
     pub fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, DdsError> {
+        // Before any downsampling or hand-off to a backend (#395).
+        self.format.ensure_supported()?;
         let width = image.width();
         let height = image.height();
 
@@ -141,6 +143,7 @@ impl DdsEncoder {
     ///
     /// Complete DDS file as bytes
     pub fn encode_with_mipmaps(&self, mipmaps: &[RgbaImage]) -> Result<Vec<u8>, DdsError> {
+        self.format.ensure_supported()?;
         if mipmaps.is_empty() {
             return Err(DdsError::InvalidMipmapChain(
                 "Empty mipmap chain".to_string(),
@@ -297,7 +300,7 @@ impl DdsEncoder {
         Ok(output)
     }
 
-    /// Compress a single image to BC1/BC3 format using the configured compressor.
+    /// Compress a single image to the encoder's format using the configured compressor.
     ///
     /// Levels smaller than one 4×4 block (the 2×2 and 1×1 tail of a full chain)
     /// are padded up to block size first — see [`pad_to_block_multiple`].
@@ -355,17 +358,46 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_4x4_bc3() {
-        let image = RgbaImage::new(4, 4);
-        let encoder = DdsEncoder::new(DdsFormat::BC3).without_mipmaps();
+    fn encode_rejects_unsupported_format() {
+        let result = DdsEncoder::new(DdsFormat::BC3).encode(RgbaImage::new(4, 4));
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
+    }
 
-        let result = encoder.encode(image);
-        assert!(result.is_ok());
+    #[test]
+    fn encode_with_mipmaps_rejects_unsupported_format() {
+        let result = DdsEncoder::new(DdsFormat::BC3).encode_with_mipmaps(&[RgbaImage::new(4, 4)]);
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
+    }
 
-        let dds = result.unwrap();
+    #[test]
+    fn encode_rejects_unsupported_format_before_the_mipmap_backend_runs() {
+        /// A backend that records whether it was asked to do any work.
+        struct Recording(std::sync::atomic::AtomicBool);
+        impl MipmapCompressor for Recording {
+            fn compress_mipmap_chain(
+                &self,
+                _image: RgbaImage,
+                _format: DdsFormat,
+                _mipmap_count: usize,
+            ) -> Result<Vec<u8>, DdsError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+            fn name(&self) -> &str {
+                "recording"
+            }
+        }
 
-        // Header (128) + 1 block (16) = 144 bytes
-        assert_eq!(dds.len(), 128 + 16);
+        let backend = Arc::new(Recording(std::sync::atomic::AtomicBool::new(false)));
+        let result = DdsEncoder::new(DdsFormat::BC3)
+            .with_mipmap_compressor(Arc::clone(&backend) as Arc<dyn MipmapCompressor>)
+            .encode(RgbaImage::new(256, 256));
+
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
+        assert!(
+            !backend.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the backend must not be reached for an unsupported format"
+        );
     }
 
     #[test]
@@ -482,17 +514,6 @@ mod tests {
 
         // 256×256 = 64×64 blocks, each 8 bytes = 32768
         assert_eq!(compressed.len(), 32768);
-    }
-
-    #[test]
-    fn test_compress_image_256x256_bc3() {
-        let image = RgbaImage::new(256, 256);
-        let encoder = DdsEncoder::new(DdsFormat::BC3);
-
-        let compressed = encoder.compress_image(&image).unwrap();
-
-        // 256×256 = 64×64 blocks, each 16 bytes = 65536
-        assert_eq!(compressed.len(), 65536);
     }
 
     #[test]
@@ -795,18 +816,5 @@ mod tests {
                 .unwrap();
             assert_eq!(compressed.len(), 8, "{}x{} must be one BC1 block", w, h);
         }
-    }
-
-    #[test]
-    fn test_bc3_full_chain_size() {
-        // BC3 uses 16-byte blocks; the same tail rule applies.
-        let dds = DdsEncoder::new(DdsFormat::BC3)
-            .with_compressor(Arc::new(crate::dds::SoftwareCompressor))
-            .encode(RgbaImage::new(256, 256))
-            .unwrap();
-
-        let levels = walk_payload(&dds, 256, 256, 16);
-        assert_eq!(levels.len(), 9);
-        assert_eq!(*levels.last().unwrap(), (1, 1));
     }
 }
