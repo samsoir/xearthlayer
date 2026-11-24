@@ -572,6 +572,15 @@ CI will fail if pre-commit checks were not run.
 matrix — `main`'s branch protection requires the exact status context `Verify`, and
 matrix jobs are renamed.
 
+### License
+
+XEarthLayer is **GPL-3.0-or-later** (#376; releases up to 0.5.1-beta.2 were MIT). Every
+dependency must be under a GPLv3-compatible license: `deny.toml` lists the allowed ones,
+`make licenses` and the CI `Licenses` job check them. Extend the list only after checking
+the FSF's compatibility list. `--version` on both binaries prints the GPL notice
+(`LONG_VERSION` in each `main.rs`). The copyright years appear there, in the README and in
+the two `[package.metadata.deb]` `copyright` fields: bump them together.
+
 ### Key Crates Used
 
 - `fuse3` - Async FUSE filesystem (multi-threaded)

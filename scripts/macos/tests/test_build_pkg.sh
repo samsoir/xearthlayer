@@ -3,11 +3,13 @@ SCRIPT="$SCRIPTS_DIR/build-pkg.sh"
 
 # The Installer wraps the license text itself and keeps every newline it is
 # given, so each paragraph must be one line. The words must be exactly those
-# of the repository's LICENSE.
+# of the repository's LICENSE, whose GPL text opens with an indented title.
+words() { tr -s '[:space:]' ' ' <"$1" | sed 's/^ //; s/ $//'; }
+
 assert_license_is_unwrapped() {
     local license="$SCRIPTS_DIR/../../LICENSE"
     [ -f "$1" ] || fail "no LICENSE.txt in the resources"
-    assert_eq "$(tr -s '[:space:]' ' ' <"$1")" "$(tr -s '[:space:]' ' ' <"$license")"
+    assert_eq "$(words "$1")" "$(words "$license")"
     assert_eq "$(grep -c . "$1")" "$(awk 'NF && !p {n++} {p = NF} END {print n}' "$license")"
 }
 

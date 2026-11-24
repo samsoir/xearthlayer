@@ -47,10 +47,23 @@ use handlers::{
 use services::{ConsoleOutput, ConsolePrompt, DefaultPublisherService};
 use traits::{CommandContext, CommandHandler};
 
+/// `--version` output after the version: the notice GPLv3 asks interactive
+/// programs to show (copyright, license, no warranty). `-V` stays the bare
+/// version line.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "Copyright (C) 2025-2026 XEarthLayer Contributors\n",
+    "License GPL-3.0-or-later <https://www.gnu.org/licenses/gpl-3.0.html>\n",
+    "This is free software: you are free to change and redistribute it.\n",
+    "There is NO WARRANTY, to the extent permitted by law.",
+);
+
 /// Create and publish XEarthLayer scenery packages.
 #[derive(Parser)]
 #[command(name = "xearthlayer-publish")]
 #[command(version)]
+#[command(long_version = LONG_VERSION)]
 #[command(about = "Create and publish XEarthLayer scenery packages", long_about = None)]
 struct Cli {
     /// Work in this library generation (e.g. v1) instead of the current one
@@ -387,5 +400,39 @@ mod cli_tests {
     #[test]
     fn the_command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    fn version_output(binary: &str, flag: &str) -> String {
+        let Err(err) = <Cli as clap::Parser>::try_parse_from([binary, flag]) else {
+            panic!("{flag} must stop parsing to print the version");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        err.to_string()
+    }
+
+    #[test]
+    fn long_version_states_the_license_and_the_absence_of_warranty() {
+        let out = version_output("xearthlayer-publish", "--version");
+
+        assert!(
+            out.starts_with(&format!(
+                "xearthlayer-publish {}\n",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{out}"
+        );
+        assert!(out.contains("XEarthLayer Contributors"), "{out}");
+        assert!(out.contains("GPL-3.0-or-later"), "{out}");
+        assert!(out.contains("NO WARRANTY"), "{out}");
+    }
+
+    #[test]
+    fn short_version_is_the_version_alone() {
+        let out = version_output("xearthlayer-publish", "-V");
+
+        assert_eq!(
+            out.trim_end(),
+            format!("xearthlayer-publish {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

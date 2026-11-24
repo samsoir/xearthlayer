@@ -21,7 +21,7 @@ path = "src/main.rs"
 [package.metadata.deb]
 name = "xearthlayer-publish"
 maintainer = "Sam de Freyssinet <sam@def.reyssi.net>"
-copyright = "2025, XEarthLayer Contributors"
+copyright = "2025-2026, XEarthLayer Contributors"
 license-file = ["../LICENSE", "0"]
 extended-description = """\
 xearthlayer-publish creates distributable XEarthLayer scenery packages from \
