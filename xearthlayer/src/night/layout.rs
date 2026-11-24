@@ -2,13 +2,20 @@
 //! `LitLayout`, the full mip chain geometry of a lit footprint and the bytes
 //! of its levels (phase 2a): the header, the black levels X-Plane drops, the
 //! top level it uploads and the generated payload.
+//!
+//! What is lit, and which levels are blank, follows X-Plane's texture
+//! setting and lives here; the DDS size arithmetic (header, level and file
+//! lengths, chain levels) is [`crate::dds::layout`]'s.
 
 use std::sync::OnceLock;
 
 use bytes::Bytes;
 
-use crate::cache::integrity::full_chain_bc1_dds_size;
+use crate::dds::layout::{self, full_chain_levels};
 use crate::dds::{DdsFormat, DdsHeader};
+
+/// The lit format: lit DDS files are BC1.
+const LIT_FORMAT: DdsFormat = DdsFormat::BC1;
 
 /// First visible level of a ZL16 lit texture: about 7.5 m per texel.
 pub const FIRST_VISIBLE_ZL16: u32 = 1024;
@@ -43,9 +50,9 @@ impl LitLayout {
         };
         let top = (wanted_first << blank_levels).min(MAX_TOP_LEVEL);
         let first_visible = top >> blank_levels;
-        let levels = top.ilog2() + 1;
-        let header = Bytes::from(DdsHeader::new(top, top, levels, DdsFormat::BC1).to_bytes());
-        let total_len = full_chain_bc1_dds_size(top, top) as u64;
+        let levels = full_chain_levels(top, top);
+        let header = Bytes::from(DdsHeader::new(top, top, levels, LIT_FORMAT).to_bytes());
+        let total_len = layout::file_len(top, top, levels, LIT_FORMAT) as u64;
         Self {
             top,
             levels,
@@ -72,8 +79,8 @@ impl LitLayout {
 
     /// Bytes of the visible levels (first visible level down to 1 x 1).
     pub fn payload_len(&self) -> u64 {
-        full_chain_bc1_dds_size(self.first_visible, self.first_visible) as u64
-            - self.header.len() as u64
+        let size = self.first_visible;
+        layout::chain_len(size, size, full_chain_levels(size, size), LIT_FORMAT) as u64
     }
 
     /// Where the visible levels start: after the header and the blank levels.
@@ -120,8 +127,9 @@ impl LitLayout {
 pub fn minimal_black_dds() -> Bytes {
     static DDS: OnceLock<Bytes> = OnceLock::new();
     DDS.get_or_init(|| {
-        let mut bytes = DdsHeader::new(4, 4, 3, DdsFormat::BC1).to_bytes();
-        bytes.resize(bytes.len() + 3 * 8, 0);
+        let levels = full_chain_levels(4, 4);
+        let mut bytes = DdsHeader::new(4, 4, levels, LIT_FORMAT).to_bytes();
+        bytes.resize(layout::file_len(4, 4, levels, LIT_FORMAT), 0);
         Bytes::from(bytes)
     })
     .clone()
@@ -136,7 +144,8 @@ mod lit_tests {
         let l = LitLayout::new(16, 4); // top 2048, first visible 1024
         assert_eq!(
             l.payload_len(),
-            full_chain_bc1_dds_size(1024, 1024) as u64 - 128
+            layout::file_len(1024, 1024, full_chain_levels(1024, 1024), DdsFormat::BC1) as u64
+                - 128
         );
         assert_eq!(l.payload_start(), 128 + 2048 * 2048 / 2);
         assert_eq!(l.payload_start() + l.payload_len(), l.total_len);

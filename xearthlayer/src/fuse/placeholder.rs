@@ -5,104 +5,77 @@
 //!
 //! # Static Placeholder
 //!
-//! A singleton placeholder is pre-generated at first access and cached for the
-//! lifetime of the application. This ensures we **never** return empty data to
-//! X-Plane, even under memory pressure or when encoding fails.
+//! The placeholder is a solid colour, so it needs no encoder: every 4×4 block
+//! of every level is the same 8 bytes, one BC1 block of opaque magenta. The
+//! file is the DDS header of a 4096×4096 BC1 tile with its full mip chain,
+//! then that block once for every block of the chain: [`EXPECTED_DDS_SIZE`]
+//! bytes, with its geometry from [`crate::dds::layout`]. Building it
+//! allocates the file and nothing else (no image, no mip chain, no encode;
+//! about a millisecond).
+//!
+//! [`init_placeholder_cache`] builds it when the service starts
+//! (`XEarthLayerService::start`), so no FUSE handler ever builds it (#386).
+//! It is never written to a cache.
 
-use crate::dds::{DdsEncoder, DdsError, DdsFormat};
+use crate::dds::layout::{self, full_chain_levels};
+use crate::dds::{DdsFormat, DdsHeader};
 use bytes::Bytes;
-use image::RgbaImage;
 use std::sync::OnceLock;
 
-/// Static placeholder cache - generated once, never fails after first success.
+/// Static placeholder cache - built once, at service start.
 /// `Bytes`, so handing out the placeholder is a refcount bump rather than an
 /// 11 MB copy. It is returned on every timeout, which is exactly when the
 /// process is least able to afford the allocation (#237).
 static DEFAULT_PLACEHOLDER: OnceLock<Bytes> = OnceLock::new();
 
-/// Generate a magenta placeholder DDS texture.
+/// Width and height of the placeholder: a standard ortho tile.
+const PLACEHOLDER_SIZE: u32 = 4096;
+
+/// RGB565 magenta: red 31, green 0, blue 31, which decodes to exactly
+/// (255, 0, 255).
+const MAGENTA_565: u16 = 0xF81F;
+
+/// One BC1 block of opaque magenta: both endpoints magenta, every index 0
+/// (`color0`).
 ///
-/// Creates a solid magenta (255, 0, 255, 255) texture of the specified dimensions
-/// and encodes it as a DDS file.
+/// Equal endpoints select BC1's three-colour mode, whose index 3 is
+/// transparent black; no texel here takes index 3, so every texel is opaque
+/// magenta. It is the block the ISPC encoder wrote for solid magenta when the
+/// placeholder was encoded from an image, so the placeholder's bytes did not
+/// change when that encode was removed (#386).
+const MAGENTA_BC1_BLOCK: [u8; 8] = {
+    let c = MAGENTA_565.to_le_bytes();
+    [c[0], c[1], c[0], c[1], 0, 0, 0, 0]
+};
+
+/// A `size`×`size` BC1 DDS with its full mip chain whose every block is
+/// `block`: the header, then `block` once for every block of every level.
 ///
-/// # Arguments
-///
-/// * `width` - Texture width in pixels (typically 4096)
-/// * `height` - Texture height in pixels (typically 4096)
-/// * `format` - DDS compression format (only BC1 is supported, #395)
-/// * `mipmap_count` - Number of mipmap levels; pass
-///   `MipmapGenerator::full_chain_count(width, height)` for the full chain
-///
-/// # Returns
-///
-/// Complete DDS file as bytes
-///
-/// # Errors
-///
-/// Returns error if DDS encoding fails (should be rare for solid color)
-///
-/// # Examples
-///
-/// ```
-/// use xearthlayer::fuse::generate_magenta_placeholder;
-/// use xearthlayer::dds::DdsFormat;
-///
-/// let placeholder = generate_magenta_placeholder(4096, 4096, DdsFormat::BC1, 5).unwrap();
-/// assert!(placeholder.len() > 0);
-/// assert_eq!(&placeholder[0..4], b"DDS "); // Valid DDS header
-/// ```
-pub fn generate_magenta_placeholder(
-    width: u32,
-    height: u32,
-    format: DdsFormat,
-    mipmap_count: usize,
-) -> Result<Vec<u8>, DdsError> {
-    // Create solid magenta image
-    let mut image = RgbaImage::new(width, height);
-    for pixel in image.pixels_mut() {
-        *pixel = image::Rgba([255, 0, 255, 255]); // Magenta
+/// Its one large allocation is the file itself, sized by
+/// [`crate::dds::layout`].
+fn solid_bc1_full_chain(size: u32, block: [u8; 8]) -> Vec<u8> {
+    let format = DdsFormat::BC1;
+    let levels = full_chain_levels(size, size);
+    let len = layout::file_len(size, size, levels, format);
+    let mut bytes = Vec::with_capacity(len);
+    bytes.extend_from_slice(&DdsHeader::new(size, size, levels, format).to_bytes());
+    bytes.resize(len, 0);
+    for chunk in bytes[layout::HEADER_LEN..].chunks_exact_mut(format.block_bytes()) {
+        chunk.copy_from_slice(&block);
     }
-
-    // Encode to DDS
-    let encoder = DdsEncoder::new(format).with_mipmap_count(mipmap_count);
-    encoder.encode(image)
+    bytes
 }
 
-/// Generate a default magenta placeholder for X-Plane tiles.
+/// Get the default placeholder: a 4096×4096 BC1 DDS with its full mip chain,
+/// solid opaque magenta, [`EXPECTED_DDS_SIZE`] bytes.
 ///
-/// Uses standard settings: 4096×4096, BC1 compression, full mipmap chain.
-///
-/// The placeholder must carry the same chain length as a real tile — it is
-/// served through the same FUSE read path and checked against the same
-/// [`EXPECTED_DDS_SIZE`].
+/// The placeholder is built once and cached for the life of the process;
+/// [`init_placeholder_cache`] builds it at service start. Called before that,
+/// it builds it here, which takes about a millisecond and cannot fail.
 ///
 /// # Returns
 ///
-/// Complete DDS file as bytes
-pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
-    generate_magenta_placeholder(
-        4096,
-        4096,
-        DdsFormat::BC1,
-        crate::dds::MipmapGenerator::full_chain_count(4096, 4096),
-    )
-}
-
-/// Get the default placeholder, guaranteed to never return empty data.
-///
-/// This function uses a cached static placeholder that is generated once at
-/// first access. If initial generation fails (extremely rare), it panics at
-/// startup before X-Plane requests any tiles.
-///
-/// # Returns
-///
-/// A clone of the cached placeholder DDS file (4096×4096, BC1, full chain).
-///
-/// # Panics
-///
-/// Panics if the placeholder cannot be generated on first access. This is
-/// intentional - we'd rather fail early at startup than return corrupted
-/// data to X-Plane during flight.
+/// The cached placeholder (a refcount bump, not a copy).
 ///
 /// # Example
 ///
@@ -116,25 +89,16 @@ pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
 /// ```
 pub fn get_default_placeholder() -> Bytes {
     DEFAULT_PLACEHOLDER
-        .get_or_init(|| {
-            Bytes::from(
-                generate_default_placeholder()
-                    .expect("Failed to generate default placeholder - this is a critical error"),
-            )
-        })
+        .get_or_init(|| Bytes::from(solid_bc1_full_chain(PLACEHOLDER_SIZE, MAGENTA_BC1_BLOCK)))
         .clone()
 }
 
-/// Initialize the placeholder cache.
+/// Build the placeholder cache now.
 ///
-/// Call this early during startup to ensure the placeholder is ready before
-/// any FUSE requests arrive. If initialization fails, this returns an error
-/// so the application can fail gracefully with a clear error message.
-///
-/// # Returns
-///
-/// Ok(()) if the placeholder was successfully generated and cached, or
-/// Err if generation failed.
+/// `XEarthLayerService::start` calls this before any FUSE request can
+/// arrive, so no FUSE handler ever builds the placeholder (#386). Building
+/// it takes about a millisecond and cannot fail; calling this again does
+/// nothing.
 ///
 /// # Example
 ///
@@ -142,15 +106,10 @@ pub fn get_default_placeholder() -> Bytes {
 /// use xearthlayer::fuse::init_placeholder_cache;
 ///
 /// // Initialize at startup
-/// init_placeholder_cache().expect("Failed to initialize placeholder cache");
+/// init_placeholder_cache();
 /// ```
-pub fn init_placeholder_cache() -> Result<(), DdsError> {
-    // Force initialization by calling get_or_init with our generator
-    // If it fails, the error propagates
-    let _ = DEFAULT_PLACEHOLDER.get_or_init(|| {
-        Bytes::from(generate_default_placeholder().expect("Failed to generate placeholder"))
-    });
-    Ok(())
+pub fn init_placeholder_cache() {
+    get_default_placeholder();
 }
 
 /// Expected DDS size for a 4096×4096 BC1 tile with a full mipmap chain.
@@ -160,12 +119,13 @@ pub fn init_placeholder_cache() -> Result<(), DdsError> {
 /// it must track what the encoder actually emits — a regression test asserts
 /// both agree.
 ///
-/// The computation lives in `cache::integrity` (the canonical cache
-/// integrity model shared by all cache tiers) so that DDS disk cache
-/// validation and this FUSE-boundary check can never drift apart. This
-/// re-export exists so existing callers of `fuse::EXPECTED_DDS_SIZE` keep
-/// working. The dependency direction is `fuse -> cache::integrity`, never
-/// the reverse: `cache::integrity` must not import anything from `fuse`.
+/// The arithmetic lives in [`crate::dds::layout`] and the constant in
+/// `cache::integrity` (the canonical cache integrity model shared by all
+/// cache tiers) so that DDS disk cache validation and this FUSE-boundary
+/// check can never drift apart. This re-export exists so existing callers of
+/// `fuse::EXPECTED_DDS_SIZE` keep working. The dependency direction is
+/// `fuse -> cache::integrity`, never the reverse: `cache::integrity` must
+/// not import anything from `fuse`.
 pub use crate::cache::integrity::EXPECTED_DDS_SIZE;
 
 /// Validates that DDS data is well-formed and returns it, or substitutes
@@ -221,155 +181,96 @@ pub fn validate_dds_or_placeholder(data: Bytes, context: &str) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dds::DdsEncoder;
+    use image::RgbaImage;
 
+    /// The 16 texels of a BC1 block, decoded as RGBA.
+    fn decode(block: &[u8]) -> Vec<[u8; 4]> {
+        let mut rgba = [0u8; 4 * 4 * 4];
+        bcdec_rs::bc1(block, &mut rgba, 16);
+        rgba.chunks_exact(4)
+            .map(|t| [t[0], t[1], t[2], t[3]])
+            .collect()
+    }
+
+    /// The constant is what the encoder writes for solid magenta, so the
+    /// placeholder built from it is byte for byte the one the old full
+    /// encode produced (#386 review).
     #[test]
-    fn test_generate_magenta_placeholder_basic() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 3);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Check it's a valid DDS file
-        assert!(dds.len() > 128); // At least header + some data
-        assert_eq!(&dds[0..4], b"DDS ");
+    fn the_magenta_block_is_what_ispc_encodes_for_solid_magenta() {
+        use crate::dds::{DdsFormat, ImageCompressor, IspcCompressor};
+        let magenta = RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 255, 255]));
+        let encoded = IspcCompressor.compress(&magenta, DdsFormat::BC1).unwrap();
+        assert_eq!(encoded, MAGENTA_BC1_BLOCK);
     }
 
     #[test]
-    fn test_generate_magenta_placeholder_4096() {
-        let result = generate_magenta_placeholder(4096, 4096, DdsFormat::BC1, 5);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Should have header (128) + data for 5 mipmap levels
-        // 4096: 1024×1024 blocks * 8 = 8388608
-        // 2048: 512×512 blocks * 8 = 2097152
-        // 1024: 256×256 blocks * 8 = 524288
-        // 512: 128×128 blocks * 8 = 131072
-        // 256: 64×64 blocks * 8 = 32768
-        // Total: 11173888 + 128 = 11174016
-        assert_eq!(dds.len(), 11_174_016);
+    fn the_magenta_block_decodes_to_opaque_magenta() {
+        assert_eq!(decode(&MAGENTA_BC1_BLOCK), vec![[255, 0, 255, 255]; 16]);
     }
 
     #[test]
-    fn test_generate_magenta_placeholder_rejects_unsupported_format() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC3, 3);
-        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
-    }
-
-    #[test]
-    fn test_generate_magenta_placeholder_different_sizes() {
-        let sizes = vec![
-            (256, 256),
-            (512, 512),
-            (1024, 1024),
-            (2048, 2048),
-            (4096, 4096),
-        ];
-
-        for (width, height) in sizes {
-            let result = generate_magenta_placeholder(width, height, DdsFormat::BC1, 3);
-            assert!(
-                result.is_ok(),
-                "Failed to generate placeholder for {}x{}",
-                width,
-                height
-            );
-            let dds = result.unwrap();
-            assert_eq!(&dds[0..4], b"DDS ");
+    fn no_texel_of_the_magenta_block_takes_the_transparent_index() {
+        // Equal endpoints select the three-colour mode, where index 3 is
+        // transparent black: every texel must take another index.
+        let c0 = u16::from_le_bytes([MAGENTA_BC1_BLOCK[0], MAGENTA_BC1_BLOCK[1]]);
+        let c1 = u16::from_le_bytes([MAGENTA_BC1_BLOCK[2], MAGENTA_BC1_BLOCK[3]]);
+        assert_eq!((c0, c1), (MAGENTA_565, MAGENTA_565));
+        let indices = u32::from_le_bytes(MAGENTA_BC1_BLOCK[4..].try_into().unwrap());
+        for texel in 0..16 {
+            assert_ne!((indices >> (2 * texel)) & 3, 3, "texel {texel}");
         }
     }
 
     #[test]
-    fn test_generate_magenta_placeholder_various_mipmap_counts() {
-        for mipmap_count in 1..=5 {
-            let result = generate_magenta_placeholder(4096, 4096, DdsFormat::BC1, mipmap_count);
-            assert!(result.is_ok(), "Failed with {} mipmap levels", mipmap_count);
+    fn the_placeholder_is_the_size_of_a_tile() {
+        assert_eq!(get_default_placeholder().len(), EXPECTED_DDS_SIZE);
+    }
+
+    #[test]
+    fn the_placeholder_header_is_what_the_encoder_writes_for_a_real_tile() {
+        let tile = DdsEncoder::new(DdsFormat::BC1)
+            .encode(RgbaImage::new(4096, 4096))
+            .unwrap();
+        let placeholder = get_default_placeholder();
+        assert_eq!(placeholder.len(), tile.len());
+        assert_eq!(
+            placeholder[..layout::HEADER_LEN],
+            tile[..layout::HEADER_LEN],
+            "DDS header"
+        );
+    }
+
+    #[test]
+    fn every_block_of_every_level_decodes_to_opaque_magenta() {
+        let placeholder = get_default_placeholder();
+        let payload = &placeholder[layout::HEADER_LEN..];
+        // 4096 down to 1: 1,398,103 blocks.
+        assert_eq!(payload.len(), 1_398_103 * 8);
+        let blocks: std::collections::HashSet<&[u8]> = payload.chunks_exact(8).collect();
+        assert_eq!(blocks.len(), 1, "one block, repeated");
+        for block in blocks {
+            assert_eq!(decode(block), vec![[255, 0, 255, 255]; 16]);
         }
     }
 
     #[test]
-    fn test_generate_default_placeholder() {
-        let result = generate_default_placeholder();
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Should be 4096×4096 BC1 with the full 13-level mipmap chain
-        assert_eq!(dds.len(), EXPECTED_DDS_SIZE);
-        assert_eq!(&dds[0..4], b"DDS ");
-    }
-
-    #[test]
-    fn test_placeholder_not_empty() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 1);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Should have header + data
-        // 256×256 = 64×64 blocks, each 8 bytes = 32768
-        // Header: 128
-        // Total: 32896
-        assert_eq!(dds.len(), 32896);
-    }
-
-    #[test]
-    fn test_placeholder_header_contains_dimensions() {
-        let result = generate_magenta_placeholder(1024, 512, DdsFormat::BC1, 1);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Check dimensions in header (width at offset 16, height at offset 12)
-        let height_bytes = &dds[12..16];
-        let height = u32::from_le_bytes([
-            height_bytes[0],
-            height_bytes[1],
-            height_bytes[2],
-            height_bytes[3],
-        ]);
-        assert_eq!(height, 512);
-
-        let width_bytes = &dds[16..20];
-        let width = u32::from_le_bytes([
-            width_bytes[0],
-            width_bytes[1],
-            width_bytes[2],
-            width_bytes[3],
-        ]);
-        assert_eq!(width, 1024);
-    }
-
-    #[test]
-    fn test_placeholder_header_mipmap_count() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 5);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // Mipmap count at offset 28
-        let mipmap_bytes = &dds[28..32];
-        let mipmap_count = u32::from_le_bytes([
-            mipmap_bytes[0],
-            mipmap_bytes[1],
-            mipmap_bytes[2],
-            mipmap_bytes[3],
-        ]);
-        assert_eq!(mipmap_count, 5);
-    }
-
-    #[test]
-    fn test_placeholder_bc1_fourcc() {
-        let result = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 1);
-        assert!(result.is_ok());
-        let dds = result.unwrap();
-
-        // FourCC at offset 84
-        assert_eq!(&dds[84..88], b"DXT1");
-    }
-
-    #[test]
-    fn test_multiple_placeholders_same_result() {
-        let placeholder1 = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 3).unwrap();
-        let placeholder2 = generate_magenta_placeholder(256, 256, DdsFormat::BC1, 3).unwrap();
-
-        // Should be deterministic
-        assert_eq!(placeholder1, placeholder2);
+    fn a_solid_dds_is_the_header_then_its_block_with_no_image_behind_it() {
+        // By construction: the payload is the block it is given, verbatim,
+        // wherever it falls in the chain, so no image is downsampled or
+        // encoded to make it, and the file is allocated once, at its size.
+        let block = [1, 2, 3, 4, 5, 6, 7, 8];
+        let dds = solid_bc1_full_chain(64, block);
+        let levels = full_chain_levels(64, 64);
+        assert_eq!(dds.len(), layout::file_len(64, 64, levels, DdsFormat::BC1));
+        assert_eq!(dds.capacity(), dds.len(), "allocated once, at its size");
+        assert_eq!(
+            dds[..layout::HEADER_LEN],
+            DdsHeader::new(64, 64, levels, DdsFormat::BC1).to_bytes()
+        );
+        assert!(dds[layout::HEADER_LEN..]
+            .chunks_exact(8)
+            .all(|b| b == block));
     }
 
     #[test]
@@ -401,19 +302,18 @@ mod tests {
         let placeholder1 = get_default_placeholder();
         let placeholder2 = get_default_placeholder();
 
-        // The data should be identical
+        // The data should be identical, and the same allocation
         assert_eq!(placeholder1, placeholder2);
+        assert_eq!(placeholder1.as_ptr(), placeholder2.as_ptr());
     }
 
     #[test]
-    fn test_init_placeholder_cache_succeeds() {
-        // This should succeed without error
-        let result = init_placeholder_cache();
-        assert!(result.is_ok());
+    fn init_placeholder_cache_builds_the_placeholder_get_returns() {
+        init_placeholder_cache();
+        init_placeholder_cache();
 
-        // After init, get_default_placeholder should work
-        let placeholder = get_default_placeholder();
-        assert!(!placeholder.is_empty());
+        let placeholder = DEFAULT_PLACEHOLDER.get().expect("built by init");
+        assert_eq!(placeholder.as_ptr(), get_default_placeholder().as_ptr());
     }
 
     #[test]

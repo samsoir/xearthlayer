@@ -56,19 +56,12 @@ impl MipmapGenerator {
 
     /// Count the total number of mipmap levels from full size down to 1×1.
     ///
-    /// Equivalent to `floor(log2(min(width, height))) + 1`, computed by
-    /// halving until either dimension reaches 1. Matches the behavior of
-    /// `generate_chain()` which stops when `width <= 1 || height <= 1`.
+    /// `floor(log2(min(width, height))) + 1`, from
+    /// [`layout::full_chain_levels`](crate::dds::layout::full_chain_levels).
+    /// Matches the behavior of `generate_chain()` which stops when
+    /// `width <= 1 || height <= 1`.
     pub fn full_chain_count(width: u32, height: u32) -> usize {
-        let mut count = 1usize;
-        let mut w = width;
-        let mut h = height;
-        while w > 1 && h > 1 {
-            w /= 2;
-            h /= 2;
-            count += 1;
-        }
-        count
+        crate::dds::layout::full_chain_levels(width, height) as usize
     }
 
     /// Downsample image by 2× using box filter (simple average).

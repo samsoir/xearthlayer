@@ -3,9 +3,7 @@
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
 //! to DirectDraw Surface (DDS) format with BC1 compression.
 
-use crate::dds::{
-    default_compressor, DdsEncoder, DdsFormat, DdsHeader, ImageCompressor, MipmapGenerator,
-};
+use crate::dds::{default_compressor, layout, DdsEncoder, DdsFormat, ImageCompressor};
 use crate::texture::{TextureEncoder, TextureError};
 use image::RgbaImage;
 use std::sync::Arc;
@@ -145,56 +143,15 @@ impl DdsTextureEncoder {
 
     /// Resolve the mipmap chain length for the given dimensions.
     ///
-    /// Mirrors `DdsEncoder::resolve_mipmap_count` so that `expected_size()` —
-    /// which becomes the `st_size` FUSE reports to X-Plane — can never
-    /// disagree with the number of levels actually written.
-    fn resolve_mipmap_count(&self, width: u32, height: u32) -> usize {
-        let full = MipmapGenerator::full_chain_count(width, height);
-        match self.mipmap_count {
-            Some(count) => count.clamp(1, full),
-            None => full,
-        }
-    }
-
-    /// Calculate total data size for a DDS file with mipmaps.
-    ///
-    /// `mipmap_count` must already be clamped to the chain length that the
-    /// dimensions actually support; this loop does not terminate at 1×1 on its
-    /// own and would otherwise over-count.
-    ///
-    /// # Arguments
-    ///
-    /// * `width` - Base image width
-    /// * `height` - Base image height
-    /// * `format` - Compression format
-    /// * `mipmap_count` - Number of mipmap levels
-    fn calculate_data_size(
-        width: u32,
-        height: u32,
-        format: DdsFormat,
-        mipmap_count: usize,
-    ) -> usize {
-        let block_size: usize = match format {
-            DdsFormat::BC1 => 8,
-            DdsFormat::BC3 => 16,
-        };
-
-        let mut total_size = 0;
-        let mut w = width;
-        let mut h = height;
-
-        for _ in 0..mipmap_count {
-            // Calculate blocks (round up to multiple of 4)
-            let blocks_wide = w.div_ceil(4) as usize;
-            let blocks_high = h.div_ceil(4) as usize;
-            total_size += blocks_wide * blocks_high * block_size;
-
-            // Next mipmap level
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-        }
-
-        total_size
+    /// Resolved by [`layout::chain_levels`], as `DdsEncoder` resolves it, so
+    /// that `expected_size()` — which becomes the `st_size` FUSE reports to
+    /// X-Plane — can never disagree with the number of levels actually
+    /// written.
+    fn resolve_mipmap_count(&self, width: u32, height: u32) -> u32 {
+        let requested = self
+            .mipmap_count
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX));
+        layout::chain_levels(width, height, requested)
     }
 }
 
@@ -216,10 +173,8 @@ impl TextureEncoder for DdsTextureEncoder {
     }
 
     fn expected_size(&self, width: u32, height: u32) -> usize {
-        let header_size = std::mem::size_of::<DdsHeader>(); // 128 bytes
-        let count = self.resolve_mipmap_count(width, height);
-        let data_size = Self::calculate_data_size(width, height, self.format, count);
-        header_size + data_size
+        let levels = self.resolve_mipmap_count(width, height);
+        layout::file_len(width, height, levels, self.format)
     }
 
     fn extension(&self) -> &str {
@@ -397,28 +352,6 @@ mod tests {
 
         assert_eq!(encoder1.format(), encoder2.format());
         assert_eq!(encoder1.mipmap_count(), encoder2.mipmap_count());
-    }
-
-    #[test]
-    fn test_calculate_data_size_bc1() {
-        // 4×4 image, 1 mipmap
-        let size = DdsTextureEncoder::calculate_data_size(4, 4, DdsFormat::BC1, 1);
-        assert_eq!(size, 8); // 1 block * 8 bytes
-
-        // 256×256 image, 1 mipmap
-        let size = DdsTextureEncoder::calculate_data_size(256, 256, DdsFormat::BC1, 1);
-        assert_eq!(size, 32768); // 64*64 blocks * 8 bytes
-    }
-
-    #[test]
-    fn test_calculate_data_size_bc3() {
-        // 4×4 image, 1 mipmap
-        let size = DdsTextureEncoder::calculate_data_size(4, 4, DdsFormat::BC3, 1);
-        assert_eq!(size, 16); // 1 block * 16 bytes
-
-        // 256×256 image, 1 mipmap
-        let size = DdsTextureEncoder::calculate_data_size(256, 256, DdsFormat::BC3, 1);
-        assert_eq!(size, 65536); // 64*64 blocks * 16 bytes
     }
 
     #[test]

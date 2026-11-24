@@ -14,6 +14,8 @@
 use image::RgbaImage;
 
 use super::BC1_FLOOR;
+use crate::dds::layout::BLOCK_DIM;
+use crate::dds::DdsFormat;
 
 /// Stored-value margin of a tint: green when G exceeds both R and B by more
 /// than this, purple when R and B both exceed G by more. A margin of 4 misses
@@ -36,7 +38,7 @@ const TINT_PENALTY: f32 = 1000.0;
 const MAX_SWEEPS: usize = 64;
 
 /// Bytes of one BC1 block.
-const BLOCK_BYTES: usize = 8;
+const BLOCK_BYTES: usize = DdsFormat::BC1.block_bytes();
 
 /// Rec.709 luminance weights, applied to stored-value differences.
 const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
@@ -72,16 +74,11 @@ fn introduced(decoded: [u8; 3], source: [u8; 3]) -> bool {
     decoded.iter().max().is_some_and(|&m| m >= BC1_FLOOR) && t != Tint::None && t != tint(source)
 }
 
-/// The BC1 bytes of a level of `width` x `height` texels.
-pub fn level_len(width: u32, height: u32) -> usize {
-    (width.div_ceil(4) * height.div_ceil(4)) as usize * BLOCK_BYTES
-}
-
 /// Repairs, in place, the blocks of one BC1 level (`blocks`, as the encoder
 /// wrote them) whose decode tints a texel of `level` (the image they were
 /// encoded from) green or purple.
 pub fn repair_level(blocks: &mut [u8], level: &RgbaImage) {
-    let per_row = level.width().div_ceil(4);
+    let per_row = level.width().div_ceil(BLOCK_DIM);
     for (i, block) in blocks.chunks_exact_mut(BLOCK_BYTES).enumerate() {
         let block: &mut [u8; BLOCK_BYTES] = block.try_into().expect("8-byte chunk");
         if below_floor(block) {
@@ -321,7 +318,7 @@ pub(crate) mod tests {
     /// image it was encoded from, does not have.
     pub(crate) fn introduced_tints(encoded: &[u8], level: &RgbaImage) -> usize {
         let (width, height) = level.dimensions();
-        let per_row = width.div_ceil(4) as usize;
+        let per_row = width.div_ceil(BLOCK_DIM) as usize;
         let mut count = 0;
         for (i, block) in encoded.chunks_exact(BLOCK_BYTES).enumerate() {
             let (bx, by) = ((i % per_row) as u32, (i / per_row) as u32);

@@ -2,6 +2,9 @@
 
 use std::path::Path;
 
+use crate::dds::layout::level_len;
+use crate::dds::DdsFormat;
+
 /// One lit pattern: the top level of a Laminar `*_LIT.dds`, as RGB.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LitPattern {
@@ -47,7 +50,7 @@ pub fn decode_dxt1(bytes: &[u8], ground_scale_m: f64) -> Option<LitPattern> {
     }
     let size = w as usize;
     let blocks = size / 4;
-    let top = dds.data.get(..blocks * blocks * 8)?;
+    let top = dds.data.get(..level_len(w, h, DdsFormat::BC1))?;
     let mut rgba = vec![0u8; size * size * 4];
     let pitch = size * 4;
     for by in 0..blocks {

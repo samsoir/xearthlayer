@@ -9,7 +9,8 @@
 use crate::dds::compressor::{
     default_compressor, pad_to_block_multiple, ImageCompressor, MipmapCompressor,
 };
-use crate::dds::mipmap::{MipmapGenerator, MipmapStream};
+use crate::dds::layout;
+use crate::dds::mipmap::MipmapStream;
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
 use std::sync::Arc;
@@ -251,17 +252,16 @@ impl DdsEncoder {
     ///
     /// When no explicit count is set, counts levels from full size down to 1×1.
     ///
-    /// An explicit override is clamped to the full chain length. Without the
-    /// clamp a caller asking for more levels than the dimensions allow would
-    /// write that number into the DDS header while [`MipmapStream`] silently
-    /// stopped at 1×1, leaving the header over-declaring what the payload
-    /// contains.
+    /// An explicit override is clamped to the full chain length
+    /// ([`layout::chain_levels`]). Without the clamp a caller asking for more
+    /// levels than the dimensions allow would write that number into the DDS
+    /// header while [`MipmapStream`] silently stopped at 1×1, leaving the
+    /// header over-declaring what the payload contains.
     fn resolve_mipmap_count(&self, width: u32, height: u32) -> usize {
-        let full = MipmapGenerator::full_chain_count(width, height);
-        match self.mipmap_count {
-            Some(count) => count.clamp(1, full),
-            None => full,
-        }
+        let requested = self
+            .mipmap_count
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX));
+        layout::chain_levels(width, height, requested) as usize
     }
 
     /// Delegate compression to a MipmapCompressor backend.
@@ -319,6 +319,7 @@ impl DdsEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dds::mipmap::MipmapGenerator;
 
     #[test]
     fn test_encoder_new() {

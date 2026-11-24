@@ -14,13 +14,11 @@
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel), whose worker
 //! gets its device from [`create_gpu_resources`].
 
+use super::layout::{self, BLOCK_DIM};
 use super::types::{DdsError, DdsFormat};
 use image::RgbaImage;
 use std::borrow::Cow;
 use std::sync::Arc;
-
-/// Edge length of a BCn compression block, in pixels.
-pub(crate) const BLOCK_DIM: u32 = 4;
 
 /// Pad an image up to a whole number of 4×4 compression blocks.
 ///
@@ -207,12 +205,11 @@ impl ImageCompressor for SoftwareCompressor {
             return Err(DdsError::InvalidDimensions(width, height));
         }
 
-        let blocks_wide = width.div_ceil(4);
-        let blocks_high = height.div_ceil(4);
+        let blocks_wide = width.div_ceil(BLOCK_DIM);
+        let blocks_high = height.div_ceil(BLOCK_DIM);
 
-        // BC1 is the only supported format (checked above): 8 bytes a block.
-        const BC1_BLOCK_BYTES: u32 = 8;
-        let mut output = Vec::with_capacity((blocks_wide * blocks_high * BC1_BLOCK_BYTES) as usize);
+        // BC1 is the only supported format (checked above).
+        let mut output = Vec::with_capacity(layout::level_len(width, height, format));
 
         for block_y in 0..blocks_high {
             for block_x in 0..blocks_wide {

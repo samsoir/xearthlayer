@@ -120,6 +120,12 @@ impl XEarthLayerService {
 
         tracing::info!("Creating XEarthLayerService using current runtime");
 
+        // Build the magenta placeholder FUSE serves on a timeout or failure
+        // now, before anything is mounted, so no FUSE handler ever builds it
+        // (#386). It is copied from one block, about a millisecond: no
+        // blocking thread needed.
+        crate::fuse::init_placeholder_cache();
+
         // 1. Create MetricsSystem FIRST (so we can inject client into caches)
         let metrics_system = MetricsSystem::new(&runtime_handle);
         let metrics_client = metrics_system.client();
@@ -542,7 +548,10 @@ impl XEarthLayerService {
     /// Calculate the expected DDS file size based on encoder configuration.
     ///
     /// Returns the expected file size for a standard 4096×4096 DDS texture
-    /// with the configured format and mipmap levels.
+    /// with the configured format and mipmap levels, from
+    /// [`crate::dds::layout`]. FUSE reports it as `st_size`; for the default
+    /// configuration it equals `EXPECTED_DDS_SIZE`, the size every FUSE read
+    /// is checked against.
     pub fn expected_dds_size(&self) -> usize {
         self.dds_encoder.expected_size(4096, 4096)
     }
@@ -642,6 +651,45 @@ mod tests {
 
                 service.shutdown_cache().await;
                 assert!(!cache_dir.exists());
+            });
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    /// #391: the size FUSE reports as `st_size` (`expected_dds_size`, from
+    /// the configured encoder) and the size every FUSE read and DDS disk
+    /// entry is checked against (`EXPECTED_DDS_SIZE`) are one number for the
+    /// default configuration, so they cannot drift apart again. Runs on its
+    /// own runtime for the reason given on the test below; disk caching off,
+    /// so nothing is written.
+    #[test]
+    fn expected_dds_size_is_the_read_gate_size_by_default() {
+        use crate::cache::integrity::EXPECTED_DDS_SIZE;
+        use crate::provider::ProviderConfig;
+        use tempfile::tempdir;
+
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let temp_dir = tempdir().unwrap();
+                let config = ServiceConfig::builder()
+                    .cache_directory(temp_dir.path().join("cache"))
+                    .disk_cache_enabled(false)
+                    .build();
+                assert_eq!(
+                    config.texture(),
+                    ServiceConfig::default().texture(),
+                    "the default texture configuration"
+                );
+
+                let mut service = XEarthLayerService::start(config, ProviderConfig::bing())
+                    .await
+                    .expect("a Bing service starts offline");
+
+                assert_eq!(service.expected_dds_size(), EXPECTED_DDS_SIZE);
+
+                service.shutdown_cache().await;
             });
         })
         .join()

@@ -21,7 +21,6 @@ pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoale
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use placeholder::{
-    generate_default_placeholder, generate_magenta_placeholder, get_default_placeholder,
-    init_placeholder_cache, validate_dds_or_placeholder, EXPECTED_DDS_SIZE,
+    get_default_placeholder, init_placeholder_cache, validate_dds_or_placeholder, EXPECTED_DDS_SIZE,
 };
 pub use support::{DdsHandler, DdsRequest, DdsResponse};

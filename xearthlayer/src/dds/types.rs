@@ -16,8 +16,10 @@ use std::fmt;
 /// what is supported.
 ///
 /// The variants beyond BC1 name formats without implementing them; their
-/// format facts (block size, FourCC) stay in [`DdsHeader`] because they
-/// describe the format and encode nothing. Adding a format means a kernel in
+/// format facts stay because they describe the format and encode nothing:
+/// the block size in [`DdsFormat::block_bytes`] (with the rest of the file
+/// geometry in [`crate::dds::layout`]) and the FourCC in [`DdsHeader`].
+/// Adding a format means a kernel in
 /// every backend, a format-aware expected tile size for the FUSE read gate and
 /// the DDS disk cache validator, a placeholder in that format, and a
 /// user-facing setting. See `docs/dev/dds-implementation.md`.

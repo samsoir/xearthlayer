@@ -1,5 +1,6 @@
 //! DDS header construction.
 
+use crate::dds::layout;
 use crate::dds::types::*;
 
 impl DdsHeader {
@@ -17,16 +18,8 @@ impl DdsHeader {
             DdsFormat::BC3 => *b"DXT5",
         };
 
-        // Calculate linear size for the main surface
-        // BC1: 8 bytes per 4×4 block
-        // BC3: 16 bytes per 4×4 block
-        let block_size = match format {
-            DdsFormat::BC1 => 8,
-            DdsFormat::BC3 => 16,
-        };
-        let blocks_wide = width.div_ceil(4);
-        let blocks_high = height.div_ceil(4);
-        let pitch_or_linear_size = blocks_wide * blocks_high * block_size;
+        // Linear size: the bytes of the main surface (level 0).
+        let pitch_or_linear_size = layout::level_len(width, height, format) as u32;
 
         // Determine flags
         let mut flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE;
@@ -70,7 +63,7 @@ impl DdsHeader {
 
     /// Convert header to byte array for writing to file.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(128);
+        let mut bytes = Vec::with_capacity(layout::HEADER_LEN);
 
         // Magic
         bytes.extend_from_slice(&self.magic);

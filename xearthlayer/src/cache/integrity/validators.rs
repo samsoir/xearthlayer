@@ -1,6 +1,7 @@
 //! Validators for the opaque blob cache tiers (DDS tiles, raw chunks).
 
 use super::{CacheEntryValidator, IntegrityError};
+use crate::dds::{layout, DdsFormat};
 
 /// A validator expressed as magic bytes plus an optional exact length.
 ///
@@ -83,47 +84,26 @@ pub fn raw_chunk_validator() -> MagicAndSize {
     }
 }
 
-/// Total byte size of a BC1 DDS with a full mipmap chain, header included.
-///
-/// Walks the chain the same way the encoder does — halving until a dimension
-/// reaches 1, and sizing every level as `blocks_wide * blocks_high * 8`. The
-/// `div_ceil` matters for the tail: 4×4, 2×2 and 1×1 each still occupy one
-/// whole 8-byte block, which the naive `w * h / 2` under-counts.
-pub(crate) const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
-    const HEADER_BYTES: usize = 128;
-    const BLOCK_BYTES: usize = 8;
-
-    let mut total = HEADER_BYTES;
-    let mut w = width;
-    let mut h = height;
-
-    loop {
-        let blocks_wide = w.div_ceil(4) as usize;
-        let blocks_high = h.div_ceil(4) as usize;
-        total += blocks_wide * blocks_high * BLOCK_BYTES;
-
-        if w <= 1 || h <= 1 {
-            return total;
-        }
-
-        w /= 2;
-        h /= 2;
-    }
-}
-
 /// Expected DDS size for a 4096×4096 BC1 tile with a full mipmap chain.
 ///
 /// This is the standard size for X-Plane ortho tiles: 13 levels, 11,184,952
-/// bytes. `validate_dds_or_placeholder` gates every FUSE read against it, so
-/// it must track what the encoder actually emits —
-/// `fuse::placeholder::tests::test_generate_default_placeholder` asserts both
-/// agree, through the real `DdsEncoder`.
+/// bytes, computed by [`crate::dds::layout`], which owns the DDS size
+/// arithmetic. `validate_dds_or_placeholder` gates every FUSE read against
+/// it, so it must track what the encoder actually emits: the encoder's
+/// `test_default_emits_full_chain_4096_bc1` pins the encoded length, and the
+/// service's `expected_dds_size()` (FUSE `st_size`) is asserted equal to it
+/// for the default configuration.
 ///
 /// It is BC1-only by construction, which is correct because BC1 is the only
 /// format the encoder accepts (#395). A second format would need a
 /// format-aware size here, for FUSE `st_size` and for the DDS disk validator:
 /// see `docs/dev/dds-implementation.md`, "Supported formats".
-pub const EXPECTED_DDS_SIZE: usize = full_chain_bc1_dds_size(4096, 4096);
+pub const EXPECTED_DDS_SIZE: usize = layout::file_len(
+    4096,
+    4096,
+    layout::full_chain_levels(4096, 4096),
+    DdsFormat::BC1,
+);
 
 #[cfg(test)]
 mod tests {

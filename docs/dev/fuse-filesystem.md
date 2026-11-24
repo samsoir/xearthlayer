@@ -424,7 +424,7 @@ xearthlayer/src/
 │   │   ├── union_fs.rs         # Multi-source union (patches)
 │   │   └── ortho_union_fs.rs   # Consolidated ortho mount
 │   ├── filename.rs         # DDS filename parsing
-│   └── placeholder.rs      # Magenta placeholder generation
+│   └── placeholder.rs      # Magenta placeholder: header + one BC1 block repeated, built at service start
 ├── ortho_union/
 │   ├── mod.rs              # Module exports
 │   ├── index.rs            # OrthoUnionIndex (tile → source mapping)

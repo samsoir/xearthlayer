@@ -319,7 +319,7 @@ identical forever, and so logs say which one actually happened.
 ## Known Limitations
 
 - **`EXPECTED_DDS_SIZE` is BC1-only, by construction.** It's computed from
-  `full_chain_bc1_dds_size(4096, 4096)`. BC3 was retired (#395) and the
+  `dds::layout::file_len(4096, 4096, full_chain_levels(4096, 4096), BC1)`. BC3 was retired (#395) and the
   encoder rejects every format other than BC1, so every tile that can reach
   the DDS disk tier has this size and the check is correct. A future format
   needs a format-aware expected size here, in the FUSE read gate and for
