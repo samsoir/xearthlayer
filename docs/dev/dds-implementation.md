@@ -20,7 +20,8 @@ xearthlayer/src/dds/
 ├── layout.rs       - DDS file geometry: header length, block bytes, level, chain and file sizes
 ├── header.rs       - DDS header construction and serialization
 ├── bc1.rs          - BC1/DXT1 compression (8 bytes per block)
-├── compressor.rs   - ImageCompressor, MipmapCompressor, IspcCompressor, SoftwareCompressor
+├── compressor.rs   - ImageCompressor, MipmapCompressor, IspcCompressor, SoftwareCompressor,
+│                     compress_level (pad one level to whole blocks, compress it)
 ├── gpu_channel.rs  - GpuEncoderChannel (GPU worker)
 ├── mipmap.rs       - Mipmap chain generation with box filtering
 ├── encoder.rs      - Main DDS encoder API
@@ -40,6 +41,13 @@ lighting layout (`LitLayout`, `minimal_black_dds`), the BC1 repair pass, the Lam
 pattern decoder and the magenta placeholder all call it; none writes the arithmetic
 out. It is not `cache::layout`, which places the cache tiers on disk.
 
+`dds::compress_level(kernel, level, format)` (#392) is the one definition of
+encoding a single level: it pads the level to whole 4×4 blocks and compresses it
+with the kernel it is given, returning exactly `level_len` bytes. `DdsEncoder`
+calls it for every level of the CPU path, and night lighting calls it per lit
+level with `IspcCompressor` named, so the lit payload buffer is sized from
+`dds::layout` before anything is encoded.
+
 ## Supported formats
 
 XEarthLayer encodes BC1 (DXT1) only (#395). BC3 (DXT5) was retired: a BC3 tile is
@@ -54,6 +62,7 @@ The encoder interfaces keep their `format` parameter (`DdsFormat`) as the extens
 point for future formats:
 
 - `ImageCompressor::compress(image, format)`
+- `compress_level(kernel, level, format)`
 - `MipmapCompressor::compress_mipmap_chain(image, format, count)`
 - `DdsEncoder::new(format)`
 - `TextureConfig::new(format)`
@@ -65,6 +74,8 @@ supported. Any value other than BC1 is rejected with `DdsError::UnsupportedForma
 - when the encoder is built at service start (`create_encoder` in
   `service/builder.rs`), so a wrong format fails at startup and not once per tile;
 - at the top of `DdsEncoder::encode`, before any work;
+- in `compress_level`, before the level is padded or the kernel runs (an empty
+  level is refused there too, with `InvalidDimensions(0, 0)`);
 - at each backend entry point: `IspcCompressor`, `SoftwareCompressor`, and
   `GpuEncoderChannel`, which rejects before the request is sent to the GPU worker.
 
