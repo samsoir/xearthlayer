@@ -125,9 +125,10 @@ impl ServiceConfig {
 
     /// Whether the disk cache tiers (DDS, chunk and lit) run this session.
     ///
-    /// `false` is `run --no-cache`: nothing under `cache.directory` is
-    /// created, read, written or deleted, and the executor gets disk caches
-    /// that always miss. The memory tier always runs.
+    /// `false` is `run --no-cache`: no disk tier is created, read, written
+    /// or deleted, and the executor gets disk caches that always miss. The
+    /// memory tier always runs. The scenery and ortho union index caches are
+    /// not tiers and are unaffected.
     pub fn disk_cache_enabled(&self) -> bool {
         self.disk_cache_enabled
     }

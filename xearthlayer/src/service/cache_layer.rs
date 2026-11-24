@@ -30,8 +30,10 @@
 //! ```
 //!
 //! With disk caching off (`ServiceConfig::disk_cache_enabled` false, which
-//! is `run --no-cache`) only the memory tier runs: no disk tier starts and
-//! nothing under `cache.directory` is created, read, written or deleted.
+//! is `run --no-cache`) only the memory tier runs: no disk tier starts, and
+//! this layer creates, reads, writes and deletes nothing under
+//! `cache.directory`. (The scenery and ortho union index caches, which are not
+//! tiers and are not this layer's, still load and save as usual.)
 //! [`CacheLayer::executor_disk_caches`] then answers
 //! [`ExecutorDiskCaches::Off`], and the executor gets disk caches that
 //! always miss.
@@ -77,6 +79,15 @@ pub struct DiskBudgets {
     pub chunk: u64,
     /// `None` when night lighting is off.
     pub lit: Option<u64>,
+}
+
+/// The directory the disk tiers live under: `cache.directory`, else the
+/// platform cache directory.
+fn disk_root(config: &ServiceConfig) -> PathBuf {
+    config
+        .cache_directory()
+        .cloned()
+        .unwrap_or_else(crate::paths::tile_cache_dir)
 }
 
 /// Disk budgets per tier. Night lighting takes its fixed share first, so
@@ -158,11 +169,7 @@ impl DiskTiers {
         let dds_disk_budget = budgets.dds;
         let chunk_disk_budget = budgets.chunk;
 
-        // Get cache directory with default
-        let cache_dir = config
-            .cache_directory()
-            .cloned()
-            .unwrap_or_else(crate::paths::tile_cache_dir);
+        let cache_dir = disk_root(config);
 
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
 
@@ -982,24 +989,20 @@ mod tests {
         cache_layer.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn test_cache_layer_default_directories() {
-        // Test with config that has no cache directory set
-        let config = ServiceConfig::builder()
-            .cache_memory_size(1_000_000)
-            .cache_disk_size(10_000_000)
-            .disk_gc_interval(3600)
+    /// The root of the disk tiers: the configured directory, else the
+    /// platform's. Checked without starting a layer, which would create the
+    /// tiers in the user's real cache directory (it used to, as
+    /// `~/.cache/xearthlayer/test/`).
+    #[test]
+    fn the_disk_root_is_the_configured_directory_else_the_platforms() {
+        let unset = ServiceConfig::builder().build();
+        assert!(unset.cache_directory().is_none());
+        assert_eq!(disk_root(&unset), crate::paths::tile_cache_dir());
+
+        let set = ServiceConfig::builder()
+            .cache_directory(PathBuf::from("/somewhere/else"))
             .build();
-        let metrics = create_test_metrics();
-
-        // This should use the default cache directory
-        let result = CacheLayer::new(&config, "test", metrics).await;
-
-        // It may fail if the default directory doesn't exist or isn't writable,
-        // but it shouldn't panic
-        if let Ok(cache_layer) = result {
-            cache_layer.shutdown().await;
-        }
+        assert_eq!(disk_root(&set), PathBuf::from("/somewhere/else"));
     }
 
     #[test]
