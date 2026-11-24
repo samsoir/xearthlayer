@@ -167,6 +167,7 @@ through each ortho source's own path, not through the mount:
   packages), and takes the first it finds. The block is Ortho4XP's: each
   coordinate floored to a multiple of 10 (`+37-123` is in `+30-130`).
 - Recipes load lazily on first use and live in a cache bounded by bytes,
+  evicted least recently used (LRU, for the reason the payload cache is; #387),
   each about 1.5 MB decoded. "No recipe for this tile" is cached too, so
   countryside costs one lookup per tile per session.
 - A rejected file is logged once and then treated as a dark tile.
@@ -559,8 +560,12 @@ Inside:
   plus road extract permits are at most a third of the headroom (10 of 10,
   so the night share is fully used). This keeps `executor` free of a
   dependency on `night`.
-- **Cache.** Reads go memory (256 MB, bounded by bytes), then disk, then
-  generate. The disk tier holds payloads only (file sizes and the DDS layout
+- **Cache.** Reads go memory (256 MB, bounded by bytes, least recently used
+  evicted first), then disk, then generate. LRU, not moka's default TinyLFU
+  (#387): TinyLFU admits a new entry only if it is read more often than the
+  one it would evict, and a payload just generated has been read once, so
+  once the cache was full it was refused and the next read of the texture,
+  tens of seconds later, went to disk or generated it again. The disk tier holds payloads only (file sizes and the DDS layout
   are unchanged) under `{cache_dir}/night/` in region folders, with its own
   GC daemon on the prefetch lane. With `night.enabled` it takes 5% of
   `cache.disk_size` first (`LIT_DISK_SHARE`) and `dds_disk_ratio` splits the
