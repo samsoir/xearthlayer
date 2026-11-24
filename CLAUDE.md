@@ -56,7 +56,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
-   - `dds::compress_level(kernel, level, format)` (#392): pad one level to whole blocks and compress it, the one definition of a single-level encode; `DdsEncoder` uses it per level and night lighting calls it with `IspcCompressor`. `DdsEncoder::encode_with_mipmaps` (it panicked with a GPU encoder) is gone
+   - `dds::compress_level_into(kernel, level, format, out)` (#392, #393): pad one level to whole blocks and compress it into a slice of exactly `level_len` bytes, the one definition of a single-level encode (`compress_level` is the same into its own buffer). Kernels write in place through `ImageCompressor::compress_into` (ISPC via `compress_blocks_into`; the default compresses and copies). `DdsEncoder` allocates the file once at `file_len` and compresses each level into its slice, so an encoded 4096 tile is one 11,184,952-byte allocation with no spare capacity; night lighting's `bc1_levels` does the same with `IspcCompressor`. `DdsEncoder::encode_with_mipmaps` (it panicked with a GPU encoder) is gone. The GPU path still grows its output
    - `MipmapCompressor` trait for full-pipeline backends (GPU):
      - `GpuEncoderChannel` — Worker-side mipmap streaming, zero-clone channel transfer
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)

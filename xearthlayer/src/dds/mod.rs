@@ -60,9 +60,12 @@
 //! - [`IspcCompressor`] — SIMD-optimized (default, recommended)
 //! - [`SoftwareCompressor`] — Pure-Rust fallback
 //!
-//! [`compress_level`] pads a level of any size to whole blocks and compresses
-//! it with a given [`ImageCompressor`]: the per-level entry point used by
-//! [`DdsEncoder`] and by night lighting, which names [`IspcCompressor`].
+//! [`compress_level_into`] pads a level of any size to whole blocks and
+//! compresses it with a given [`ImageCompressor`] straight into a slice of
+//! the level's exact size: the per-level entry point used by [`DdsEncoder`],
+//! which writes a whole file into one buffer allocated at its size, and by
+//! night lighting, which names [`IspcCompressor`]. [`compress_level`] is the
+//! same into a buffer of its own.
 //!
 //! [`MipmapCompressor`] — full-pipeline compression:
 //! - [`GpuEncoderChannel`] — Worker-side mipmap streaming via GPU compute
@@ -87,8 +90,8 @@ mod types;
 
 // Public API
 pub use compressor::{
-    compress_level, create_gpu_resources, default_compressor, ImageCompressor, IspcCompressor,
-    MipmapCompressor, SoftwareCompressor,
+    compress_level, compress_level_into, create_gpu_resources, default_compressor, ImageCompressor,
+    IspcCompressor, MipmapCompressor, SoftwareCompressor,
 };
 pub use encoder::DdsEncoder;
 pub use gpu_channel::create_gpu_encoder_channel;

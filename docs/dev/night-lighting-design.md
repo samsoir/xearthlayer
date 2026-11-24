@@ -490,15 +490,17 @@ floors every level (see BC1 floor), BC1-encodes each level through
 `dds::compress_level` with `IspcCompressor` named, whatever
 `texture.compressor` says, and repairs the blocks of each level whose
 decode tints a dim texel, against that level's own texels (see BC1
-endpoint repair). The levels go into one buffer allocated at the
-payload's exact size from `dds::layout` (699,064 bytes for a ZL16
-texture at 1024 px, 174,776 at 512 px); no DDS header is built. Until
-#392 the payload was cut from a full DDS that the encoder had grown to
-1,048,832 bytes at ZL16, all of it held by the cached payload while the
-payload cache, bounded by payload length, counted 699,064, so a full
-256 MB cache held up to about 400 MB. At its exact size a generated
-ZL16 payload is below glibc's 1 MiB mmap threshold (#227) and comes
-from the arenas, as payloads read from the lit disk tier always did. A
+endpoint repair). Each level is compressed and repaired in its own
+slice of one buffer allocated at the payload's exact size from
+`dds::layout` (699,064 bytes for a ZL16 texture at 1024 px, 174,776 at
+512 px; `dds::compress_level_into`, #393); no DDS header is built. Until
+#392 the payload was cut from a full DDS that the encoder had grown by
+doubling to a 1,048,832-byte mapping at ZL16. The unwritten tail of
+that mapping was never touched, so it took address space, not memory:
+the payload cache, bounded by payload length, was not exceeded in
+resident terms. At its exact size a generated ZL16 payload is below
+glibc's 1 MiB mmap threshold (#227) and comes from the arenas, as
+payloads read from the lit disk tier always did. A
 lit payload is about a tenth of an ortho tile, so wiring the GPU channel
 worker into the lit path is not worth it now. A real ZL16 texture at 1024 px
 generated in about 130 ms warm and 147 ms cold before the LED stage, and

@@ -5,14 +5,15 @@ use std::fmt;
 /// DDS compression format.
 ///
 /// Every encoder interface takes a `DdsFormat` ([`ImageCompressor`],
-/// [`MipmapCompressor`], [`DdsEncoder`], [`compress_level`]), and that
-/// parameter is the extension point for formats XEarthLayer may support
-/// later. **Only BC1 is implemented today** (#395): every other value is
-/// rejected with [`DdsError::UnsupportedFormat`] when the service builds its
-/// encoder (`service::builder::create_encoder`, so a wrong format fails at
-/// startup) and at every encode entry point (`DdsEncoder::encode`,
-/// `compress_level`, each compressor's `compress`, and the GPU channel
-/// before it sends). Constructors such as `DdsEncoder::new` do not reject.
+/// [`MipmapCompressor`], [`DdsEncoder`], [`compress_level`],
+/// [`compress_level_into`]), and that parameter is the extension point for
+/// formats XEarthLayer may support later. **Only BC1 is implemented today**
+/// (#395): every other value is rejected with [`DdsError::UnsupportedFormat`]
+/// when the service builds its encoder (`service::builder::create_encoder`,
+/// so a wrong format fails at startup) and at every encode entry point
+/// (`DdsEncoder::encode`, `compress_level` and `compress_level_into`, each
+/// compressor's `compress` and `compress_into`, and the GPU channel before it
+/// sends). Constructors such as `DdsEncoder::new` do not reject.
 /// [`DdsFormat::is_supported`] is the one statement of what is supported.
 ///
 /// The variants beyond BC1 name formats without implementing them; their
@@ -28,6 +29,7 @@ use std::fmt;
 /// [`MipmapCompressor`]: crate::dds::MipmapCompressor
 /// [`DdsEncoder`]: crate::dds::DdsEncoder
 /// [`compress_level`]: crate::dds::compress_level
+/// [`compress_level_into`]: crate::dds::compress_level_into
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DdsFormat {
     /// BC1/DXT1 compression (4:1, no alpha or 1-bit alpha). The only

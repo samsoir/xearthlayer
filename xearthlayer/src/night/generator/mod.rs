@@ -20,7 +20,7 @@ use super::laminar::LitPattern;
 use super::recipe::Recipe;
 use super::roads::field::RoadField;
 use super::roads::RoadModel;
-use crate::dds::{compress_level, layout, DdsFormat, IspcCompressor};
+use crate::dds::{compress_level_into, layout, DdsFormat, IspcCompressor};
 use crate::fuse::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
@@ -137,22 +137,23 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
 
 /// The BC1 blocks of `levels`, in order, without a DDS header, each level
 /// repaired where its endpoints tint dim texels ([`bc1_repair`]), in a
-/// buffer allocated once at its exact size.
+/// buffer allocated once at its exact size, each level compressed and
+/// repaired in its own slice of it.
 ///
 /// The kernel is [`IspcCompressor`], named here and never taken from a
 /// default: lit bytes are versioned by [`LIT_GENERATOR_VERSION`] and
 /// fingerprinted on disk on the understanding that they come from ISPC,
 /// whatever `texture.compressor` says.
 fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
-    let len = levels
-        .iter()
-        .map(|level| layout::level_len(level.width(), level.height(), DdsFormat::BC1))
-        .sum();
-    let mut payload = Vec::with_capacity(len);
+    let level_len =
+        |level: &RgbaImage| layout::level_len(level.width(), level.height(), DdsFormat::BC1);
+    let mut payload = vec![0; levels.iter().map(level_len).sum()];
+    let mut at = 0;
     for level in levels {
-        let mut blocks = compress_level(&IspcCompressor, level, DdsFormat::BC1)?;
-        bc1_repair::repair_level(&mut blocks, level);
-        payload.extend_from_slice(&blocks);
+        let blocks = &mut payload[at..at + level_len(level)];
+        compress_level_into(&IspcCompressor, level, DdsFormat::BC1, blocks)?;
+        bc1_repair::repair_level(blocks, level);
+        at += blocks.len();
     }
     Ok(payload)
 }
@@ -218,6 +219,7 @@ fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dds::compress_level;
     use crate::fuse::TextureKind;
     use crate::night::parse_recipe;
     use crate::night::roads::field::RoadField;

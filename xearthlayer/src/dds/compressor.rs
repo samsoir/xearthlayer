@@ -23,16 +23,16 @@ use std::sync::Arc;
 /// Pad an image up to a whole number of 4×4 compression blocks.
 ///
 /// The tail of a mipmap chain reaches 2×2 and 1×1, which are smaller than a
-/// single BCn block. Two backends mishandle that:
+/// single BCn block. Two backends cannot take such a level:
 ///
 /// - The GPU kernel asserts both dimensions are multiples of 4 and panics
 ///   otherwise, taking the whole encoder worker down with it.
 /// - The ISPC kernel reads a full 4×4 footprint at `stride = width * 4`, so on
-///   a tightly packed 2×2 (16-byte) or 1×1 (4-byte) surface it reads out of
-///   bounds. It also sizes its output from the pixel area (`ceil(w*h/16)`)
-///   rather than `blocks_wide * blocks_high`; for the square power-of-two
-///   levels of a production tile the two agree, but a non-square level such as
-///   8×2 gets one block allocated where the header expects two.
+///   a tightly packed 2×2 (16-byte) or 1×1 (4-byte) surface it would read out
+///   of bounds, and it sizes its output from the pixel area (`ceil(w*h/16)`)
+///   rather than `blocks_wide * blocks_high`, one block where an 8×2 level
+///   takes two. [`IspcCompressor`] therefore refuses a level that is not whole
+///   blocks ([`DdsError::InvalidDimensions`]).
 ///
 /// `SoftwareCompressor` already handles sub-block levels correctly — padding
 /// only changes its pad-region pixels from black to edge-replicated.
@@ -69,36 +69,74 @@ pub(crate) fn pad_to_block_multiple(image: &RgbaImage) -> Cow<'_, RgbaImage> {
     Cow::Owned(padded)
 }
 
-/// Block-compress one level of any size with `kernel`: pad it to whole
-/// blocks by replicating its edge (`pad_to_block_multiple`, which says why
-/// every kernel needs it), then compress. The bytes are
-/// [`layout::level_len`]`(width, height, format)` long, the 2 x 2 and 1 x 1
-/// levels at the tail of a chain taking one block each.
+/// Block-compress one level of any size with `kernel` into `out`: pad it to
+/// whole blocks by replicating its edge (`pad_to_block_multiple`, which says
+/// why every kernel needs it), then compress straight into `out`, which must
+/// be exactly [`layout::level_len`]`(width, height, format)` bytes, the
+/// level's place in a DDS file (the 2 x 2 and 1 x 1 levels at the tail of a
+/// chain take one block each).
 ///
-/// This is the one definition of "pad then compress": [`DdsEncoder`] calls it
-/// for every level, and a caller that needs each level on its own (the night
-/// lighting generator, which encodes only its visible levels and repairs each
-/// one after the kernel) calls it directly, naming its kernel rather than
-/// taking a default.
+/// This is the one definition of "pad then compress", [`compress_level`]
+/// being this into a buffer of its own. [`DdsEncoder`] calls it for every
+/// level, each into its slice of one buffer allocated at the file's exact
+/// size (#393), and so does the night lighting generator, which encodes only
+/// its visible levels and repairs each one after the kernel, naming its
+/// kernel rather than taking a default.
 ///
 /// # Errors
 ///
-/// [`DdsError::UnsupportedFormat`] for any format but BC1, and
+/// [`DdsError::UnsupportedFormat`] for any format but BC1,
 /// [`DdsError::InvalidDimensions`] (with the level's own size) for an empty
-/// level, both before the kernel runs; otherwise whatever the kernel returns.
+/// level and [`DdsError::CompressionFailed`] for `out` of any other length,
+/// all before the kernel runs or `out` is written; otherwise whatever the
+/// kernel returns, `out` then holding no defined bytes.
 ///
 /// [`DdsEncoder`]: super::DdsEncoder
+pub fn compress_level_into(
+    kernel: &dyn ImageCompressor,
+    level: &RgbaImage,
+    format: DdsFormat,
+    out: &mut [u8],
+) -> Result<(), DdsError> {
+    check_level_into(level, format, out)?;
+    kernel.compress_into(&pad_to_block_multiple(level), format, out)
+}
+
+/// [`compress_level_into`] a buffer of the level's exact size, returned.
+///
+/// # Errors
+///
+/// Those of [`compress_level_into`]: an unsupported format or an empty level
+/// before the kernel runs, otherwise whatever the kernel returns.
 pub fn compress_level(
     kernel: &dyn ImageCompressor,
     level: &RgbaImage,
     format: DdsFormat,
 ) -> Result<Vec<u8>, DdsError> {
+    let (width, height) = level.dimensions();
+    let mut blocks = vec![0; layout::level_len(width, height, format)];
+    compress_level_into(kernel, level, format, &mut blocks)?;
+    Ok(blocks)
+}
+
+/// What every entry point that compresses a level into a caller's slice
+/// checks before a kernel runs or `out` is written: the format is supported,
+/// the level is not empty, and `out` is exactly the level's
+/// [`layout::level_len`] bytes.
+fn check_level_into(level: &RgbaImage, format: DdsFormat, out: &[u8]) -> Result<(), DdsError> {
     format.ensure_supported()?;
     let (width, height) = level.dimensions();
     if width == 0 || height == 0 {
         return Err(DdsError::InvalidDimensions(width, height));
     }
-    kernel.compress(&pad_to_block_multiple(level), format)
+    let len = layout::level_len(width, height, format);
+    if out.len() != len {
+        return Err(DdsError::CompressionFailed(format!(
+            "a {width}x{height} {format} level takes {len} bytes, the output has {}",
+            out.len()
+        )));
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -110,7 +148,8 @@ pub fn compress_level(
 /// Implementations handle the full-surface compression in a single call.
 /// The DDS encoder handles mipmap generation and header assembly; this trait
 /// is only responsible for compressing one image level. Callers go through
-/// [`compress_level`], which pads a level to whole blocks first.
+/// [`compress_level_into`] or [`compress_level`], which pad a level to whole
+/// blocks first.
 ///
 /// # Thread Safety
 ///
@@ -121,7 +160,8 @@ pub trait ImageCompressor: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `image` - Source RGBA image (dimensions should be multiples of 4)
+    /// * `image` - Source RGBA image (dimensions should be multiples of 4;
+    ///   a backend may refuse others, as [`IspcCompressor`] does)
     /// * `format` - Target compression format. Only BC1 is supported; any
     ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
     ///   (see [`DdsFormat`]).
@@ -130,6 +170,47 @@ pub trait ImageCompressor: Send + Sync {
     ///
     /// Compressed block data (without DDS header).
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError>;
+
+    /// Compress an RGBA image into `out`, which must be exactly
+    /// [`layout::level_len`]`(width, height, format)` bytes: the image's
+    /// place as a level of a DDS file, so a whole file can be written into
+    /// one buffer allocated once at its size (#393).
+    ///
+    /// The default calls [`compress`](Self::compress) and copies its blocks,
+    /// so a backend that only implements `compress` works unchanged
+    /// ([`SoftwareCompressor`]); a backend that can write into a slice
+    /// overrides it ([`IspcCompressor`]).
+    ///
+    /// # Errors
+    ///
+    /// [`DdsError::UnsupportedFormat`] for any format but BC1,
+    /// [`DdsError::InvalidDimensions`] for an empty image and
+    /// [`DdsError::CompressionFailed`] for `out` of any other length, all
+    /// before `out` is written: an implementation must never panic on a
+    /// wrong length. Otherwise whatever `compress` returns, or
+    /// [`DdsError::CompressionFailed`] when it returns another number of
+    /// bytes than `out` holds.
+    fn compress_into(
+        &self,
+        image: &RgbaImage,
+        format: DdsFormat,
+        out: &mut [u8],
+    ) -> Result<(), DdsError> {
+        check_level_into(image, format, out)?;
+        let blocks = self.compress(image, format)?;
+        if blocks.len() != out.len() {
+            return Err(DdsError::CompressionFailed(format!(
+                "{} compressed a {}x{} level to {} bytes, not {}",
+                self.name(),
+                image.width(),
+                image.height(),
+                blocks.len(),
+                out.len()
+            )));
+        }
+        out.copy_from_slice(&blocks);
+        Ok(())
+    }
 
     /// Human-readable name for logging and diagnostics.
     fn name(&self) -> &str;
@@ -189,27 +270,45 @@ pub trait MipmapCompressor: Send + Sync {
 pub struct IspcCompressor;
 
 impl ImageCompressor for IspcCompressor {
+    /// [`compress_into`](Self::compress_into) a buffer of the level's size.
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
-        format.ensure_supported()?;
-        let width = image.width();
-        let height = image.height();
+        let mut blocks = vec![0; layout::level_len(image.width(), image.height(), format)];
+        self.compress_into(image, format, &mut blocks)?;
+        Ok(blocks)
+    }
 
-        if width == 0 || height == 0 {
+    /// Compresses straight into `out` with
+    /// `intel_tex_2::bc1::compress_blocks_into`, which asserts that `out` is
+    /// the kernel's own size for the surface (`calc_output_size`, from the
+    /// pixel count: `ceil(w * h / 16) * 8`). Everything is checked first, so
+    /// no input reaches that assertion: `out` must be
+    /// [`layout::level_len`] bytes and the image whole 4 x 4 blocks, for
+    /// which the two sizes are equal. A level that is not whole blocks is
+    /// refused ([`DdsError::InvalidDimensions`]) rather than compressed: the
+    /// kernel reads a whole block's footprint and would read past the image
+    /// (`pad_to_block_multiple`); [`compress_level_into`] pads it first.
+    fn compress_into(
+        &self,
+        image: &RgbaImage,
+        format: DdsFormat,
+        out: &mut [u8],
+    ) -> Result<(), DdsError> {
+        check_level_into(image, format, out)?;
+        let (width, height) = image.dimensions();
+        if !width.is_multiple_of(BLOCK_DIM) || !height.is_multiple_of(BLOCK_DIM) {
             return Err(DdsError::InvalidDimensions(width, height));
         }
 
-        let rgba_data = image.as_raw();
-        let stride = width * 4; // tightly packed RGBA
-
         let surface = intel_tex_2::RgbaSurface {
-            data: rgba_data,
+            data: image.as_raw(),
             width,
             height,
-            stride,
+            stride: width * 4, // tightly packed RGBA
         };
 
         // BC1 is the only supported format (checked above).
-        Ok(intel_tex_2::bc1::compress_blocks(&surface))
+        intel_tex_2::bc1::compress_blocks_into(&surface, out);
+        Ok(())
     }
 
     fn name(&self) -> &str {
@@ -367,7 +466,7 @@ pub use gpu::create_gpu_resources;
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -452,7 +551,7 @@ mod tests {
     // =========================================================================
 
     /// A level whose texels differ from one another: a hash of the position.
-    fn varied(width: u32, height: u32) -> RgbaImage {
+    pub(crate) fn varied(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_fn(width, height, |x, y| {
             let h = (u64::from(y) << 32 | u64::from(x)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             image::Rgba([(h >> 40) as u8, (h >> 48) as u8, (h >> 56) as u8, 255])
@@ -558,6 +657,245 @@ mod tests {
         let result = compress_level(&kernel, &RgbaImage::new(2, 2), DdsFormat::BC3);
         assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
         assert!(!kernel.called());
+    }
+
+    // =========================================================================
+    // compress_into and compress_level_into (#393)
+    // =========================================================================
+
+    /// What `out` holds before a call, so a test can see whether it was
+    /// written.
+    const UNTOUCHED: u8 = 0xEE;
+
+    /// Block-aligned levels: square, non-square and not a power of two.
+    const WHOLE_BLOCKS: [(u32, u32); 6] =
+        [(4, 4), (8, 4), (64, 16), (16, 64), (100, 100), (256, 256)];
+
+    /// Levels of every shape a chain or a caller can hand over, block-aligned
+    /// or not.
+    const EVERY_SHAPE: [(u32, u32); 11] = [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (8, 2),
+        (2, 8),
+        (5, 7),
+        (64, 16),
+        (33, 17),
+        (100, 100),
+        (256, 256),
+    ];
+
+    fn untouched(len: usize) -> Vec<u8> {
+        vec![UNTOUCHED; len]
+    }
+
+    #[test]
+    fn compress_into_writes_what_compress_returns() {
+        let kernels: [&dyn ImageCompressor; 2] = [&IspcCompressor, &SoftwareCompressor];
+        for kernel in kernels {
+            for (w, h) in WHOLE_BLOCKS {
+                let level = varied(w, h);
+                let mut out = untouched(layout::level_len(w, h, DdsFormat::BC1));
+                kernel
+                    .compress_into(&level, DdsFormat::BC1, &mut out)
+                    .unwrap();
+                assert_eq!(
+                    out,
+                    kernel.compress(&level, DdsFormat::BC1).unwrap(),
+                    "{} {w}x{h}",
+                    kernel.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ispc_writes_the_bytes_its_allocating_kernel_returns() {
+        // `compress` and `compress_into` both reach the kernel through
+        // `compress_blocks_into` now: pin them to `compress_blocks`, the call
+        // `compress` made before #393, which allocates its own buffer.
+        for (w, h) in WHOLE_BLOCKS {
+            let level = varied(w, h);
+            let expected = intel_tex_2::bc1::compress_blocks(&intel_tex_2::RgbaSurface {
+                data: level.as_raw(),
+                width: w,
+                height: h,
+                stride: w * 4,
+            });
+            let mut out = untouched(layout::level_len(w, h, DdsFormat::BC1));
+            IspcCompressor
+                .compress_into(&level, DdsFormat::BC1, &mut out)
+                .unwrap();
+            assert_eq!(out, expected, "compress_into {w}x{h}");
+            assert_eq!(
+                IspcCompressor.compress(&level, DdsFormat::BC1).unwrap(),
+                expected,
+                "compress {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn compress_into_rejects_an_unsupported_format_before_touching_out() {
+        let recording = Recording::default();
+        let kernels: [&dyn ImageCompressor; 3] = [&IspcCompressor, &SoftwareCompressor, &recording];
+        for kernel in kernels {
+            // Sized for either format, so only the format is wrong.
+            for len in [
+                layout::level_len(4, 4, DdsFormat::BC1),
+                layout::level_len(4, 4, DdsFormat::BC3),
+            ] {
+                let mut out = untouched(len);
+                let result = kernel.compress_into(&varied(4, 4), DdsFormat::BC3, &mut out);
+                assert!(
+                    matches!(result, Err(DdsError::UnsupportedFormat(_))),
+                    "{}: {result:?}",
+                    kernel.name()
+                );
+                assert_eq!(out, untouched(len), "{} wrote out", kernel.name());
+            }
+        }
+        assert!(!recording.called());
+    }
+
+    #[test]
+    fn compress_into_refuses_an_out_of_the_wrong_length_without_panicking() {
+        // intel_tex_2's compress_blocks_into asserts on the length: a wrong
+        // one must be an error before it is reached, not a panic.
+        let recording = Recording::default();
+        let kernels: [&dyn ImageCompressor; 3] = [&IspcCompressor, &SoftwareCompressor, &recording];
+        let len = layout::level_len(16, 16, DdsFormat::BC1);
+        for kernel in kernels {
+            for wrong in [0, 8, len - 8, len - 1, len + 1, len + 8] {
+                let mut out = untouched(wrong);
+                let result = kernel.compress_into(&varied(16, 16), DdsFormat::BC1, &mut out);
+                assert!(
+                    matches!(result, Err(DdsError::CompressionFailed(_))),
+                    "{} {wrong} bytes: {result:?}",
+                    kernel.name()
+                );
+                assert_eq!(out, untouched(wrong), "{} wrote out", kernel.name());
+            }
+        }
+        assert!(!recording.called(), "the kernel ran for a wrong length");
+    }
+
+    #[test]
+    fn ispc_refuses_a_level_that_is_not_whole_blocks() {
+        // The kernel reads a whole 4 x 4 footprint, so on a level that is not
+        // whole blocks it would read past the image; compress_level_into pads
+        // first and never hands it one.
+        for (w, h) in [(1, 1), (2, 2), (3, 3), (8, 2), (2, 8), (5, 7), (33, 17)] {
+            let mut out = untouched(layout::level_len(w, h, DdsFormat::BC1));
+            let result = IspcCompressor.compress_into(&varied(w, h), DdsFormat::BC1, &mut out);
+            assert!(
+                matches!(result, Err(DdsError::InvalidDimensions(rw, rh)) if (rw, rh) == (w, h)),
+                "{w}x{h}: {result:?}"
+            );
+            assert_eq!(out, untouched(out.len()), "{w}x{h} wrote out");
+            let result = IspcCompressor.compress(&varied(w, h), DdsFormat::BC1);
+            assert!(
+                matches!(result, Err(DdsError::InvalidDimensions(rw, rh)) if (rw, rh) == (w, h)),
+                "compress {w}x{h}: {result:?}"
+            );
+        }
+    }
+
+    /// A kernel whose `compress` returns one block too many.
+    struct Overlong;
+
+    impl ImageCompressor for Overlong {
+        fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+            let mut blocks = SoftwareCompressor.compress(image, format)?;
+            blocks.extend_from_slice(&[0; 8]);
+            Ok(blocks)
+        }
+
+        fn name(&self) -> &str {
+            "overlong"
+        }
+    }
+
+    #[test]
+    fn the_default_compress_into_refuses_a_kernel_that_returns_the_wrong_length() {
+        let len = layout::level_len(8, 8, DdsFormat::BC1);
+        let mut out = untouched(len);
+        let result = Overlong.compress_into(&varied(8, 8), DdsFormat::BC1, &mut out);
+        assert!(
+            matches!(result, Err(DdsError::CompressionFailed(_))),
+            "{result:?}"
+        );
+        assert_eq!(out, untouched(len));
+    }
+
+    #[test]
+    fn compress_level_into_is_the_kernel_on_the_padded_level() {
+        // The reference is compress_level as #392 wrote it: pad, then the
+        // kernel's own compress.
+        let kernels: [&dyn ImageCompressor; 2] = [&IspcCompressor, &SoftwareCompressor];
+        for kernel in kernels {
+            for (w, h) in EVERY_SHAPE {
+                let level = varied(w, h);
+                let expected = kernel
+                    .compress(&pad_to_block_multiple(&level), DdsFormat::BC1)
+                    .unwrap();
+                let mut out = untouched(layout::level_len(w, h, DdsFormat::BC1));
+                compress_level_into(kernel, &level, DdsFormat::BC1, &mut out).unwrap();
+                assert_eq!(out, expected, "{} {w}x{h}", kernel.name());
+                assert_eq!(
+                    compress_level(kernel, &level, DdsFormat::BC1).unwrap(),
+                    expected,
+                    "compress_level {} {w}x{h}",
+                    kernel.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compress_level_into_rejects_before_the_kernel_runs_or_out_is_touched() {
+        let len = layout::level_len(4, 4, DdsFormat::BC1);
+        let cases: [(RgbaImage, DdsFormat, usize); 6] = [
+            (varied(4, 4), DdsFormat::BC3, len),
+            (RgbaImage::new(0, 0), DdsFormat::BC1, 0),
+            (RgbaImage::new(0, 5), DdsFormat::BC1, len),
+            (varied(4, 4), DdsFormat::BC1, len - 1),
+            (varied(4, 4), DdsFormat::BC1, len + 1),
+            (varied(2, 2), DdsFormat::BC1, 0),
+        ];
+        for (n, (level, format, out_len)) in cases.into_iter().enumerate() {
+            let kernel = Recording::default();
+            let mut out = untouched(out_len);
+            let result = compress_level_into(&kernel, &level, format, &mut out);
+            assert!(result.is_err(), "case {n}: {result:?}");
+            assert!(!kernel.called(), "case {n} reached the kernel");
+            assert_eq!(out, untouched(out_len), "case {n} wrote out");
+        }
+    }
+
+    #[test]
+    fn compress_level_into_names_what_it_rejects() {
+        let mut out = untouched(8);
+        assert!(matches!(
+            compress_level_into(&IspcCompressor, &varied(4, 4), DdsFormat::BC3, &mut out),
+            Err(DdsError::UnsupportedFormat(_))
+        ));
+        assert!(matches!(
+            compress_level_into(
+                &IspcCompressor,
+                &RgbaImage::new(0, 5),
+                DdsFormat::BC1,
+                &mut out
+            ),
+            Err(DdsError::InvalidDimensions(0, 5))
+        ));
+        let mut short = untouched(7);
+        assert!(matches!(
+            compress_level_into(&IspcCompressor, &varied(2, 2), DdsFormat::BC1, &mut short),
+            Err(DdsError::CompressionFailed(_))
+        ));
     }
 }
 

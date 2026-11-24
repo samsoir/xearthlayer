@@ -21,7 +21,8 @@ xearthlayer/src/dds/
 ├── header.rs       - DDS header construction and serialization
 ├── bc1.rs          - BC1/DXT1 compression (8 bytes per block)
 ├── compressor.rs   - ImageCompressor, MipmapCompressor, IspcCompressor, SoftwareCompressor,
-│                     compress_level (pad one level to whole blocks, compress it)
+│                     compress_level / compress_level_into (pad one level to whole
+│                     blocks, compress it into a new buffer or a given slice)
 ├── gpu_channel.rs  - GpuEncoderChannel (GPU worker)
 ├── mipmap.rs       - Mipmap chain generation with box filtering
 ├── encoder.rs      - Main DDS encoder API
@@ -41,12 +42,34 @@ lighting layout (`LitLayout`, `minimal_black_dds`), the BC1 repair pass, the Lam
 pattern decoder and the magenta placeholder all call it; none writes the arithmetic
 out. It is not `cache::layout`, which places the cache tiers on disk.
 
-`dds::compress_level(kernel, level, format)` (#392) is the one definition of
-encoding a single level: it pads the level to whole 4×4 blocks and compresses it
-with the kernel it is given, returning exactly `level_len` bytes. `DdsEncoder`
-calls it for every level of the CPU path, and night lighting calls it per lit
-level with `IspcCompressor` named, so the lit payload buffer is sized from
-`dds::layout` before anything is encoded.
+`dds::compress_level_into(kernel, level, format, out)` (#392, #393) is the one
+definition of encoding a single level: it pads the level to whole 4×4 blocks and
+compresses it with the kernel it is given into `out`, which must be exactly
+`level_len` bytes. `compress_level` is the same into a buffer of its own. Kernels
+write in place through `ImageCompressor::compress_into` (ISPC through
+`intel_tex_2`'s `compress_blocks_into`; the default compresses and copies, which
+is what `SoftwareCompressor` does).
+
+So every DDS buffer is sized from `dds::layout` before anything is encoded, and
+allocated once:
+
+- `DdsEncoder` allocates the whole file at `file_len` for the resolved level
+  count, writes the header into its first `HEADER_LEN` bytes and compresses each
+  level into its slice (`compress_chain_into`; a level that would overrun the
+  file, or a file left short, is an error). The returned `Vec` has no spare
+  capacity, so `Bytes::from` adopts it as is: an encoded 4096 tile is one
+  allocation of 11,184,952 bytes. It used to start from the header and grow by
+  doubling to 16,777,472 bytes, a mapping of which the unwritten third took no
+  memory but counted in the allocator's `mmap_mb` (see
+  `memory-telemetry.md`), with a copy of every level on the way. Measured on a
+  4096 noise tile with the service's allocator settings (#227): about 1,000 to
+  2,700 fewer page faults and 1 to 1.5 ms less per encode, about 3%.
+- Night lighting's `bc1_levels` allocates the lit payload at its exact size and
+  compresses each lit level into its slice with `IspcCompressor` named, then
+  repairs that slice in place.
+
+The GPU path (`GpuEncoderChannel`, `encode_with_mipmap_compressor`) still grows
+its output from the header and copies it once more; it is not covered by this.
 
 ## Supported formats
 
@@ -62,7 +85,8 @@ The encoder interfaces keep their `format` parameter (`DdsFormat`) as the extens
 point for future formats:
 
 - `ImageCompressor::compress(image, format)`
-- `compress_level(kernel, level, format)`
+- `ImageCompressor::compress_into(image, format, out)`
+- `compress_level(kernel, level, format)` and `compress_level_into(kernel, level, format, out)`
 - `MipmapCompressor::compress_mipmap_chain(image, format, count)`
 - `DdsEncoder::new(format)`
 - `TextureConfig::new(format)`
@@ -74,10 +98,15 @@ supported. Any value other than BC1 is rejected with `DdsError::UnsupportedForma
 - when the encoder is built at service start (`create_encoder` in
   `service/builder.rs`), so a wrong format fails at startup and not once per tile;
 - at the top of `DdsEncoder::encode`, before any work;
-- in `compress_level`, before the level is padded or the kernel runs (an empty
-  level is refused there too, with `InvalidDimensions(0, 0)`);
+- in `compress_level` and `compress_level_into`, before the level is padded or
+  the kernel runs or `out` is written (an empty level is refused there too, with
+  `InvalidDimensions(0, 0)`, and an `out` that is not exactly `level_len` bytes
+  with `CompressionFailed`);
 - at each backend entry point: `IspcCompressor`, `SoftwareCompressor`, and
   `GpuEncoderChannel`, which rejects before the request is sent to the GPU worker.
+  `IspcCompressor` also refuses a level that is not whole 4×4 blocks
+  (`InvalidDimensions`) rather than letting the kernel read past it;
+  `compress_level(_into)` pads first, so no caller reaches that.
 
 The format facts stay where they describe the format and encode nothing: the block
 size (8 or 16 bytes) is `DdsFormat::block_bytes` in `dds::layout`, and the FourCC
