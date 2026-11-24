@@ -21,10 +21,10 @@ pub enum NetworkLevel {
     /// Every limit as designed: up to 1,024 connections per lane, for
     /// prosumer or enterprise network hardware.
     Max,
-    /// Two thirds of each limit, for capable home routers. The default.
+    /// 80% of each limit, for capable home routers. The default.
     #[default]
     High,
-    /// One third of each limit.
+    /// 65% of each limit, for older or low spec home routers.
     Low,
 }
 
@@ -32,15 +32,21 @@ impl NetworkLevel {
     /// Every level, fastest first.
     pub const ALL: [NetworkLevel; 3] = [NetworkLevel::Max, NetworkLevel::High, NetworkLevel::Low];
 
-    /// `limit` at this level: all of it, two thirds or one third, rounded up
+    /// The share of each limit this level opens, in percent. High and Low
+    /// come from field testing of where home routers start to drop out
+    /// (#367); they were two thirds and one third before.
+    pub fn percent(self) -> usize {
+        match self {
+            NetworkLevel::Max => 100,
+            NetworkLevel::High => 80,
+            NetworkLevel::Low => 65,
+        }
+    }
+
+    /// `limit` at this level: [`percent`](Self::percent) of it, rounded up
     /// and never below one, so a limit of one still allows a connection.
     pub fn scale(self, limit: usize) -> usize {
-        let thirds = match self {
-            NetworkLevel::Max => return limit.max(1),
-            NetworkLevel::High => 2,
-            NetworkLevel::Low => 1,
-        };
-        (limit * thirds).div_ceil(3).max(1)
+        (limit * self.percent()).div_ceil(100).max(1)
     }
 
     /// The name `config.ini` uses.
@@ -89,16 +95,18 @@ mod tests {
 
     #[test]
     fn package_downloads_scale_the_configured_value() {
-        let mut config = ConfigFile::default();
-        config.packages.concurrent_downloads = 5;
-        let at = |level| {
-            let mut c = config.clone();
-            c.network.connections = level;
-            c.package_downloads()
+        let at = |parts, level| {
+            let mut config = ConfigFile::default();
+            config.packages.concurrent_downloads = parts;
+            config.network.connections = level;
+            config.package_downloads()
         };
-        assert_eq!(at(NetworkLevel::Max), 5);
-        assert_eq!(at(NetworkLevel::High), 4);
-        assert_eq!(at(NetworkLevel::Low), 2);
+        assert_eq!(at(5, NetworkLevel::Max), 5);
+        // 80% of 5 is 4; 65% is 3.25, rounded up to 4 as well.
+        assert_eq!(at(5, NetworkLevel::High), 4);
+        assert_eq!(at(5, NetworkLevel::Low), 4);
+        assert_eq!(at(10, NetworkLevel::High), 8);
+        assert_eq!(at(10, NetworkLevel::Low), 7);
     }
 
     #[test]
@@ -109,20 +117,21 @@ mod tests {
     }
 
     #[test]
-    fn high_is_two_thirds_rounded_up() {
-        assert_eq!(NetworkLevel::High.scale(1024), 683);
-        assert_eq!(NetworkLevel::High.scale(10), 7);
+    fn high_is_80_percent_rounded_up() {
+        assert_eq!(NetworkLevel::High.scale(1024), 820);
+        assert_eq!(NetworkLevel::High.scale(10), 8);
         assert_eq!(NetworkLevel::High.scale(5), 4);
-        assert_eq!(NetworkLevel::High.scale(3), 2);
+        assert_eq!(NetworkLevel::High.scale(3), 3);
         assert_eq!(NetworkLevel::High.scale(1), 1);
     }
 
     #[test]
-    fn low_is_one_third_rounded_up() {
-        assert_eq!(NetworkLevel::Low.scale(1024), 342);
-        assert_eq!(NetworkLevel::Low.scale(10), 4);
-        assert_eq!(NetworkLevel::Low.scale(5), 2);
-        assert_eq!(NetworkLevel::Low.scale(3), 1);
+    fn low_is_65_percent_rounded_up() {
+        assert_eq!(NetworkLevel::Low.scale(1024), 666);
+        assert_eq!(NetworkLevel::Low.scale(20), 13);
+        assert_eq!(NetworkLevel::Low.scale(10), 7);
+        assert_eq!(NetworkLevel::Low.scale(5), 4);
+        assert_eq!(NetworkLevel::Low.scale(3), 2);
         assert_eq!(NetworkLevel::Low.scale(1), 1);
     }
 

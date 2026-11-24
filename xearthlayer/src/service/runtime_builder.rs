@@ -600,13 +600,13 @@ mod tests {
         assert_eq!(
             RuntimeBuilder::lane_sizing(builder.capacity_share, builder.network_level)
                 .prefetch_http_permits,
-            683
+            820
         );
         let builder = builder.with_network_level(NetworkLevel::Low);
         assert_eq!(
             RuntimeBuilder::lane_sizing(builder.capacity_share, builder.network_level)
                 .prefetch_http_permits,
-            342
+            666
         );
     }
 

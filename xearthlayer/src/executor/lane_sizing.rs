@@ -115,8 +115,8 @@ mod tests {
         let base = LaneSizing::from_configured_share(0.35);
         for (level, permits) in [
             (NetworkLevel::Max, DEFAULT_MAX_CONCURRENT_HTTP),
-            (NetworkLevel::High, 683),
-            (NetworkLevel::Low, 342),
+            (NetworkLevel::High, 820),
+            (NetworkLevel::Low, 666),
         ] {
             let sizing = base.clone().at_network_level(level);
             assert_eq!(sizing.prefetch_http_permits, permits, "{level}");

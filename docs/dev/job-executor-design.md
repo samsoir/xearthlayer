@@ -956,8 +956,8 @@ mediate between FUSE and prefetch, and there is no prefetch quota inside a share
 pool (`max_prefetch_fraction` and `prefetch_in_flight` were removed).
 
 Each lane's HTTP semaphore holds `DEFAULT_MAX_CONCURRENT_HTTP` (1024) permits at
-the `network.connections` level (#367): all of them at `max`, two thirds at
-`high`, one third at `low`. The demand lane's arrives in
+the `network.connections` level (#367): all of them at `max`, 80% at `high`,
+65% at `low` (`NetworkLevel::percent`, rounded up). The demand lane's arrives in
 `ServiceConfig::chunk_download_config`, the prefetch lane's through
 `LaneSizing::at_network_level`. The level scales only connections; the CPU,
 network-task and disk pools bound work on this host, not load on the user's
