@@ -49,7 +49,6 @@ impl From<crate::dds::DdsError> for TextureError {
             },
             crate::dds::DdsError::UnsupportedFormat(msg) => TextureError::UnsupportedFormat(msg),
             crate::dds::DdsError::CompressionFailed(msg) => TextureError::EncodingFailed(msg),
-            crate::dds::DdsError::InvalidMipmapChain(msg) => TextureError::EncodingFailed(msg),
         }
     }
 }

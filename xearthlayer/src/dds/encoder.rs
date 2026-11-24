@@ -1,13 +1,14 @@
 //! DDS encoder - main API for encoding images to DDS format.
 //!
 //! The encoder delegates compression to a backend via [`CompressorBackend`]:
-//! - [`ImageCompressor`] backends (ISPC, Software) compress one level at a time;
-//!   the encoder manages mipmap iteration via [`MipmapStream`].
+//! - [`ImageCompressor`] backends (ISPC, Software) compress one level at a time
+//!   through [`compress_level`]; the encoder manages mipmap iteration via
+//!   [`MipmapStream`].
 //! - [`MipmapCompressor`] backends (GPU channel) own the full mipmap pipeline;
 //!   the encoder only handles DDS header assembly.
 
 use crate::dds::compressor::{
-    default_compressor, pad_to_block_multiple, ImageCompressor, MipmapCompressor,
+    compress_level, default_compressor, ImageCompressor, MipmapCompressor,
 };
 use crate::dds::layout;
 use crate::dds::mipmap::MipmapStream;
@@ -123,59 +124,21 @@ impl DdsEncoder {
                 };
                 self.encode_with_mipmap_compressor(compressor, image, width, height, count)
             }
-            CompressorBackend::Image(_) => {
+            CompressorBackend::Image(compressor) => {
                 if self.generate_mipmaps {
                     let count = self.resolve_mipmap_count(width, height);
-                    self.encode_mipmap_stream(image, width, height, count)
+                    self.encode_mipmap_stream(compressor.as_ref(), image, width, height, count)
                 } else {
-                    self.encode_single_level(image, width, height)
+                    self.encode_single_level(compressor.as_ref(), image, width, height)
                 }
             }
         }
     }
 
-    /// Encode with pre-generated mipmap chain.
-    ///
-    /// # Arguments
-    ///
-    /// * `mipmaps` - Mipmap chain (level 0 = full resolution)
-    ///
-    /// # Returns
-    ///
-    /// Complete DDS file as bytes
-    pub fn encode_with_mipmaps(&self, mipmaps: &[RgbaImage]) -> Result<Vec<u8>, DdsError> {
-        self.format.ensure_supported()?;
-        if mipmaps.is_empty() {
-            return Err(DdsError::InvalidMipmapChain(
-                "Empty mipmap chain".to_string(),
-            ));
-        }
-
-        let base_image = &mipmaps[0];
-        let width = base_image.width();
-        let height = base_image.height();
-
-        // Validate dimensions
-        if width == 0 || height == 0 {
-            return Err(DdsError::InvalidDimensions(width, height));
-        }
-
-        // Create header
-        let header = DdsHeader::new(width, height, mipmaps.len() as u32, self.format);
-        let mut output = header.to_bytes();
-
-        // Compress each mipmap level
-        for mipmap in mipmaps {
-            let compressed = self.compress_image(mipmap)?;
-            output.extend_from_slice(&compressed);
-        }
-
-        Ok(output)
-    }
-
     /// Compress a single image (no mipmaps) into a DDS file.
     fn encode_single_level(
         &self,
+        compressor: &dyn ImageCompressor,
         image: RgbaImage,
         width: u32,
         height: u32,
@@ -184,7 +147,7 @@ impl DdsEncoder {
         let mut output = header.to_bytes();
 
         let uncompressed_bytes = (width * height * 4) as usize;
-        let compressed = self.compress_image(&image)?;
+        let compressed = compress_level(compressor, &image, self.format)?;
 
         debug!(
             width,
@@ -206,6 +169,7 @@ impl DdsEncoder {
     /// next is produced — only one uncompressed level lives in memory at a time.
     fn encode_mipmap_stream(
         &self,
+        compressor: &dyn ImageCompressor,
         image: RgbaImage,
         width: u32,
         height: u32,
@@ -224,7 +188,7 @@ impl DdsEncoder {
 
         for (level_idx, level) in MipmapStream::new(image, count).enumerate() {
             let level_bytes = (level.width() * level.height() * 4) as usize;
-            let compressed = self.compress_image(&level)?;
+            let compressed = compress_level(compressor, &level, self.format)?;
 
             debug!(
                 level = level_idx,
@@ -299,21 +263,6 @@ impl DdsEncoder {
 
         Ok(output)
     }
-
-    /// Compress a single image to the encoder's format using the configured compressor.
-    ///
-    /// Levels smaller than one 4×4 block (the 2×2 and 1×1 tail of a full chain)
-    /// are padded up to block size first — see [`pad_to_block_multiple`].
-    fn compress_image(&self, image: &RgbaImage) -> Result<Vec<u8>, DdsError> {
-        match &self.backend {
-            CompressorBackend::Image(compressor) => {
-                compressor.compress(&pad_to_block_multiple(image), self.format)
-            }
-            CompressorBackend::Mipmap(_) => {
-                unreachable!("compress_image called with MipmapCompressor backend")
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -361,12 +310,6 @@ mod tests {
     #[test]
     fn encode_rejects_unsupported_format() {
         let result = DdsEncoder::new(DdsFormat::BC3).encode(RgbaImage::new(4, 4));
-        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
-    }
-
-    #[test]
-    fn encode_with_mipmaps_rejects_unsupported_format() {
-        let result = DdsEncoder::new(DdsFormat::BC3).encode_with_mipmaps(&[RgbaImage::new(4, 4)]);
         assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
     }
 
@@ -433,20 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_empty_mipmap_chain() {
-        let encoder = DdsEncoder::new(DdsFormat::BC1);
-        let mipmaps: Vec<RgbaImage> = vec![];
-
-        let result = encoder.encode_with_mipmaps(&mipmaps);
-        assert!(result.is_err());
-
-        match result {
-            Err(DdsError::InvalidMipmapChain(_)) => {}
-            _ => panic!("Expected InvalidMipmapChain error"),
-        }
-    }
-
-    #[test]
     fn test_encode_zero_dimensions() {
         let image = RgbaImage::new(0, 0);
         let encoder = DdsEncoder::new(DdsFormat::BC1);
@@ -496,28 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_image_4x4() {
-        let image = RgbaImage::new(4, 4);
-        let encoder = DdsEncoder::new(DdsFormat::BC1);
-
-        let compressed = encoder.compress_image(&image).unwrap();
-
-        // 4×4 = 1 block, BC1 = 8 bytes
-        assert_eq!(compressed.len(), 8);
-    }
-
-    #[test]
-    fn test_compress_image_256x256_bc1() {
-        let image = RgbaImage::new(256, 256);
-        let encoder = DdsEncoder::new(DdsFormat::BC1);
-
-        let compressed = encoder.compress_image(&image).unwrap();
-
-        // 256×256 = 64×64 blocks, each 8 bytes = 32768
-        assert_eq!(compressed.len(), 32768);
-    }
-
-    #[test]
     fn test_encode_non_power_of_2() {
         // DDS can handle non-power-of-2 dimensions
         let image = RgbaImage::new(100, 100);
@@ -559,12 +466,20 @@ mod tests {
 
     #[test]
     fn test_fused_encode_matches_pregenerated() {
-        let image = RgbaImage::new(256, 256);
-        let encoder = DdsEncoder::new(DdsFormat::BC1).with_mipmap_count(5);
+        let image = RgbaImage::from_fn(256, 256, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, 255])
+        });
+        let encoder = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(crate::dds::IspcCompressor))
+            .with_mipmap_count(5);
 
-        // Generate expected output via the pre-generated path
-        let mipmaps = MipmapGenerator::generate_chain_with_count(&image, 5);
-        let expected = encoder.encode_with_mipmaps(&mipmaps).unwrap();
+        // Expected: the header, then each level of a pre-generated chain.
+        let mut expected = DdsHeader::new(256, 256, 5, DdsFormat::BC1).to_bytes();
+        for level in MipmapGenerator::generate_chain_with_count(&image, 5) {
+            let blocks =
+                compress_level(&crate::dds::IspcCompressor, &level, DdsFormat::BC1).unwrap();
+            expected.extend_from_slice(&blocks);
+        }
 
         // Fused pipeline should produce identical bytes
         let result = encoder.encode(image).unwrap();
@@ -801,21 +716,5 @@ mod tests {
 
         assert_eq!(u32::from_le_bytes(dds[28..32].try_into().unwrap()), 3);
         assert_eq!(walk_payload(&dds, 4096, 4096, 8).len(), 3);
-    }
-
-    #[test]
-    fn test_sub_block_levels_compress_to_one_block() {
-        // 2x2 and 1x1 are smaller than a BC1 block but must still emit one
-        // whole 8-byte block each. This is what padding to the block size
-        // guarantees across every compressor backend.
-        for (w, h) in [(4u32, 4u32), (2, 2), (1, 1)] {
-            let compressed = crate::dds::SoftwareCompressor
-                .compress(
-                    &pad_to_block_multiple(&RgbaImage::new(w, h)),
-                    DdsFormat::BC1,
-                )
-                .unwrap();
-            assert_eq!(compressed.len(), 8, "{}x{} must be one BC1 block", w, h);
-        }
     }
 }
