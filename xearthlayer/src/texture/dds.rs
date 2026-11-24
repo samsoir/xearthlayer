@@ -29,10 +29,9 @@ pub struct DdsTextureEncoder {
     format: DdsFormat,
     /// Mipmap levels to emit; `None` means the full chain for the texture size.
     mipmap_count: Option<usize>,
-    /// Image compressor for per-level encoding (ISPC, Software).
-    /// Also used as fallback for `encode_with_mipmaps()` when pre-generated
-    /// mipmap chains are supplied directly. Always initialized to the default
-    /// compressor even when `mipmap_compressor` is set.
+    /// Image compressor for per-level encoding (ISPC, Software). Always
+    /// initialized to the default compressor even when `mipmap_compressor`
+    /// is set.
     compressor: Arc<dyn ImageCompressor>,
     /// When set, `encode()` delegates the full mipmap chain to this backend
     /// instead of iterating levels via `MipmapStream` + `compressor`.

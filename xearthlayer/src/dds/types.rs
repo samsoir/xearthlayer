@@ -5,15 +5,15 @@ use std::fmt;
 /// DDS compression format.
 ///
 /// Every encoder interface takes a `DdsFormat` ([`ImageCompressor`],
-/// [`MipmapCompressor`], [`DdsEncoder`]), and that parameter is the extension
-/// point for formats XEarthLayer may support later. **Only BC1 is implemented
-/// today** (#395): every other value is rejected with
-/// [`DdsError::UnsupportedFormat`] when the service builds its encoder
-/// (`service::builder::create_encoder`, so a wrong format fails at startup)
-/// and at every encode entry point (`DdsEncoder::encode` and
-/// `encode_with_mipmaps`, each compressor's `compress`, and the GPU channel
-/// before it sends). Constructors such as `DdsEncoder::new` do not reject. [`DdsFormat::is_supported`] is the one statement of
-/// what is supported.
+/// [`MipmapCompressor`], [`DdsEncoder`], [`compress_level`]), and that
+/// parameter is the extension point for formats XEarthLayer may support
+/// later. **Only BC1 is implemented today** (#395): every other value is
+/// rejected with [`DdsError::UnsupportedFormat`] when the service builds its
+/// encoder (`service::builder::create_encoder`, so a wrong format fails at
+/// startup) and at every encode entry point (`DdsEncoder::encode`,
+/// `compress_level`, each compressor's `compress`, and the GPU channel
+/// before it sends). Constructors such as `DdsEncoder::new` do not reject.
+/// [`DdsFormat::is_supported`] is the one statement of what is supported.
 ///
 /// The variants beyond BC1 name formats without implementing them; their
 /// format facts stay because they describe the format and encode nothing:
@@ -27,6 +27,7 @@ use std::fmt;
 /// [`ImageCompressor`]: crate::dds::ImageCompressor
 /// [`MipmapCompressor`]: crate::dds::MipmapCompressor
 /// [`DdsEncoder`]: crate::dds::DdsEncoder
+/// [`compress_level`]: crate::dds::compress_level
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DdsFormat {
     /// BC1/DXT1 compression (4:1, no alpha or 1-bit alpha). The only
@@ -75,8 +76,6 @@ pub enum DdsError {
     UnsupportedFormat(String),
     /// Compression failed
     CompressionFailed(String),
-    /// Invalid mipmap chain
-    InvalidMipmapChain(String),
 }
 
 impl fmt::Display for DdsError {
@@ -87,7 +86,6 @@ impl fmt::Display for DdsError {
             }
             DdsError::UnsupportedFormat(msg) => write!(f, "Unsupported format: {}", msg),
             DdsError::CompressionFailed(msg) => write!(f, "Compression failed: {}", msg),
-            DdsError::InvalidMipmapChain(msg) => write!(f, "Invalid mipmap chain: {}", msg),
         }
     }
 }

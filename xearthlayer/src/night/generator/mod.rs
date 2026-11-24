@@ -20,7 +20,7 @@ use super::laminar::LitPattern;
 use super::recipe::Recipe;
 use super::roads::field::RoadField;
 use super::roads::RoadModel;
-use crate::dds::{layout, DdsFormat};
+use crate::dds::{compress_level, layout, DdsFormat, IspcCompressor};
 use crate::fuse::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
@@ -122,26 +122,39 @@ pub const BC1_FLOOR: u8 = 8;
 /// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light,
 /// and every level is floored at [`BC1_FLOOR`] after its dimming, then
 /// repaired where BC1 tints it ([`bc1_repair`]).
+///
+/// An empty image is an error ([`DdsError::InvalidDimensions`]), which the
+/// service serves as black.
+///
+/// [`DdsError::InvalidDimensions`]: crate::dds::DdsError::InvalidDimensions
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
     let mut chain = lit_chain(&image);
     for (n, level) in chain.iter_mut().enumerate() {
         dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
     }
-    bc1_levels(&chain)
+    bc1_levels(&chain).map(bytes::Bytes::from)
 }
 
-/// The BC1 blocks of `levels`, in order, without the DDS header, each level
-/// repaired where its endpoints tint dim texels ([`bc1_repair`]).
-fn bc1_levels(levels: &[RgbaImage]) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let mut dds = crate::dds::DdsEncoder::new(DdsFormat::BC1).encode_with_mipmaps(levels)?;
-    let mut at = layout::HEADER_LEN;
+/// The BC1 blocks of `levels`, in order, without a DDS header, each level
+/// repaired where its endpoints tint dim texels ([`bc1_repair`]), in a
+/// buffer allocated once at its exact size.
+///
+/// The kernel is [`IspcCompressor`], named here and never taken from a
+/// default: lit bytes are versioned by [`LIT_GENERATOR_VERSION`] and
+/// fingerprinted on disk on the understanding that they come from ISPC,
+/// whatever `texture.compressor` says.
+fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
+    let len = levels
+        .iter()
+        .map(|level| layout::level_len(level.width(), level.height(), DdsFormat::BC1))
+        .sum();
+    let mut payload = Vec::with_capacity(len);
     for level in levels {
-        let len = layout::level_len(level.width(), level.height(), DdsFormat::BC1);
-        bc1_repair::repair_level(&mut dds[at..at + len], level);
-        at += len;
+        let mut blocks = compress_level(&IspcCompressor, level, DdsFormat::BC1)?;
+        bc1_repair::repair_level(&mut blocks, level);
+        payload.extend_from_slice(&blocks);
     }
-    debug_assert_eq!(at, dds.len(), "the encoder writes the levels in order");
-    Ok(bytes::Bytes::from(dds).slice(layout::HEADER_LEN..))
+    Ok(payload)
 }
 
 /// Scales a level's stored R, G and B by `gain`, then turns black every
@@ -414,10 +427,7 @@ mod tests {
 
     /// One level BC1-encoded by ISPC alone, without the repair.
     fn unrepaired(level: &RgbaImage) -> Vec<u8> {
-        let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1)
-            .encode_with_mipmaps(std::slice::from_ref(level))
-            .unwrap();
-        dds[layout::HEADER_LEN..].to_vec()
+        compress_level(&IspcCompressor, level, DdsFormat::BC1).unwrap()
     }
 
     #[test]
@@ -458,6 +468,166 @@ mod tests {
         assert!(bc1_repair::tests::introduced_tints(&unrepaired(&level), &level) > 0);
         let encoded = bc1_levels(std::slice::from_ref(&level)).unwrap();
         assert_eq!(bc1_repair::tests::introduced_tints(&encoded, &level), 0);
+    }
+
+    /// Size of the golden level: eight levels, 128 px down to 1 px, so both
+    /// fade levels and six full ones.
+    const GOLDEN_SIZE: u32 = 128;
+
+    /// A deterministic level lit at every level of its chain, built from a
+    /// hash of each texel's position: the flight 9 lamps (which the nearest
+    /// level's dimming takes to `(9, 7, 5)`, a block ISPC tints purple, so
+    /// the repair has work to do), sparse sodium lamps, a ramp of dim warm
+    /// texels across [`BC1_FLOOR`], and LED white lines beside a dimmer road.
+    fn golden_level() -> RgbaImage {
+        let lamp_quarter = lamps(GOLDEN_SIZE / 2, [17, 13, 9], [15, 11, 9], [15, 13, 9]);
+        RgbaImage::from_fn(GOLDEN_SIZE, GOLDEN_SIZE, |x, y| {
+            let h = ((u64::from(y) << 32 | u64::from(x)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40)
+                as u32;
+            let half = GOLDEN_SIZE / 2;
+            let [r, g, b] = match (x < half, y < half) {
+                (true, true) => {
+                    let [r, g, b, _] = lamp_quarter.get_pixel(x, y).0;
+                    [r, g, b]
+                }
+                (false, true) if h.is_multiple_of(5) => {
+                    [255, 150 + (h >> 8) as u8 % 70, 30 + (h >> 16) as u8 % 50]
+                }
+                (true, false) => {
+                    let v = 4 + ((x + 2 * y + h % 3) % 30) as u8;
+                    [v + 1, v, v.saturating_sub(1)]
+                }
+                (false, false) if x % 8 == 0 || y % 8 == 0 => [228, 236, 255],
+                (false, false) if (x + y) % 13 == 0 => [120, 90, 40],
+                _ => [0; 3],
+            };
+            image::Rgba([r, g, b, 255])
+        })
+    }
+
+    /// The ISPC kernel class of this CPU. Pinned bytes are per CPU class:
+    /// ISPC compiles one kernel per instruction set and picks one at run
+    /// time. The x86 kernels use no approximate reciprocals, so their bytes
+    /// follow the instruction set, not the vendor; kernels with FMA (AVX2,
+    /// AVX-512) round otherwise than those without (SSE2, SSE4, AVX) and give
+    /// other bytes for most images.
+    fn ispc_kernel_class() -> &'static str {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                "x86_64 with FMA (avx2, avx512)"
+            } else {
+                "x86_64 without FMA (sse2, sse4, avx)"
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            "aarch64 (neon)"
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            "other"
+        }
+    }
+
+    /// SHA-256 of `encode_visible(golden_level())`, per ISPC kernel class.
+    /// Both x86 digests were measured by calling each x86 kernel (SSE2,
+    /// SSE4, AVX, AVX2, AVX-512 SKX) directly on one machine (2026-11-24,
+    /// #392); on this level they agree, though they differ on most images.
+    /// A class without a digest here (aarch64 so far) runs only the
+    /// structural checks and prints its digest, to be pinned from a machine
+    /// of that class.
+    const GOLDEN_PAYLOAD_SHA256: &[(&str, &str)] = &[
+        (
+            "x86_64 with FMA (avx2, avx512)",
+            "fe1cee8925fe52a3c9d85675f865faddc7317899ddbd36ab89093321fc41d6f8",
+        ),
+        (
+            "x86_64 without FMA (sse2, sse4, avx)",
+            "fe1cee8925fe52a3c9d85675f865faddc7317899ddbd36ab89093321fc41d6f8",
+        ),
+    ];
+
+    #[test]
+    fn the_golden_payload_is_pinned() {
+        // Lit bytes are versioned by `LIT_GENERATOR_VERSION` and kept on
+        // disk under a fingerprint of it: an unintended change to them, here
+        // or in the encoder below, must fail this test, not reach the cache.
+        let img = golden_level();
+        let mut chain = lit_chain(&img);
+        for (n, level) in chain.iter_mut().enumerate() {
+            dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
+        }
+        let payload = encode_visible(img).unwrap();
+
+        // Structural, the same on every CPU.
+        assert_eq!(chain.len(), 8, "128 px down to 1 px");
+        assert_eq!(
+            payload.len(),
+            layout::chain_len(GOLDEN_SIZE, GOLDEN_SIZE, 8, DdsFormat::BC1)
+        );
+        let ispc_alone = crate::dds::ImageCompressor::compress(
+            &crate::dds::IspcCompressor,
+            &chain[0],
+            DdsFormat::BC1,
+        )
+        .unwrap();
+        assert!(
+            bc1_repair::tests::introduced_tints(&ispc_alone, &chain[0]) > 0,
+            "ISPC alone tints the nearest level: the repair has work to do"
+        );
+        let mut at = 0;
+        for (n, level) in chain.iter().enumerate() {
+            let len = layout::level_len(level.width(), level.height(), DdsFormat::BC1);
+            let blocks = &payload[at..at + len];
+            assert_eq!(
+                bc1_repair::tests::introduced_tints(blocks, level),
+                0,
+                "level {n}"
+            );
+            let lit = blocks.chunks_exact(8).any(|block| {
+                let mut rgba = [0u8; 4 * 4 * 4];
+                bcdec_rs::bc1(block, &mut rgba, 16);
+                rgba.chunks_exact(4)
+                    .any(|t| t[..3].iter().any(|&c| c >= BC1_FLOOR))
+            });
+            assert!(lit, "level {n} is lit");
+            at += len;
+        }
+
+        // The bytes, on a CPU of a class they were pinned on.
+        use sha2::Digest;
+        let digest: String = sha2::Sha256::digest(&payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let class = ispc_kernel_class();
+        match GOLDEN_PAYLOAD_SHA256.iter().find(|(c, _)| *c == class) {
+            Some((_, pinned)) => assert_eq!(digest, *pinned, "lit bytes changed ({class})"),
+            None => eprintln!("no golden lit payload pinned for {class}: {digest}"),
+        }
+    }
+
+    #[test]
+    fn the_payload_is_allocated_at_its_exact_size() {
+        // A ZL16 payload grown by doubling held 1,048,832 bytes for 699,064
+        // (#392), and the payload cache weighs only the length.
+        let chain = lit_chain(&golden_level());
+        let payload = bc1_levels(&chain).unwrap();
+        assert_eq!(
+            payload.len(),
+            layout::chain_len(GOLDEN_SIZE, GOLDEN_SIZE, 8, DdsFormat::BC1)
+        );
+        assert_eq!(payload.capacity(), payload.len());
+    }
+
+    #[test]
+    fn an_empty_level_is_an_error() {
+        // The service serves black for a payload whose encode fails.
+        assert!(matches!(
+            encode_visible(RgbaImage::new(0, 0)),
+            Err(crate::dds::DdsError::InvalidDimensions(0, 0))
+        ));
     }
 
     #[test]
