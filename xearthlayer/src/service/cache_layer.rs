@@ -570,9 +570,19 @@ impl CacheLayer {
 mod tests {
     use super::*;
     use crate::cache::integrity::EXPECTED_DDS_SIZE;
-    use crate::executor::{DdsDiskCache, DiskCache, MemoryCache};
+    use crate::coord::TileCoord;
+    use crate::executor::{
+        BlockingExecutor, ChunkDownloadError, ChunkProvider, ChunkResults, DdsDiskCache, DiskCache,
+        ExecutorError, JobId, MemoryCache, NullDdsDiskCache, NullDiskCache, Task, TaskContext,
+        TaskOutput, TaskResult, TextureEncodeError, TextureEncoderAsync,
+    };
+    use crate::tasks::chunk_image::test_chunks;
+    use crate::tasks::{BuildAndCacheDdsTask, DownloadChunksTask};
     use bytes::Bytes;
+    use std::future::Future;
+    use std::pin::Pin;
     use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
 
     fn create_test_config(cache_dir: std::path::PathBuf) -> ServiceConfig {
         ServiceConfig::builder()
@@ -819,47 +829,62 @@ mod tests {
         cache_layer.shutdown().await;
     }
 
+    // ------------------------------------------------------------------
+    // Tiles built through the layer's bridges
+    // ------------------------------------------------------------------
+
+    const TILE: TileCoord = TileCoord {
+        row: 100,
+        col: 200,
+        zoom: 15,
+    };
+
+    /// Encodes every image to a well-formed, blank DDS tile.
+    struct BlankDdsEncoder;
+    impl TextureEncoderAsync for BlankDdsEncoder {
+        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+            let mut dds = vec![0u8; EXPECTED_DDS_SIZE];
+            dds[0..4].copy_from_slice(b"DDS ");
+            Ok(dds)
+        }
+        fn expected_size(&self, _w: u32, _h: u32) -> usize {
+            EXPECTED_DDS_SIZE
+        }
+    }
+
+    struct Inline;
+    impl BlockingExecutor for Inline {
+        fn execute_blocking<F, R>(
+            &self,
+            f: F,
+        ) -> Pin<Box<dyn Future<Output = Result<R, ExecutorError>> + Send>>
+        where
+            F: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            Box::pin(async move { Ok(f()) })
+        }
+    }
+
+    /// Waits up to two seconds for `ready` to hold.
+    async fn eventually<F, Fut>(what: &str, mut ready: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready().await {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// #400: a tile generated with disk caching off reaches memory and no
     /// disk tier. The build task gets what `RuntimeBuilder` gives the
-    /// executor for [`ExecutorDiskCaches::Off`]: the layer's memory bridge
-    /// and `NullDdsDiskCache`.
+    /// executor for [`ExecutorDiskCaches::Off`]: the layer's memory bridge,
+    /// `NullDdsDiskCache` and `NullDiskCache`.
     #[tokio::test]
     async fn disk_off_tile_is_cached_in_memory_only() {
-        use crate::coord::TileCoord;
-        use crate::executor::{
-            BlockingExecutor, ChunkResults, ExecutorError, JobId, NullDdsDiskCache, Task,
-            TaskContext, TaskOutput, TextureEncodeError, TextureEncoderAsync,
-        };
-        use crate::tasks::BuildAndCacheDdsTask;
-        use std::future::Future;
-        use std::pin::Pin;
-        use tokio_util::sync::CancellationToken;
-
-        struct Encoder;
-        impl TextureEncoderAsync for Encoder {
-            fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
-                let mut dds = vec![0u8; EXPECTED_DDS_SIZE];
-                dds[0..4].copy_from_slice(b"DDS ");
-                Ok(dds)
-            }
-            fn expected_size(&self, _w: u32, _h: u32) -> usize {
-                EXPECTED_DDS_SIZE
-            }
-        }
-        struct Inline;
-        impl BlockingExecutor for Inline {
-            fn execute_blocking<F, R>(
-                &self,
-                f: F,
-            ) -> Pin<Box<dyn Future<Output = Result<R, ExecutorError>> + Send>>
-            where
-                F: FnOnce() -> R + Send + 'static,
-                R: Send + 'static,
-            {
-                Box::pin(async move { Ok(f()) })
-            }
-        }
-
         let temp_dir = tempdir().unwrap();
         let cache_layer = CacheLayer::new(
             &disk_off_config(temp_dir.path().to_path_buf()),
@@ -873,22 +898,18 @@ mod tests {
             ExecutorDiskCaches::Off
         ));
 
-        let tile = TileCoord {
-            row: 100,
-            col: 200,
-            zoom: 15,
-        };
         let task = BuildAndCacheDdsTask::new(
-            tile,
-            Arc::new(Encoder),
+            TILE,
+            Arc::new(BlankDdsEncoder),
             cache_layer.memory_bridge(),
             Arc::new(NullDdsDiskCache),
+            Arc::new(NullDiskCache),
             Arc::new(Inline),
         );
         let mut chunks = ChunkResults::new();
         for row in 0..16u8 {
             for col in 0..16u8 {
-                chunks.add_success(row, col, Bytes::new());
+                chunks.add_success(row, col, test_chunks::jpeg());
             }
         }
         let mut ctx = TaskContext::new(JobId::new("no-cache"), CancellationToken::new());
@@ -898,19 +919,129 @@ mod tests {
         task.execute(&mut ctx).await;
 
         let memory = cache_layer.memory_bridge();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while memory.get(100, 200, 15).await.is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the tile never reached memory"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        eventually("the tile never reached memory", || async {
+            memory.get(100, 200, 15).await.is_some()
+        })
+        .await;
         assert_eq!(
             std::fs::read_dir(temp_dir.path()).unwrap().count(),
             0,
             "no disk tier may be written"
         );
+
+        cache_layer.shutdown().await;
+    }
+
+    /// Answers every chunk with a usable JPEG and counts the downloads of
+    /// one chunk.
+    struct ImageryProvider {
+        watched: (u32, u32),
+        watched_downloads: std::sync::atomic::AtomicUsize,
+    }
+    impl ImageryProvider {
+        /// Watches chunk `(row, col)` of [`TILE`].
+        fn watching(row: u8, col: u8) -> Self {
+            Self {
+                watched: (TILE.row * 16 + row as u32, TILE.col * 16 + col as u32),
+                watched_downloads: Default::default(),
+            }
+        }
+        fn watched_downloads(&self) -> usize {
+            self.watched_downloads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl ChunkProvider for ImageryProvider {
+        fn download_chunk(
+            &self,
+            row: u32,
+            col: u32,
+            _zoom: u8,
+        ) -> impl Future<Output = Result<Bytes, ChunkDownloadError>> + Send {
+            if (row, col) == self.watched {
+                self.watched_downloads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            async { Ok(test_chunks::jpeg()) }
+        }
+        fn name(&self) -> &str {
+            "imagery"
+        }
+    }
+
+    /// Generates [`TILE`] as a job does: download its chunks through the
+    /// chunk tier, then build and cache it through the layer's bridges.
+    async fn generate_tile(cache_layer: &CacheLayer, provider: &Arc<ImageryProvider>) {
+        let chunk_cache = cache_layer.disk_bridge().unwrap();
+        let mut ctx = TaskContext::new(JobId::new("generate"), CancellationToken::new());
+        let download =
+            DownloadChunksTask::new(TILE, Arc::clone(provider), Arc::clone(&chunk_cache));
+        let TaskResult::SuccessWithOutput(chunks) = download.execute(&mut ctx).await else {
+            panic!("the download task failed");
+        };
+        ctx.add_task_output("DownloadChunks".to_string(), chunks);
+        let build = BuildAndCacheDdsTask::new(
+            TILE,
+            Arc::new(BlankDdsEncoder),
+            cache_layer.memory_bridge(),
+            cache_layer.dds_disk_bridge().unwrap(),
+            chunk_cache,
+            Arc::new(Inline),
+        );
+        assert!(
+            matches!(
+                build.execute(&mut ctx).await,
+                TaskResult::SuccessWithOutput(_)
+            ),
+            "X-Plane gets a tile"
+        );
+    }
+
+    /// #388, the issue's scenario through the production bridges: a chunk
+    /// cache entry that is not an image (an error page cached before the
+    /// fix, or corruption on disk) is a cache hit, so it is never
+    /// downloaded again, and before the fix its tile was cached with a
+    /// magenta square. Now the tile is served but not cached, the entry is
+    /// discarded, and the next generation downloads the chunk and caches a
+    /// complete tile.
+    #[tokio::test]
+    async fn a_cached_chunk_that_fails_to_decode_is_discarded_and_downloaded_again() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let cache_layer = CacheLayer::new(&config, "Bing Maps", create_test_metrics())
+            .await
+            .unwrap();
+        let chunk_cache = cache_layer.disk_bridge().unwrap();
+        chunk_cache
+            .put(100, 200, 15, 3, 4, test_chunks::error_page())
+            .await
+            .unwrap();
+        let provider = Arc::new(ImageryProvider::watching(3, 4));
+        let memory = cache_layer.memory_bridge();
+        let dds_disk = cache_layer.dds_disk_bridge().unwrap();
+
+        generate_tile(&cache_layer, &provider).await;
+
+        assert_eq!(provider.watched_downloads(), 0, "the bad chunk was a hit");
+        eventually("the bad chunk was never discarded", || async {
+            chunk_cache.get(100, 200, 15, 3, 4).await.is_none()
+        })
+        .await;
+        assert!(memory.get(100, 200, 15).await.is_none());
+        assert!(dds_disk.get(100, 200, 15).await.is_none());
+
+        generate_tile(&cache_layer, &provider).await;
+
+        assert_eq!(provider.watched_downloads(), 1, "downloaded once more");
+        eventually("the complete tile never reached memory", || async {
+            memory.get(100, 200, 15).await.is_some()
+        })
+        .await;
+        eventually(
+            "the complete tile never reached the DDS disk tier",
+            || async { dds_disk.get(100, 200, 15).await.is_some() },
+        )
+        .await;
 
         cache_layer.shutdown().await;
     }

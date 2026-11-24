@@ -294,7 +294,14 @@ aren't mistaken for oversights in a later pass.
 
 ### Chunk validation is non-empty-only
 
-`raw_chunk_validator()` checks only that a chunk has bytes at all. Asserting
+`raw_chunk_validator()` checks only that a chunk has bytes at all. Whether
+the bytes are a usable image is checked outside the validator, without
+assuming a format (#388): before a downloaded chunk is written, by its header
+(`tasks/chunk_image.rs` `check_header`: any format the `image` crate reads, at
+256×256, no pixel decode), and at assembly, by decoding it. A cached chunk
+that fails to decode, or decodes to another size, is discarded through
+`DiskCache::discard`, so the chunk tier meets invariant 3 for content as well
+as for length. The reason the validator itself asserts no format follows. Asserting
 a JPEG magic (`0xFF 0xD8`) would require proving that all seven current
 imagery providers — Bing, Go2, Google, Apple, ArcGIS, Mapbox, USGS — return
 JPEG for every tile they serve. That has not been audited. Claiming an
@@ -318,6 +325,10 @@ identical forever, and so logs say which one actually happened.
 
 ## Known Limitations
 
+- **A JPEG cut short after its header still decodes.** The decoder is lenient
+  and fills what is missing, so a truncated chunk passes both the header check
+  and assembly, and its tile is cached with a damaged square. Rejecting it
+  would need a strict decode on the download path (#388).
 - **`EXPECTED_DDS_SIZE` is BC1-only, by construction.** It's computed from
   `dds::layout::file_len(4096, 4096, full_chain_levels(4096, 4096), BC1)`. BC3 was retired (#395) and the
   encoder rejects every format other than BC1, so every tile that can reach

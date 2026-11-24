@@ -74,16 +74,27 @@ touching the filesystem.
 Each tier has its own completeness rule.
 
 **Chunk disk.** `DownloadChunksTask` writes a chunk after a successful HTTP
-download, in a spawned task (`spawn_cache_write`). A chunk that failed every
-attempt is never written, so the next request for that tile retries it. Chunks
+download, in a spawned task (`spawn_cache_write`), and only when the body's
+header is that of a 256×256 image (`tasks/chunk_image.rs` `check_header`, #388;
+any format the `image` crate reads, not JPEG only, and no pixels are decoded).
+A body that is not, such as an error page sent with status 200 by the provider
+or by a proxy, CDN or captive portal in between, is a failed attempt, retried
+like a transport error. A chunk that failed every attempt is never written, so
+the next request for that tile retries it. Chunks
 already downloaded when a job is killed keep their writes (#300).
 
 **Memory and DDS disk.** `BuildAndCacheDdsTask` writes both, in two spawned tasks,
-only when `ChunkResults::is_complete()` is true: 256 chunks obtained and no
-failures. A tile with any failed chunk has magenta regions. It is served to
-X-Plane so the sim does not stall, and never persisted (#180). Completeness counts
-chunks obtained, not chunks decoded: a chunk that is present but fails to decode
-is drawn magenta in a tile that is still written.
+only when the tile is complete: `ChunkResults::is_complete()` (256 chunks
+obtained, no failures) and every chunk decoded to a 256×256 image
+(`assemble_chunks` returns an empty `AssembledTile::rejected`; #388). A tile with
+any failed or rejected chunk has magenta regions. It is served to X-Plane so the
+sim does not stall, and never persisted (#180). Each rejected chunk is also
+removed from the chunk disk tier (`DiskCache::discard`, in the background), so
+the next request downloads it again instead of rebuilding the same magenta
+square. The discard is by key, whether the chunk came from the cache or from a
+fresh download that passed the header check but not the decode; discarding an
+absent entry does nothing. A fresh chunk's own background write can land after
+its discard, and that entry is then rejected and discarded on its next read.
 
 **Promotion.** A DDS disk hit in the daemon is written back to the memory tier.
 

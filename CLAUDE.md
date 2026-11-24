@@ -43,6 +43,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Parallel download of 256 chunks (16×16) per tile
    - Configurable concurrency, timeout, and retry logic
    - Failed chunks are not cached (retry on next request); see Cache System for tile-level rules
+   - A usable chunk is a 256×256 image (`tasks/chunk_image.rs`, #388, the one statement of it): a 200 response whose header is not one (any format `image` reads, not JPEG only) is a failed, retryable attempt and never cached (`check_header`, no pixel decode); at assembly a chunk that does not decode to one (`decode`) is painted magenta, counted in `AssembledTile::rejected`, and discarded from the chunk disk tier through `DiskCache::discard`
    - Retry classification lives in `executor/adapters/provider.rs` `map_provider_error`: transport failures and non-404 statuses are retryable, HTTP 404 is permanent (one attempt) because every shipped provider answers 404 only for "no tile here" (#301). The HTTP clients emit `ProviderError::HttpStatus { status, url }` for non-success responses, so callers match on the code, never on message text
    - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300). A tile whose encode finishes while its job is being cancelled is kept: when it is complete, `BuildAndCacheDdsTask` writes it to memory and DDS disk before returning `Cancelled`, unless the cancel is the executor's shutdown (#385). `JobExecutor::shutdown` cancels its own `shutting_down` token before any job token and dispatch puts it on every `TaskContext`, so a task reads `is_cancelled()` first and `is_shutting_down()` second to tell a shutdown from a kill or an error policy
 
@@ -85,8 +86,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Region-based disk layout: files in 1°×1° DSF subdirs named like `coord::format_dsf_name` (`layout::is_region_dir_name`), e.g. `+37-123/tile_12_1582_658.cache`
    - Read path: memory hit → DDS disk hit (+ promote to memory) → chunk disk (assemble+encode) → network
    - Write path (per-tier completeness rules):
-     - Chunk disk: per-chunk, only successful HTTP downloads (failed/magenta chunks never written)
-     - Memory + DDS disk: per-tile, fire-and-forget after encode, **only when all 256 chunks succeeded** (`ChunkResults::is_complete()`). Tiles with any failed chunks are served to X-Plane (so the sim doesn't stall) but never persisted; see issue #180. A complete tile whose job is cancelled mid-encode is still written, except under executor shutdown (#385)
+     - Chunk disk: per-chunk, only successful HTTP downloads whose body passes `chunk_image::check_header` (failed/magenta chunks never written)
+     - Memory + DDS disk: per-tile, fire-and-forget after encode, **only when all 256 chunks downloaded and decoded to 256×256** (`ChunkResults::is_complete()` and an empty `AssembledTile::rejected`, #388). Tiles with any failed chunks are served to X-Plane (so the sim doesn't stall) but never persisted; see issue #180. A complete tile whose job is cancelled mid-encode is still written, except under executor shutdown (#385)
    - Parallel startup scanning via rayon over region directories
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - `run --no-cache` (#400) turns off the disk tiers for the session: `ServiceConfig::disk_cache_enabled` false, `CacheLayer` starts only the memory tier, `executor_disk_caches()` returns `ExecutorDiskCaches::Off` (the executor gets `NullDdsDiskCache`/`NullDiskCache`), no GC daemon, no legacy cleanup, no lit tier, no prefetch (`run.rs` `prefetch_off_reason` decides the session's prefetch from `prefetch.enabled`, `--no-prefetch` and `--no-cache`, and sets `OrchestratorConfig::prefetch.enabled`; `--no-prefetch` used to reach only the banner), and clap refuses `--airport` with it. The memory tier stays: FUSE serving depends on it. The scenery and ortho union index caches are not tiers and still load and save
@@ -463,6 +464,7 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
+| `xearthlayer/src/tasks/chunk_image.rs` | What a usable chunk is: `check_header` (download path) and `decode` (assembly), 256×256, any format `image` reads |
 | `xearthlayer/src/tasks/` | Task implementations (CachedTileProbe, DownloadChunks, BuildAndCacheDds, CacheGcBatch) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/dds/layout.rs` | DDS file geometry: every size in a DDS file (#391) |

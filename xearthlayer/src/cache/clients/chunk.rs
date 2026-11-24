@@ -132,6 +132,27 @@ impl ChunkCacheClient {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
+    /// Delete a chunk from the cache.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if the chunk was cached, `Ok(false)` if it was not, `Err`
+    /// if it could not be deleted.
+    pub async fn delete(
+        &self,
+        tile_row: u32,
+        tile_col: u32,
+        zoom: u8,
+        chunk_row: u8,
+        chunk_col: u8,
+    ) -> Result<bool, std::io::Error> {
+        let key = Self::chunk_to_key(tile_row, tile_col, zoom, chunk_row, chunk_col);
+        self.cache
+            .delete(&key)
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     /// Check if a chunk exists in the cache.
     ///
     /// # Arguments
@@ -239,6 +260,32 @@ mod tests {
             .unwrap();
 
         assert!(client.contains(100, 200, 15, 8, 12).await);
+
+        service.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_chunk_and_says_whether_it_was_there() {
+        let service = CacheService::start(ServiceCacheConfig::memory(1_000_000, None))
+            .await
+            .unwrap();
+        let client = ChunkCacheClient::new(service.cache());
+        client
+            .set(100, 200, 15, 8, 12, vec![1, 2, 3].into())
+            .await
+            .unwrap();
+        client
+            .set(100, 200, 15, 8, 13, vec![4, 5, 6].into())
+            .await
+            .unwrap();
+
+        assert!(client.delete(100, 200, 15, 8, 12).await.unwrap());
+        assert!(client.get(100, 200, 15, 8, 12).await.is_none());
+        assert!(!client.delete(100, 200, 15, 8, 12).await.unwrap());
+        assert!(
+            client.get(100, 200, 15, 8, 13).await.is_some(),
+            "only the named chunk is deleted"
+        );
 
         service.shutdown().await;
     }
