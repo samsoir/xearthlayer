@@ -236,4 +236,10 @@ Made with :heart: in California.
 
 ## License
 
-Licensed under the MIT License. See [LICENSE](LICENSE) for details.
+Copyright (C) 2025-2026 XEarthLayer Contributors
+
+XEarthLayer is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+XEarthLayer is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the [GNU General Public License](LICENSE) for more details.
+
+Releases up to and including 0.5.1-beta.2 were published under the MIT License and remain available under it. Every later release is GPL-3.0-or-later ([#376](https://github.com/samsoir/xearthlayer/issues/376)).

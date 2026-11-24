@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### License
+
+- **XEarthLayer is now licensed under the GNU General Public License, version 3 or later** ([#376](https://github.com/samsoir/xearthlayer/issues/376)): Releases up to and including 0.5.1-beta.2 were MIT and remain available under MIT; this and every later release are GPL-3.0-or-later. The GPL keeps XEarthLayer and the work built on it open, and lets XEarthLayer use GPL components such as the WinFsp crates a Windows port needs. Every past contributor agreed to the change. Nothing changes in how XEarthLayer works: the `LICENSE` file, the crate and Linux package metadata, and the license the macOS installer shows now carry the GPL, and `xearthlayer --version` and `xearthlayer-publish --version` print the copyright and license notice.
+
 #### Dashboard
 
 - **The prefetch lane meter is labelled `Utilization` and shows its history** ([#355](https://github.com/samsoir/xearthlayer/issues/355)): The Prefetch System pane's meter shows how much of the prefetch lane is in use, from 0% at rest to 100% with every slot busy. It was labelled `Capacity`, which names the fixed size rather than the share in use; it now reads `Utilization`, aligned with the `Prefetch` row above it. Beside the meter a sparkline shows the lane's utilization over the last twelve seconds, one cell per second, each the average of that second, scaled against a full lane so a half-busy lane always draws at half height. The other panes' sparklines show the last twelve draws, 1.2 seconds at the dashboard's refresh rate, which is too short to read a trend from.
