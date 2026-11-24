@@ -785,6 +785,32 @@ pub enum Signal {
 | `Stop` | Clean application shutdown |
 | `Kill` | Timeout exceeded, abort immediately |
 
+### Cancellation versus shutdown
+
+A job's cancellation token is cancelled by three things: a `Kill` signal (the
+daemon sends one when a FUSE request times out), an error policy, and
+`JobExecutor::shutdown`. Tasks see the same `is_cancelled()` for all three, but
+one of them must behave differently: a tile whose encode finishes while its job
+is being cancelled is worth keeping after a FUSE timeout (X-Plane will ask for
+it again) and not during shutdown (#385).
+
+`JobExecutor` owns a `shutting_down` token. `shutdown()` cancels it before it
+cancels any job, and dispatch hands it to every task through
+`TaskContext::with_executor_shutdown`; `TaskContext::is_shutting_down()` reads
+it. A task that must tell the two apart reads `is_cancelled()` first and
+`is_shutting_down()` second: shutdown is marked before any job is cancelled, so
+a cancel seen without it is a kill or an error policy. Contexts built outside
+dispatch (`TaskContext::new`, `with_child_sender`) get a token nobody cancels.
+
+`BuildAndCacheDdsTask` uses it: after a successful encode of a complete tile it
+starts the memory and DDS disk writes unless the executor is shutting down,
+then returns `Cancelled` if the job was cancelled. An incomplete tile is never
+written (#180).
+
+A `Kill` is applied when the executor next runs `process_signals`, at the end
+of a turn of its loop; on an otherwise idle executor that waits for the running
+task to finish (#407).
+
 ### Telemetry
 
 Jobs and tasks emit telemetry events via a sink abstraction. The executor doesn't know how events are consumed—this follows the "emit, don't present" pattern.
