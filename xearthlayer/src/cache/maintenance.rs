@@ -108,9 +108,13 @@ pub fn find_tiers(cache_dir: &Path) -> io::Result<Vec<TierDirectories>> {
             continue;
         };
         if name == layout::LIT_DIR {
-            lit = true;
+            lit = layout::looks_like_tier_dir(&entry.path());
         } else if layout::is_region_dir_name(&name) {
-            legacy.push(entry.path());
+            // The pre-#398 chunk tier, but only a region of cache files: a
+            // folder of the user's named like a region is not ours.
+            if layout::holds_only_cache_entries(&entry.path()) {
+                legacy.push(entry.path());
+            }
         } else {
             providers.push(name);
         }
@@ -120,8 +124,11 @@ pub fn find_tiers(cache_dir: &Path) -> io::Result<Vec<TierDirectories>> {
 
     let mut tiers = Vec::new();
     for provider in providers {
+        // A directory is a tier only if it holds regions of cache files and
+        // nothing else: `cache.directory` may be a folder that also holds
+        // the user's own `dds` or `chunks` (#399 review).
         let dds = layout::dds_dir(cache_dir, &provider);
-        if is_real_dir(&dds) {
+        if layout::looks_like_tier_dir(&dds) {
             tiers.push(TierDirectories {
                 tier: CacheTier::Dds {
                     provider: provider.clone(),
@@ -130,7 +137,7 @@ pub fn find_tiers(cache_dir: &Path) -> io::Result<Vec<TierDirectories>> {
             });
         }
         let chunks = layout::chunk_dir(cache_dir, &provider);
-        if is_real_dir(&chunks) {
+        if layout::looks_like_tier_dir(&chunks) {
             tiers.push(TierDirectories {
                 tier: CacheTier::Chunks { provider },
                 dirs: vec![chunks],
@@ -152,24 +159,44 @@ pub fn find_tiers(cache_dir: &Path) -> io::Result<Vec<TierDirectories>> {
     Ok(tiers)
 }
 
-/// A directory, not a link to one.
-fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
-}
-
 /// Files and bytes under `dir`, links counted as files and never followed.
+///
+/// A file or directory that disappears while it is counted is skipped:
+/// `stats` does not refuse while `run` is active, and the GC and the cache's
+/// write-then-rename remove and rename files at any moment.
 fn count_dir_contents(dir: &Path) -> io::Result<(usize, u64)> {
+    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut files = 0;
     let mut bytes = 0;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if gone(&e) => return Ok((0, 0)),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        if file_type.is_dir() {
             let (sub_files, sub_bytes) = count_dir_contents(&entry.path())?;
             files += sub_files;
             bytes += sub_bytes;
         } else {
-            files += 1;
-            bytes += entry.metadata()?.len();
+            match entry.metadata() {
+                Ok(m) => {
+                    files += 1;
+                    bytes += m.len();
+                }
+                Err(e) if gone(&e) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok((files, bytes))
@@ -428,6 +455,23 @@ mod tests {
 
     /// A tier name that is a file, not a directory, is not a tier.
     #[test]
+    fn folders_that_are_not_tiers_are_never_touched() {
+        // `cache.directory` pointed at a folder that also holds other things,
+        // the home directory for example (#399 review).
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        write(&root.join("Documents/dds/report.pdf"), 10);
+        write(&root.join("work/chunks/src/main.rs"), 10);
+        write(&root.join("night/notes.txt"), 10);
+        write(&root.join("+30-120/+30-120.dsf"), 10);
+        let before = every_file(root);
+
+        assert!(find_tiers(root).unwrap().is_empty());
+        clear_disk_cache(root).unwrap();
+        assert_eq!(every_file(root), before);
+    }
+
+    #[test]
     fn files_named_like_tiers_are_not_tiers() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -462,7 +506,12 @@ mod tests {
         clear_disk_cache(&root).unwrap();
 
         assert!(elsewhere.join("precious.bin").is_file());
-        assert!(!layout::chunk_dir(&root, GO2).exists());
+        // A region holding a link is not a region of cache files, so the
+        // whole tier is left alone rather than trusted (see
+        // `layout::looks_like_tier_dir`).
+        assert!(layout::chunk_dir(&root, GO2)
+            .join("+37-123/c.cache")
+            .is_file());
     }
 
     #[test]

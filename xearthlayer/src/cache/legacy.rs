@@ -11,7 +11,7 @@
 use std::io;
 use std::path::Path;
 
-use super::layout::is_region_dir_name;
+use super::layout::{holds_only_cache_entries, is_region_dir_name};
 
 /// What one cleanup pass did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -22,14 +22,19 @@ pub struct LegacyChunkCleanup {
     pub bytes_freed: u64,
     /// Region directories that could not be deleted (each logged as a warning).
     pub failed: usize,
+    /// Region-named directories left alone because they hold something other
+    /// than cache files: not the old chunk tier, whatever their name.
+    pub kept: usize,
 }
 
 /// Delete every region directory directly in `cache_dir`.
 ///
 /// Only directories whose name is a region name
-/// ([`is_region_dir_name`]) are touched; provider directories, `night/`,
-/// `tmp/`, index cache files and anything else are left alone, as are
-/// symbolic links. A missing or unreadable `cache_dir` is a no-op. A
+/// ([`is_region_dir_name`]) and that hold nothing but cache files
+/// ([`holds_only_cache_entries`]) are touched: `cache.directory` may also
+/// hold the user's own folders, scenery among them, named like regions.
+/// Provider directories, `night/`, `tmp/`, index cache files and anything
+/// else are left alone, as are symbolic links. A missing or unreadable `cache_dir` is a no-op. A
 /// directory that cannot be deleted is logged and counted, never fatal.
 ///
 /// Blocking: call it from a blocking thread, never an async worker.
@@ -47,6 +52,14 @@ pub fn remove_legacy_chunk_regions(cache_dir: &Path) -> LegacyChunkCleanup {
         }
 
         let path = entry.path();
+        if !holds_only_cache_entries(&path) {
+            outcome.kept += 1;
+            tracing::debug!(
+                directory = %path.display(),
+                "Kept a region-named directory that holds more than cache files"
+            );
+            continue;
+        }
         let bytes = tree_size(&path);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {
@@ -135,7 +148,8 @@ mod tests {
             LegacyChunkCleanup {
                 removed: 3,
                 bytes_freed: 150,
-                failed: 0
+                failed: 0,
+                kept: 0,
             }
         );
         assert!(!root.join("+37-123").exists());
@@ -144,6 +158,26 @@ mod tests {
         for path in &keep {
             assert!(path.exists(), "{} must be kept", path.display());
         }
+    }
+
+    /// A region name is not proof: `cache.directory` may hold the user's own
+    /// folders, scenery among them, named like regions.
+    #[test]
+    fn a_region_holding_anything_but_cache_files_is_kept() {
+        let root = tempdir().unwrap();
+        let root = root.path();
+        write(&root.join("+30-120").join("+30-120.dsf"), 10);
+        write(&root.join("+31-120").join("chunk_16_1_2_3_4.cache"), 10);
+        write(&root.join("+31-120").join("notes.txt"), 10);
+        write(&root.join("+32-120").join("chunk_16_1_2_3_4.cache"), 10);
+
+        let outcome = remove_legacy_chunk_regions(root);
+
+        assert_eq!(outcome.removed, 1, "only the region of cache files");
+        assert_eq!(outcome.kept, 2);
+        assert!(root.join("+30-120/+30-120.dsf").exists());
+        assert!(root.join("+31-120/notes.txt").exists());
+        assert!(!root.join("+32-120").exists());
     }
 
     #[test]

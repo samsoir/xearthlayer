@@ -55,6 +55,49 @@ pub fn is_region_dir_name(name: &str) -> bool {
         && b[4..7].iter().all(u8::is_ascii_digit)
 }
 
+/// Whether the region directory `region` holds only what a disk tier
+/// writes: regular files named `*.cache`, or `*.tmp` left by an interrupted
+/// write. No subdirectory, no symbolic link, nothing else. An empty region
+/// qualifies; one that cannot be read does not.
+///
+/// The guard for code that deletes tiers (`cache clear`, the legacy chunk
+/// cleanup): a region name alone is not proof, because `cache.directory`
+/// can point at a folder that also holds the user's own files, scenery
+/// folders named like regions among them. Reads the directory.
+pub fn holds_only_cache_entries(region: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(region) else {
+        return false;
+    };
+    entries.into_iter().all(|entry| {
+        entry.is_ok_and(|entry| {
+            let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            is_file && (name.ends_with(".cache") || name.ends_with(".tmp"))
+        })
+    })
+}
+
+/// Whether `dir` looks like a disk tier: a directory, not a link to one,
+/// whose every entry is a region directory (by [`is_region_dir_name`])
+/// holding only cache entries ([`holds_only_cache_entries`]). An empty
+/// directory qualifies. Reads the directory.
+pub fn looks_like_tier_dir(dir: &Path) -> bool {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.into_iter().all(|entry| {
+        entry.is_ok_and(|entry| {
+            entry.file_type().is_ok_and(|t| t.is_dir())
+                && entry.file_name().to_str().is_some_and(is_region_dir_name)
+                && holds_only_cache_entries(&entry.path())
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +133,82 @@ mod tests {
         ] {
             assert!(!is_region_dir_name(name), "{name:?}");
         }
+    }
+
+    fn region_with(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for f in files {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_region_of_cache_files_holds_only_cache_entries() {
+        let dir = region_with(&[
+            "tile_12_1_2.cache",
+            "chunk_12_1_2_0_0.cache",
+            "tile_12_1_3.tmp",
+        ]);
+        assert!(holds_only_cache_entries(dir.path()));
+        assert!(holds_only_cache_entries(region_with(&[]).path()));
+    }
+
+    #[test]
+    fn a_region_holding_anything_else_does_not() {
+        // Real scenery: a DSF in a folder named like a region (#398 review).
+        assert!(!holds_only_cache_entries(
+            region_with(&["+30-120.dsf"]).path()
+        ));
+        assert!(!holds_only_cache_entries(
+            region_with(&["tile.cache", "notes.txt"]).path()
+        ));
+
+        let with_subdir = region_with(&["tile.cache"]);
+        std::fs::create_dir(with_subdir.path().join("nested")).unwrap();
+        assert!(!holds_only_cache_entries(with_subdir.path()));
+
+        let missing = tempfile::tempdir().unwrap();
+        assert!(!holds_only_cache_entries(&missing.path().join("absent")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_cache_file_is_not_a_cache_entry() {
+        let target = region_with(&["tile.cache"]);
+        let region = region_with(&[]);
+        std::os::unix::fs::symlink(
+            target.path().join("tile.cache"),
+            region.path().join("tile.cache"),
+        )
+        .unwrap();
+        assert!(!holds_only_cache_entries(region.path()));
+    }
+
+    #[test]
+    fn a_tier_directory_holds_only_regions_of_cache_entries() {
+        let tier = tempfile::tempdir().unwrap();
+        assert!(looks_like_tier_dir(tier.path()), "an empty tier");
+        std::fs::create_dir(tier.path().join("+37-123")).unwrap();
+        std::fs::write(tier.path().join("+37-123/tile_12_1_2.cache"), b"x").unwrap();
+        assert!(looks_like_tier_dir(tier.path()));
+    }
+
+    #[test]
+    fn a_directory_that_merely_has_a_tier_name_is_not_a_tier() {
+        // `~/work/dds` when `cache.directory` is the home directory.
+        let not_tier = tempfile::tempdir().unwrap();
+        std::fs::write(not_tier.path().join("report.pdf"), b"x").unwrap();
+        assert!(!looks_like_tier_dir(not_tier.path()));
+
+        let other_subdir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(other_subdir.path().join("src")).unwrap();
+        assert!(!looks_like_tier_dir(other_subdir.path()));
+
+        let region_with_dsf = tempfile::tempdir().unwrap();
+        std::fs::create_dir(region_with_dsf.path().join("+30-120")).unwrap();
+        std::fs::write(region_with_dsf.path().join("+30-120/+30-120.dsf"), b"x").unwrap();
+        assert!(!looks_like_tier_dir(region_with_dsf.path()));
     }
 
     #[test]
