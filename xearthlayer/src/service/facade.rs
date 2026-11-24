@@ -120,6 +120,12 @@ impl XEarthLayerService {
 
         tracing::info!("Creating XEarthLayerService using current runtime");
 
+        // Build the magenta placeholder FUSE serves on a timeout or failure
+        // now, before anything is mounted, so no FUSE handler ever builds it
+        // (#386). It is copied from one block, about a millisecond: no
+        // blocking thread needed.
+        crate::fuse::init_placeholder_cache();
+
         // 1. Create MetricsSystem FIRST (so we can inject client into caches)
         let metrics_system = MetricsSystem::new(&runtime_handle);
         let metrics_client = metrics_system.client();
