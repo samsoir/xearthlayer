@@ -150,9 +150,12 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     }
 
     // Print prefetch status (details printed later after prefetcher starts)
-    let prefetch_enabled = config.prefetch.enabled && !args.no_prefetch;
-    if !use_tui && !prefetch_enabled {
-        println!("Prefetch: Disabled");
+    let prefetch_off =
+        prefetch_off_reason(config.prefetch.enabled, args.no_prefetch, args.no_cache);
+    if !use_tui {
+        if let Some(line) = prefetch_banner(prefetch_off) {
+            println!("{line}");
+        }
     }
     if !use_tui {
         println!();
@@ -170,6 +173,10 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     );
     // X-World Pro (#213): preflight contributed the detection when
     // packages.xworld_pro is on; overlay consolidation leaves those continents out.
+    // The session's decision, not the file's: `--no-prefetch` and
+    // `--no-cache` turn prefetch off (before this, `--no-prefetch` reached
+    // only the banner and prefetch ran anyway).
+    orch_config.prefetch.enabled = prefetch_off.is_none();
     orch_config.xworld_pro = ctx
         .xworld_pro()
         .map(xearthlayer::xworld_pro::OverlayCoverage::from_detection);
@@ -333,6 +340,34 @@ fn outcome(received: Option<Signal>, front_end_error: Option<CliError>) -> Resul
     }
 }
 
+/// Why prefetch does not run this session, or `None` when it does.
+///
+/// `--no-cache` turns it off as well: prefetch fills the disk cache ahead of
+/// the aircraft, and with the disk tiers off (#400) its tiles would reach only
+/// the memory tier, to be evicted long before they are flown over, while its
+/// regions were never confirmed.
+fn prefetch_off_reason(
+    config_enabled: bool,
+    no_prefetch: bool,
+    no_cache: bool,
+) -> Option<&'static str> {
+    if no_prefetch {
+        Some("--no-prefetch")
+    } else if no_cache {
+        Some("--no-cache: prefetched tiles would reach only the memory cache")
+    } else if !config_enabled {
+        Some("prefetch.enabled = false")
+    } else {
+        None
+    }
+}
+
+/// The banner's prefetch line when prefetch is off; nothing when it runs
+/// (its details are printed once it starts).
+fn prefetch_banner(off_reason: Option<&str>) -> Option<String> {
+    off_reason.map(|reason| format!("Prefetch: Disabled ({reason})"))
+}
+
 /// The banner's cache line. `--no-cache` turns off the disk tiers only (the
 /// memory tier always runs), so the line names what is still on and what is
 /// off rather than claiming caching is disabled (#400).
@@ -373,6 +408,39 @@ mod tests {
         assert_eq!(
             cache_banner(2 * gb, 40 * gb, false),
             "Cache: 2 GB memory, 40 GB disk"
+        );
+    }
+
+    #[test]
+    fn prefetch_runs_only_when_the_config_enables_it_and_no_flag_stops_it() {
+        assert_eq!(prefetch_off_reason(true, false, false), None);
+        assert_eq!(
+            prefetch_off_reason(false, false, false),
+            Some("prefetch.enabled = false")
+        );
+        // --no-prefetch reached only the banner, so prefetch kept running.
+        assert_eq!(
+            prefetch_off_reason(true, true, false),
+            Some("--no-prefetch")
+        );
+    }
+
+    /// Prefetch fills the disk cache ahead of the aircraft. With the disk
+    /// tiers off (#400) its tiles reach only the memory tier, where they are
+    /// evicted long before they are flown over, and its regions are never
+    /// confirmed.
+    #[test]
+    fn no_cache_turns_prefetch_off() {
+        assert!(prefetch_off_reason(true, false, true)
+            .is_some_and(|reason| reason.contains("--no-cache")));
+    }
+
+    #[test]
+    fn the_prefetch_line_names_why_it_is_off() {
+        assert_eq!(prefetch_banner(None), None);
+        assert_eq!(
+            prefetch_banner(Some("--no-prefetch")).as_deref(),
+            Some("Prefetch: Disabled (--no-prefetch)")
         );
     }
 
