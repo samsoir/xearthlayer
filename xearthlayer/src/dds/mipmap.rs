@@ -67,23 +67,34 @@ impl MipmapGenerator {
     /// Downsample image by 2× using box filter (simple average).
     ///
     /// Each output pixel is the average of a 2×2 block of input pixels, per
-    /// channel, truncated: `(a + b + c + d) / 4`. An odd last column or row
-    /// has no partner and is dropped, so a `w×h` source gives `w/2 × h/2`
-    /// (a 1-wide or 1-high source gives an empty image).
+    /// channel, alpha included: `(a + b + c + d) / 4` rounded to the nearest
+    /// step, ties to even ([`block_average`], #394), so the chain does not
+    /// darken or brighten level by level. An odd last column or row has no
+    /// partner and is dropped, so a `w×h` source gives `w/2 × h/2` (a 1-wide
+    /// or 1-high source gives an empty image).
     ///
-    /// Works on the raw RGBA bytes, one output row at a time and in two
-    /// passes, with no per-pixel bounds checks (#389):
+    /// Works on the raw RGBA bytes, one output row at a time and in three
+    /// passes, with no per-pixel bounds checks (#389, #394):
     ///
     /// 1. the row's two source rows are added byte by byte into a `u16`
     ///    scratch row (a plain element-wise loop the compiler vectorises);
-    /// 2. each output channel is the sum of two neighbouring scratch
-    ///    entries, one pixel (4 entries) apart, divided by 4.
+    /// 2. each 2×2 block's sum, per channel, is the sum of two neighbouring
+    ///    entries of that row, one pixel (4 entries) apart, written to a
+    ///    second `u16` scratch row with an entry per output byte;
+    /// 3. that row is averaged into the output byte by byte by
+    ///    [`block_average`], again a plain element-wise loop the compiler
+    ///    vectorises.
     ///
-    /// The scratch row is the one allocation besides the output: a
-    /// `Vec<u16>` with an entry per byte of a source row (less an odd last
-    /// pixel), allocated once per call and reused for every row. Both
-    /// encoder backends run this through [`MipmapStream`] for every level of
-    /// every tile.
+    /// The rounding is a pass of its own because, folded into pass 2, the
+    /// compiler vectorises it across the one-pixel stride with so many
+    /// shuffles that the 4096×4096 chain took twice as long as with the
+    /// truncating average it replaced; as its own pass it adds about a tenth.
+    ///
+    /// The two scratch rows are the only allocations besides the output:
+    /// `Vec<u16>`s with an entry per byte of a source row (less an odd last
+    /// pixel) and per byte of an output row, allocated once per call and
+    /// reused for every row. Both encoder backends run this through
+    /// [`MipmapStream`] for every level of every tile.
     pub(crate) fn downsample_box_2x(source: &RgbaImage) -> RgbaImage {
         const CHANNELS: usize = 4;
 
@@ -101,6 +112,8 @@ impl MipmapGenerator {
         // an odd last source pixel is left out here, as the halved width
         // requires.
         let mut column_sums = vec![0u16; 2 * out_row];
+        // The 2×2 block sums of one output row, an entry per output byte.
+        let mut block_sums = vec![0u16; out_row];
 
         // `chunks_exact` drops an odd last source row, as the halved height
         // requires.
@@ -113,22 +126,43 @@ impl MipmapGenerator {
                 *sum = u16::from(t) + u16::from(b);
             }
 
-            for (pixel, pair) in out
+            for (block, pair) in block_sums
                 .chunks_exact_mut(CHANNELS)
                 .zip(column_sums.chunks_exact(2 * CHANNELS))
             {
                 for c in 0..CHANNELS {
-                    // Truncating average of the 2×2 block. #394 rounds it
-                    // instead (add 2 to the sum before this divide, or round
-                    // half to even); this line is the only one that changes.
-                    pixel[c] = ((pair[c] + pair[c + CHANNELS]) / 4) as u8;
+                    block[c] = pair[c] + pair[c + CHANNELS];
                 }
+            }
+
+            for (byte, &sum) in out.iter_mut().zip(&block_sums) {
+                *byte = block_average(sum);
             }
         }
 
         RgbaImage::from_raw(new_width, new_height, output)
             .expect("output buffer is sized from the halved dimensions")
     }
+}
+
+/// The average of a 2×2 block's four channel values, from their sum
+/// (`0..=1020`), rounded to the nearest step with ties to even (#394).
+///
+/// The sum leaves a remainder of 0, 1, 2 or 3 over 4 about equally often on
+/// imagery, and each level is built from the one above, so any bias in this
+/// rounding accumulates down the chain. Truncating (`sum / 4`) lost 0.375 of
+/// a step a level, darkening distant terrain; rounding half up
+/// (`(sum + 2) / 4`) would gain 0.125 a level. Ties to even has no bias:
+/// a remainder of 2 rounds down when the quotient is even and up when it is
+/// odd.
+///
+/// `(sum >> 2) & 1` is the quotient's parity, so adding it to `sum + 1`
+/// carries into the quotient exactly for a remainder of 3, or of 2 with an
+/// odd quotient. Alpha goes through it too, and an opaque block stays
+/// opaque: 1020 gives 255.
+#[inline(always)]
+const fn block_average(sum: u16) -> u8 {
+    ((sum + 1 + ((sum >> 2) & 1)) >> 2) as u8
 }
 
 /// Streaming mipmap generator that yields one level at a time.
@@ -206,9 +240,27 @@ impl Iterator for MipmapStream {
 mod tests {
     use super::*;
 
+    /// `sum / 4` rounded to the nearest whole step, a tie going to the even
+    /// one: round half to even, by its definition, in exact arithmetic on the
+    /// rational `sum / 4 = q + r/4` (no bit tricks, so it is independent of
+    /// the formula the fast path uses).
+    fn round_half_to_even_quarter(sum: u16) -> u8 {
+        let (q, r) = (sum / 4, sum % 4);
+        // r/4 against 1/2, compared as 2r against 4.
+        let rounded = match (2 * r).cmp(&4) {
+            std::cmp::Ordering::Less => q,
+            std::cmp::Ordering::Greater => q + 1,
+            std::cmp::Ordering::Equal if q % 2 == 0 => q,
+            std::cmp::Ordering::Equal => q + 1,
+        };
+        u8::try_from(rounded).expect("a sum of four bytes averages to a byte")
+    }
+
     /// The per-pixel `downsample_box_2x` that the raw-slice loop replaced
-    /// (#389), kept verbatim as the reference the rewrite must match byte for
-    /// byte.
+    /// (#389), kept as the independent reference the fast path must match
+    /// byte for byte. Since #394 each block average is rounded half to even
+    /// by [`round_half_to_even_quarter`], the definition, where the fast path
+    /// uses a bit trick.
     fn downsample_box_2x_reference(source: &RgbaImage) -> RgbaImage {
         let new_width = source.width() / 2;
         let new_height = source.height() / 2;
@@ -223,12 +275,11 @@ mod tests {
                 let p01 = source.get_pixel(x * 2, y * 2 + 1);
                 let p11 = source.get_pixel(x * 2 + 1, y * 2 + 1);
 
-                let avg = image::Rgba([
-                    ((p00[0] as u16 + p10[0] as u16 + p01[0] as u16 + p11[0] as u16) / 4) as u8,
-                    ((p00[1] as u16 + p10[1] as u16 + p01[1] as u16 + p11[1] as u16) / 4) as u8,
-                    ((p00[2] as u16 + p10[2] as u16 + p01[2] as u16 + p11[2] as u16) / 4) as u8,
-                    ((p00[3] as u16 + p10[3] as u16 + p01[3] as u16 + p11[3] as u16) / 4) as u8,
-                ]);
+                let avg = image::Rgba(std::array::from_fn(|c| {
+                    round_half_to_even_quarter(
+                        p00[c] as u16 + p10[c] as u16 + p01[c] as u16 + p11[c] as u16,
+                    )
+                }));
 
                 output.put_pixel(x, y, avg);
             }
@@ -237,24 +288,46 @@ mod tests {
         output
     }
 
-    /// Deterministic noise: every byte of every channel drawn from SplitMix64,
-    /// so all 256 values of each channel occur and every 2×2 sum is exercised.
-    fn noise(width: u32, height: u32, seed: u64) -> RgbaImage {
+    /// An endless deterministic byte stream from SplitMix64.
+    fn noise_bytes(seed: u64) -> impl Iterator<Item = u8> {
         let mut state = seed;
-        let mut next = move || {
+        std::iter::repeat_with(move || {
             state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
             let mut z = state;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^ (z >> 31)
-        };
+        })
+        .flat_map(u64::to_le_bytes)
+    }
+
+    /// Deterministic noise: every byte of every channel drawn from SplitMix64,
+    /// so all 256 values of each channel occur and every 2×2 sum is exercised.
+    fn noise(width: u32, height: u32, seed: u64) -> RgbaImage {
         let len = width as usize * height as usize * 4;
-        let mut bytes = Vec::with_capacity(len + 8);
-        while bytes.len() < len {
-            bytes.extend_from_slice(&next().to_le_bytes());
-        }
-        bytes.truncate(len);
+        let bytes = noise_bytes(seed).take(len).collect();
         RgbaImage::from_raw(width, height, bytes).expect("buffer sized for the image")
+    }
+
+    /// Noise whose every byte is uniform over `0..=254`: the bytes of
+    /// [`noise_bytes`] with each 255 skipped. Each channel's mean is then
+    /// close to a whole step, 127, where [`noise`]'s is close to 127.5.
+    fn noise_with_whole_step_mean(width: u32, height: u32, seed: u64) -> RgbaImage {
+        let len = width as usize * height as usize * 4;
+        let bytes = noise_bytes(seed).filter(|&b| b != 255).take(len).collect();
+        RgbaImage::from_raw(width, height, bytes).expect("buffer sized for the image")
+    }
+
+    /// The mean of each channel over every pixel of `image`, in steps.
+    fn channel_means(image: &RgbaImage) -> [f64; 4] {
+        let mut sums = [0u64; 4];
+        for pixel in image.as_raw().chunks_exact(4) {
+            for (sum, &value) in sums.iter_mut().zip(pixel) {
+                *sum += u64::from(value);
+            }
+        }
+        let pixels = f64::from(image.width()) * f64::from(image.height());
+        sums.map(|sum| sum as f64 / pixels)
     }
 
     fn solid(width: u32, height: u32, colour: [u8; 4]) -> RgbaImage {
@@ -349,6 +422,22 @@ mod tests {
         source
     }
 
+    /// The fast path's average is round half to even of `sum / 4` for every
+    /// sum four bytes can make, all 1021 of `0..=1020`, against the
+    /// definition.
+    #[test]
+    fn the_block_average_rounds_half_to_even_for_every_sum() {
+        let sums = 0..=4 * u16::from(u8::MAX);
+        assert_eq!(sums.len(), 1021);
+        for sum in sums {
+            assert_eq!(
+                block_average(sum),
+                round_half_to_even_quarter(sum),
+                "sum {sum}"
+            );
+        }
+    }
+
     #[test]
     fn downsample_matches_reference_on_noise_of_every_small_shape() {
         // Every width and height from 0 to 9: odd, non-square, the 2×2 and
@@ -420,6 +509,43 @@ mod tests {
                 expected = downsample_box_2x_reference(&expected);
             }
             assert_same_image(&actual, &expected, &format!("level {level}"));
+            levels += 1;
+        }
+        assert_eq!(levels, 13);
+    }
+
+    /// The chain must not change the brightness of a tile with distance
+    /// (#394): at every level of a 4096×4096 chain, each channel's mean stays
+    /// within half a step of the source's. A truncating average loses 0.375
+    /// of a step a level and fails at level 2; rounding half up gains 0.125
+    /// a level and fails at level 4 or 5; rounding half to even does not
+    /// drift.
+    ///
+    /// The source's bytes are uniform over `0..=254`, so its channel means
+    /// are close to a whole step. The 1×1 level is one pixel, a whole step,
+    /// and a source mean half way between two steps would leave it half a
+    /// step off however the chain rounds.
+    #[test]
+    fn every_level_keeps_the_source_mean_within_half_a_step() {
+        let source = noise_with_whole_step_mean(4096, 4096, 394);
+        let source_means = channel_means(&source);
+        let count = MipmapGenerator::full_chain_count(4096, 4096);
+
+        let mut levels = 0;
+        for (level, image) in MipmapStream::new(source, count).enumerate() {
+            let means = channel_means(&image);
+            for c in 0..4 {
+                let drift = means[c] - source_means[c];
+                assert!(
+                    drift.abs() <= 0.5,
+                    "level {level} ({}x{}) channel {c}: mean {:.3} against the source's {:.3}, \
+                     {drift:+.3} of a step",
+                    image.width(),
+                    image.height(),
+                    means[c],
+                    source_means[c],
+                );
+            }
             levels += 1;
         }
         assert_eq!(levels, 13);
