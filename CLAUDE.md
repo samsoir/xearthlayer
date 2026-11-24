@@ -49,6 +49,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1 (DXT1) only (#395): the encoder interfaces keep their `format: DdsFormat` parameter as the extension point; any other format (`DdsFormat::BC3` stays as a named, unsupported value) is rejected with `DdsError::UnsupportedFormat` at `create_encoder`, `DdsEncoder::encode` and every backend entry point, `DdsFormat::is_supported()` being the one statement of what is supported. `texture.format` and `run --dds-format` are retired. What adding a format takes: `docs/dev/dds-implementation.md` "Supported formats"
    - Full mipmap chain generation (13 levels for a 4096×4096 tile, 11,184,952 bytes)
+   - `dds::layout` (#391) owns DDS file geometry: `HEADER_LEN`, `BLOCK_DIM`, `DdsFormat::block_bytes`, `level_len`, `full_chain_levels`, `chain_levels`, `chain_len`, `file_len`, all const. The header, both CPU compressors, the GPU worker, `DdsTextureEncoder::expected_size` (FUSE `st_size`), `EXPECTED_DDS_SIZE`, `LitLayout`, BC1 repair, the Laminar decoder and the placeholder call it; never write the arithmetic out. Not `cache::layout`, which places cache tiers on disk
+   - The magenta placeholder (`fuse/placeholder.rs`, served on a tile timeout or failure) is the header plus one BC1 block repeated for the whole chain, built by `XEarthLayerService::start` through `init_placeholder_cache` (#386); no encoder, and never built on a FUSE path
    - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
@@ -461,6 +463,8 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
 | `xearthlayer/src/tasks/` | Task implementations (CachedTileProbe, DownloadChunks, BuildAndCacheDds, CacheGcBatch) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
+| `xearthlayer/src/dds/layout.rs` | DDS file geometry: every size in a DDS file (#391) |
+| `xearthlayer/src/fuse/placeholder.rs` | Magenta placeholder (one BC1 block repeated) and the DDS read gate |
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
 | `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |

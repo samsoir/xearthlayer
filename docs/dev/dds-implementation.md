@@ -17,6 +17,7 @@ Successfully implemented complete DDS (DirectX Surface) texture encoding with BC
 xearthlayer/src/dds/
 ├── types.rs        - Core types, errors, DDS header structures
 ├── conversion.rs   - RGB565 conversion, color distance, interpolation
+├── layout.rs       - DDS file geometry: header length, block bytes, level, chain and file sizes
 ├── header.rs       - DDS header construction and serialization
 ├── bc1.rs          - BC1/DXT1 compression (8 bytes per block)
 ├── compressor.rs   - ImageCompressor, MipmapCompressor, IspcCompressor, SoftwareCompressor
@@ -25,6 +26,19 @@ xearthlayer/src/dds/
 ├── encoder.rs      - Main DDS encoder API
 └── mod.rs          - Public API exports
 ```
+
+## DDS geometry
+
+`dds::layout` (`dds/layout.rs`, #391) owns every size in a DDS file, as const
+fns: `HEADER_LEN` (128), `BLOCK_DIM` (4), `DdsFormat::block_bytes`, `level_len`
+(one level, `ceil(w/4) * ceil(h/4) * block_bytes`, so 2×2 and 1×1 levels take one
+block each), `full_chain_levels` (`floor(log2(min(w, h))) + 1`: the chain stops at
+the smaller side), `chain_levels` (a requested count clamped to the full chain),
+`chain_len` and `file_len`. The header, both CPU compressors, the GPU worker,
+`DdsTextureEncoder::expected_size` (FUSE `st_size`), `EXPECTED_DDS_SIZE`, the night
+lighting layout (`LitLayout`, `minimal_black_dds`), the BC1 repair pass, the Laminar
+pattern decoder and the magenta placeholder all call it; none writes the arithmetic
+out. It is not `cache::layout`, which places the cache tiers on disk.
 
 ## Supported formats
 
@@ -54,18 +68,22 @@ supported. Any value other than BC1 is rejected with `DdsError::UnsupportedForma
 - at each backend entry point: `IspcCompressor`, `SoftwareCompressor`, and
   `GpuEncoderChannel`, which rejects before the request is sent to the GPU worker.
 
-The format facts (block size of 8 or 16 bytes, FourCC `DXT1` or `DXT5`) stay in
-`DdsHeader`: they describe the format and encode nothing. `EXPECTED_DDS_SIZE`, the
-FUSE read gate (`validate_dds_or_placeholder`), the DDS disk validator and the magenta
-placeholder are BC1-only by construction, which is correct because only BC1 can be
-encoded.
+The format facts stay where they describe the format and encode nothing: the block
+size (8 or 16 bytes) is `DdsFormat::block_bytes` in `dds::layout`, and the FourCC
+(`DXT1` or `DXT5`) is in `DdsHeader`. `EXPECTED_DDS_SIZE`
+(`file_len(4096, 4096, full_chain_levels(4096, 4096), BC1)`), the FUSE read gate
+(`validate_dds_or_placeholder`), the DDS disk validator and the magenta placeholder
+are BC1-only by construction, which is correct because only BC1 can be encoded.
 
 Adding a format requires:
 
 1. A kernel arm in each backend: ISPC, software and GPU.
-2. A format-aware expected size for FUSE `st_size`, the read gate
-   (`validate_dds_or_placeholder`) and the DDS disk validator.
-3. A magenta placeholder in that format.
+2. A format-aware expected size for the read gate (`validate_dds_or_placeholder`)
+   and the DDS disk validator. `dds::layout` and FUSE `st_size`
+   (`DdsTextureEncoder::expected_size`) already take the format.
+3. A magenta placeholder in that format: one solid block of the format repeated
+   for the whole chain (`solid_bc1_full_chain` in `fuse/placeholder.rs` is the
+   BC1 one), no encoder needed.
 4. Adding the format to `DdsFormat::is_supported`.
 5. A user-facing switch: a config key and its validation.
 
