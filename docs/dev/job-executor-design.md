@@ -1235,13 +1235,16 @@ impl Task for BuildAndCacheDdsTask<..> {
         let chunks: ChunkResults = ctx
             .get_output("DownloadChunks", OUTPUT_KEY_CHUNKS)
             .ok_or_else(|| TaskError::missing_input("chunks"))?;
-        let tile_complete = chunks.is_complete();
+        let all_downloaded = chunks.is_complete();
 
         // Both CPU-bound steps run on the blocking pool
-        let image = executor.execute_blocking(move || assemble_chunks(chunks)).await?;
-        let dds = executor.execute_blocking(move || encoder.encode(image)).await?;
+        let assembled = executor.execute_blocking(move || assemble_chunks(chunks)).await?;
+        // Complete: every chunk downloaded and decoded to 256x256 (#180, #388)
+        let tile_complete = all_downloaded && assembled.rejected.is_empty();
+        spawn_chunk_discards(assembled.rejected); // off the chunk disk tier
+        let dds = executor.execute_blocking(move || encoder.encode(assembled.image)).await?;
 
-        // Memory and DDS disk cache writes only for complete tiles (#180)
+        // Memory and DDS disk cache writes only for complete tiles
         if tile_complete {
             spawn_cache_writes(dds.clone());
         }
