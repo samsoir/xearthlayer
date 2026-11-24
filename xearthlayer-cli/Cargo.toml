@@ -19,7 +19,7 @@ path = "src/main.rs"
 [package.metadata.deb]
 name = "xearthlayer"
 maintainer = "Sam de Freyssinet <sam@def.reyssi.net>"
-copyright = "2025, XEarthLayer Contributors"
+copyright = "2025-2026, XEarthLayer Contributors"
 license-file = ["../LICENSE", "0"]
 extended-description = """\
 XEarthLayer delivers satellite/aerial imagery to X-Plane without massive downloads. \

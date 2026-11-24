@@ -3,7 +3,7 @@ Version:        0.6.0
 Release:        1%{?dist}
 Summary:        High-quality satellite imagery for X-Plane, streamed on demand
 
-License:        MIT
+License:        GPL-3.0-or-later
 URL:            https://github.com/samsoir/xearthlayer
 Source0:        %{name}-%{version}.tar.gz
 

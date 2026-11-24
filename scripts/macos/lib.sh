@@ -95,8 +95,8 @@ unwrap_paragraphs() {
 
 # Prints the productbuild distribution for one product's package: arm64
 # only, macOS 12 or later (the casks' `depends_on macos: :monterey`), one
-# hidden choice, no customisation, no scripts. Both packages show the MIT
-# license (LICENSE.txt) for the user to accept. The runtime also gets the
+# hidden choice, no customisation, no scripts. Both packages show the GPL
+# (LICENSE.txt) for the user to accept. The runtime also gets the
 # welcome, readme and conclusion pages from pkg/macos/, which cover macFUSE:
 # the publisher does not mount anything, so it needs none of them.
 render_distribution() {

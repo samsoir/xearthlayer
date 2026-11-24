@@ -37,9 +37,22 @@ use xearthlayer::config::ConfigFile;
 // CLI Argument Definitions
 // ============================================================================
 
+/// `--version` output after the version: the notice GPLv3 asks interactive
+/// programs to show (copyright, license, no warranty). `-V` stays the bare
+/// version line.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "Copyright (C) 2025-2026 XEarthLayer Contributors\n",
+    "License GPL-3.0-or-later <https://www.gnu.org/licenses/gpl-3.0.html>\n",
+    "This is free software: you are free to change and redistribute it.\n",
+    "There is NO WARRANTY, to the extent permitted by law.",
+);
+
 #[derive(Parser)]
 #[command(name = "xearthlayer")]
 #[command(version = xearthlayer::VERSION)]
+#[command(long_version = LONG_VERSION)]
 #[command(about = "Satellite imagery streaming for X-Plane", long_about = None)]
 struct Cli {
     /// Enable debug-level logging for the xearthlayer crate.
@@ -508,5 +521,36 @@ mod tests {
                 "{command} with a region and --all"
             );
         }
+    }
+
+    fn version_output(binary: &str, flag: &str) -> String {
+        let Err(err) = <Cli as clap::Parser>::try_parse_from([binary, flag]) else {
+            panic!("{flag} must stop parsing to print the version");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        err.to_string()
+    }
+
+    #[test]
+    fn long_version_states_the_license_and_the_absence_of_warranty() {
+        let out = version_output("xearthlayer", "--version");
+
+        assert!(
+            out.starts_with(&format!("xearthlayer {}\n", env!("CARGO_PKG_VERSION"))),
+            "{out}"
+        );
+        assert!(out.contains("XEarthLayer Contributors"), "{out}");
+        assert!(out.contains("GPL-3.0-or-later"), "{out}");
+        assert!(out.contains("NO WARRANTY"), "{out}");
+    }
+
+    #[test]
+    fn short_version_is_the_version_alone() {
+        let out = version_output("xearthlayer", "-V");
+
+        assert_eq!(
+            out.trim_end(),
+            format!("xearthlayer {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
