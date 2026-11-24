@@ -456,9 +456,7 @@ xearthlayer/src/
 ├── tasks/
 │   ├── mod.rs              # Module exports
 │   ├── download_chunks.rs  # Parallel chunk downloads
-│   ├── assemble_image.rs   # JPEG decode, canvas assembly
-│   ├── encode_dds.rs       # BC1/BC3 compression
-│   └── cache_write.rs      # Memory cache write
+│   └── build_and_cache_dds.rs  # JPEG decode, canvas assembly, BC1 encode, cache write
 ├── prefetch/
 │   ├── mod.rs              # Module exports
 │   ├── strategy.rs         # Prefetcher trait

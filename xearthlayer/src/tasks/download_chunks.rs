@@ -165,7 +165,7 @@ where
 
                 // Store chunks in task output for next task
                 let mut output = TaskOutput::new();
-                output.set("chunks", chunks);
+                output.set(OUTPUT_KEY_CHUNKS, chunks);
 
                 TaskResult::SuccessWithOutput(output)
             }
@@ -174,13 +174,9 @@ where
     }
 }
 
-/// Output key for chunk results.
-pub const OUTPUT_KEY_CHUNKS: &str = "chunks";
-
-/// Helper function to extract chunks from task output.
-pub fn get_chunks_from_output(output: &TaskOutput) -> Option<&ChunkResults> {
-    output.get::<ChunkResults>(OUTPUT_KEY_CHUNKS)
-}
+/// Output key under which [`DownloadChunksTask`] stores its `ChunkResults`
+/// and [`super::BuildAndCacheDdsTask`] reads them.
+pub(crate) const OUTPUT_KEY_CHUNKS: &str = "chunks";
 
 // ============================================================================
 // Internal implementation - lifted from pipeline/stages/download
@@ -577,11 +573,6 @@ mod tests {
         ctx.add_task_output(crate::tasks::CACHED_TILE_PROBE_TASK.to_string(), probe);
 
         assert!(matches!(task.execute(&mut ctx).await, TaskResult::Success));
-    }
-
-    #[test]
-    fn test_output_key() {
-        assert_eq!(OUTPUT_KEY_CHUNKS, "chunks");
     }
 
     /// A chunk cache with nothing in it that accepts every write.

@@ -457,7 +457,7 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
-| `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
+| `xearthlayer/src/tasks/` | Task implementations (CachedTileProbe, DownloadChunks, BuildAndCacheDds, CacheGcBatch) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |

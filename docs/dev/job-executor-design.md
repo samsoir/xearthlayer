@@ -1135,11 +1135,14 @@ impl Job for DdsGenerateJob {
     }
 
     fn create_tasks(&self) -> Vec<Box<dyn Task>> {
-        vec![
-            Box::new(DownloadChunksTask::new(self.path.clone())),
-            Box::new(AssembleImageTask::new()),
-            Box::new(EncodeDdsTask::new(self.path.clone())),
-        ]
+        let mut tasks: Vec<Box<dyn Task>> = Vec::with_capacity(3);
+        if self.probe_cache {
+            // Prefetch lane only: skip tiles cached since the job was queued
+            tasks.push(Box::new(CachedTileProbeTask::new(..)));
+        }
+        tasks.push(Box::new(DownloadChunksTask::with_config(..)));
+        tasks.push(Box::new(BuildAndCacheDdsTask::new(..)));
+        tasks
     }
 }
 ```
@@ -1187,73 +1190,43 @@ impl Task for DownloadChunksTask {
 }
 ```
 
-### AssembleImageTask
+### BuildAndCacheDdsTask
 
 ```rust
-/// Task to assemble chunks into a full image.
-pub struct AssembleImageTask;
+/// Task to assemble the chunks into an image, encode it as DDS and cache it.
+pub struct BuildAndCacheDdsTask<E, M, D, X> { /* tile, encoder, caches, executor */ }
 
-impl Task for AssembleImageTask {
+impl Task for BuildAndCacheDdsTask<..> {
     fn name(&self) -> &str {
-        "AssembleImage"
+        "BuildAndCacheDds"
     }
 
     fn resource_type(&self) -> ResourceType {
-        ResourceType::CPU  // Image assembly is CPU-bound
+        ResourceType::CPU  // JPEG decode and BC1 encoding are CPU-bound
     }
 
     async fn execute(&self, ctx: &mut TaskContext) -> TaskResult {
-        // Get chunks from previous task
-        let chunks: &Vec<Bytes> = ctx
-            .get_output("DownloadChunks", "chunks")
+        let chunks: ChunkResults = ctx
+            .get_output("DownloadChunks", OUTPUT_KEY_CHUNKS)
             .ok_or_else(|| TaskError::missing_input("chunks"))?;
+        let tile_complete = chunks.is_complete();
 
-        // Assemble into 4096x4096 image
-        let image = assemble_chunks(chunks)?;
+        // Both CPU-bound steps run on the blocking pool
+        let image = executor.execute_blocking(move || assemble_chunks(chunks)).await?;
+        let dds = executor.execute_blocking(move || encoder.encode(image)).await?;
 
-        let mut output = TaskOutput::new();
-        output.set("image", image);
-        TaskResult::SuccessWithOutput(output)
+        // Memory and DDS disk cache writes only for complete tiles (#180)
+        if tile_complete {
+            spawn_cache_writes(dds.clone());
+        }
+        TaskResult::SuccessWithOutput(dds)
     }
 }
 ```
 
-### EncodeDdsTask
-
-```rust
-/// Task to encode image as DDS and cache it.
-pub struct EncodeDdsTask {
-    path: PathBuf,
-}
-
-impl Task for EncodeDdsTask {
-    fn name(&self) -> &str {
-        "EncodeDds"
-    }
-
-    fn resource_type(&self) -> ResourceType {
-        ResourceType::CPU  // BC1 encoding is CPU-bound
-    }
-
-    async fn execute(&self, ctx: &mut TaskContext) -> TaskResult {
-        let image: &DynamicImage = ctx
-            .get_output("AssembleImage", "image")
-            .ok_or_else(|| TaskError::missing_input("image"))?;
-
-        // Encode to DDS
-        let dds_data = encode_bc1_dds(image)?;
-
-        // Store in caches
-        let cache = &ctx.resources().memory_cache;
-        cache.put(&self.path, dds_data.clone()).await;
-
-        let disk_cache = &ctx.resources().disk_cache;
-        disk_cache.put(&self.path, &dds_data).await?;
-
-        TaskResult::Success
-    }
-}
-```
+Assembly, encoding and caching were once three tasks (`AssembleImageTask`,
+`EncodeDdsTask`, `CacheWriteTask`). They were fused into `BuildAndCacheDdsTask`
+and the three were deleted in #383.
 
 ## Execution Flow
 
@@ -1290,9 +1263,8 @@ xearthlayer/src/
 ├── tasks/                      # Task implementations
 │   ├── mod.rs
 │   ├── download_chunks.rs      # DownloadChunksTask
-│   ├── assemble_image.rs       # AssembleImageTask
-│   ├── encode_dds.rs           # EncodeDdsTask
-│   ├── cache_write.rs          # CacheWriteTask
+│   ├── build_and_cache_dds.rs  # BuildAndCacheDdsTask (assemble, encode, cache)
+│   ├── cache_gc_batch.rs       # CacheGcBatchTask
 │   └── cached_tile_probe.rs    # CachedTileProbeTask (prefetch lane admission re-check)
 │
 ├── fuse/fuse3/
@@ -1447,7 +1419,7 @@ before using it for work that must respect admission.
 #[derive(Debug, Clone)]
 pub struct ChunkResults { ... }
 
-// In AssembleImageTask
+// In AssembleImageTask (now BuildAndCacheDdsTask)
 let chunks = ctx.get_output::<ChunkResults>("DownloadChunks", "chunks")?.clone();
 executor.execute_blocking(move || assemble_chunks(chunks)).await
 ```

@@ -17,6 +17,7 @@
 //! Returns the DDS data via `TaskOutput` key "dds_data" (`Vec<u8>`).
 //! Cache write is fire-and-forget (spawned async task).
 
+use super::download_chunks::OUTPUT_KEY_CHUNKS;
 use crate::coord::TileCoord;
 use crate::executor::{
     BlockingExecutor, ChunkResults, DdsDiskCache, MemoryCache, ResourceType, Task, TaskContext,
@@ -156,7 +157,8 @@ where
                 let metrics = ctx.metrics_clone();
 
                 // Step 1: Get chunks from previous task (returns owned clone)
-                let chunks: ChunkResults = match ctx.get_output("DownloadChunks", "chunks") {
+                let chunks: ChunkResults = match ctx.get_output("DownloadChunks", OUTPUT_KEY_CHUNKS)
+                {
                     Some(c) => c,
                     None => {
                         return TaskResult::Failed(TaskError::missing_input("chunks"));
@@ -357,7 +359,7 @@ where
 }
 
 // ============================================================================
-// Internal implementation - lifted from assemble_image.rs
+// Chunk assembly
 // ============================================================================
 
 /// Synchronous chunk assembly (runs in spawn_blocking).

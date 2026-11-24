@@ -55,7 +55,7 @@ use std::pin::Pin;
 pub trait Task: Send + Sync + 'static {
     /// Returns a human-readable name for logging/display.
     ///
-    /// This should be a short, descriptive name like "DownloadChunks" or "EncodeDds".
+    /// This should be a short, descriptive name like "DownloadChunks" or "BuildAndCacheDds".
     fn name(&self) -> &str;
 
     /// Returns the resource type required by this task.
