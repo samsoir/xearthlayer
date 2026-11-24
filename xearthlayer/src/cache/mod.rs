@@ -43,6 +43,7 @@
 mod config;
 pub mod gc_scheduler;
 pub mod integrity;
+pub mod layout;
 pub mod lru_index;
 pub mod providers;
 mod service;

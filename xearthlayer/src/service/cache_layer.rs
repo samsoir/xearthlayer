@@ -170,7 +170,7 @@ impl CacheLayer {
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
 
         // DDS disk goes into a dedicated subdirectory
-        let dds_disk_dir = disk_dir.join(provider_name).join("dds");
+        let dds_disk_dir = crate::cache::layout::dds_dir(&disk_dir, provider_name);
         // Chunks keep the existing provider directory layout
         let chunk_disk_dir = disk_dir.clone();
 
@@ -231,7 +231,7 @@ impl CacheLayer {
         // It reports no metrics: `DiskTier::Lit` has no counters yet.
         let lit_disk_service = match budgets.lit {
             Some(lit_budget) => {
-                let lit_disk_dir = disk_dir.join("night");
+                let lit_disk_dir = crate::cache::layout::lit_dir(&disk_dir);
                 let lit_config = ServiceCacheConfig::disk(
                     lit_budget,
                     lit_disk_dir.clone(),
