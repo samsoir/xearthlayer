@@ -104,19 +104,32 @@ See `docs/configuration.md`.
 ## Technical Details
 
 ### Mipmap Chain Structure
-For 4096×4096 with 5 levels:
+A 4096×4096 tile carries the full chain, 13 levels down to 1×1:
 - Level 0: 4096×4096 (8,388,608 bytes BC1)
 - Level 1: 2048×2048 (2,097,152 bytes BC1)
 - Level 2: 1024×1024 (524,288 bytes BC1)
-- Level 3: 512×512 (131,072 bytes BC1)
-- Level 4: 256×256 (32,768 bytes BC1)
-- **Total**: 11,173,888 bytes + 128 byte header = 11.18 MB
+- Levels 3 to 10: 512×512 down to 4×4 (174,760 bytes together)
+- Levels 11 and 12: 2×2 and 1×1, one 8-byte block each (edge-padded to 4×4 before encoding)
+- **Total**: 11,184,824 bytes + 128 byte header = 11,184,952 bytes (`EXPECTED_DDS_SIZE`)
+
+### Mipmap Downsample
+`MipmapGenerator::downsample_box_2x` (`dds/mipmap.rs`) builds each level from
+the one above with a 2×2 box filter, on raw RGBA bytes (#389): for each output
+row it adds the two source rows byte by byte into a `u16` scratch row, then
+averages adjacent pixel pairs. Per channel the result is `(a + b + c + d) / 4`,
+truncated; an odd last row or column of the source is dropped. The two-pass
+form lets the compiler vectorise the row sum: the 4096×4096 chain takes about
+6 ms on one core, against about 13 ms for the earlier per-pixel loop, with
+byte-identical output. Both encoder backends use it: the CPU path through
+`MipmapStream`, and the GPU worker, where it runs on the single worker thread
+for every tile. The truncation darkens each level slightly; #394 changes it to
+round.
 
 ### Compression Algorithm
 - **Endpoint Selection**: Bounding box method (min/max per channel)
 - **Color Quantization**: RGB565 format (5-6-5 bits)
 - **Index Generation**: Perceptual color distance with green weighting
-- **Mipmap Filtering**: Box filter (2×2 average)
+- **Mipmap Filtering**: Box filter (2×2 average, see [Mipmap Downsample](#mipmap-downsample))
 
 ### File Format Compliance
 - Microsoft DirectDraw Surface specification
