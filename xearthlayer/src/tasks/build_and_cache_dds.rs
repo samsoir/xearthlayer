@@ -17,7 +17,7 @@
 //! Returns the DDS data via `TaskOutput` key "dds_data" (`Vec<u8>`).
 //! Cache write is fire-and-forget (spawned async task).
 
-use super::chunk_image::{self, CHUNK_PIXELS};
+use super::chunk_image::{self, ChunkPixels, CHUNK_PIXELS, CHUNK_ROW_BYTES};
 use super::download_chunks::OUTPUT_KEY_CHUNKS;
 use crate::coord::TileCoord;
 use crate::executor::{
@@ -38,6 +38,8 @@ use tracing::{debug, warn};
 const TILE_SIZE: u32 = 4096;
 const CHUNK_SIZE: u32 = CHUNK_PIXELS;
 const CHUNKS_PER_SIDE: u32 = 16;
+/// RGBA, one byte a channel.
+const BYTES_PER_PIXEL: usize = 4;
 
 /// Magenta color for failed chunks (R=255, G=0, B=255, A=255)
 const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
@@ -458,8 +460,8 @@ where
 struct AssembledTile {
     image: RgbaImage,
     /// Chunks `(row, col)` that were downloaded or read from the chunk cache
-    /// but are not usable images: they failed [`chunk_image::decode`] (did
-    /// not decode, or were not 256x256). Each is painted magenta like a
+    /// but are not usable images: they failed [`chunk_image::decode_into`]
+    /// (did not decode, or were not 256x256). Each is painted magenta like a
     /// failed download. A tile with any is not complete (#388).
     rejected: Vec<(u8, u8)>,
 }
@@ -469,9 +471,11 @@ struct AssembledTile {
 /// Every chunk position gets either its chunk's pixels or a magenta square:
 /// magenta for a chunk that failed to download (absent from `chunks`) and
 /// for one that is not a usable image, which is also listed in
-/// [`AssembledTile::rejected`].
+/// [`AssembledTile::rejected`]. Chunks are decoded one after another into a
+/// single [`ChunkPixels`] and copied onto the canvas a row at a time (#390).
 fn assemble_chunks(chunks: ChunkResults) -> AssembledTile {
     let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+    let mut pixels = ChunkPixels::new();
     let mut rejected = Vec::new();
 
     // Process each chunk position
@@ -482,9 +486,9 @@ fn assemble_chunks(chunks: ChunkResults) -> AssembledTile {
 
             if let Some(data) = chunks.get(row, col) {
                 // Decode and place the chunk
-                match chunk_image::decode(data) {
-                    Ok(chunk_image) => {
-                        place_chunk(&mut canvas, &chunk_image, x_offset, y_offset);
+                match chunk_image::decode_into(data, &mut pixels) {
+                    Ok(()) => {
+                        place_chunk(&mut canvas, &pixels, x_offset, y_offset);
                     }
                     Err(e) => {
                         warn!(
@@ -510,28 +514,47 @@ fn assemble_chunks(chunks: ChunkResults) -> AssembledTile {
     }
 }
 
-/// Places a chunk image onto the canvas at the specified offset.
-///
-/// The chunk is [`CHUNK_SIZE`] square: [`chunk_image::decode`] returns no
-/// other size.
-fn place_chunk(canvas: &mut RgbaImage, chunk: &RgbaImage, x_offset: u32, y_offset: u32) {
-    debug_assert_eq!(chunk.dimensions(), (CHUNK_SIZE, CHUNK_SIZE));
-
-    for y in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            let pixel = chunk.get_pixel(x, y);
-            canvas.put_pixel(x_offset + x, y_offset + y, *pixel);
-        }
+/// Copies a decoded chunk onto the canvas at the specified offset, a row at
+/// a time.
+fn place_chunk(canvas: &mut RgbaImage, chunk: &ChunkPixels, x_offset: u32, y_offset: u32) {
+    for (canvas_row, chunk_row) in chunk_rows_mut(canvas, x_offset, y_offset).zip(chunk.rows()) {
+        canvas_row.copy_from_slice(chunk_row);
     }
 }
 
-/// Fills a chunk region with magenta.
+/// Fills a chunk region with magenta, a row at a time.
 fn fill_magenta(canvas: &mut RgbaImage, x_offset: u32, y_offset: u32) {
-    for y in 0..CHUNK_SIZE {
-        for x in 0..CHUNK_SIZE {
-            canvas.put_pixel(x_offset + x, y_offset + y, MAGENTA);
-        }
+    for canvas_row in chunk_rows_mut(canvas, x_offset, y_offset) {
+        canvas_row.copy_from_slice(&MAGENTA_ROW);
     }
+}
+
+/// One chunk row of [`MAGENTA`].
+const MAGENTA_ROW: [u8; CHUNK_ROW_BYTES] = {
+    let mut row = [0; CHUNK_ROW_BYTES];
+    let mut i = 0;
+    while i < CHUNK_ROW_BYTES {
+        row[i] = MAGENTA.0[i % BYTES_PER_PIXEL];
+        i += 1;
+    }
+    row
+};
+
+/// The [`CHUNK_SIZE`] rows of `canvas` that the chunk whose top left pixel
+/// is at `(x_offset, y_offset)` covers, top to bottom, each
+/// [`CHUNK_ROW_BYTES`] of RGBA.
+fn chunk_rows_mut(
+    canvas: &mut RgbaImage,
+    x_offset: u32,
+    y_offset: u32,
+) -> impl Iterator<Item = &mut [u8]> {
+    let stride = canvas.width() as usize * BYTES_PER_PIXEL;
+    let left = x_offset as usize * BYTES_PER_PIXEL;
+    let top = y_offset as usize;
+    let canvas_bytes: &mut [u8] = canvas;
+    canvas_bytes[top * stride..(top + CHUNK_SIZE as usize) * stride]
+        .chunks_exact_mut(stride)
+        .map(move |row| &mut row[left..left + CHUNK_ROW_BYTES])
 }
 
 #[cfg(test)]
@@ -629,6 +652,132 @@ mod tests {
         assert!(assembled.rejected.is_empty());
         assert!(chunk_is_imagery(&assembled.image, 0, 0));
         assert!(chunk_is_imagery(&assembled.image, 15, 15));
+    }
+
+    // ------------------------------------------------------------------
+    // Byte-identical to the assembly it replaced (#390)
+    // ------------------------------------------------------------------
+
+    /// The assembly before #390, kept as the reference the fast one must
+    /// match byte for byte: every chunk through [`chunk_image::decode`] into
+    /// its own image, then onto the canvas pixel by pixel, magenta likewise.
+    fn reference_assembly(chunks: &ChunkResults) -> AssembledTile {
+        let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+        let mut rejected = Vec::new();
+        for row in 0..CHUNKS_PER_SIDE as u8 {
+            for col in 0..CHUNKS_PER_SIDE as u8 {
+                let (x_offset, y_offset) = (col as u32 * CHUNK_SIZE, row as u32 * CHUNK_SIZE);
+                let chunk = chunks.get(row, col).and_then(|data| {
+                    chunk_image::decode(data)
+                        .map_err(|_| rejected.push((row, col)))
+                        .ok()
+                });
+                for y in 0..CHUNK_SIZE {
+                    for x in 0..CHUNK_SIZE {
+                        let pixel = chunk.as_ref().map_or(MAGENTA, |c| *c.get_pixel(x, y));
+                        canvas.put_pixel(x_offset + x, y_offset + y, pixel);
+                    }
+                }
+            }
+        }
+        AssembledTile {
+            image: canvas,
+            rejected,
+        }
+    }
+
+    /// Asserts that `assemble_chunks` builds exactly the reference's tile.
+    fn assert_assembles_as_the_reference_does(chunks: ChunkResults) {
+        let reference = reference_assembly(&chunks);
+
+        let assembled = assemble_chunks(chunks);
+
+        assert_eq!(assembled.rejected, reference.rejected);
+        let differing = (assembled.image.as_raw().iter())
+            .zip(reference.image.as_raw())
+            .filter(|(got, want)| got != want)
+            .count();
+        assert_eq!(differing, 0, "canvas bytes differing from the reference");
+    }
+
+    #[test]
+    fn assembly_is_byte_identical_to_the_reference() {
+        // Every kind of chunk body at its own position (JPEGs of every mode,
+        // damaged JPEGs, PNGs, wrong sizes, non-images), three failed
+        // downloads, and usable flat JPEGs everywhere else.
+        let corpus = test_chunks::corpus();
+        assert!(corpus.len() + 3 <= 256, "{} bodies", corpus.len());
+        let mut chunks = ChunkResults::new();
+        for (index, (_, body)) in corpus.into_iter().enumerate() {
+            chunks.add_success(index as u8 / 16, index as u8 % 16, body);
+        }
+        for index in 0..256usize {
+            let (row, col) = (index as u8 / 16, index as u8 % 16);
+            if chunks.get(row, col).is_some() {
+                continue;
+            }
+            if [200, 230, 255].contains(&index) {
+                chunks.add_failure(row, col, 3, "network".to_string());
+            } else {
+                chunks.add_success(row, col, jpeg());
+            }
+        }
+
+        assert_assembles_as_the_reference_does(chunks);
+    }
+
+    /// Timing of the assembly before and after #390, on 256 distinct
+    /// textured chunks (4:4:4, from the `image` encoder) and on 256 copies of
+    /// a libjpeg-turbo 4:2:0 chunk. Run with
+    /// `cargo test --release -p xearthlayer assembly_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run in release with --ignored --nocapture"]
+    fn assembly_timing() {
+        use std::hint::black_box;
+
+        fn time(label: &str, mut assemble: impl FnMut() -> AssembledTile) -> f64 {
+            let mut samples: Vec<f64> = (0..15)
+                .map(|_| {
+                    let start = Instant::now();
+                    black_box(assemble());
+                    start.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{label:<44} min {:>7.2} ms   median {:>7.2} ms",
+                samples[0], samples[7]
+            );
+            samples[7]
+        }
+
+        let textured: Vec<Bytes> = (0..256)
+            .map(|seed| {
+                let image = image::DynamicImage::ImageRgb8(test_chunks::textured(seed));
+                test_chunks::jpeg_of(&image, 85)
+            })
+            .collect();
+        let ycc420 = vec![test_chunks::fixture("ycc420_q75"); 256];
+
+        for (label, bodies) in [("textured 4:4:4 q85", textured), ("ycc420_q75", ycc420)] {
+            let bytes: usize = bodies.iter().map(Bytes::len).sum();
+            let mut chunks = ChunkResults::new();
+            for (index, body) in bodies.into_iter().enumerate() {
+                chunks.add_success(index as u8 / 16, index as u8 % 16, body);
+            }
+            println!("{label}: 256 chunks, {bytes} bytes of JPEG");
+            let before = time("  before (decode, put_pixel)", || {
+                reference_assembly(&chunks)
+            });
+            let after = time("  after (zune RGBA, row copies)", || {
+                assemble_chunks(chunks.clone())
+            });
+            println!(
+                "  median saved {:.2} ms ({:.0}%)",
+                before - after,
+                100.0 * (before - after) / before
+            );
+        }
     }
 
     #[test]

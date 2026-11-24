@@ -19,6 +19,12 @@ xearthlayer-package = { path = "../xearthlayer-package" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 reqwest.workspace = true
 image = "0.25"
+# Imagery chunks are decoded straight to RGBA with the JPEG decoder `image`
+# itself uses (#390). Keep these at the versions `image` resolves in
+# Cargo.lock, so they add no crate and the fast path and its `image` fallback
+# decode with the same code: bump them together with `image`.
+zune-jpeg = "0.5.13"
+zune-core = "0.5.1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
