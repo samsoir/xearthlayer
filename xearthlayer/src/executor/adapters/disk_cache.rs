@@ -132,7 +132,9 @@ impl crate::executor::DiskCache for DiskCacheAdapter {
 
 /// A no-op disk cache that never caches anything.
 ///
-/// Useful for testing or when disk caching is disabled.
+/// Every read misses and every write is dropped; it holds no path and
+/// performs no I/O. The executor's chunk cache with disk caching off
+/// (`run --no-cache`, #400), and a test double.
 pub struct NullDiskCache;
 
 impl crate::executor::DiskCache for NullDiskCache {
@@ -162,7 +164,10 @@ impl crate::executor::DiskCache for NullDiskCache {
 
 /// A no-op DDS disk cache that never caches anything.
 ///
-/// Useful for testing or when DDS disk caching is disabled.
+/// Every read and `contains` misses and every write is dropped; it holds no
+/// path and performs no I/O. The executor's DDS disk cache with disk caching
+/// off (`run --no-cache`, #400), including the prefetch lane's cached tile
+/// probe, and a test double.
 pub struct NullDdsDiskCache;
 
 impl crate::executor::DdsDiskCache for NullDdsDiskCache {

@@ -183,7 +183,7 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Disable caching (always generate tiles fresh)
+        /// Do not read or write the disk caches this session (memory cache only)
         #[arg(long)]
         no_cache: bool,
 

@@ -116,6 +116,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         memory_cache_max: cfg.cache.memory_size,
         dds_disk_cache_max: dds_disk_max,
         chunk_disk_cache_max: chunk_disk_max,
+        disk_caching: orchestrator.config().disk_cache_enabled(),
         provider_name: cfg.provider.provider_type.clone(),
         // Same derivation the runtime builder uses, so the group the panel
         // shows is the group the lane enforces.

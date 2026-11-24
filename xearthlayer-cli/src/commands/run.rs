@@ -108,7 +108,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .chunk_max_retries(config.executor.max_retries)
         .prefetch_capacity_share(config.prefetch.capacity_share)
         .network_level(config.network.connections)
-        .cache_enabled(!args.no_cache)
+        .disk_cache_enabled(!args.no_cache)
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
@@ -139,16 +139,14 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         }
         println!();
 
-        // Print cache info
-        if !args.no_cache {
-            println!(
-                "Cache: {} memory, {} disk",
-                format_size(config.cache.memory_size),
-                format_size(config.cache.disk_size)
-            );
-        } else {
-            println!("Cache: Disabled");
-        }
+        println!(
+            "{}",
+            cache_banner(
+                config.cache.memory_size,
+                config.cache.disk_size,
+                args.no_cache
+            )
+        );
     }
 
     // Print prefetch status (details printed later after prefetcher starts)
@@ -335,6 +333,24 @@ fn outcome(received: Option<Signal>, front_end_error: Option<CliError>) -> Resul
     }
 }
 
+/// The banner's cache line. `--no-cache` turns off the disk tiers only (the
+/// memory tier always runs), so the line names what is still on and what is
+/// off rather than claiming caching is disabled (#400).
+fn cache_banner(memory_size: usize, disk_size: usize, no_cache: bool) -> String {
+    if no_cache {
+        format!(
+            "Cache: {} memory, disk caching off (--no-cache)",
+            format_size(memory_size)
+        )
+    } else {
+        format!(
+            "Cache: {} memory, {} disk",
+            format_size(memory_size),
+            format_size(disk_size)
+        )
+    }
+}
+
 /// Resolve the per-chunk HTTP timeout from the `--timeout` flag and config.
 ///
 /// The flag wins when given, otherwise `executor.request_timeout_secs` applies.
@@ -350,6 +366,25 @@ fn resolve_chunk_timeout_secs(flag: Option<u64>, configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_line_names_both_tiers() {
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(
+            cache_banner(2 * gb, 40 * gb, false),
+            "Cache: 2 GB memory, 40 GB disk"
+        );
+    }
+
+    /// #400: `--no-cache` turns off the disk tiers only, and the line says so.
+    #[test]
+    fn the_cache_line_says_disk_caching_is_off() {
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(
+            cache_banner(2 * gb, 40 * gb, true),
+            "Cache: 2 GB memory, disk caching off (--no-cache)"
+        );
+    }
 
     #[test]
     fn chunk_timeout_falls_back_to_the_configured_value() {

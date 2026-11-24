@@ -20,17 +20,17 @@ pub const DEFAULT_GC_INTERVAL_SECS: u64 = 60;
 /// let config = ServiceConfig::builder()
 ///     .texture(TextureConfig::new(DdsFormat::BC1).with_mipmap_count(5))
 ///     .chunk_request_timeout_secs(10)
-///     .cache_enabled(true)
+///     .disk_cache_enabled(true)
 ///     .build();
 ///
-/// assert!(config.cache_enabled());
+/// assert!(config.disk_cache_enabled());
 /// ```
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     /// Texture encoding configuration
     texture: TextureConfig,
-    /// Whether caching is enabled
-    cache_enabled: bool,
+    /// Whether the disk cache tiers run (`run --no-cache` turns them off).
+    disk_cache_enabled: bool,
     /// FUSE mountpoint (optional, only needed for serve command)
     mountpoint: Option<String>,
     /// Cache directory path
@@ -123,9 +123,13 @@ impl ServiceConfig {
         )
     }
 
-    /// Check if caching is enabled.
-    pub fn cache_enabled(&self) -> bool {
-        self.cache_enabled
+    /// Whether the disk cache tiers (DDS, chunk and lit) run this session.
+    ///
+    /// `false` is `run --no-cache`: nothing under `cache.directory` is
+    /// created, read, written or deleted, and the executor gets disk caches
+    /// that always miss. The memory tier always runs.
+    pub fn disk_cache_enabled(&self) -> bool {
+        self.disk_cache_enabled
     }
 
     /// Get the FUSE mountpoint, if configured.
@@ -194,7 +198,7 @@ impl Default for ServiceConfig {
         };
         Self {
             texture: TextureConfig::default(),
-            cache_enabled: true,
+            disk_cache_enabled: true,
             mountpoint: None,
             cache_directory: None,
             cache_memory_size: None,
@@ -224,7 +228,7 @@ impl Default for ServiceConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ServiceConfigBuilder {
     texture: Option<TextureConfig>,
-    cache_enabled: Option<bool>,
+    disk_cache_enabled: Option<bool>,
     mountpoint: Option<String>,
     cache_directory: Option<PathBuf>,
     cache_memory_size: Option<usize>,
@@ -273,9 +277,10 @@ impl ServiceConfigBuilder {
         self
     }
 
-    /// Enable or disable caching.
-    pub fn cache_enabled(mut self, enabled: bool) -> Self {
-        self.cache_enabled = Some(enabled);
+    /// Enable or disable the disk cache tiers (default on). The memory tier
+    /// always runs.
+    pub fn disk_cache_enabled(mut self, enabled: bool) -> Self {
+        self.disk_cache_enabled = Some(enabled);
         self
     }
 
@@ -355,7 +360,7 @@ impl ServiceConfigBuilder {
         };
         ServiceConfig {
             texture: self.texture.unwrap_or_default(),
-            cache_enabled: self.cache_enabled.unwrap_or(true),
+            disk_cache_enabled: self.disk_cache_enabled.unwrap_or(true),
             mountpoint: self.mountpoint,
             cache_directory: self.cache_directory,
             cache_memory_size: self.cache_memory_size,
@@ -403,7 +408,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = ServiceConfig::default();
-        assert!(config.cache_enabled());
+        assert!(config.disk_cache_enabled());
         assert!(config.mountpoint().is_none());
     }
 
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn test_builder_defaults() {
         let config = ServiceConfig::builder().build();
-        assert!(config.cache_enabled());
+        assert!(config.disk_cache_enabled());
         assert!(config.mountpoint().is_none());
     }
 
@@ -469,8 +474,8 @@ mod tests {
 
     #[test]
     fn test_builder_cache_disabled() {
-        let config = ServiceConfig::builder().cache_enabled(false).build();
-        assert!(!config.cache_enabled());
+        let config = ServiceConfig::builder().disk_cache_enabled(false).build();
+        assert!(!config.disk_cache_enabled());
     }
 
     #[test]
@@ -496,14 +501,14 @@ mod tests {
         let config = ServiceConfig::builder()
             .texture(TextureConfig::new(DdsFormat::BC1).with_mipmap_count(5))
             .chunk_request_timeout_secs(45)
-            .cache_enabled(true)
+            .disk_cache_enabled(true)
             .mountpoint("/mnt/test")
             .build();
 
         assert_eq!(config.texture().format(), DdsFormat::BC1);
         assert_eq!(config.texture().mipmap_count(), Some(5));
         assert_eq!(config.chunk_request_timeout_secs(), 45);
-        assert!(config.cache_enabled());
+        assert!(config.disk_cache_enabled());
         assert_eq!(config.mountpoint(), Some("/mnt/test"));
     }
 

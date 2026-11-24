@@ -21,18 +21,20 @@
 //!                         DdsClient
 //! ```
 
-use crate::cache::adapters::{DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge};
+use crate::cache::adapters::MemoryCacheBridge;
 use crate::cache::MemoryCache;
 use crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE;
 use crate::dds::DdsFormat;
 use crate::executor::{
-    AsyncProviderAdapter, DiskCacheAdapter, DownloadConfig, ExecutorCacheAdapter, LaneSizing,
-    NullDdsDiskCache, NullDiskCache, TextureEncoderAdapter, TokioExecutor,
+    AsyncProviderAdapter, DdsDiskCache, DiskCache, DiskCacheAdapter, DownloadConfig,
+    ExecutorCacheAdapter, LaneSizing, NullDdsDiskCache, NullDiskCache, TextureEncoderAdapter,
+    TokioExecutor,
 };
 use crate::jobs::DefaultDdsJobFactory;
 use crate::metrics::MetricsClient;
 use crate::provider::AsyncProviderType;
 use crate::runtime::{RuntimeConfig, XEarthLayerRuntime};
+use crate::service::cache_layer::ExecutorDiskCaches;
 use crate::texture::DdsTextureEncoder;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -363,14 +365,18 @@ impl RuntimeBuilder {
 
     /// Builds the XEarthLayerRuntime using the cache service architecture.
     ///
-    /// This method creates the runtime using `MemoryCacheBridge` and `DiskCacheBridge`
-    /// from the cache layer. The bridges wrap `CacheService` instances that manage
-    /// their own lifecycle, including internal GC daemons.
+    /// This method creates the runtime using the caches of the `CacheLayer`:
+    /// its `MemoryCacheBridge`, and the disk caches it hands the executor.
+    /// With [`ExecutorDiskCaches::Persistent`] those are the DDS and chunk
+    /// tiers' bridges, which wrap `CacheService` instances that manage their
+    /// own lifecycle. With [`ExecutorDiskCaches::Off`] (`run --no-cache`)
+    /// both lanes get `NullDdsDiskCache` and `NullDiskCache`, which always
+    /// miss and drop writes without touching the disk.
     ///
     /// # Arguments
     ///
     /// * `memory_bridge` - Memory cache bridge from `CacheLayer`
-    /// * `disk_bridge` - Disk cache bridge from `CacheLayer` (has internal GC!)
+    /// * `disk_caches` - `CacheLayer::executor_disk_caches()`
     ///
     /// # Panics
     ///
@@ -382,19 +388,43 @@ impl RuntimeBuilder {
     ///
     /// ```ignore
     /// use xearthlayer::service::RuntimeBuilder;
-    /// use xearthlayer::cache::adapters::{MemoryCacheBridge, DiskCacheBridge};
     ///
     /// let runtime = RuntimeBuilder::new(provider_name, format, encoder)
     ///     .with_async_provider(provider)
     ///     .with_runtime_handle(handle)
-    ///     .build_with_cache_service(memory_bridge, dds_disk_bridge, disk_bridge);
+    ///     .build_with_cache_service(
+    ///         cache_layer.memory_bridge(),
+    ///         cache_layer.executor_disk_caches(),
+    ///     );
     /// ```
     pub fn build_with_cache_service(
         self,
         memory_bridge: Arc<MemoryCacheBridge>,
-        dds_disk_bridge: Arc<DdsDiskCacheBridge>,
-        disk_bridge: Arc<DiskCacheBridge>,
+        disk_caches: ExecutorDiskCaches,
     ) -> XEarthLayerRuntime {
+        match disk_caches {
+            ExecutorDiskCaches::Persistent { dds, chunks } => {
+                self.build_with_disk_caches(memory_bridge, dds, chunks)
+            }
+            ExecutorDiskCaches::Off => self.build_with_disk_caches(
+                memory_bridge,
+                Arc::new(NullDdsDiskCache),
+                Arc::new(NullDiskCache),
+            ),
+        }
+    }
+
+    /// Builds the runtime on the memory bridge and the given disk caches.
+    fn build_with_disk_caches<DD, D>(
+        self,
+        memory_bridge: Arc<MemoryCacheBridge>,
+        dds_disk_bridge: Arc<DD>,
+        disk_bridge: Arc<D>,
+    ) -> XEarthLayerRuntime
+    where
+        DD: DdsDiskCache + 'static,
+        D: DiskCache + 'static,
+    {
         let async_provider = self
             .async_provider
             .expect("RuntimeBuilder: async_provider is required");
@@ -435,22 +465,25 @@ impl RuntimeBuilder {
     }
 
     /// Creates a factory with bridge adapters from the cache service.
-    #[allow(clippy::too_many_arguments)]
-    fn create_factory_with_bridges(
+    fn create_factory_with_bridges<DD, D>(
         async_provider: Arc<AsyncProviderType>,
         encoder: Arc<DdsTextureEncoder>,
         memory_bridge: Arc<MemoryCacheBridge>,
-        dds_disk_bridge: Arc<DdsDiskCacheBridge>,
-        disk_bridge: Arc<DiskCacheBridge>,
+        dds_disk_bridge: Arc<DD>,
+        disk_bridge: Arc<D>,
         download_config: DownloadConfig,
     ) -> DefaultDdsJobFactory<
         ProviderAdapter,
         EncoderAdapter,
         MemoryCacheBridge,
-        DdsDiskCacheBridge,
-        DiskCacheBridge,
+        DD,
+        D,
         TokioExecutor,
-    > {
+    >
+    where
+        DD: DdsDiskCache,
+        D: DiskCache,
+    {
         let provider_adapter = Arc::new(AsyncProviderAdapter::from_arc(async_provider));
         let encoder_adapter = Arc::new(TextureEncoderAdapter::new(encoder));
         let executor = Arc::new(TokioExecutor::new());
@@ -660,6 +693,36 @@ mod tests {
 
         assert!(runtime.is_running());
         runtime.shutdown().await;
+    }
+
+    /// #400: with disk caching off the cache layer hands the builder
+    /// `ExecutorDiskCaches::Off`, and the runtime starts on null disk caches.
+    #[tokio::test]
+    async fn builds_a_runtime_with_disk_caching_off() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let config = crate::service::ServiceConfig::builder()
+            .cache_directory(cache_dir.clone())
+            .cache_memory_size(1_000_000)
+            .disk_cache_enabled(false)
+            .build();
+        let metrics = crate::metrics::MetricsSystem::new(&tokio::runtime::Handle::current());
+        let cache_layer = crate::service::CacheLayer::new(&config, "bing", metrics.client())
+            .await
+            .unwrap();
+
+        let runtime = RuntimeBuilder::new("bing", DdsFormat::BC1, create_test_encoder())
+            .with_async_provider(create_test_provider())
+            .with_runtime_handle(tokio::runtime::Handle::current())
+            .build_with_cache_service(
+                cache_layer.memory_bridge(),
+                cache_layer.executor_disk_caches(),
+            );
+
+        assert!(runtime.is_running());
+        runtime.shutdown().await;
+        cache_layer.shutdown().await;
+        assert!(!cache_dir.exists());
     }
 
     #[tokio::test]

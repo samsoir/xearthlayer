@@ -14,6 +14,7 @@
 //! │  │                                                         │      │
 //! │  │  memory_service ──────► MemoryCacheBridge ──────┐      │      │
 //! │  │                                                  │      │      │
+//! │  │  disk (None with `run --no-cache`):              │      │      │
 //! │  │  dds_disk_service ────► DdsDiskCacheBridge ─────┼──► Executor │
 //! │  │       │                                          │      │      │
 //! │  │       └──► GC daemon (DDS budget)               │      │      │
@@ -28,6 +29,13 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! With disk caching off (`ServiceConfig::disk_cache_enabled` false, which
+//! is `run --no-cache`) only the memory tier runs: no disk tier starts and
+//! nothing under `cache.directory` is created, read, written or deleted.
+//! [`CacheLayer::executor_disk_caches`] then answers
+//! [`ExecutorDiskCaches::Off`], and the executor gets disk caches that
+//! always miss.
+//!
 //! # Example
 //!
 //! ```ignore
@@ -36,10 +44,9 @@
 //!
 //! let cache_layer = CacheLayer::new(&config, "bing", metrics).await?;
 //!
-//! // Get bridges for executor integration
+//! // Get the caches for executor integration
 //! let memory_bridge = cache_layer.memory_bridge();
-//! let dds_disk_bridge = cache_layer.dds_disk_bridge();
-//! let disk_bridge = cache_layer.disk_bridge();
+//! let disk_caches = cache_layer.executor_disk_caches();
 //!
 //! // Later: graceful shutdown
 //! cache_layer.shutdown().await;
@@ -96,24 +103,26 @@ pub fn disk_budgets(disk_size: u64, dds_ratio: f64, night_enabled: bool) -> Disk
     }
 }
 
-/// Cache layer encapsulating the three-tier cache hierarchy.
+/// The disk caches the executor is given: the layer's tiers, or none.
 ///
-/// This struct owns all cache services and their bridge adapters,
-/// providing a unified interface for cache management within the service.
-///
-/// The three tiers are:
-/// - **Memory** (moka LRU): Fastest, serves active FUSE reads
-/// - **DDS Disk** (LRU + GC): Persistent DDS tiles, avoids re-encoding
-/// - **Chunk Disk** (LRU + GC): Raw imagery chunks, requires assembly + encoding
-///
-/// With night lighting enabled there is also a **Lit Disk** tier (5% of the
-/// disk budget) holding generated lit texture payloads.
-pub struct CacheLayer {
-    /// `cache.directory`: the root the disk tiers live under.
-    disk_dir: PathBuf,
+/// `RuntimeBuilder::build_with_cache_service` maps [`Off`](Self::Off) to
+/// `NullDdsDiskCache` and `NullDiskCache`, which always miss and drop
+/// writes, so demand, prefetch and the prefetch lane's cached tile probe
+/// all see "not cached".
+pub enum ExecutorDiskCaches {
+    /// Disk caching is on: the DDS and chunk tiers' bridges.
+    Persistent {
+        dds: Arc<DdsDiskCacheBridge>,
+        chunks: Arc<DiskCacheBridge>,
+    },
+    /// Disk caching is off (`run --no-cache`).
+    Off,
+}
 
-    /// Memory cache service (owns LRU eviction).
-    memory_service: CacheService,
+/// The disk tiers, all started together or not at all.
+struct DiskTiers {
+    /// `cache.directory`: the root the disk tiers live under.
+    cache_dir: PathBuf,
 
     /// DDS disk cache service (encoded DDS tiles on disk).
     dds_disk_service: CacheService,
@@ -125,9 +134,6 @@ pub struct CacheLayer {
     /// lighting is off.
     lit_disk_service: Option<CacheService>,
 
-    /// Memory cache bridge (implements executor::MemoryCache).
-    memory_bridge: Arc<MemoryCacheBridge>,
-
     /// DDS disk cache bridge (implements executor::DdsDiskCache).
     dds_disk_bridge: Arc<DdsDiskCacheBridge>,
 
@@ -135,37 +141,13 @@ pub struct CacheLayer {
     disk_bridge: Arc<DiskCacheBridge>,
 }
 
-impl CacheLayer {
-    /// Create a new cache layer with the given configuration.
-    ///
-    /// This method:
-    /// 1. Creates memory cache service
-    /// 2. Computes disk budgets: night lighting's 5% first (only when
-    ///    enabled), then DDS/chunk from `dds_disk_ratio` of the rest
-    /// 3. Creates DDS disk cache service at `{disk_dir}/{provider}/dds/`
-    /// 4. Creates chunk disk cache service at `{disk_dir}/{provider}/chunks/`
-    /// 5. When night lighting is enabled, creates the lit disk cache
-    ///    service at `{disk_dir}/night/`
-    /// 6. Creates bridge adapters for executor integration
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Service configuration with cache settings
-    /// * `provider_name` - Provider name for disk cache subdirectory
-    /// * `metrics` - Metrics client for cache statistics
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any cache service fails to start.
-    pub async fn new(
+impl DiskTiers {
+    /// Start the DDS, chunk and (with night lighting) lit disk tiers.
+    async fn start(
         config: &ServiceConfig,
         provider_name: &str,
         metrics: MetricsClient,
     ) -> Result<Self, ServiceError> {
-        // Get cache sizes with defaults
-        let memory_size = config
-            .cache_memory_size()
-            .unwrap_or(DEFAULT_MEMORY_CACHE_SIZE) as u64;
         let disk_size = config.cache_disk_size().unwrap_or(DEFAULT_DISK_CACHE_SIZE) as u64;
         let dds_ratio = config
             .cache_dds_disk_ratio()
@@ -177,7 +159,7 @@ impl CacheLayer {
         let chunk_disk_budget = budgets.chunk;
 
         // Get cache directory with default
-        let disk_dir = config
+        let cache_dir = config
             .cache_directory()
             .cloned()
             .unwrap_or_else(crate::paths::tile_cache_dir);
@@ -187,22 +169,10 @@ impl CacheLayer {
         // Both ortho tiers live under the provider (#398): chunk keys carry no
         // provider, so a shared chunk tier would build one provider's tiles
         // from another's imagery.
-        let dds_disk_dir = crate::cache::layout::dds_dir(&disk_dir, provider_name);
-        let chunk_disk_dir = crate::cache::layout::chunk_dir(&disk_dir, provider_name);
+        let dds_disk_dir = crate::cache::layout::dds_dir(&cache_dir, provider_name);
+        let chunk_disk_dir = crate::cache::layout::chunk_dir(&cache_dir, provider_name);
 
-        // 1. Start memory cache service (with metrics for self-reporting size)
-        let memory_config =
-            ServiceCacheConfig::memory(memory_size, None).with_metrics(metrics.clone());
-        let memory_service = CacheService::start(memory_config)
-            .await
-            .map_err(|e| ServiceError::CacheError(format!("Memory cache start failed: {}", e)))?;
-
-        info!(
-            max_size_bytes = memory_size,
-            "Memory cache service started in CacheLayer"
-        );
-
-        // 2. Start DDS disk cache service
+        // DDS disk cache service
         let dds_disk_config = ServiceCacheConfig::disk(
             dds_disk_budget,
             dds_disk_dir.clone(),
@@ -222,7 +192,7 @@ impl CacheLayer {
             "DDS disk cache service started (ratio={dds_ratio})"
         );
 
-        // 3. Start chunk disk cache service with metrics
+        // Chunk disk cache service with metrics
         let chunk_disk_config = ServiceCacheConfig::disk(
             chunk_disk_budget,
             chunk_disk_dir.clone(),
@@ -243,11 +213,11 @@ impl CacheLayer {
             "Chunk disk cache service started in CacheLayer"
         );
 
-        // 4. Start the lit disk cache service, only with night lighting on.
+        // The lit disk cache service, only with night lighting on.
         // It reports no metrics: `DiskTier::Lit` has no counters yet.
         let lit_disk_service = match budgets.lit {
             Some(lit_budget) => {
-                let lit_disk_dir = crate::cache::layout::lit_dir(&disk_dir);
+                let lit_disk_dir = crate::cache::layout::lit_dir(&cache_dir);
                 let lit_config = ServiceCacheConfig::disk(
                     lit_budget,
                     lit_disk_dir.clone(),
@@ -270,26 +240,142 @@ impl CacheLayer {
             None => None,
         };
 
-        // 5. Create bridge adapters
-        let memory_bridge = Arc::new(MemoryCacheBridge::new(memory_service.cache()));
         let dds_disk_bridge = Arc::new(DdsDiskCacheBridge::new(dds_disk_service.cache()));
         let disk_bridge = Arc::new(DiskCacheBridge::with_metrics(
             chunk_disk_service.cache(),
             metrics,
         ));
 
-        info!("CacheLayer initialized with three-tier cache bridges");
-
         Ok(Self {
-            disk_dir,
-            memory_service,
+            cache_dir,
             dds_disk_service,
             chunk_disk_service,
             lit_disk_service,
-            memory_bridge,
             dds_disk_bridge,
             disk_bridge,
         })
+    }
+
+    async fn shutdown(self) {
+        if let Some(lit) = self.lit_disk_service {
+            lit.shutdown().await;
+            info!("Lit disk cache service shut down");
+        }
+
+        self.chunk_disk_service.shutdown().await;
+        info!("Chunk disk cache service shut down");
+
+        self.dds_disk_service.shutdown().await;
+        info!("DDS disk cache service shut down");
+    }
+}
+
+/// Cache layer encapsulating the three-tier cache hierarchy.
+///
+/// This struct owns all cache services and their bridge adapters,
+/// providing a unified interface for cache management within the service.
+///
+/// The three tiers are:
+/// - **Memory** (moka LRU): Fastest, serves active FUSE reads
+/// - **DDS Disk** (LRU + GC): Persistent DDS tiles, avoids re-encoding
+/// - **Chunk Disk** (LRU + GC): Raw imagery chunks, requires assembly + encoding
+///
+/// With night lighting enabled there is also a **Lit Disk** tier (5% of the
+/// disk budget) holding generated lit texture payloads.
+///
+/// With disk caching off (`run --no-cache`) only the memory tier exists and
+/// every disk accessor answers `None`.
+pub struct CacheLayer {
+    /// Memory cache service (owns LRU eviction).
+    memory_service: CacheService,
+
+    /// Memory cache bridge (implements executor::MemoryCache).
+    memory_bridge: Arc<MemoryCacheBridge>,
+
+    /// The disk tiers; `None` when disk caching is off.
+    disk: Option<DiskTiers>,
+}
+
+impl CacheLayer {
+    /// Create a new cache layer with the given configuration.
+    ///
+    /// This method:
+    /// 1. Creates memory cache service
+    /// 2. When disk caching is on (`ServiceConfig::disk_cache_enabled`):
+    ///    - computes disk budgets: night lighting's 5% first (only when
+    ///      enabled), then DDS/chunk from `dds_disk_ratio` of the rest
+    ///    - creates DDS disk cache service at `{disk_dir}/{provider}/dds/`
+    ///    - creates chunk disk cache service at `{disk_dir}/{provider}/chunks/`
+    ///    - when night lighting is enabled, creates the lit disk cache
+    ///      service at `{disk_dir}/night/`
+    /// 3. Creates bridge adapters for executor integration
+    ///
+    /// With disk caching off, step 2 is skipped entirely: nothing under
+    /// `cache.directory` is created or read.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Service configuration with cache settings
+    /// * `provider_name` - Provider name for disk cache subdirectory
+    /// * `metrics` - Metrics client for cache statistics
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any cache service fails to start.
+    pub async fn new(
+        config: &ServiceConfig,
+        provider_name: &str,
+        metrics: MetricsClient,
+    ) -> Result<Self, ServiceError> {
+        let memory_size = config
+            .cache_memory_size()
+            .unwrap_or(DEFAULT_MEMORY_CACHE_SIZE) as u64;
+
+        // Memory cache service (with metrics for self-reporting size)
+        let memory_config =
+            ServiceCacheConfig::memory(memory_size, None).with_metrics(metrics.clone());
+        let memory_service = CacheService::start(memory_config)
+            .await
+            .map_err(|e| ServiceError::CacheError(format!("Memory cache start failed: {}", e)))?;
+
+        info!(
+            max_size_bytes = memory_size,
+            "Memory cache service started in CacheLayer"
+        );
+
+        let disk = if config.disk_cache_enabled() {
+            Some(DiskTiers::start(config, provider_name, metrics).await?)
+        } else {
+            info!("Disk caching off for this session (--no-cache): memory cache only");
+            None
+        };
+
+        let memory_bridge = Arc::new(MemoryCacheBridge::new(memory_service.cache()));
+
+        info!(disk_caching = disk.is_some(), "CacheLayer initialized");
+
+        Ok(Self {
+            memory_service,
+            memory_bridge,
+            disk,
+        })
+    }
+
+    /// Whether the disk tiers run this session (`false` with `--no-cache`).
+    pub fn disk_caching(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// The disk caches to hand the executor: the DDS and chunk tiers, or
+    /// [`ExecutorDiskCaches::Off`] when disk caching is off.
+    pub fn executor_disk_caches(&self) -> ExecutorDiskCaches {
+        match &self.disk {
+            Some(disk) => ExecutorDiskCaches::Persistent {
+                dds: Arc::clone(&disk.dds_disk_bridge),
+                chunks: Arc::clone(&disk.disk_bridge),
+            },
+            None => ExecutorDiskCaches::Off,
+        }
     }
 
     /// Get the memory cache bridge for executor integration.
@@ -300,20 +386,20 @@ impl CacheLayer {
         Arc::clone(&self.memory_bridge)
     }
 
-    /// Get the DDS disk cache bridge for executor integration.
+    /// Get the DDS disk cache bridge.
     ///
-    /// This bridge implements `executor::DdsDiskCache` and can be passed
-    /// to the executor daemon for the read path and to the build task for writes.
-    pub fn dds_disk_bridge(&self) -> Arc<DdsDiskCacheBridge> {
-        Arc::clone(&self.dds_disk_bridge)
+    /// This bridge implements `executor::DdsDiskCache` and
+    /// `DdsDiskCacheChecker`. `None` when disk caching is off.
+    pub fn dds_disk_bridge(&self) -> Option<Arc<DdsDiskCacheBridge>> {
+        self.disk.as_ref().map(|d| Arc::clone(&d.dds_disk_bridge))
     }
 
-    /// Get the chunk disk cache bridge for executor integration.
+    /// Get the chunk disk cache bridge.
     ///
-    /// This bridge implements `executor::DiskCache` and can be passed
-    /// to the job factory for chunk download caching.
-    pub fn disk_bridge(&self) -> Arc<DiskCacheBridge> {
-        Arc::clone(&self.disk_bridge)
+    /// This bridge implements `executor::DiskCache`. `None` when disk
+    /// caching is off.
+    pub fn disk_bridge(&self) -> Option<Arc<DiskCacheBridge>> {
+        self.disk.as_ref().map(|d| Arc::clone(&d.disk_bridge))
     }
 
     /// Get the raw memory cache for direct access.
@@ -324,14 +410,16 @@ impl CacheLayer {
         self.memory_service.cache()
     }
 
-    /// Get the raw chunk disk cache for direct access.
-    pub fn raw_disk_cache(&self) -> Arc<dyn Cache> {
-        self.chunk_disk_service.cache()
+    /// Get the raw chunk disk cache for direct access; `None` when disk
+    /// caching is off.
+    pub fn raw_disk_cache(&self) -> Option<Arc<dyn Cache>> {
+        self.disk.as_ref().map(|d| d.chunk_disk_service.cache())
     }
 
-    /// Get the raw DDS disk cache for direct access.
-    pub fn raw_dds_disk_cache(&self) -> Arc<dyn Cache> {
-        self.dds_disk_service.cache()
+    /// Get the raw DDS disk cache for direct access; `None` when disk
+    /// caching is off.
+    pub fn raw_dds_disk_cache(&self) -> Option<Arc<dyn Cache>> {
+        self.disk.as_ref().map(|d| d.dds_disk_service.cache())
     }
 
     /// Get the chunk disk cache provider for GC scheduler integration.
@@ -341,32 +429,40 @@ impl CacheLayer {
     /// - GC configuration (needs_gc, gc_target_size)
     /// - Cache directory path
     ///
-    /// Returns `None` if the disk service is not a disk cache (shouldn't happen).
+    /// `None` when disk caching is off.
     pub fn disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
-        self.chunk_disk_service.disk_provider()
+        self.disk
+            .as_ref()
+            .and_then(|d| d.chunk_disk_service.disk_provider())
     }
 
     /// Get the DDS disk cache provider for GC scheduler integration.
     ///
-    /// Returns the underlying `DiskCacheProvider` for the DDS tier.
+    /// `None` when disk caching is off.
     pub fn dds_disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
-        self.dds_disk_service.disk_provider()
+        self.disk
+            .as_ref()
+            .and_then(|d| d.dds_disk_service.disk_provider())
     }
 
     /// Get the lit disk cache provider for GC scheduler integration.
     ///
-    /// `None` when night lighting is off.
+    /// `None` when disk caching or night lighting is off.
     pub fn lit_disk_provider(&self) -> Option<Arc<crate::cache::DiskCacheProvider>> {
-        self.lit_disk_service
+        self.disk
             .as_ref()
+            .and_then(|d| d.lit_disk_service.as_ref())
             .and_then(|s| s.disk_provider())
     }
 
     /// Get the raw lit disk cache for direct access.
     ///
-    /// `None` when night lighting is off.
+    /// `None` when disk caching or night lighting is off.
     pub fn lit_disk_cache(&self) -> Option<Arc<dyn Cache>> {
-        self.lit_disk_service.as_ref().map(|s| s.cache())
+        self.disk
+            .as_ref()
+            .and_then(|d| d.lit_disk_service.as_ref())
+            .map(|s| s.cache())
     }
 
     /// Delete, on a blocking thread, the region directories the chunk tier
@@ -375,10 +471,12 @@ impl CacheLayer {
     ///
     /// Returns at once; the outcome is logged (removals at info, failures
     /// as warnings) and also returned through the handle, which callers may
-    /// drop.
-    pub fn spawn_legacy_chunk_cleanup(&self) -> tokio::task::JoinHandle<LegacyChunkCleanup> {
-        let cache_dir = self.disk_dir.clone();
-        tokio::task::spawn_blocking(move || {
+    /// drop. `None`, and nothing touched, when disk caching is off.
+    pub fn spawn_legacy_chunk_cleanup(
+        &self,
+    ) -> Option<tokio::task::JoinHandle<LegacyChunkCleanup>> {
+        let cache_dir = self.disk.as_ref()?.cache_dir.clone();
+        Some(tokio::task::spawn_blocking(move || {
             let outcome = remove_legacy_chunk_regions(&cache_dir);
             if outcome.removed > 0 {
                 info!(
@@ -396,7 +494,7 @@ impl CacheLayer {
                 );
             }
             outcome
-        })
+        }))
     }
 
     /// Scan and report the initial disk cache sizes.
@@ -405,11 +503,15 @@ impl CacheLayer {
     /// Call this during service initialization when the UI can display
     /// progress feedback.
     ///
-    /// Returns the combined scanned size in bytes.
+    /// Returns the combined scanned size in bytes; 0, without touching the
+    /// disk, when disk caching is off.
     pub async fn scan_disk_cache_size(&self) -> u64 {
+        let Some(disk) = &self.disk else {
+            return 0;
+        };
         let mut total = 0u64;
 
-        match self.dds_disk_service.scan_initial_size().await {
+        match disk.dds_disk_service.scan_initial_size().await {
             Ok(size) => {
                 info!(
                     initial_size_bytes = size,
@@ -422,7 +524,7 @@ impl CacheLayer {
             }
         }
 
-        match self.chunk_disk_service.scan_initial_size().await {
+        match disk.chunk_disk_service.scan_initial_size().await {
             Ok(size) => {
                 info!(
                     initial_size_bytes = size,
@@ -446,16 +548,9 @@ impl CacheLayer {
         info!("Shutting down CacheLayer");
 
         // Shutdown in reverse order
-        if let Some(lit) = self.lit_disk_service {
-            lit.shutdown().await;
-            info!("Lit disk cache service shut down");
+        if let Some(disk) = self.disk {
+            disk.shutdown().await;
         }
-
-        self.chunk_disk_service.shutdown().await;
-        info!("Chunk disk cache service shut down");
-
-        self.dds_disk_service.shutdown().await;
-        info!("DDS disk cache service shut down");
 
         self.memory_service.shutdown().await;
         info!("Memory cache service shut down");
@@ -577,8 +672,8 @@ mod tests {
             .await
             .unwrap();
 
-        let bing_chunks = bing.disk_bridge();
-        let go2_chunks = go2.disk_bridge();
+        let bing_chunks = bing.disk_bridge().unwrap();
+        let go2_chunks = go2.disk_bridge().unwrap();
         bing_chunks
             .put(100, 200, 15, 3, 4, Bytes::from_static(b"bing"))
             .await
@@ -617,18 +712,197 @@ mod tests {
             .unwrap();
         cache_layer
             .disk_bridge()
+            .unwrap()
             .put(100, 200, 15, 0, 0, Bytes::from_static(b"kept"))
             .await
             .unwrap();
 
-        let outcome = cache_layer.spawn_legacy_chunk_cleanup().await.unwrap();
+        let outcome = cache_layer
+            .spawn_legacy_chunk_cleanup()
+            .unwrap()
+            .await
+            .unwrap();
 
         assert_eq!(outcome.removed, 1);
         assert_eq!(outcome.bytes_freed, 64);
         assert!(!legacy.exists());
         assert_eq!(
-            cache_layer.disk_bridge().get(100, 200, 15, 0, 0).await,
+            cache_layer
+                .disk_bridge()
+                .unwrap()
+                .get(100, 200, 15, 0, 0)
+                .await,
             Some(Bytes::from_static(b"kept"))
+        );
+
+        cache_layer.shutdown().await;
+    }
+
+    fn disk_off_config(cache_dir: std::path::PathBuf) -> ServiceConfig {
+        ServiceConfig::builder()
+            .cache_directory(cache_dir)
+            .cache_memory_size(1_000_000)
+            .cache_disk_size(10_000_000)
+            .cache_dds_disk_ratio(0.6)
+            .disk_gc_interval(3600)
+            .night_enabled(true)
+            .disk_cache_enabled(false)
+            .build()
+    }
+
+    /// #400: with disk caching off (`run --no-cache`) no disk tier starts,
+    /// nothing is created under `cache.directory`, and the executor is
+    /// handed null disk caches. The memory tier works as usual.
+    #[tokio::test]
+    async fn disk_off_starts_no_disk_tier_and_creates_nothing() {
+        let temp_dir = tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let cache_layer = CacheLayer::new(
+            &disk_off_config(cache_dir.clone()),
+            "Bing Maps",
+            create_test_metrics(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!cache_layer.disk_caching());
+        assert!(matches!(
+            cache_layer.executor_disk_caches(),
+            ExecutorDiskCaches::Off
+        ));
+        assert!(cache_layer.dds_disk_bridge().is_none());
+        assert!(cache_layer.disk_bridge().is_none());
+        assert!(cache_layer.disk_provider().is_none());
+        assert!(cache_layer.dds_disk_provider().is_none());
+        assert!(cache_layer.lit_disk_provider().is_none());
+        assert!(cache_layer.lit_disk_cache().is_none());
+        assert_eq!(cache_layer.scan_disk_cache_size().await, 0);
+
+        let memory = cache_layer.memory_bridge();
+        memory.put(100, 200, 15, vec![1, 2, 3].into()).await;
+        assert_eq!(
+            memory.get(100, 200, 15).await,
+            Some(Bytes::from(vec![1, 2, 3]))
+        );
+
+        assert!(
+            !cache_dir.exists(),
+            "nothing may be created under cache.directory"
+        );
+        cache_layer.shutdown().await;
+    }
+
+    /// #400: the legacy cleanup is a disk operation too, so it does not run
+    /// with disk caching off.
+    #[tokio::test]
+    async fn disk_off_runs_no_legacy_cleanup() {
+        let temp_dir = tempdir().unwrap();
+        let legacy = temp_dir.path().join("+37-123");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let cache_layer = CacheLayer::new(
+            &disk_off_config(temp_dir.path().to_path_buf()),
+            "Bing Maps",
+            create_test_metrics(),
+        )
+        .await
+        .unwrap();
+
+        assert!(cache_layer.spawn_legacy_chunk_cleanup().is_none());
+        assert!(legacy.exists());
+        cache_layer.shutdown().await;
+    }
+
+    /// #400: a tile generated with disk caching off reaches memory and no
+    /// disk tier. The build task gets what `RuntimeBuilder` gives the
+    /// executor for [`ExecutorDiskCaches::Off`]: the layer's memory bridge
+    /// and `NullDdsDiskCache`.
+    #[tokio::test]
+    async fn disk_off_tile_is_cached_in_memory_only() {
+        use crate::coord::TileCoord;
+        use crate::executor::{
+            BlockingExecutor, ChunkResults, ExecutorError, JobId, NullDdsDiskCache, Task,
+            TaskContext, TaskOutput, TextureEncodeError, TextureEncoderAsync,
+        };
+        use crate::tasks::BuildAndCacheDdsTask;
+        use std::future::Future;
+        use std::pin::Pin;
+        use tokio_util::sync::CancellationToken;
+
+        struct Encoder;
+        impl TextureEncoderAsync for Encoder {
+            fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+                let mut dds = vec![0u8; EXPECTED_DDS_SIZE];
+                dds[0..4].copy_from_slice(b"DDS ");
+                Ok(dds)
+            }
+            fn expected_size(&self, _w: u32, _h: u32) -> usize {
+                EXPECTED_DDS_SIZE
+            }
+        }
+        struct Inline;
+        impl BlockingExecutor for Inline {
+            fn execute_blocking<F, R>(
+                &self,
+                f: F,
+            ) -> Pin<Box<dyn Future<Output = Result<R, ExecutorError>> + Send>>
+            where
+                F: FnOnce() -> R + Send + 'static,
+                R: Send + 'static,
+            {
+                Box::pin(async move { Ok(f()) })
+            }
+        }
+
+        let temp_dir = tempdir().unwrap();
+        let cache_layer = CacheLayer::new(
+            &disk_off_config(temp_dir.path().to_path_buf()),
+            "Bing Maps",
+            create_test_metrics(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            cache_layer.executor_disk_caches(),
+            ExecutorDiskCaches::Off
+        ));
+
+        let tile = TileCoord {
+            row: 100,
+            col: 200,
+            zoom: 15,
+        };
+        let task = BuildAndCacheDdsTask::new(
+            tile,
+            Arc::new(Encoder),
+            cache_layer.memory_bridge(),
+            Arc::new(NullDdsDiskCache),
+            Arc::new(Inline),
+        );
+        let mut chunks = ChunkResults::new();
+        for row in 0..16u8 {
+            for col in 0..16u8 {
+                chunks.add_success(row, col, Bytes::new());
+            }
+        }
+        let mut ctx = TaskContext::new(JobId::new("no-cache"), CancellationToken::new());
+        let mut output = TaskOutput::new();
+        output.set("chunks", chunks);
+        ctx.add_task_output("DownloadChunks".to_string(), output);
+        task.execute(&mut ctx).await;
+
+        let memory = cache_layer.memory_bridge();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while memory.get(100, 200, 15).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the tile never reached memory"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_dir(temp_dir.path()).unwrap().count(),
+            0,
+            "no disk tier may be written"
         );
 
         cache_layer.shutdown().await;
@@ -657,7 +931,7 @@ mod tests {
         let metrics = create_test_metrics();
 
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
-        let bridge = cache_layer.dds_disk_bridge();
+        let bridge = cache_layer.dds_disk_bridge().unwrap();
 
         // This bridge is backed by the real DDS tier (`.as_dds_tier()`), so
         // a round trip must satisfy the DDS validator (#253) — arbitrary
@@ -681,7 +955,7 @@ mod tests {
         let metrics = create_test_metrics();
 
         let cache_layer = CacheLayer::new(&config, "test", metrics).await.unwrap();
-        let bridge = cache_layer.disk_bridge();
+        let bridge = cache_layer.disk_bridge().unwrap();
 
         bridge
             .put(100, 200, 15, 0, 0, vec![1, 2, 3].into())

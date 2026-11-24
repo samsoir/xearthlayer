@@ -33,7 +33,7 @@ mod orchestrator_config;
 mod prewarm;
 mod runtime_builder;
 
-pub use cache_layer::CacheLayer;
+pub use cache_layer::{CacheLayer, ExecutorDiskCaches};
 pub use config::{ServiceConfig, ServiceConfigBuilder};
 pub use error::ServiceError;
 pub use facade::XEarthLayerService;
