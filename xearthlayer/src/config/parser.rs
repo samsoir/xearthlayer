@@ -89,14 +89,18 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
             })?;
         }
         if let Some(v) = section.get("dds_disk_ratio") {
-            config.cache.dds_disk_ratio =
-                v.parse::<f64>()
-                    .map_err(|_| ConfigFileError::InvalidValue {
-                        section: "cache".to_string(),
-                        key: "dds_disk_ratio".to_string(),
-                        value: v.to_string(),
-                        reason: "expected a number between 0.0 and 1.0".to_string(),
-                    })?;
+            // The rule `config set` enforces, so a hand-edited file cannot
+            // hold a ratio the disk budgets cannot split (#401).
+            let invalid = || ConfigFileError::InvalidValue {
+                section: "cache".to_string(),
+                key: "dds_disk_ratio".to_string(),
+                value: v.to_string(),
+                reason: "expected a number between 0.0 and 1.0".to_string(),
+            };
+            ConfigKey::CacheDdsDiskRatio
+                .validate(v)
+                .map_err(|_| invalid())?;
+            config.cache.dds_disk_ratio = v.parse::<f64>().map_err(|_| invalid())?;
         }
     }
 
@@ -622,6 +626,44 @@ mod tests {
             assert!(
                 ConfigFile::load_from(&path).is_err(),
                 "{bad} must be rejected"
+            );
+        }
+    }
+
+    /// #401: a ratio outside 0.0 to 1.0 overflowed the disk budgets, so the
+    /// file is held to the same rule as `config set`.
+    #[test]
+    fn dds_disk_ratio_outside_zero_to_one_is_rejected_on_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        for bad in ["1.5", "-0.1", "inf", "-inf", "NaN", "abc"] {
+            std::fs::write(&path, format!("[cache]\ndds_disk_ratio = {bad}\n")).unwrap();
+            match ConfigFile::load_from(&path) {
+                Err(ConfigFileError::InvalidValue { key, reason, .. }) => {
+                    assert_eq!(key, "dds_disk_ratio");
+                    assert_eq!(reason, "expected a number between 0.0 and 1.0");
+                }
+                other => panic!("{bad} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dds_disk_ratio_from_zero_to_one_is_accepted_on_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        for (good, expected) in [
+            ("0", 0.0),
+            ("0.0", 0.0),
+            ("0.6", 0.6),
+            ("1", 1.0),
+            ("1.0", 1.0),
+        ] {
+            std::fs::write(&path, format!("[cache]\ndds_disk_ratio = {good}\n")).unwrap();
+            assert_eq!(
+                ConfigFile::load_from(&path).unwrap().cache.dds_disk_ratio,
+                expected,
+                "{good} must be accepted"
             );
         }
     }

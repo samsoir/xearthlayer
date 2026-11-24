@@ -73,13 +73,23 @@ pub struct DiskBudgets {
 /// Disk budgets per tier. Night lighting takes its fixed share first, so
 /// the DDS/chunk ratio keeps its meaning and the sum never exceeds
 /// `disk_size`; without night lighting the split is the one before it.
+///
+/// Total for any `dds_ratio`: the configuration rejects a ratio outside
+/// 0.0 to 1.0, but this function does not rely on it (#401). A ratio
+/// outside the range is clamped to it and NaN gives the default split, so
+/// the sum of the budgets never exceeds `disk_size`.
 pub fn disk_budgets(disk_size: u64, dds_ratio: f64, night_enabled: bool) -> DiskBudgets {
+    let dds_ratio = if dds_ratio.is_nan() {
+        DEFAULT_DDS_DISK_RATIO
+    } else {
+        dds_ratio.clamp(0.0, 1.0)
+    };
     let lit = night_enabled.then_some((disk_size as f64 * LIT_DISK_SHARE) as u64);
-    let rest = disk_size - lit.unwrap_or(0);
-    let dds = (rest as f64 * dds_ratio) as u64;
+    let rest = disk_size.saturating_sub(lit.unwrap_or(0));
+    let dds = ((rest as f64 * dds_ratio) as u64).min(rest);
     DiskBudgets {
         dds,
-        chunk: rest - dds,
+        chunk: rest.saturating_sub(dds),
         lit,
     }
 }
@@ -614,6 +624,55 @@ mod tests {
             10_000_000,
             "never over budget"
         );
+    }
+
+    /// #401: a ratio outside 0.0 to 1.0 overflowed `rest - dds` (a panic in
+    /// debug, a chunk budget near 2^64 in release) or starved the DDS tier.
+    #[test]
+    fn a_ratio_outside_zero_to_one_never_exceeds_the_disk_size() {
+        for night in [false, true] {
+            for ratio in [
+                1.5,
+                -0.5,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::MAX,
+            ] {
+                let b = disk_budgets(10_000_000, ratio, night);
+                let total = b.dds as u128 + b.chunk as u128 + b.lit.unwrap_or(0) as u128;
+                assert!(
+                    total <= 10_000_000,
+                    "ratio {ratio}, night {night}: {b:?} exceeds the disk size"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ratio_outside_zero_to_one_is_clamped() {
+        assert_eq!(
+            disk_budgets(10_000_000, 1.5, false),
+            disk_budgets(10_000_000, 1.0, false)
+        );
+        assert_eq!(
+            disk_budgets(10_000_000, f64::INFINITY, true),
+            disk_budgets(10_000_000, 1.0, true)
+        );
+        assert_eq!(
+            disk_budgets(10_000_000, -0.5, false),
+            disk_budgets(10_000_000, 0.0, false)
+        );
+    }
+
+    #[test]
+    fn a_nan_ratio_gives_the_default_split() {
+        for night in [false, true] {
+            assert_eq!(
+                disk_budgets(10_000_000, f64::NAN, night),
+                disk_budgets(10_000_000, DEFAULT_DDS_DISK_RATIO, night)
+            );
+        }
     }
 
     #[tokio::test]

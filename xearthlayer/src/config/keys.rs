@@ -1238,6 +1238,31 @@ mod tests {
         assert!(spec.is_satisfied_by("abc").is_err());
     }
 
+    /// `f64::from_str` accepts these spellings, so the range check alone
+    /// must keep them out (#401).
+    #[test]
+    fn float_range_spec_rejects_nan_and_infinities() {
+        let spec = FloatRangeSpec::new(0.0, 1.0);
+        for bad in ["NaN", "nan", "inf", "-inf", "infinity", "-infinity"] {
+            assert!(spec.is_satisfied_by(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn config_set_rejects_a_non_finite_dds_disk_ratio() {
+        let mut config = ConfigFile::default();
+        for bad in ["NaN", "inf", "-inf", "1.5", "-0.1"] {
+            assert!(
+                ConfigKey::CacheDdsDiskRatio.set(&mut config, bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        assert_eq!(
+            config.cache.dds_disk_ratio,
+            crate::config::DEFAULT_DDS_DISK_RATIO
+        );
+    }
+
     #[test]
     fn test_config_key_takeoff_climb_ft_round_trip() {
         let mut config = ConfigFile::default();
