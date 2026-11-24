@@ -4,7 +4,6 @@
 //! and the `ConfigFile::default()` implementation.
 
 use super::settings::*;
-use crate::dds::DdsFormat;
 
 // =============================================================================
 // General settings
@@ -251,7 +250,6 @@ impl Default for ConfigFile {
                 dds_disk_ratio: DEFAULT_DDS_DISK_RATIO,
             },
             texture: TextureSettings {
-                format: DdsFormat::BC1,
                 compressor: DEFAULT_COMPRESSOR.to_string(),
                 gpu_device: DEFAULT_GPU_DEVICE.to_string(),
             },

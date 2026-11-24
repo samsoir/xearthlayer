@@ -107,9 +107,6 @@ disk_size = {}
 dds_disk_ratio = {}
 
 [texture]
-; DDS compression format: bc1 (smaller, opaque) or bc3 (larger, with alpha)
-; bc1 recommended for satellite imagery
-format = {}
 ; Texture compressor backend: software, ispc (SIMD), or gpu (wgpu)
 ; ispc is recommended for best CPU performance
 compressor = {}
@@ -269,7 +266,6 @@ connections = {}
         format_size(config.cache.memory_size),
         format_size(config.cache.disk_size),
         config.cache.dds_disk_ratio,
-        config.texture.format.to_string().to_lowercase(),
         config.texture.compressor,
         config.texture.gpu_device,
         config.generation.threads,

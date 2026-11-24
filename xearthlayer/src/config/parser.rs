@@ -12,7 +12,6 @@ use super::keys::{ConfigKey, ConfigKeyError};
 use super::settings::ConfigFile;
 use super::size::parse_size;
 use super::upgrade::{deprecated_value, folded_value};
-use crate::dds::DdsFormat;
 
 /// Parse an `Ini` object into a `ConfigFile`.
 ///
@@ -103,21 +102,8 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
 
     // [texture] section
     if let Some(section) = ini.section(Some("texture")) {
-        if let Some(v) = section.get("format") {
-            let v = v.to_lowercase();
-            config.texture.format = match v.as_str() {
-                "bc1" => DdsFormat::BC1,
-                "bc3" => DdsFormat::BC3,
-                _ => {
-                    return Err(ConfigFileError::InvalidValue {
-                        section: "texture".to_string(),
-                        key: "format".to_string(),
-                        value: v,
-                        reason: "must be 'bc1' or 'bc3'".to_string(),
-                    });
-                }
-            };
-        }
+        // `format` was retired in #395 (BC1 only) and is not read: an old
+        // config loads whatever the line says, and `config upgrade` drops it.
         if let Some(v) = section.get("compressor") {
             let v = v.to_lowercase();
             match v.as_str() {
@@ -798,6 +784,26 @@ disk_size = 50GB
         assert_eq!(path, PathBuf::from("/absolute/path"));
     }
 
+    /// #395: `texture.format` is no longer read, so a config written by an
+    /// older version loads whatever the line says, and the rest of
+    /// `[texture]` is still honoured.
+    #[test]
+    fn test_retired_texture_format_line_is_ignored() {
+        for value in ["bc1", "bc3", "anything"] {
+            let temp_dir = TempDir::new().unwrap();
+            let config_path = temp_dir.path().join("config.ini");
+            std::fs::write(
+                &config_path,
+                format!("[texture]\nformat = {value}\ncompressor = software\n"),
+            )
+            .unwrap();
+
+            let config = ConfigFile::load_from(&config_path)
+                .unwrap_or_else(|e| panic!("format = {value} must not fail the load: {e}"));
+            assert_eq!(config.texture.compressor, "software");
+        }
+    }
+
     #[test]
     fn test_partial_config() {
         let temp_dir = TempDir::new().unwrap();
@@ -825,7 +831,6 @@ timeout = 45
 
         // Default values
         assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
-        assert_eq!(config.texture.format, DdsFormat::BC1);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use commands::cache::CacheAction;
-use commands::common::{DdsCompression, ProviderType};
+use commands::common::ProviderType;
 use commands::scenery_index::SceneryIndexAction;
 use logging_init::{init_cli_logging, LogTarget};
 use xearthlayer::config::ConfigFile;
@@ -178,10 +178,6 @@ enum Commands {
         /// MapBox access token (default: from config)
         #[arg(long)]
         mapbox_token: Option<String>,
-
-        /// DDS compression format (default: from config)
-        #[arg(long, value_enum)]
-        dds_format: Option<DdsCompression>,
 
         /// Per-chunk download timeout in seconds (default: executor.request_timeout_secs)
         #[arg(long)]
@@ -334,7 +330,6 @@ fn main() -> ExitCode {
             provider,
             google_api_key,
             mapbox_token,
-            dds_format,
             timeout,
             no_cache,
             no_prefetch,
@@ -344,7 +339,6 @@ fn main() -> ExitCode {
                 provider,
                 google_api_key,
                 mapbox_token,
-                dds_format,
                 timeout,
                 no_cache,
                 no_prefetch,
@@ -404,6 +398,23 @@ mod tests {
             &["xearthlayer", "patches", "list"],
         ] {
             assert_eq!(target_of(argv), LogTarget::None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn run_has_no_dds_format_option() {
+        // BC1 is the only format (#395): the option that chose it is gone.
+        for argv in [
+            ["xearthlayer", "run", "--dds-format", "bc1"],
+            ["xearthlayer", "run", "--dds-format", "bc3"],
+        ] {
+            let Err(err) = Cli::try_parse_from(argv) else {
+                panic!("{argv:?} must not parse");
+            };
+            assert!(
+                err.to_string().contains("--dds-format"),
+                "the error should name the removed option: {err}"
+            );
         }
     }
 

@@ -120,7 +120,6 @@ mod tests {
         assert!(config.provider.google_api_key.is_none());
         assert_eq!(config.cache.memory_size, DEFAULT_MEMORY_CACHE_SIZE);
         assert_eq!(config.cache.disk_size, DEFAULT_DISK_CACHE_SIZE);
-        assert_eq!(config.texture.format, crate::dds::DdsFormat::BC1);
         assert!(config.xplane.scenery_dir.is_none());
     }
 

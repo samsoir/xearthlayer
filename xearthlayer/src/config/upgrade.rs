@@ -177,6 +177,10 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     // backend only, so every old value (auto, macfuse-fskit, kernel) now
     // means the same thing and nothing is folded.
     "fuse.macos_backend",
+    // Removed in #395: BC1 is the only format XEarthLayer encodes (BC3 never
+    // produced a usable tile), so the setting has nothing to choose and
+    // nothing to fold.
+    "texture.format",
 ];
 
 /// A value a setting no longer accepts, and the value that replaces it.
@@ -634,7 +638,7 @@ memory_size = 2GB
             .contains(&"cache.memory_size".to_string()));
         assert!(analysis
             .missing_keys
-            .contains(&"texture.format".to_string()));
+            .contains(&"texture.compressor".to_string()));
     }
 
     #[test]
@@ -797,6 +801,28 @@ type = bing
         assert!(DEPRECATED_KEYS.contains(&"executor.network_concurrent"));
         assert!(DEPRECATED_KEYS.contains(&"executor.cpu_concurrent"));
         assert!(DEPRECATED_KEYS.contains(&"executor.disk_io_concurrent"));
+    }
+
+    /// #395: BC1 is the only format, so the setting that chose it is gone.
+    #[test]
+    fn test_analyze_flags_texture_format_as_deprecated() {
+        assert!(DEPRECATED_KEYS.contains(&"texture.format"));
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        std::fs::write(&config_path, "[texture]\nformat = bc3\ncompressor = ispc\n").unwrap();
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        assert!(analysis
+            .deprecated_keys
+            .contains(&"texture.format".to_string()));
+        assert!(!analysis
+            .unknown_keys
+            .contains(&"texture.format".to_string()));
+        assert!(!analysis
+            .missing_keys
+            .contains(&"texture.format".to_string()));
     }
 
     #[test]
