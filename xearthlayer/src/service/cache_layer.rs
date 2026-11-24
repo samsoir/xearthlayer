@@ -45,11 +45,13 @@
 //! cache_layer.shutdown().await;
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::info;
 
+use crate::cache::legacy::{remove_legacy_chunk_regions, LegacyChunkCleanup};
 use crate::cache::{
     Cache, CacheService, DdsDiskCacheBridge, DiskCacheBridge, MemoryCacheBridge, ServiceCacheConfig,
 };
@@ -107,6 +109,9 @@ pub fn disk_budgets(disk_size: u64, dds_ratio: f64, night_enabled: bool) -> Disk
 /// With night lighting enabled there is also a **Lit Disk** tier (5% of the
 /// disk budget) holding generated lit texture payloads.
 pub struct CacheLayer {
+    /// `cache.directory`: the root the disk tiers live under.
+    disk_dir: PathBuf,
+
     /// Memory cache service (owns LRU eviction).
     memory_service: CacheService,
 
@@ -138,7 +143,7 @@ impl CacheLayer {
     /// 2. Computes disk budgets: night lighting's 5% first (only when
     ///    enabled), then DDS/chunk from `dds_disk_ratio` of the rest
     /// 3. Creates DDS disk cache service at `{disk_dir}/{provider}/dds/`
-    /// 4. Creates chunk disk cache service at `{disk_dir}/{provider}/`
+    /// 4. Creates chunk disk cache service at `{disk_dir}/{provider}/chunks/`
     /// 5. When night lighting is enabled, creates the lit disk cache
     ///    service at `{disk_dir}/night/`
     /// 6. Creates bridge adapters for executor integration
@@ -179,10 +184,11 @@ impl CacheLayer {
 
         let gc_interval = Duration::from_secs(config.disk_gc_interval_secs());
 
-        // DDS disk goes into a dedicated subdirectory
+        // Both ortho tiers live under the provider (#398): chunk keys carry no
+        // provider, so a shared chunk tier would build one provider's tiles
+        // from another's imagery.
         let dds_disk_dir = crate::cache::layout::dds_dir(&disk_dir, provider_name);
-        // Chunks keep the existing provider directory layout
-        let chunk_disk_dir = disk_dir.clone();
+        let chunk_disk_dir = crate::cache::layout::chunk_dir(&disk_dir, provider_name);
 
         // 1. Start memory cache service (with metrics for self-reporting size)
         let memory_config =
@@ -275,6 +281,7 @@ impl CacheLayer {
         info!("CacheLayer initialized with three-tier cache bridges");
 
         Ok(Self {
+            disk_dir,
             memory_service,
             dds_disk_service,
             chunk_disk_service,
@@ -360,6 +367,36 @@ impl CacheLayer {
     /// `None` when night lighting is off.
     pub fn lit_disk_cache(&self) -> Option<Arc<dyn Cache>> {
         self.lit_disk_service.as_ref().map(|s| s.cache())
+    }
+
+    /// Delete, on a blocking thread, the region directories the chunk tier
+    /// left directly in `cache.directory` before it moved under its
+    /// provider (#398). Nothing else in the directory is touched.
+    ///
+    /// Returns at once; the outcome is logged (removals at info, failures
+    /// as warnings) and also returned through the handle, which callers may
+    /// drop.
+    pub fn spawn_legacy_chunk_cleanup(&self) -> tokio::task::JoinHandle<LegacyChunkCleanup> {
+        let cache_dir = self.disk_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = remove_legacy_chunk_regions(&cache_dir);
+            if outcome.removed > 0 {
+                info!(
+                    removed = outcome.removed,
+                    bytes_freed = outcome.bytes_freed,
+                    directory = %cache_dir.display(),
+                    "Removed legacy chunk cache regions from the cache root"
+                );
+            }
+            if outcome.failed > 0 {
+                tracing::warn!(
+                    failed = outcome.failed,
+                    directory = %cache_dir.display(),
+                    "Some legacy chunk cache regions could not be removed"
+                );
+            }
+            outcome
+        })
     }
 
     /// Scan and report the initial disk cache sizes.
@@ -502,6 +539,97 @@ mod tests {
         let dds_provider = cache_layer.dds_disk_provider().unwrap();
         let expected_dds_dir = temp_dir.path().join("bing").join("dds");
         assert_eq!(dds_provider.directory(), &expected_dds_dir);
+
+        cache_layer.shutdown().await;
+    }
+
+    /// #398: the chunk tier lives under its provider, beside the DDS tier.
+    #[tokio::test]
+    async fn chunk_tier_lives_under_its_provider() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+
+        let cache_layer = CacheLayer::new(&config, "Bing Maps", create_test_metrics())
+            .await
+            .unwrap();
+
+        let chunk_provider = cache_layer.disk_provider().unwrap();
+        assert_eq!(
+            chunk_provider.directory().as_path(),
+            crate::cache::layout::chunk_dir(temp_dir.path(), "Bing Maps").as_path()
+        );
+
+        cache_layer.shutdown().await;
+    }
+
+    /// #398: two providers sharing one `cache.directory` never read each
+    /// other's chunks, so a provider switch cannot build tiles from the old
+    /// provider's imagery.
+    #[tokio::test]
+    async fn two_providers_never_read_each_others_chunks() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+
+        let bing = CacheLayer::new(&config, "Bing Maps", create_test_metrics())
+            .await
+            .unwrap();
+        let go2 = CacheLayer::new(&config, "Google GO2", create_test_metrics())
+            .await
+            .unwrap();
+
+        let bing_chunks = bing.disk_bridge();
+        let go2_chunks = go2.disk_bridge();
+        bing_chunks
+            .put(100, 200, 15, 3, 4, Bytes::from_static(b"bing"))
+            .await
+            .unwrap();
+        go2_chunks
+            .put(100, 200, 15, 5, 6, Bytes::from_static(b"go2"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bing_chunks.get(100, 200, 15, 3, 4).await,
+            Some(Bytes::from_static(b"bing"))
+        );
+        assert_eq!(go2_chunks.get(100, 200, 15, 3, 4).await, None);
+        assert_eq!(
+            go2_chunks.get(100, 200, 15, 5, 6).await,
+            Some(Bytes::from_static(b"go2"))
+        );
+        assert_eq!(bing_chunks.get(100, 200, 15, 5, 6).await, None);
+
+        bing.shutdown().await;
+        go2.shutdown().await;
+    }
+
+    /// #398: the root-level regions the chunk tier left behind are deleted
+    /// on a blocking thread, and the tiers themselves are untouched.
+    #[tokio::test]
+    async fn legacy_chunk_cleanup_removes_root_regions_only() {
+        let temp_dir = tempdir().unwrap();
+        let legacy = temp_dir.path().join("+37-123");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("chunk_16_1_2_3_4.cache"), [0u8; 64]).unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let cache_layer = CacheLayer::new(&config, "Bing Maps", create_test_metrics())
+            .await
+            .unwrap();
+        cache_layer
+            .disk_bridge()
+            .put(100, 200, 15, 0, 0, Bytes::from_static(b"kept"))
+            .await
+            .unwrap();
+
+        let outcome = cache_layer.spawn_legacy_chunk_cleanup().await.unwrap();
+
+        assert_eq!(outcome.removed, 1);
+        assert_eq!(outcome.bytes_freed, 64);
+        assert!(!legacy.exists());
+        assert_eq!(
+            cache_layer.disk_bridge().get(100, 200, 15, 0, 0).await,
+            Some(Bytes::from_static(b"kept"))
+        );
 
         cache_layer.shutdown().await;
     }

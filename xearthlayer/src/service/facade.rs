@@ -146,6 +146,12 @@ impl XEarthLayerService {
         // 3. Create CacheLayer WITH metrics for GC reporting
         let cache_layer = CacheLayer::new(&config, &provider_name, metrics_client.clone()).await?;
 
+        // The chunk tier's pre-#398 regions in the cache root are no longer
+        // indexed, so never counted or evicted: delete them in the
+        // background. Detached: startup never waits for it, and it logs its
+        // own outcome.
+        drop(cache_layer.spawn_legacy_chunk_cleanup());
+
         // 4. Scan initial disk cache size and report to metrics
         let initial_disk_size = cache_layer.scan_disk_cache_size().await;
         metrics_client.disk_cache_initial_size(initial_disk_size);

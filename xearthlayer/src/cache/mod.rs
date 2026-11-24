@@ -44,6 +44,7 @@ mod config;
 pub mod gc_scheduler;
 pub mod integrity;
 pub mod layout;
+pub mod legacy;
 pub mod lru_index;
 pub mod maintenance;
 pub mod providers;
