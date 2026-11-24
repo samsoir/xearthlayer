@@ -141,4 +141,6 @@ All contributors are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+By contributing, you agree that your contributions will be licensed under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later).
+
+New dependencies must be under a license compatible with GPLv3. `make licenses` checks them against the list in `deny.toml`, and CI runs the same check.

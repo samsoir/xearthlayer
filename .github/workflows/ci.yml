@@ -37,6 +37,19 @@ jobs:
       - name: Run make verify
         run: make verify
 
+  # XEarthLayer is GPL-3.0-or-later (#376): every dependency must carry a
+  # license GPLv3 can absorb. The allowed list and how to extend it are in
+  # deny.toml; `make licenses` runs the same check locally.
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   # macOS is a Tier 1 platform. Pinned to macos-15 (Apple Silicon) rather than
   # macos-latest: that label has moved across both OS versions and CPU
   # architectures, and a silent bump would surface as an unexplained failure on

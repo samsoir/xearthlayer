@@ -16,7 +16,7 @@ members = [
 version = "0.5.1-beta.2"
 edition = "2021"
 authors = ["XEarthLayer Contributors"]
-license = "MIT"
+license = "GPL-3.0-or-later"
 # Minimum supported Rust, matching the pin in rust-toolchain.toml. rustup users
 # get that pin automatically and never notice; this field is what gives everyone
 # else a clear "requires rustc 1.97.1, you have X" instead of an inscrutable

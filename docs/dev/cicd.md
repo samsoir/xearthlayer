@@ -45,7 +45,10 @@ procedure is in the [runbook](app-release-runbook.md#branch-model--release-chann
 | `close-issues-on-develop-merge.yml` | a push to `develop/**` | Close the issues the pushed commits say they close |
 
 `ci.yml` and `release-test.yml` each run two jobs — `Verify` (Linux) and
-`Verify (macOS)`.
+`Verify (macOS)`. `ci.yml` also runs `Licenses`: `cargo deny check licenses`
+against the GPL-3.0-compatible list in `deny.toml` (#376), the check
+`make licenses` runs locally. It is a separate job, not part of `make verify`,
+so contributors need no `cargo-deny` for `make pre-commit`.
 
 ### Issue closing on develop merges
 

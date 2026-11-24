@@ -281,6 +281,13 @@ audit: ## Run security audit
 	$(CARGO) audit
 	@echo "$(GREEN)Security audit complete!$(NC)"
 
+.PHONY: licenses
+licenses: ## Check every dependency's license is GPL-3.0 compatible (deny.toml)
+	@echo "$(BLUE)Checking dependency licenses...$(NC)"
+	@command -v cargo-deny >/dev/null 2>&1 || { echo "$(YELLOW)Installing cargo-deny...$(NC)"; cargo install cargo-deny --locked; }
+	$(CARGO) deny check licenses
+	@echo "$(GREEN)Dependency licenses are GPL-3.0 compatible!$(NC)"
+
 ##@ Benchmarking
 
 .PHONY: bench
