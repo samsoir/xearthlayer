@@ -1257,6 +1257,25 @@ Assembly, encoding and caching were once three tasks (`AssembleImageTask`,
 `EncodeDdsTask`, `CacheWriteTask`). They were fused into `BuildAndCacheDdsTask`
 and the three were deleted in #383.
 
+`assemble_chunks` decodes each chunk through `chunk_image::decode_into` into one
+reusable 256 KiB `ChunkPixels` per tile and copies it onto the 4096×4096 canvas
+row by row; a rejected chunk is filled magenta by row (#390). A 3-component
+YCbCr or 1-component grayscale JPEG, the imagery providers' usual answer, is
+decoded by `zune-jpeg` straight to RGBA, the decoder the `image` crate runs
+for JPEG, with `image`'s options. Anything else goes to `chunk_image::decode`,
+the reference, which decides every reject: other formats, RGB, CMYK and YCCK
+JPEGs (zune's RGBA conversions for them differ from `image`'s), frames whose
+component count does not fit their colour space, and any JPEG zune does not
+convert whole. zune writes whole rows and every row it converts ends in an
+opaque pixel, so the last alpha byte of each row is cleared before decoding and
+must read 255 after; a truncated JPEG (zune fills the rest with 128, alpha
+included) or one ended early by a stray marker (rows left unwritten, holding
+the previous chunk) fails that check. The canvas and the rejected list are
+therefore byte for byte what `decode` gives, which the tests check on a corpus
+of subsampling modes, progressive, restart and arithmetic JPEGs, damaged
+variants, PNGs and wrong sizes (`xearthlayer/tests/fixtures/chunks/`). On a
+tile of 4:2:0 chunks assembly takes about 31 ms instead of 43 ms.
+
 ## Execution Flow
 
 A tile is one `DdsGenerateJob` (download chunks, assemble and encode, cache).
