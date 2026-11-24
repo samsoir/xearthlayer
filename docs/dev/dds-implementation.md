@@ -132,16 +132,31 @@ A 4096×4096 tile carries the full chain, 13 levels down to 1×1:
 
 ### Mipmap Downsample
 `MipmapGenerator::downsample_box_2x` (`dds/mipmap.rs`) builds each level from
-the one above with a 2×2 box filter, on raw RGBA bytes (#389): for each output
-row it adds the two source rows byte by byte into a `u16` scratch row, then
-averages adjacent pixel pairs. Per channel the result is `(a + b + c + d) / 4`,
-truncated; an odd last row or column of the source is dropped. The two-pass
-form lets the compiler vectorise the row sum: the 4096×4096 chain takes about
-6 ms on one core, against about 13 ms for the earlier per-pixel loop, with
-byte-identical output. Both encoder backends use it: the CPU path through
-`MipmapStream`, and the GPU worker, where it runs on the single worker thread
-for every tile. The truncation darkens each level slightly; #394 changes it to
-round.
+the one above with a 2×2 box filter, on raw RGBA bytes (#389). Each output row
+takes three passes: the two source rows are added byte by byte into a `u16`
+scratch row, adjacent pixel pairs of that row are added into a second scratch
+row of block sums, and each block sum `s = a + b + c + d` becomes its average
+through `block_average`, rounded half to even: `(s + 1 + ((s >> 2) & 1)) >> 2`
+(#394). An odd last row or column of the source is dropped.
+
+The rounding keeps every level as bright as the one above it. Truncating
+`s / 4`, as the encoder did before #394, loses three eighths of a step per
+level on noisy imagery, so a tile's fifth level was about two steps darker
+than its source and its smallest about four and a half (out of 255). Rounding
+half up gains an eighth of a step per level instead; half to even has no bias.
+`every_level_keeps_the_source_mean_within_half_a_step` holds the mean of every
+level of a 4096 chain within half a step of the source's, which truncation and
+half-up both fail. A sum of 1020 averages to 255, so opaque alpha stays opaque.
+
+The passes are separate so that each is a contiguous loop the compiler
+vectorises. Folding the rounding into the pair pass made the chain about twice
+as slow: the compiler vectorised it across the 4-byte pixel stride, with a
+shuffle for every pixel. The 4096×4096 chain takes about 6 to 7 ms on one core,
+about a tenth more than the truncating two-pass version and half the earlier
+per-pixel loop (about 13 ms). Both encoder backends use it: the CPU path
+through `MipmapStream`, and the GPU worker, where it runs on the single worker
+thread for every tile. Night lighting does not: its levels are averaged in
+linear light by `lit_chain` (see `night-lighting-design.md`).
 
 ### Compression Algorithm
 - **Endpoint Selection**: Bounding box method (min/max per channel)
