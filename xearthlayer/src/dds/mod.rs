@@ -78,8 +78,8 @@ mod types;
 
 // Public API
 pub use compressor::{
-    create_gpu_resources, create_wgpu_compressor, default_compressor, ImageCompressor,
-    IspcCompressor, MipmapCompressor, SoftwareCompressor, WgpuCompressor,
+    create_gpu_resources, default_compressor, ImageCompressor, IspcCompressor, MipmapCompressor,
+    SoftwareCompressor,
 };
 pub use encoder::DdsEncoder;
 pub use gpu_channel::create_gpu_encoder_channel;

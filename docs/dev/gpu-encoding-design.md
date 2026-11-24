@@ -210,8 +210,8 @@ No changes to task, executor, or job code. The compressor is injected via the ex
 
 | File | Purpose |
 |------|---------|
-| `dds/compressor.rs` | `ImageCompressor` trait, `SoftwareCompressor`, `IspcCompressor`, `WgpuCompressor` |
-| `dds/gpu_channel.rs` | `GpuEncoderChannel`, `MipmapCompressor` trait, GPU worker task |
+| `dds/compressor.rs` | `ImageCompressor` and `MipmapCompressor` traits, `SoftwareCompressor`, `IspcCompressor`, `create_gpu_resources` |
+| `dds/gpu_channel.rs` | `GpuEncoderChannel` (implements `MipmapCompressor`), GPU worker task |
 | `dds/mipmap.rs` | `MipmapStream` iterator |
 | `dds/encoder.rs` | `DdsEncoder`, `CompressorBackend` dispatch |
 | `service/builder.rs` | Compressor construction and wiring |
