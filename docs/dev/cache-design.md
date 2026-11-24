@@ -342,7 +342,11 @@ environment variables for the cache.
   demand, prefetch, `CachedTileProbeTask` and prewarm see every tile as not on
   disk, and the prefetch coordinator's DDS disk filter is not installed;
 - no GC scheduler daemon is spawned;
-- night lighting runs without its disk tier.
+- night lighting runs without its disk tier;
+- prefetch does not run (`run.rs` `prefetch_off_reason`, which also applies
+  `--no-prefetch`), because its tiles would reach only the memory tier and be
+  evicted long before they are flown over, and clap refuses `--airport` with
+  `--no-cache` for the same reason.
 
 The memory tier works as usual, because FUSE serving, the coalescer and the
 open-handle memo depend on it. The startup banner says

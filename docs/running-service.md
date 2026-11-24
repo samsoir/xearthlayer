@@ -94,7 +94,7 @@ Press Ctrl+C to stop.
 | `--airport <ICAO>` | Pre-warm cache around an airport before X-Plane loads (e.g., `KJFK`, `EGLL`) |
 | `--provider <TYPE>` | Override imagery provider: `bing`, `go2`, `google` |
 | `--timeout <SECS>` | Override `executor.request_timeout_secs`, the per-chunk HTTP timeout |
-| `--no-cache` | Do not read or write the disk caches this session; tiles are cached in memory only |
+| `--no-cache` | Do not read or write the disk caches this session; tiles are cached in memory only. Also turns prefetch off, and cannot be combined with `--airport` |
 
 ### No Packages Installed
 

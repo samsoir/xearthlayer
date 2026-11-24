@@ -297,7 +297,9 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 | `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 
-`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file.
+`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file, and so does `xearthlayer run --no-cache`, because without the disk cache prefetched tiles would be dropped before they are needed.
+
+Every setting given a range in these tables is checked when `config.ini` is read, by the same rule as `xearthlayer config set`; a value outside it stops XEarthLayer with a message naming the setting and its range. `box_extent = 6.5`, the default before 7.0, is read as 7.0, and `xearthlayer config upgrade` rewrites it.
 
 `mode` was removed in v0.5.0. Its values `opportunistic` and `aggressive` once chose between two triggers that belonged to earlier designs, and both had come to behave the same; `disabled` did what `enabled = false` does. A file that still has a `mode` line keeps working: `mode = disabled` is read as `enabled = false`, any other value is ignored, and `xearthlayer config upgrade` writes `enabled = false` for `disabled` and removes the line.
 
