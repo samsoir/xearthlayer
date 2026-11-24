@@ -89,7 +89,8 @@ impl JobExecutor {
             job.cancellation.clone(),
             job.child_job_tx.clone(),
             Arc::clone(&job.task_outputs),
-        );
+        )
+        .with_executor_shutdown(self.shutting_down.clone());
 
         if let Some(ref metrics) = self.metrics_client {
             ctx = ctx.with_metrics(metrics.clone());

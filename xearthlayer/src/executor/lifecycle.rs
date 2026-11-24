@@ -548,7 +548,13 @@ impl JobExecutor {
     }
 
     /// Shuts down the executor.
+    ///
+    /// Marks the shutdown on `shutting_down` before cancelling any job, so a
+    /// task that finds its job cancelled can tell this cancel from a kill or
+    /// an error policy (`TaskContext::is_shutting_down`, #385).
     pub(crate) async fn shutdown(&mut self) {
+        self.shutting_down.cancel();
+
         let mut jobs = self.active_jobs.lock().await;
         for (job_id, job) in jobs.iter_mut() {
             job.cancellation.cancel();

@@ -33,9 +33,43 @@ pub trait OptionalMetrics {
     fn job_timed_out(&self, duration_us: u64);
     fn encode_started(&self);
     fn encode_completed(&self, bytes: u64, duration_us: u64);
+    fn encode_failed(&self);
     fn assembly_completed(&self, duration_us: u64);
     fn fuse_request_started(&self);
     fn fuse_request_completed(&self);
+}
+
+/// One encode in `encodes_active`, from [`start`](Self::start) until it is
+/// [`completed`](Self::completed) or dropped.
+///
+/// Dropping it uncompleted sends `EncodeFailed`, so every way out of an
+/// encode (an encoder error, a panic, a task that returns early or is
+/// dropped) ends it exactly once, and only a completed encode counts toward
+/// `encodes_completed` and `bytes_encoded` (#385).
+#[must_use = "dropping the guard ends the encode as failed"]
+pub struct EncodeGuard {
+    metrics: Option<MetricsClient>,
+}
+
+impl EncodeGuard {
+    /// Sends `EncodeStarted`.
+    pub fn start(metrics: &Option<MetricsClient>) -> Self {
+        metrics.encode_started();
+        Self {
+            metrics: metrics.clone(),
+        }
+    }
+
+    /// Sends `EncodeCompleted` instead of the `EncodeFailed` a drop sends.
+    pub fn completed(mut self, bytes: u64, duration_us: u64) {
+        self.metrics.take().encode_completed(bytes, duration_us);
+    }
+}
+
+impl Drop for EncodeGuard {
+    fn drop(&mut self) {
+        self.metrics.take().encode_failed();
+    }
 }
 
 impl OptionalMetrics for Option<MetricsClient> {
@@ -215,6 +249,13 @@ impl OptionalMetrics for Option<MetricsClient> {
     }
 
     #[inline]
+    fn encode_failed(&self) {
+        if let Some(client) = self {
+            client.encode_failed();
+        }
+    }
+
+    #[inline]
     fn assembly_completed(&self, duration_us: u64) {
         if let Some(client) = self {
             client.assembly_completed(duration_us);
@@ -240,6 +281,60 @@ impl OptionalMetrics for Option<MetricsClient> {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    use crate::metrics::MetricEvent;
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<MetricEvent>) -> Vec<MetricEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn test_encode_guard_completed_sends_started_then_completed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let metrics = Some(MetricsClient::new(tx));
+
+        let encode = EncodeGuard::start(&metrics);
+        encode.completed(4096, 250);
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events[..],
+                [
+                    MetricEvent::EncodeStarted,
+                    MetricEvent::EncodeCompleted {
+                        bytes: 4096,
+                        duration_us: 250
+                    }
+                ]
+            ),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_encode_guard_dropped_sends_started_then_failed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let metrics = Some(MetricsClient::new(tx));
+
+        drop(EncodeGuard::start(&metrics));
+
+        let events = drain(&mut rx);
+        assert!(
+            matches!(
+                events[..],
+                [MetricEvent::EncodeStarted, MetricEvent::EncodeFailed]
+            ),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn test_encode_guard_without_a_client_is_a_no_op() {
+        let metrics: Option<MetricsClient> = None;
+        EncodeGuard::start(&metrics).completed(1, 1);
+        drop(EncodeGuard::start(&metrics));
+    }
 
     #[test]
     fn test_optional_metrics_some() {

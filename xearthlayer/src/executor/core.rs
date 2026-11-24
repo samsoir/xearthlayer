@@ -96,6 +96,12 @@ pub struct JobExecutor {
 
     /// Monotonic sequence counter for FIFO ordering within same priority.
     pub(crate) waiting_sequence: u64,
+
+    /// Cancelled by [`shutdown`](Self::shutdown) before it cancels the jobs,
+    /// and handed to every task's context, so a task can tell a cancel by
+    /// shutdown from a kill or an error policy, which cancel the same job
+    /// token (#385).
+    pub(crate) shutting_down: CancellationToken,
 }
 
 impl JobExecutor {
@@ -144,6 +150,7 @@ impl JobExecutor {
             loop_count: 0,
             waiting_for_permit: BinaryHeap::new(),
             waiting_sequence: 0,
+            shutting_down: CancellationToken::new(),
         };
 
         let submitter = JobSubmitter::new(job_tx);
@@ -411,6 +418,105 @@ mod tests {
         release.notify_one();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(counts.running(), 0);
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// Reports whether its context says the executor is shutting down: once
+    /// when it starts, then again with `is_cancelled` once its job is
+    /// cancelled.
+    struct ShutdownWitnessTask(mpsc::UnboundedSender<(bool, bool)>);
+
+    impl crate::executor::Task for ShutdownWitnessTask {
+        fn name(&self) -> &str {
+            "ShutdownWitnessTask"
+        }
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: &'a mut crate::executor::TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                let _ = self.0.send((ctx.is_cancelled(), ctx.is_shutting_down()));
+                ctx.cancellation_token().cancelled().await;
+                let _ = self.0.send((ctx.is_cancelled(), ctx.is_shutting_down()));
+                crate::executor::TaskResult::Cancelled
+            })
+        }
+    }
+
+    struct ShutdownWitnessJob(mpsc::UnboundedSender<(bool, bool)>);
+
+    impl crate::executor::Job for ShutdownWitnessJob {
+        fn id(&self) -> crate::executor::JobId {
+            crate::executor::JobId::new("shutdown-witness")
+        }
+        fn name(&self) -> &str {
+            "ShutdownWitnessJob"
+        }
+        fn error_policy(&self) -> crate::executor::ErrorPolicy {
+            crate::executor::ErrorPolicy::FailFast
+        }
+        fn priority(&self) -> crate::executor::Priority {
+            crate::executor::Priority::ON_DEMAND
+        }
+        fn create_tasks(&self) -> Vec<Box<dyn crate::executor::Task>> {
+            vec![Box::new(ShutdownWitnessTask(self.0.clone()))]
+        }
+        fn on_complete(&self, _result: &crate::executor::JobResult) -> crate::executor::JobStatus {
+            crate::executor::JobStatus::Succeeded
+        }
+    }
+
+    /// A task can tell a cancel by executor shutdown from any other (#385):
+    /// its context reports the shutdown by the time its job's token is
+    /// cancelled, and not before.
+    #[tokio::test]
+    async fn tasks_see_the_executor_shutting_down_when_shutdown_cancels_their_job() {
+        let (executor, submitter) = JobExecutor::new(ExecutorConfig::default());
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(executor.run(shutdown.clone()));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _job = submitter.submit(ShutdownWitnessJob(tx));
+        let wait = std::time::Duration::from_secs(2);
+
+        let started = tokio::time::timeout(wait, rx.recv()).await.unwrap();
+        assert_eq!(started, Some((false, false)), "running, not shutting down");
+
+        shutdown.cancel();
+        let cancelled = tokio::time::timeout(wait, rx.recv()).await.unwrap();
+        assert_eq!(cancelled, Some((true, true)), "cancelled by the shutdown");
+
+        let _ = run.await;
+    }
+
+    /// A job killed through its handle (the FUSE timeout's path) is
+    /// cancelled while the executor keeps running.
+    #[tokio::test]
+    async fn a_killed_job_is_cancelled_without_the_executor_shutting_down() {
+        let (executor, submitter) = JobExecutor::new(ExecutorConfig::default());
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(executor.run(shutdown.clone()));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let job = submitter.submit(ShutdownWitnessJob(tx));
+        let wait = std::time::Duration::from_secs(2);
+
+        let started = tokio::time::timeout(wait, rx.recv()).await.unwrap();
+        assert_eq!(started, Some((false, false)));
+
+        job.kill();
+        // Signals are read on the executor's next loop turn, and a kill does
+        // not wake the loop: a submission does.
+        let _wake = submitter.submit(HeldJob);
+        let cancelled = tokio::time::timeout(wait, rx.recv()).await.unwrap();
+        assert_eq!(cancelled, Some((true, false)), "killed, not shut down");
 
         shutdown.cancel();
         let _ = run.await;

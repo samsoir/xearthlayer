@@ -336,6 +336,9 @@ impl MetricsDaemon {
                 self.state.bytes_encoded += bytes;
                 self.state.encode_time_us += duration_us;
             }
+            MetricEvent::EncodeFailed => {
+                self.state.encodes_active = self.state.encodes_active.saturating_sub(1);
+            }
 
             // Assembly events
             MetricEvent::AssemblyCompleted { duration_us } => {
@@ -994,6 +997,24 @@ mod tests {
         assert_eq!(daemon.state.encodes_active, 0);
         assert_eq!(daemon.state.encodes_completed, 1);
         assert_eq!(daemon.state.bytes_encoded, 5_000_000);
+    }
+
+    /// An encode that ends without a result leaves `encodes_active` and
+    /// counts nothing as encoded (#385).
+    #[test]
+    fn test_failed_encode_ends_without_counting_as_completed() {
+        let (mut daemon, _tx) = create_daemon();
+
+        daemon.process_event(MetricEvent::EncodeStarted);
+        daemon.process_event(MetricEvent::EncodeFailed);
+        assert_eq!(daemon.state.encodes_active, 0);
+        assert_eq!(daemon.state.encodes_completed, 0);
+        assert_eq!(daemon.state.bytes_encoded, 0);
+        assert_eq!(daemon.state.encode_time_us, 0);
+
+        // A stray end never takes the gauge below zero.
+        daemon.process_event(MetricEvent::EncodeFailed);
+        assert_eq!(daemon.state.encodes_active, 0);
     }
 
     #[test]

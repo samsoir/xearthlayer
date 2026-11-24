@@ -368,6 +368,14 @@ impl MetricsClient {
         self.send(MetricEvent::EncodeCompleted { bytes, duration_us });
     }
 
+    /// Records an encode that ended without a result (error, panic, or its
+    /// task dropped mid-encode). Prefer [`EncodeGuard`](super::EncodeGuard),
+    /// which sends this on every exit but completion.
+    #[inline]
+    pub fn encode_failed(&self) {
+        self.send(MetricEvent::EncodeFailed);
+    }
+
     // =========================================================================
     // Assembly Events
     // =========================================================================
