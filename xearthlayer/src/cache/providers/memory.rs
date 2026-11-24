@@ -1,13 +1,15 @@
 //! In-memory cache provider using moka.
 //!
 //! This provider wraps `moka::future::Cache` to provide an async-safe,
-//! lock-free in-memory cache with automatic LRU eviction.
+//! lock-free in-memory cache, bounded by bytes, with TinyLFU eviction:
+//! deliberately not LRU, because the tile stream that feeds it is a scan
+//! (see [`MemoryCacheProvider::new`], #405).
 //!
 //! # Why moka?
 //!
 //! - Lock-free reads (common case)
 //! - Concurrent writes without blocking
-//! - Automatic LRU eviction without explicit locking
+//! - Automatic eviction without explicit locking
 //! - Memory-bounded with configurable limits
 //! - Designed for async contexts
 //!
@@ -22,13 +24,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use moka::future::Cache as MokaCache;
+use moka::policy::EvictionPolicy;
 
 use crate::cache::traits::{BoxFuture, Cache, GcResult, ServiceCacheError};
 use crate::metrics::MetricsClient;
 
 /// In-memory cache provider using moka.
 ///
-/// Provides fast, async-safe access to cached data with automatic LRU eviction.
+/// Provides fast, async-safe access to cached data with automatic TinyLFU
+/// eviction (#405).
 /// The underlying moka cache uses lock-free data structures, making it safe
 /// for use across multiple async tasks.
 pub struct MemoryCacheProvider {
@@ -57,7 +61,16 @@ impl MemoryCacheProvider {
                 value.len().min(u32::MAX as usize) as u32
             })
             // Maximum total weight (size in bytes)
-            .max_capacity(max_size_bytes);
+            .max_capacity(max_size_bytes)
+            // TinyLFU, deliberately, not LRU (#405): both executor lanes write
+            // every finished tile here, prefetch included, hundreds a cycle
+            // against a tier of about 47 tiles. TinyLFU admits a new tile only
+            // if it is read more often than the one it would evict, so tiles
+            // read once (most prefetch output) stay out and tiles X-Plane
+            // re-reads stay in; under LRU each prefetch burst would flush them.
+            // A tile refused here is still on the DDS disk tier. The night
+            // lighting caches are the opposite case and use LRU (#387).
+            .eviction_policy(EvictionPolicy::tiny_lfu());
 
         // Add TTL if specified
         if let Some(ttl_duration) = ttl {
@@ -356,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_provider_lru_eviction() {
+    async fn test_memory_provider_stays_under_its_budget() {
         // Cache that can hold about 2.5 entries of 1000 bytes each
         let provider = MemoryCacheProvider::new(2500, None);
 
@@ -377,6 +390,52 @@ mod tests {
             provider.size_bytes() <= 2500,
             "Expected size <= 2500, got {}",
             provider.size_bytes()
+        );
+    }
+
+    /// #405: the tier is fed by a scan. Both lanes write every finished tile
+    /// into it, prefetch included, hundreds a cycle against a tier of about
+    /// 47 tiles. Tiles that are read repeatedly must survive a run of tiles
+    /// each read once; with plain LRU every one of them would be evicted.
+    ///
+    /// Sized like production (47 entries): moka's frequency sketch is too
+    /// coarse to separate anything in a cache of a handful of entries. At 90%
+    /// rather than all, so the test does not hinge on the sketch's details.
+    #[tokio::test]
+    async fn re_read_tiles_survive_a_run_of_tiles_read_once() {
+        const TILE: usize = 1000;
+        const HELD: usize = 47;
+        let provider = MemoryCacheProvider::new((TILE * HELD) as u64, None);
+
+        let hot: Vec<String> = (0..HELD).map(|i| format!("hot{i}")).collect();
+        for key in &hot {
+            provider.set(key, vec![0u8; TILE].into()).await.unwrap();
+        }
+        for _ in 0..6 {
+            for key in &hot {
+                assert!(provider.get(key).await.unwrap().is_some());
+            }
+        }
+        provider.gc().await.unwrap();
+
+        // As the daemon does for a tile it has to generate: a memory lookup
+        // that misses, then the finished tile written.
+        for i in 0..300 {
+            let key = format!("prefetched{i}");
+            assert!(provider.get(&key).await.unwrap().is_none());
+            provider.set(&key, vec![0u8; TILE].into()).await.unwrap();
+            provider.gc().await.unwrap();
+        }
+
+        let mut survivors = 0;
+        for key in &hot {
+            if provider.get(key).await.unwrap().is_some() {
+                survivors += 1;
+            }
+        }
+        assert!(
+            survivors * 10 >= HELD * 9,
+            "only {survivors} of {HELD} re-read tiles survived 300 tiles read once"
         );
     }
 

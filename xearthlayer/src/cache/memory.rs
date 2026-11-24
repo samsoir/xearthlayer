@@ -1,4 +1,6 @@
-//! In-memory cache with LRU eviction using moka.
+//! In-memory cache using moka, with moka's default TinyLFU eviction.
+//!
+//! Not on the production path: the DDS memory tier is `MemoryCacheProvider`.
 //!
 //! This module provides an async-safe memory cache backed by `moka::future::Cache`.
 //! Moka uses lock-free data structures internally, making it safe to use from
@@ -13,7 +15,7 @@
 //! Moka provides:
 //! - Lock-free reads (common case)
 //! - Concurrent writes without blocking
-//! - Automatic LRU eviction without explicit locking
+//! - Automatic eviction without explicit locking
 //! - Memory-bounded with configurable limits
 
 use crate::cache::types::CacheKey;
@@ -25,7 +27,7 @@ use std::sync::Arc;
 /// In-memory cache for DDS tiles.
 ///
 /// Provides fast, async-safe access to recently used tiles with automatic
-/// LRU eviction when memory limits are exceeded.
+/// eviction (moka's default, TinyLFU) when memory limits are exceeded.
 ///
 /// This implementation uses `moka::future::Cache` which is designed for
 /// async contexts and uses lock-free data structures internally.

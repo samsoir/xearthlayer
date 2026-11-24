@@ -5,7 +5,7 @@
 //!
 //! # Available Providers
 //!
-//! - [`MemoryCacheProvider`]: In-memory LRU cache using moka
+//! - [`MemoryCacheProvider`]: In-memory cache using moka, TinyLFU eviction (#405)
 //! - [`DiskCacheProvider`]: On-disk cache with background GC daemon
 //!
 //! # Creating Providers

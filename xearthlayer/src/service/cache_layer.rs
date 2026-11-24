@@ -283,7 +283,7 @@ impl DiskTiers {
 /// providing a unified interface for cache management within the service.
 ///
 /// The three tiers are:
-/// - **Memory** (moka LRU): Fastest, serves active FUSE reads
+/// - **Memory** (moka, TinyLFU): Fastest, serves active FUSE reads
 /// - **DDS Disk** (LRU + GC): Persistent DDS tiles, avoids re-encoding
 /// - **Chunk Disk** (LRU + GC): Raw imagery chunks, requires assembly + encoding
 ///
@@ -293,7 +293,7 @@ impl DiskTiers {
 /// With disk caching off (`run --no-cache`) only the memory tier exists and
 /// every disk accessor answers `None`.
 pub struct CacheLayer {
-    /// Memory cache service (owns LRU eviction).
+    /// Memory cache service (owns its eviction, TinyLFU, #405).
     memory_service: CacheService,
 
     /// Memory cache bridge (implements executor::MemoryCache).

@@ -34,7 +34,7 @@ pub enum ProviderConfig {
     /// In-memory cache using moka.
     Memory {
         /// Optional time-to-live for entries.
-        /// If `None`, entries are only evicted by LRU when size limit is reached.
+        /// If `None`, entries are only evicted when the size limit is reached.
         ttl: Option<Duration>,
     },
 

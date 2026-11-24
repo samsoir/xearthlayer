@@ -351,7 +351,7 @@ mod tests {
     //
     // `filter_memory_cache` used to be backed by a local `HashSet` shadow
     // of "tiles we believe are cached" as a fast path. The shadow went
-    // stale in production (memory cache evicts tiles under its small LRU
+    // stale in production (memory cache evicts tiles under its small
     // budget, but the shadow kept saying "cached"), causing the filter to
     // falsely report 100% cache hits and starving the prefetcher of work
     // for minutes at a time. The fix: always query the authoritative
