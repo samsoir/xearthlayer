@@ -128,6 +128,19 @@ impl crate::executor::DiskCache for DiskCacheAdapter {
 
         Ok(())
     }
+
+    async fn discard(&self, tile_row: u32, tile_col: u32, zoom: u8, chunk_row: u8, chunk_col: u8) {
+        let path = self.chunk_path(tile_row, tile_col, zoom, chunk_row, chunk_col);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to discard unusable chunk from the chunk cache"
+            ),
+        }
+    }
 }
 
 /// A no-op disk cache that never caches anything.
@@ -159,6 +172,16 @@ impl crate::executor::DiskCache for NullDiskCache {
         _data: Bytes,
     ) -> Result<(), std::io::Error> {
         Ok(())
+    }
+
+    async fn discard(
+        &self,
+        _tile_row: u32,
+        _tile_col: u32,
+        _zoom: u8,
+        _chunk_row: u8,
+        _chunk_col: u8,
+    ) {
     }
 }
 
@@ -305,6 +328,42 @@ mod tests {
         // Non-existent chunk should still be None
         let result = adapter.get(100, 200, 16, 10, 10).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn discard_deletes_only_the_named_chunk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let adapter = DiskCacheAdapter::new(temp_dir.path().to_path_buf(), "test");
+        adapter
+            .put(100, 200, 16, 5, 10, vec![1, 2, 3].into())
+            .await
+            .unwrap();
+        adapter
+            .put(100, 200, 16, 5, 11, vec![4, 5, 6].into())
+            .await
+            .unwrap();
+
+        adapter.discard(100, 200, 16, 5, 10).await;
+
+        assert!(!adapter.chunk_path(100, 200, 16, 5, 10).exists());
+        assert!(adapter.get(100, 200, 16, 5, 10).await.is_none());
+        assert!(adapter.get(100, 200, 16, 5, 11).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn discarding_a_chunk_that_is_not_cached_is_harmless() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let adapter = DiskCacheAdapter::new(temp_dir.path().to_path_buf(), "test");
+
+        adapter.discard(100, 200, 16, 5, 10).await;
+
+        assert!(adapter.get(100, 200, 16, 5, 10).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_null_disk_cache_discard_is_a_no_op() {
+        NullDiskCache.discard(100, 200, 16, 0, 0).await;
+        assert!(NullDiskCache.get(100, 200, 16, 0, 0).await.is_none());
     }
 
     #[tokio::test]

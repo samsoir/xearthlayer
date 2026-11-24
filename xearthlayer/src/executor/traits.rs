@@ -199,8 +199,8 @@ pub trait MemoryCache: Send + Sync + 'static {
 
 /// Trait for disk cache (chunk-level).
 ///
-/// Disk cache stores individual JPEG chunks for persistence across sessions.
-/// Operations are async since they involve disk I/O.
+/// Disk cache stores individual imagery chunks for persistence across
+/// sessions. Operations are async since they involve disk I/O.
 pub trait DiskCache: Send + Sync + 'static {
     /// The cache tier this trait writes to. Derived rather than declared at
     /// call sites so a wrong tier cannot be typed by hand — see issue #216.
@@ -232,6 +232,28 @@ pub trait DiskCache: Send + Sync + 'static {
         chunk_col: u8,
         data: Bytes,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+
+    /// Removes a chunk its reader found unusable, so the next request for it
+    /// downloads it again.
+    ///
+    /// The chunk tier's own validator sees bytes only; whether they decode
+    /// to a 256x256 image is found by the task that assembles the tile,
+    /// which calls this for every chunk that does not (#388). Invariant 3 of
+    /// the cache integrity model (`docs/dev/cache-integrity-design.md`): a
+    /// rejected entry is deleted, not left in place, or every later read
+    /// rejects it again and its tile can never be cached.
+    ///
+    /// Discarding a chunk that is not cached is not an error. A failure to
+    /// delete is logged, not returned: the caller has already stopped
+    /// trusting the entry.
+    fn discard(
+        &self,
+        tile_row: u32,
+        tile_col: u32,
+        zoom: u8,
+        chunk_row: u8,
+        chunk_col: u8,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 // ============================================================================

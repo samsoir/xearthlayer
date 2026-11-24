@@ -76,6 +76,11 @@ pub fn lit_payload_validator() -> MagicAndSize {
 /// not been audited. Claiming an unverified magic would turn a correctness
 /// fix into an outage by rejecting valid chunks, so this checks only that the
 /// entry holds bytes at all.
+///
+/// Whether a chunk is a usable image is decided elsewhere, by format-neutral
+/// decoding (#388): a downloaded body whose image header does not say
+/// 256x256 is never written here, and an entry that fails to decode when its
+/// tile is assembled is removed through the executor's `DiskCache::discard`.
 pub fn raw_chunk_validator() -> MagicAndSize {
     MagicAndSize {
         name: "raw_chunk",

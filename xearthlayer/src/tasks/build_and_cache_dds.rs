@@ -17,11 +17,12 @@
 //! Returns the DDS data via `TaskOutput` key "dds_data" (`Vec<u8>`).
 //! Cache write is fire-and-forget (spawned async task).
 
+use super::chunk_image::{self, CHUNK_PIXELS};
 use super::download_chunks::OUTPUT_KEY_CHUNKS;
 use crate::coord::TileCoord;
 use crate::executor::{
-    BlockingExecutor, ChunkResults, DdsDiskCache, MemoryCache, ResourceType, Task, TaskContext,
-    TaskError, TaskOutput, TaskResult, TextureEncoderAsync,
+    BlockingExecutor, ChunkResults, DdsDiskCache, DiskCache, MemoryCache, ResourceType, Task,
+    TaskContext, TaskError, TaskOutput, TaskResult, TextureEncoderAsync,
 };
 use crate::metrics::{EncodeGuard, MetricsClient, OptionalMetrics};
 use bytes::Bytes;
@@ -35,7 +36,7 @@ use tracing::{debug, warn};
 
 /// Tile dimensions
 const TILE_SIZE: u32 = 4096;
-const CHUNK_SIZE: u32 = 256;
+const CHUNK_SIZE: u32 = CHUNK_PIXELS;
 const CHUNKS_PER_SIDE: u32 = 16;
 
 /// Magenta color for failed chunks (R=255, G=0, B=255, A=255)
@@ -47,6 +48,15 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 /// 1. Assemble chunks into a 4096×4096 RGBA image
 /// 2. Encode the image to DDS format with BC1 compression
 /// 3. Spawn fire-and-forget cache write (non-blocking)
+///
+/// # Complete tiles
+///
+/// Only a complete tile is cached: every one of its 256 chunks downloaded
+/// (or came from the chunk cache) and decoded to a 256x256 image. Any other
+/// tile has magenta squares where those chunks belong; it is served to
+/// X-Plane so the sim does not stall, but never remembered (#180, #388).
+/// A chunk that arrived but is not a usable image is also discarded from the
+/// chunk cache, so the next request downloads it (#388).
 ///
 /// # Cancellation
 ///
@@ -68,11 +78,12 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// The DDS data is returned directly to avoid cache read race conditions
 /// with eventual consistency caches like moka.
-pub struct BuildAndCacheDdsTask<E, M, DD, X>
+pub struct BuildAndCacheDdsTask<E, M, DD, D, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
     DD: DdsDiskCache,
+    D: DiskCache,
     X: BlockingExecutor,
 {
     /// Tile coordinates
@@ -87,15 +98,19 @@ where
     /// DDS disk cache for persistent tile storage
     dds_disk_cache: Arc<DD>,
 
+    /// Chunk disk cache, from which unusable chunks are discarded
+    chunk_cache: Arc<D>,
+
     /// Executor for CPU-bound blocking operations
     executor: Arc<X>,
 }
 
-impl<E, M, DD, X> BuildAndCacheDdsTask<E, M, DD, X>
+impl<E, M, DD, D, X> BuildAndCacheDdsTask<E, M, DD, D, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
     DD: DdsDiskCache,
+    D: DiskCache,
     X: BlockingExecutor,
 {
     /// Creates a new build and cache DDS task.
@@ -106,12 +121,15 @@ where
     /// * `encoder` - Texture encoder for DDS compression
     /// * `memory_cache` - Memory cache to write completed tiles
     /// * `dds_disk_cache` - DDS disk cache for persistent storage
+    /// * `chunk_cache` - Chunk disk cache, from which chunks that are not
+    ///   usable images are discarded (#388)
     /// * `executor` - Executor for blocking operations (spawn_blocking)
     pub fn new(
         tile: TileCoord,
         encoder: Arc<E>,
         memory_cache: Arc<M>,
         dds_disk_cache: Arc<DD>,
+        chunk_cache: Arc<D>,
         executor: Arc<X>,
     ) -> Self {
         Self {
@@ -119,6 +137,7 @@ where
             encoder,
             memory_cache,
             dds_disk_cache,
+            chunk_cache,
             executor,
         }
     }
@@ -182,13 +201,39 @@ where
             );
         });
     }
+
+    /// Spawns the fire-and-forget discard of `rejected` chunks from the chunk
+    /// cache, so the next request for the tile downloads them (#388).
+    ///
+    /// Every rejected chunk is discarded, whether it was read from the chunk
+    /// cache or just downloaded, so where each chunk came from need not be
+    /// tracked: a downloaded chunk that passed the header check but fails to
+    /// decode was written to the chunk cache too, and discarding a chunk
+    /// that is not cached does nothing. A downloaded chunk's own write is
+    /// spawned as well and may land after its discard; the entry is then
+    /// rejected and discarded on its next read instead.
+    fn spawn_chunk_discards(&self, rejected: Vec<(u8, u8)>) {
+        if rejected.is_empty() {
+            return;
+        }
+        let chunk_cache = Arc::clone(&self.chunk_cache);
+        let tile = self.tile;
+        tokio::spawn(async move {
+            for (chunk_row, chunk_col) in rejected {
+                chunk_cache
+                    .discard(tile.row, tile.col, tile.zoom, chunk_row, chunk_col)
+                    .await;
+            }
+        });
+    }
 }
 
-impl<E, M, DD, X> Task for BuildAndCacheDdsTask<E, M, DD, X>
+impl<E, M, DD, D, X> Task for BuildAndCacheDdsTask<E, M, DD, D, X>
 where
     E: TextureEncoderAsync,
     M: MemoryCache,
     DD: DdsDiskCache,
+    D: DiskCache,
     X: BlockingExecutor,
 {
     fn name(&self) -> &str {
@@ -235,10 +280,11 @@ where
 
                 let success_count = chunks.success_count();
                 let failure_count = chunks.failure_count();
-                // Capture completeness before chunks are moved into assembly.
-                // Cache writes (memory + DDS disk) are gated on this further down;
-                // see issue #180.
-                let tile_complete = chunks.is_complete();
+                // Captured before `chunks` is moved into assembly: every
+                // chunk downloaded or came from the chunk cache (#180). The
+                // tile is complete only if every one of them also decodes
+                // (#388), which assembly tells.
+                let all_downloaded = chunks.is_complete();
 
                 debug!(
                     job_id = %job_id,
@@ -256,21 +302,10 @@ where
                     .execute_blocking(move || assemble_chunks(chunks))
                     .await;
 
-                if ctx.is_cancelled() {
-                    return TaskResult::Cancelled;
-                }
-
-                let image = match image_result {
-                    Ok(Ok(img)) => {
-                        let duration_us = assembly_start.elapsed().as_micros() as u64;
-                        metrics.assembly_completed(duration_us);
-                        img
-                    }
-                    Ok(Err(e)) => {
-                        return TaskResult::Failed(TaskError::new(format!(
-                            "Assembly failed: {}",
-                            e
-                        )));
+                let assembled = match image_result {
+                    Ok(assembled) => assembled,
+                    Err(_) if ctx.is_cancelled() => {
+                        return TaskResult::Cancelled;
                     }
                     Err(e) => {
                         return TaskResult::Failed(TaskError::new(format!(
@@ -279,6 +314,25 @@ where
                         )));
                     }
                 };
+
+                // The tile is complete, and may be cached, only if every
+                // chunk downloaded and decoded to a 256x256 image (#180,
+                // #388).
+                let rejected_count = assembled.rejected.len();
+                let tile_complete = all_downloaded && rejected_count == 0;
+
+                // Unusable chunks leave the chunk cache whatever becomes of
+                // this job: kept, they would rebuild the same magenta
+                // squares on every request (#388).
+                self.spawn_chunk_discards(assembled.rejected);
+
+                if ctx.is_cancelled() {
+                    return TaskResult::Cancelled;
+                }
+
+                let duration_us = assembly_start.elapsed().as_micros() as u64;
+                metrics.assembly_completed(duration_us);
+                let image = assembled.image;
 
                 debug!(
                     job_id = %job_id,
@@ -338,13 +392,14 @@ where
                 // `TaskContext::is_shutting_down`).
                 let cancelled = ctx.is_cancelled();
 
-                // Cache writes are gated on tile completeness (captured above
-                // before `chunks` was moved into assembly). A tile assembled
-                // with any failed chunks contains magenta-filled regions that
-                // would be structurally indistinguishable from a successful tile
-                // once persisted, and would never be re-fetched. We still serve
-                // the tile to X-Plane (so the sim doesn't stall), but never
-                // remember it, cancelled or not. See issue #180.
+                // Cache writes are gated on tile completeness (decided above,
+                // after assembly). A tile assembled with any chunk that failed
+                // to download or to decode contains magenta-filled regions
+                // that would be structurally indistinguishable from a
+                // successful tile once persisted, and would never be
+                // re-fetched. We still serve the tile to X-Plane (so the sim
+                // doesn't stall), but never remember it, cancelled or not.
+                // See issues #180 and #388.
                 if tile_complete {
                     if cancelled && ctx.is_shutting_down() {
                         debug!(
@@ -368,6 +423,7 @@ where
                         tile = ?self.tile,
                         success_count = success_count,
                         failure_count = failure_count,
+                        rejected_count = rejected_count,
                         size_bytes = dds_size,
                         "Tile incomplete; serving DDS to X-Plane but skipping cache writes"
                     );
@@ -398,9 +454,25 @@ where
 // Chunk assembly
 // ============================================================================
 
+/// A tile image assembled from its chunks.
+struct AssembledTile {
+    image: RgbaImage,
+    /// Chunks `(row, col)` that were downloaded or read from the chunk cache
+    /// but are not usable images: they failed [`chunk_image::decode`] (did
+    /// not decode, or were not 256x256). Each is painted magenta like a
+    /// failed download. A tile with any is not complete (#388).
+    rejected: Vec<(u8, u8)>,
+}
+
 /// Synchronous chunk assembly (runs in spawn_blocking).
-fn assemble_chunks(chunks: ChunkResults) -> Result<RgbaImage, String> {
+///
+/// Every chunk position gets either its chunk's pixels or a magenta square:
+/// magenta for a chunk that failed to download (absent from `chunks`) and
+/// for one that is not a usable image, which is also listed in
+/// [`AssembledTile::rejected`].
+fn assemble_chunks(chunks: ChunkResults) -> AssembledTile {
     let mut canvas = RgbaImage::new(TILE_SIZE, TILE_SIZE);
+    let mut rejected = Vec::new();
 
     // Process each chunk position
     for row in 0..CHUNKS_PER_SIDE as u8 {
@@ -408,21 +480,21 @@ fn assemble_chunks(chunks: ChunkResults) -> Result<RgbaImage, String> {
             let x_offset = col as u32 * CHUNK_SIZE;
             let y_offset = row as u32 * CHUNK_SIZE;
 
-            if let Some(jpeg_data) = chunks.get(row, col) {
+            if let Some(data) = chunks.get(row, col) {
                 // Decode and place the chunk
-                match decode_chunk(jpeg_data) {
+                match chunk_image::decode(data) {
                     Ok(chunk_image) => {
                         place_chunk(&mut canvas, &chunk_image, x_offset, y_offset);
                     }
                     Err(e) => {
-                        // Decode failed - use magenta placeholder
                         warn!(
                             chunk_row = row,
                             chunk_col = col,
                             error = %e,
-                            "Failed to decode chunk, using magenta placeholder"
+                            "Chunk is not a usable image, using magenta placeholder"
                         );
                         fill_magenta(&mut canvas, x_offset, y_offset);
+                        rejected.push((row, col));
                     }
                 }
             } else {
@@ -432,24 +504,21 @@ fn assemble_chunks(chunks: ChunkResults) -> Result<RgbaImage, String> {
         }
     }
 
-    Ok(canvas)
-}
-
-/// Decodes JPEG data into an RGBA image.
-fn decode_chunk(jpeg_data: &[u8]) -> Result<RgbaImage, String> {
-    let img =
-        image::load_from_memory(jpeg_data).map_err(|e| format!("image decode error: {}", e))?;
-    Ok(img.to_rgba8())
+    AssembledTile {
+        image: canvas,
+        rejected,
+    }
 }
 
 /// Places a chunk image onto the canvas at the specified offset.
+///
+/// The chunk is [`CHUNK_SIZE`] square: [`chunk_image::decode`] returns no
+/// other size.
 fn place_chunk(canvas: &mut RgbaImage, chunk: &RgbaImage, x_offset: u32, y_offset: u32) {
-    // Handle chunks that might not be exactly 256x256
-    let chunk_width = chunk.width().min(CHUNK_SIZE);
-    let chunk_height = chunk.height().min(CHUNK_SIZE);
+    debug_assert_eq!(chunk.dimensions(), (CHUNK_SIZE, CHUNK_SIZE));
 
-    for y in 0..chunk_height {
-        for x in 0..chunk_width {
+    for y in 0..CHUNK_SIZE {
+        for x in 0..CHUNK_SIZE {
             let pixel = chunk.get_pixel(x, y);
             canvas.put_pixel(x_offset + x, y_offset + y, *pixel);
         }
@@ -469,6 +538,8 @@ fn fill_magenta(canvas: &mut RgbaImage, x_offset: u32, y_offset: u32) {
 mod tests {
     use super::*;
     use crate::executor::{ExecutorError, JobId, TextureEncodeError};
+    use crate::tasks::chunk_image::test_chunks::{self, encoded, error_page, jpeg};
+    use image::ImageFormat;
     use std::time::Duration;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
     use tokio_util::sync::CancellationToken;
@@ -482,7 +553,8 @@ mod tests {
     #[test]
     fn test_assemble_chunks_empty() {
         let chunks = ChunkResults::new();
-        let result = assemble_chunks(chunks).unwrap();
+        let assembled = assemble_chunks(chunks);
+        let result = &assembled.image;
 
         assert_eq!(result.width(), TILE_SIZE);
         assert_eq!(result.height(), TILE_SIZE);
@@ -490,6 +562,73 @@ mod tests {
         // All pixels should be magenta
         let pixel = result.get_pixel(0, 0);
         assert_eq!(*pixel, MAGENTA);
+        // Missing chunks are failed downloads, counted by `ChunkResults`.
+        assert!(assembled.rejected.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Unusable chunks: painted magenta, counted (#388)
+    // ------------------------------------------------------------------
+
+    /// Whether the chunk at `(row, col)` of `image` is magenta at its four
+    /// corners and centre.
+    fn chunk_is_magenta(image: &RgbaImage, row: u32, col: u32) -> bool {
+        let (x, y) = (col * CHUNK_SIZE, row * CHUNK_SIZE);
+        let last = CHUNK_SIZE - 1;
+        [(0, 0), (last, 0), (0, last), (last, last), (128, 128)]
+            .iter()
+            .all(|&(dx, dy)| *image.get_pixel(x + dx, y + dy) == MAGENTA)
+    }
+
+    /// Whether the chunk at `(row, col)` of `image` holds the test chunks'
+    /// colour at its four corners and centre (JPEG is lossy).
+    fn chunk_is_imagery(image: &RgbaImage, row: u32, col: u32) -> bool {
+        let (x, y) = (col * CHUNK_SIZE, row * CHUNK_SIZE);
+        let last = CHUNK_SIZE - 1;
+        [(0, 0), (last, 0), (0, last), (last, last), (128, 128)]
+            .iter()
+            .all(|&(dx, dy)| {
+                let pixel = image.get_pixel(x + dx, y + dy).0;
+                pixel[3] == 255
+                    && pixel
+                        .iter()
+                        .zip(test_chunks::COLOUR.0)
+                        .all(|(got, want)| got.abs_diff(want) <= 4)
+            })
+    }
+
+    #[test]
+    fn unusable_chunks_are_painted_magenta_and_counted() {
+        let chunks = chunks_with([
+            ((2, 3), error_page()),
+            ((7, 9), encoded(128, 128, ImageFormat::Jpeg)),
+            ((15, 15), encoded(512, 512, ImageFormat::Jpeg)),
+        ]);
+
+        let assembled = assemble_chunks(chunks);
+
+        let mut rejected = assembled.rejected.clone();
+        rejected.sort_unstable();
+        assert_eq!(rejected, vec![(2, 3), (7, 9), (15, 15)]);
+        // A smaller chunk is not placed in a corner of its square, nor a
+        // larger one cropped: each square is magenta, like a failed download.
+        for (row, col) in [(2, 3), (7, 9), (15, 15)] {
+            assert!(
+                chunk_is_magenta(&assembled.image, row, col),
+                "chunk ({row}, {col})"
+            );
+        }
+        assert!(chunk_is_imagery(&assembled.image, 0, 0));
+        assert!(chunk_is_imagery(&assembled.image, 7, 8));
+    }
+
+    #[test]
+    fn a_tile_of_usable_chunks_rejects_none() {
+        let assembled = assemble_chunks(complete_chunks());
+
+        assert!(assembled.rejected.is_empty());
+        assert!(chunk_is_imagery(&assembled.image, 0, 0));
+        assert!(chunk_is_imagery(&assembled.image, 15, 15));
     }
 
     #[test]
@@ -645,7 +784,52 @@ mod tests {
         }
     }
 
-    type TestTask<E, X> = BuildAndCacheDdsTask<E, CountingMemoryCache, CountingDdsDiskCache, X>;
+    /// A chunk cache that reports every discard as its `(row, col)`.
+    struct RecordingChunkCache {
+        discards: UnboundedSender<(u8, u8)>,
+    }
+    impl DiskCache for RecordingChunkCache {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = Option<Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+            _d: Bytes,
+        ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            async { Ok(()) }
+        }
+        fn discard(
+            &self,
+            tile_row: u32,
+            tile_col: u32,
+            zoom: u8,
+            chunk_row: u8,
+            chunk_col: u8,
+        ) -> impl Future<Output = ()> + Send {
+            assert_eq!(
+                (tile_row, tile_col, zoom),
+                (100, 200, 15),
+                "the task's tile"
+            );
+            let _ = self.discards.send((chunk_row, chunk_col));
+            async {}
+        }
+    }
+
+    type TestTask<E, X> =
+        BuildAndCacheDdsTask<E, CountingMemoryCache, CountingDdsDiskCache, RecordingChunkCache, X>;
 
     fn make_task_with_chunks(
         chunks: ChunkResults,
@@ -676,8 +860,27 @@ mod tests {
         UnboundedReceiver<(u32, u32, u8)>,
         TaskContext,
     ) {
+        let (task, mem_rx, disk_rx, _discards, ctx) =
+            make_task_with_discards(chunks, encoder, executor, job);
+        (task, mem_rx, disk_rx, ctx)
+    }
+
+    /// [`make_task`], also returning the chunk cache's discards.
+    fn make_task_with_discards<E: TextureEncoderAsync, X: BlockingExecutor>(
+        chunks: ChunkResults,
+        encoder: E,
+        executor: X,
+        job: CancellationToken,
+    ) -> (
+        TestTask<E, X>,
+        UnboundedReceiver<(u32, u32, u8)>,
+        UnboundedReceiver<(u32, u32, u8)>,
+        UnboundedReceiver<(u8, u8)>,
+        TaskContext,
+    ) {
         let (mem_tx, mem_rx) = unbounded_channel();
         let (disk_tx, disk_rx) = unbounded_channel();
+        let (discard_tx, discard_rx) = unbounded_channel();
 
         let task = BuildAndCacheDdsTask::new(
             TileCoord {
@@ -688,6 +891,9 @@ mod tests {
             Arc::new(encoder),
             Arc::new(CountingMemoryCache { tx: mem_tx }),
             Arc::new(CountingDdsDiskCache { tx: disk_tx }),
+            Arc::new(RecordingChunkCache {
+                discards: discard_tx,
+            }),
             Arc::new(executor),
         );
 
@@ -696,19 +902,30 @@ mod tests {
         output.set("chunks", chunks);
         ctx.add_task_output("DownloadChunks".to_string(), output);
 
-        (task, mem_rx, disk_rx, ctx)
+        (task, mem_rx, disk_rx, discard_rx, ctx)
     }
 
+    /// 256 usable chunks: real 256x256 JPEGs.
     fn complete_chunks() -> ChunkResults {
-        // Data content is irrelevant to the gate decision, which keys off
-        // ChunkResults::is_complete().
+        let chunks = chunks_with([]);
+        assert!(chunks.is_complete());
+        chunks
+    }
+
+    /// 256 downloaded chunks: usable JPEGs except the bodies given by
+    /// position. Every chunk downloaded, so `is_complete()` holds whatever
+    /// the bodies are.
+    fn chunks_with<const N: usize>(bodies: [((u8, u8), Bytes); N]) -> ChunkResults {
         let mut chunks = ChunkResults::new();
         for row in 0..16u8 {
             for col in 0..16u8 {
-                chunks.add_success(row, col, vec![].into());
+                let body = bodies
+                    .iter()
+                    .find(|(at, _)| *at == (row, col))
+                    .map_or_else(jpeg, |(_, body)| body.clone());
+                chunks.add_success(row, col, body);
             }
         }
-        assert!(chunks.is_complete());
         chunks
     }
 
@@ -789,17 +1006,11 @@ mod tests {
 
     #[tokio::test]
     async fn complete_tile_writes_to_both_caches() {
-        // 256 successful chunks - tile is complete. Data content is irrelevant
-        // to the gate decision, which keys off ChunkResults::is_complete().
-        let mut chunks = ChunkResults::new();
-        for row in 0..16u8 {
-            for col in 0..16u8 {
-                chunks.add_success(row, col, vec![].into());
-            }
-        }
-        assert!(chunks.is_complete());
-
-        let (task, mut mem_rx, mut disk_rx, mut ctx) = make_task_with_chunks(chunks);
+        // 256 downloaded chunks that are all 256x256 images: the tile is
+        // complete. Before #388 this test fed 256 empty bodies, every one of
+        // which failed to decode, and asserted that the resulting all-magenta
+        // tile was cached.
+        let (task, mut mem_rx, mut disk_rx, mut ctx) = make_task_with_chunks(complete_chunks());
 
         let result = task.execute(&mut ctx).await;
         assert!(matches!(result, TaskResult::SuccessWithOutput(_)));
@@ -817,6 +1028,108 @@ mod tests {
         assert_eq!(disk_put, (100, 200, 15));
     }
 
+    /// Runs a task over `chunks` and asserts X-Plane gets a tile but
+    /// neither cache does.
+    async fn assert_served_but_not_cached(chunks: ChunkResults) {
+        let (task, mut mem_rx, mut disk_rx, mut ctx) = make_task_with_chunks(chunks);
+
+        match task.execute(&mut ctx).await {
+            TaskResult::SuccessWithOutput(out) => {
+                let dds = out.get::<Bytes>("dds_data").cloned();
+                assert!(
+                    dds.is_some_and(|dds| !dds.is_empty()),
+                    "X-Plane gets a tile"
+                );
+            }
+            other => panic!("expected SuccessWithOutput, got {other:?}"),
+        }
+
+        let mem_puts = drain_within(&mut mem_rx, Duration::from_millis(100)).await;
+        let disk_puts = drain_within(&mut disk_rx, Duration::from_millis(50)).await;
+        assert!(mem_puts.is_empty(), "memory cache got {mem_puts:?}");
+        assert!(disk_puts.is_empty(), "DDS disk cache got {disk_puts:?}");
+    }
+
+    /// #388: every chunk downloaded, so `ChunkResults::is_complete()` holds,
+    /// but one is not an image. The tile has a magenta square and must not
+    /// be remembered.
+    #[tokio::test]
+    async fn undecodable_chunk_leaves_both_caches_unwritten() {
+        let chunks = chunks_with([((4, 11), error_page())]);
+        assert!(chunks.is_complete());
+
+        assert_served_but_not_cached(chunks).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_sized_chunk_leaves_both_caches_unwritten() {
+        let chunks = chunks_with([((0, 0), encoded(512, 512, ImageFormat::Jpeg))]);
+        assert!(chunks.is_complete());
+
+        assert_served_but_not_cached(chunks).await;
+    }
+
+    /// The discards that reach the chunk cache within a short wait, sorted.
+    async fn discards_within(rx: &mut UnboundedReceiver<(u8, u8)>) -> Vec<(u8, u8)> {
+        let mut discards = Vec::new();
+        while let Ok(Some(discard)) =
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        {
+            discards.push(discard);
+        }
+        discards.sort_unstable();
+        discards
+    }
+
+    /// #388: a chunk that does not decode, or is not 256x256, is removed
+    /// from the chunk cache so the next request downloads it, instead of
+    /// rebuilding the same magenta square from it forever.
+    #[tokio::test]
+    async fn unusable_chunks_are_discarded_from_the_chunk_cache() {
+        let chunks = chunks_with([
+            ((2, 3), error_page()),
+            ((7, 9), encoded(128, 128, ImageFormat::Jpeg)),
+        ]);
+        let (task, _mem_rx, _disk_rx, mut discard_rx, mut ctx) = make_task_with_discards(
+            chunks,
+            StubEncoder,
+            InlineBlockingExecutor,
+            CancellationToken::new(),
+        );
+
+        task.execute(&mut ctx).await;
+
+        assert_eq!(
+            discards_within(&mut discard_rx).await,
+            vec![(2, 3), (7, 9)],
+            "exactly the unusable chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn usable_chunks_and_failed_downloads_are_not_discarded() {
+        let mut chunks = ChunkResults::new();
+        for row in 0..16u8 {
+            for col in 0..16u8 {
+                if (row, col) == (5, 5) {
+                    chunks.add_failure(row, col, 3, "timeout".to_string());
+                } else {
+                    chunks.add_success(row, col, jpeg());
+                }
+            }
+        }
+        let (task, _mem_rx, _disk_rx, mut discard_rx, mut ctx) = make_task_with_discards(
+            chunks,
+            StubEncoder,
+            InlineBlockingExecutor,
+            CancellationToken::new(),
+        );
+
+        task.execute(&mut ctx).await;
+
+        assert!(discards_within(&mut discard_rx).await.is_empty());
+    }
+
     // ------------------------------------------------------------------
     // mem_cache_writes_active instrumentation (#209 fix wave)
     //
@@ -832,15 +1145,7 @@ mod tests {
         use crate::metrics::MetricEvent;
         use crate::metrics::MetricsClient;
 
-        let mut chunks = ChunkResults::new();
-        for row in 0..16u8 {
-            for col in 0..16u8 {
-                chunks.add_success(row, col, vec![].into());
-            }
-        }
-        assert!(chunks.is_complete());
-
-        let (task, _mem_rx, _disk_rx, ctx) = make_task_with_chunks(chunks);
+        let (task, _mem_rx, _disk_rx, ctx) = make_task_with_chunks(complete_chunks());
 
         let (metrics_tx, mut metrics_rx) = unbounded_channel();
         let mut ctx = ctx.with_metrics(MetricsClient::new(metrics_tx));

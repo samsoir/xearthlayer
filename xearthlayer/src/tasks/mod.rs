@@ -28,6 +28,7 @@
 mod build_and_cache_dds;
 mod cache_gc_batch;
 mod cached_tile_probe;
+pub(crate) mod chunk_image;
 mod download_chunks;
 
 // Primary task types

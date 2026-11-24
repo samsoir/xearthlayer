@@ -203,6 +203,7 @@ where
                 Arc::clone(&self.encoder),
                 Arc::clone(&self.memory_cache),
                 Arc::clone(&self.dds_disk_cache),
+                Arc::clone(&self.disk_cache),
                 Arc::clone(&self.executor),
             )),
         ]);
@@ -353,6 +354,16 @@ mod tests {
             _d: bytes::Bytes,
         ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send {
             async { Ok(()) }
+        }
+        fn discard(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            async {}
         }
     }
 

@@ -17,10 +17,11 @@
 //!
 //! Produces `TaskOutput` with key "chunks" containing `ChunkResults`.
 
+use super::chunk_image;
 use crate::coord::TileCoord;
 use crate::executor::{
-    ChunkProvider, ChunkResults, DiskCache, DownloadConfig, ResourceType, Task, TaskContext,
-    TaskOutput, TaskResult,
+    ChunkDownloadError, ChunkProvider, ChunkResults, DiskCache, DownloadConfig, ResourceType, Task,
+    TaskContext, TaskOutput, TaskResult,
 };
 use crate::metrics::{MetricsClient, OptionalMetrics};
 use bytes::Bytes;
@@ -304,6 +305,10 @@ where
 
 /// Downloads a single chunk, checking disk cache first.
 ///
+/// A downloaded body counts as a download, and is written to the chunk
+/// cache, only if [`require_chunk_image`] passes it; otherwise the attempt
+/// failed and is retried like a transport error (#388).
+///
 /// Emits metrics events for:
 /// - Disk cache hit/miss
 /// - Download started/completed/failed
@@ -384,6 +389,7 @@ where
             provider.download_chunk(global_row, global_col, chunk_zoom),
         )
         .await
+        .map(|downloaded| downloaded.and_then(require_chunk_image))
         {
             Ok(Ok(data)) => {
                 let duration_us = download_start.elapsed().as_micros() as u64;
@@ -475,6 +481,26 @@ where
     })
 }
 
+/// Passes a downloaded body that is a usable chunk (an image `image` can
+/// read, 256x256, judged from its header) and fails any other (#388).
+///
+/// A successful HTTP response whose body is not such an image (an error page
+/// from a proxy, a CDN or a captive portal) is a failed download, retryable
+/// like a transport error: a transient one gets its retries, and a
+/// persistent one ends as a failed chunk, painted magenta in a tile that is
+/// not cached. Either way it never reaches the chunk disk cache, where it
+/// would be a hit on every later request. Pixel data is not read here, so a
+/// body with a good header and bad data passes, and is caught when its tile
+/// is assembled.
+fn require_chunk_image(body: Bytes) -> Result<Bytes, ChunkDownloadError> {
+    match chunk_image::check_header(&body) {
+        Ok(()) => Ok(body),
+        Err(reason) => Err(ChunkDownloadError::retryable(format!(
+            "response is not a usable chunk: {reason}"
+        ))),
+    }
+}
+
 /// Spawns a fire-and-forget task to write chunk data to disk cache.
 ///
 /// Emits `disk_write_started` when beginning and `disk_write_completed`
@@ -506,6 +532,10 @@ fn spawn_cache_write<D>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::chunk_image::test_chunks::{encoded, error_page, jpeg};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
     #[test]
     fn test_task_name() {
@@ -550,6 +580,16 @@ mod tests {
             _d: Bytes,
         ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
             async { panic!("chunk cache must not be written for a cached tile") }
+        }
+        fn discard(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = ()> + Send {
+            async { panic!("chunk cache must not be discarded from for a cached tile") }
         }
     }
 
@@ -599,6 +639,199 @@ mod tests {
         ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
             async { Ok(()) }
         }
+        fn discard(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = ()> + Send {
+            async {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A body that is not a 256x256 image is a failed download (#388)
+    // ------------------------------------------------------------------
+
+    /// Answers each download with the next of its bodies, then repeats the
+    /// last one, counting the calls.
+    struct ScriptedProvider {
+        bodies: Mutex<Vec<Bytes>>,
+        calls: AtomicUsize,
+    }
+    impl ScriptedProvider {
+        fn new(bodies: impl IntoIterator<Item = Bytes>) -> Self {
+            let mut bodies: Vec<Bytes> = bodies.into_iter().collect();
+            bodies.reverse();
+            Self {
+                bodies: Mutex::new(bodies),
+                calls: AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+    impl ChunkProvider for ScriptedProvider {
+        fn download_chunk(
+            &self,
+            _row: u32,
+            _col: u32,
+            _zoom: u8,
+        ) -> impl Future<Output = Result<Bytes, crate::executor::ChunkDownloadError>> + Send
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut bodies = self.bodies.lock().unwrap();
+            let body = if bodies.len() > 1 {
+                bodies.pop().unwrap()
+            } else {
+                bodies[0].clone()
+            };
+            async move { Ok(body) }
+        }
+        fn name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    /// A chunk cache with nothing in it that reports every write.
+    struct RecordingDiskCache {
+        puts: UnboundedSender<(u8, u8, Bytes)>,
+    }
+    impl RecordingDiskCache {
+        fn new() -> (Self, UnboundedReceiver<(u8, u8, Bytes)>) {
+            let (puts, rx) = unbounded_channel();
+            (Self { puts }, rx)
+        }
+    }
+    impl DiskCache for RecordingDiskCache {
+        fn get(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = Option<Bytes>> + Send {
+            async { None }
+        }
+        fn put(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            cr: u8,
+            cc: u8,
+            d: Bytes,
+        ) -> impl Future<Output = Result<(), std::io::Error>> + Send {
+            let _ = self.puts.send((cr, cc, d));
+            async { Ok(()) }
+        }
+        fn discard(
+            &self,
+            _tr: u32,
+            _tc: u32,
+            _z: u8,
+            _cr: u8,
+            _cc: u8,
+        ) -> impl Future<Output = ()> + Send {
+            async {}
+        }
+    }
+
+    const TILE: TileCoord = TileCoord {
+        row: 100,
+        col: 200,
+        zoom: 15,
+    };
+
+    /// Downloads chunk (3, 4) of [`TILE`] with three attempts.
+    async fn download_one(
+        provider: &Arc<ScriptedProvider>,
+        cache: RecordingDiskCache,
+    ) -> Result<ChunkData, ChunkError> {
+        download_chunk_with_cache(
+            TILE,
+            3,
+            4,
+            Arc::clone(provider),
+            Arc::new(cache),
+            Duration::from_secs(10),
+            3,
+            None,
+        )
+        .await
+    }
+
+    /// The writes that reach the cache within a short wait. The writes are
+    /// spawned, so "none" means none within the window.
+    async fn puts_within(rx: &mut UnboundedReceiver<(u8, u8, Bytes)>) -> Vec<(u8, u8, Bytes)> {
+        let mut puts = Vec::new();
+        while let Ok(Some(put)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        {
+            puts.push(put);
+        }
+        puts
+    }
+
+    #[tokio::test]
+    async fn a_usable_chunk_is_cached() {
+        let provider = Arc::new(ScriptedProvider::new([jpeg()]));
+        let (cache, mut puts) = RecordingDiskCache::new();
+
+        let chunk = download_one(&provider, cache).await.ok().unwrap();
+
+        assert_eq!(chunk.data, jpeg());
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(puts_within(&mut puts).await, vec![(3, 4, jpeg())]);
+    }
+
+    #[tokio::test]
+    async fn a_non_image_body_is_retried_and_never_cached() {
+        let provider = Arc::new(ScriptedProvider::new([error_page(), jpeg()]));
+        let (cache, mut puts) = RecordingDiskCache::new();
+
+        let chunk = download_one(&provider, cache).await.ok().unwrap();
+
+        assert_eq!(chunk.data, jpeg(), "the retry's image is the chunk");
+        assert_eq!(provider.calls(), 2, "the error page is retried");
+        assert_eq!(
+            puts_within(&mut puts).await,
+            vec![(3, 4, jpeg())],
+            "only the image reaches the chunk cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_non_image_body_fails_the_chunk_after_its_retries() {
+        let provider = Arc::new(ScriptedProvider::new([error_page()]));
+        let (cache, mut puts) = RecordingDiskCache::new();
+
+        let error = download_one(&provider, cache).await.err().unwrap();
+
+        assert_eq!(provider.calls(), 3, "every attempt is spent");
+        assert_eq!(error.attempts, 3);
+        assert!(
+            error.error.contains("not an image"),
+            "the failure says why: {}",
+            error.error
+        );
+        assert!(puts_within(&mut puts).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_sized_image_is_retried_and_never_cached() {
+        let big = encoded(512, 512, image::ImageFormat::Jpeg);
+        let provider = Arc::new(ScriptedProvider::new([big]));
+        let (cache, mut puts) = RecordingDiskCache::new();
+
+        let error = download_one(&provider, cache).await.err().unwrap();
+
+        assert_eq!(provider.calls(), 3);
+        assert!(error.error.contains("512x512"), "{}", error.error);
+        assert!(puts_within(&mut puts).await.is_empty());
     }
 
     /// Counts downloads in flight: incremented when a download starts and
