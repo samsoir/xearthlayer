@@ -208,6 +208,11 @@ pub enum MetricEvent {
         duration_us: u64,
     },
 
+    /// A DDS encode ended without a result: the encoder returned an error or
+    /// panicked, or its task was dropped while waiting for it. Ends the
+    /// encode in `encodes_active` and counts nothing as encoded (#385).
+    EncodeFailed,
+
     // =========================================================================
     // Assembly Events
     // =========================================================================
@@ -397,6 +402,7 @@ impl MetricEvent {
             Self::JobTimedOut { .. } => "job_timed_out",
             Self::EncodeStarted => "encode_started",
             Self::EncodeCompleted { .. } => "encode_completed",
+            Self::EncodeFailed => "encode_failed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
             Self::FuseTileServed => "fuse_tile_served",
             Self::FuseRead { .. } => "fuse_read",

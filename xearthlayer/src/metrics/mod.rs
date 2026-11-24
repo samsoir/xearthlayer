@@ -25,7 +25,7 @@ pub use memory_probe::{
     configure_allocator, log_allocator_environment, log_malloc_trim_at_shutdown, AllocatorConfig,
     AllocatorSample, MemoryProbe, MemorySample, ProcessMemoryProbe,
 };
-pub use optional::OptionalMetrics;
+pub use optional::{EncodeGuard, OptionalMetrics};
 pub use reporter::{MetricsReporter, TuiReporter};
 pub use snapshot::TelemetrySnapshot;
 pub use state::{AggregatedState, RingBuffer, TimeSeriesHistory, DEFAULT_HISTORY_CAPACITY};

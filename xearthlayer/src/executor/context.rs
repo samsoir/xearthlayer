@@ -61,6 +61,13 @@ pub struct TaskContext {
     /// Cancellation token for cooperative cancellation.
     cancellation: CancellationToken,
 
+    /// Cancelled when the executor running this task shuts down.
+    ///
+    /// The job's own token is cancelled by a shutdown and by a kill or an
+    /// error policy alike; this one tells a shutdown apart (#385). A context
+    /// built outside an executor holds a token nobody cancels.
+    executor_shutdown: CancellationToken,
+
     /// Shared reference to outputs from completed tasks, keyed by task name.
     task_outputs: SharedTaskOutputs,
 
@@ -103,6 +110,7 @@ impl TaskContext {
         Self {
             job_id,
             cancellation,
+            executor_shutdown: CancellationToken::new(),
             task_outputs: Arc::new(RwLock::new(HashMap::new())),
             child_job_sender: None,
             spawned_children: 0,
@@ -127,6 +135,7 @@ impl TaskContext {
         Self {
             job_id,
             cancellation,
+            executor_shutdown: CancellationToken::new(),
             task_outputs,
             child_job_sender: Some(ChildJobSender {
                 sender: child_sender,
@@ -141,6 +150,15 @@ impl TaskContext {
     /// This allows tasks to emit metrics events during execution.
     pub fn with_metrics(mut self, metrics: MetricsClient) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Sets the token the executor cancels when it shuts down.
+    ///
+    /// `JobExecutor` passes its own when it dispatches a task, so
+    /// [`is_shutting_down`](Self::is_shutting_down) reports its shutdown.
+    pub fn with_executor_shutdown(mut self, executor_shutdown: CancellationToken) -> Self {
+        self.executor_shutdown = executor_shutdown;
         self
     }
 
@@ -171,6 +189,19 @@ impl TaskContext {
     /// and return `TaskResult::Cancelled` if true.
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Returns true once the executor running this task has begun shutting
+    /// down.
+    ///
+    /// The executor marks its shutdown before it cancels the jobs it holds,
+    /// so a task that has seen [`is_cancelled`](Self::is_cancelled) return
+    /// true and then reads false here was cancelled for another reason: a
+    /// kill (the FUSE timeout) or its job's error policy. Read the job's
+    /// cancellation first; read in the other order, a shutdown landing
+    /// between the two reads is mistaken for a kill.
+    pub fn is_shutting_down(&self) -> bool {
+        self.executor_shutdown.is_cancelled()
     }
 
     /// Returns the cancellation token.
@@ -307,6 +338,7 @@ impl std::fmt::Debug for TaskContext {
         f.debug_struct("TaskContext")
             .field("job_id", &self.job_id)
             .field("is_cancelled", &self.is_cancelled())
+            .field("is_shutting_down", &self.is_shutting_down())
             .field("task_outputs", &output_keys)
             .field("can_spawn_children", &self.can_spawn_children())
             .field("spawned_children", &self.spawned_children)
@@ -379,6 +411,27 @@ mod tests {
         assert!(!ctx.is_cancelled());
         token.cancel();
         assert!(ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_context_outside_an_executor_is_never_shutting_down() {
+        let token = CancellationToken::new();
+        let ctx = TaskContext::new(JobId::new("test"), token.clone());
+
+        token.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(!ctx.is_shutting_down(), "a job cancel is not a shutdown");
+    }
+
+    #[test]
+    fn test_context_reports_executor_shutdown() {
+        let shutdown = CancellationToken::new();
+        let ctx = TaskContext::new(JobId::new("test"), CancellationToken::new())
+            .with_executor_shutdown(shutdown.clone());
+
+        assert!(!ctx.is_shutting_down());
+        shutdown.cancel();
+        assert!(ctx.is_shutting_down());
     }
 
     #[test]

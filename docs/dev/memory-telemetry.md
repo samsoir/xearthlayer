@@ -69,7 +69,7 @@ mebibyte", not necessarily "nothing".
 | `heap_free_mb` | `mallinfo2.fordblks` | Free bytes held inside arenas. **This is the retention signal.** |
 | `threads` | `/proc/self/status` `Threads:` | OS thread count. `0` means **not readable on this platform**, not "no threads" — see below. |
 | `tiles_done` | `state.encodes_completed` | Cumulative DDS encodes completed. The load counter: divide by `uptime_s` for tiles/second. |
-| `encodes_active` | `state.encodes_active` | Encodes in flight right now. Each one holds a 4096×4096 RGBA source image (64 MiB) plus its output buffer. |
+| `encodes_active` | `state.encodes_active` | Encodes in flight right now. Each one holds a 4096×4096 RGBA source image (64 MiB) plus its output buffer. Every encode leaves the gauge however it ends (`metrics::EncodeGuard`, #385); before 0.5.1 a cancelled, failed or panicked encode stayed counted, so the gauge crept up after FUSE timeouts. |
 | `chunks_ok` | `state.chunks_downloaded` | Cumulative successful chunk downloads. |
 | `chunks_failed` | `state.chunks_failed` | Cumulative failed chunk downloads. A rising count means tiles are being served but not persisted (see issue #180). |
 | `mem_cache_mb` | `state.memory_cache_size_bytes` | Current moka memory cache size. Compare against `cache.memory_size`. |
