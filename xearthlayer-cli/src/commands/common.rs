@@ -2,7 +2,6 @@
 
 use clap::ValueEnum;
 use xearthlayer::config::ConfigFile;
-use xearthlayer::dds::DdsFormat;
 use xearthlayer::provider::ProviderConfig;
 
 use crate::error::CliError;
@@ -77,24 +76,6 @@ impl ProviderType {
     }
 }
 
-/// DDS compression format selection for CLI arguments.
-#[derive(Debug, Clone, ValueEnum)]
-pub enum DdsCompression {
-    /// BC1/DXT1 compression (4:1, best for opaque textures)
-    Bc1,
-    /// BC3/DXT5 compression (4:1, with full alpha channel)
-    Bc3,
-}
-
-impl From<DdsCompression> for DdsFormat {
-    fn from(compression: DdsCompression) -> Self {
-        match compression {
-            DdsCompression::Bc1 => DdsFormat::BC1,
-            DdsCompression::Bc3 => DdsFormat::BC3,
-        }
-    }
-}
-
 /// Resolve provider settings from CLI args and config.
 pub fn resolve_provider(
     cli_provider: Option<ProviderType>,
@@ -111,11 +92,4 @@ pub fn resolve_provider(
     let mapbox_token = cli_mapbox_token.or_else(|| config.provider.mapbox_access_token.clone());
 
     provider.to_config(api_key, mapbox_token)
-}
-
-/// Resolve DDS format from CLI args and config.
-pub fn resolve_dds_format(cli_format: Option<DdsCompression>, config: &ConfigFile) -> DdsFormat {
-    cli_format
-        .map(DdsFormat::from)
-        .unwrap_or(config.texture.format)
 }

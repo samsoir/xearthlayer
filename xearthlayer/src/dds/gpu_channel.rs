@@ -70,6 +70,8 @@ mod inner {
             format: DdsFormat,
             mipmap_count: usize,
         ) -> Result<Vec<u8>, DdsError> {
+            // Refused on the caller's side: the worker never sees it.
+            format.ensure_supported()?;
             let sender = self.sender.as_ref().ok_or_else(|| {
                 DdsError::CompressionFailed("GPU worker has been shut down".to_string())
             })?;
@@ -100,12 +102,15 @@ mod inner {
     // Full-tile processing internals
     // =========================================================================
 
-    /// Convert a [`DdsFormat`] to the corresponding `block_compression` variant
-    /// and compressed block size in bytes.
-    fn format_params(format: DdsFormat) -> (CompressionVariant, u32) {
+    /// The `block_compression` variant and compressed block size in bytes for
+    /// a supported [`DdsFormat`]; [`DdsError::UnsupportedFormat`] otherwise.
+    /// `compress_mipmap_chain` refuses an unsupported format before sending,
+    /// so the worker only reaches the error if called directly.
+    fn format_params(format: DdsFormat) -> Result<(CompressionVariant, u32), DdsError> {
+        format.ensure_supported()?;
         match format {
-            DdsFormat::BC1 => (CompressionVariant::BC1, 8),
-            DdsFormat::BC3 => (CompressionVariant::BC3, 16),
+            DdsFormat::BC1 => Ok((CompressionVariant::BC1, 8)),
+            other => Err(DdsError::UnsupportedFormat(other.to_string())),
         }
     }
 
@@ -132,7 +137,7 @@ mod inner {
     ) -> Result<Vec<u8>, DdsError> {
         let width = image.width();
         let height = image.height();
-        let (variant, block_size) = format_params(format);
+        let (variant, block_size) = format_params(format)?;
 
         // Pre-allocate output and readback buffers for level 0 (largest).
         // Smaller levels reuse the same buffers.
@@ -642,31 +647,24 @@ mod tests {
             .expect("worker should not panic");
     }
 
+    /// An unsupported format is refused by the caller's side of the channel:
+    /// nothing is sent, so the worker never sees it and no GPU is needed.
     #[tokio::test]
-    async fn test_mock_worker_handles_mixed_formats() {
+    async fn channel_rejects_unsupported_format_without_sending() {
         let (channel, mut rx) = mock_channel();
-        let _worker = spawn_mock_worker(&mut rx);
-        let channel = Arc::new(channel);
+        let mut rx = rx.take().expect("receiver");
 
-        // BC1: 8 bytes per 4×4 block
-        let ch = Arc::clone(&channel);
-        let bc1_result = tokio::task::spawn_blocking(move || {
-            let image = RgbaImage::new(4, 4);
-            ch.compress_mipmap_chain(image, DdsFormat::BC1, 1)
+        let result = tokio::task::spawn_blocking(move || {
+            channel.compress_mipmap_chain(RgbaImage::new(4, 4), DdsFormat::BC3, 1)
         })
         .await
         .unwrap();
-        assert_eq!(bc1_result.unwrap().len(), 8);
 
-        // BC3: 16 bytes per 4×4 block
-        let ch = Arc::clone(&channel);
-        let bc3_result = tokio::task::spawn_blocking(move || {
-            let image = RgbaImage::new(4, 4);
-            ch.compress_mipmap_chain(image, DdsFormat::BC3, 1)
-        })
-        .await
-        .unwrap();
-        assert_eq!(bc3_result.unwrap().len(), 16);
+        assert!(matches!(
+            result,
+            Err(crate::dds::DdsError::UnsupportedFormat(_))
+        ));
+        assert!(rx.try_recv().is_err(), "no request may reach the worker");
     }
 
     #[tokio::test]
@@ -808,10 +806,10 @@ mod tests {
         }
     }
 
-    /// Mixed BC1 and BC3 formats through the pipeline.
+    /// A single BC1 block through the pipeline.
     #[tokio::test]
     #[ignore] // Requires GPU hardware
-    async fn test_pipeline_mixed_formats() {
+    async fn test_pipeline_single_bc1_block() {
         let (device, queue, compressor) = match gpu_resources_or_skip() {
             Some(r) => r,
             None => return,
@@ -837,16 +835,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bc1.unwrap().len(), 8);
-
-        // BC3: 16 bytes per 4×4 block
-        let ch = Arc::clone(&channel);
-        let bc3 = tokio::task::spawn_blocking(move || {
-            let image = RgbaImage::new(4, 4);
-            ch.compress_mipmap_chain(image, DdsFormat::BC3, 1)
-        })
-        .await
-        .unwrap();
-        assert_eq!(bc3.unwrap().len(), 16);
     }
 
     /// Worker shuts down cleanly when channel is closed.

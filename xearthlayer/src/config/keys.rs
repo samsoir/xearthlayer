@@ -10,7 +10,6 @@ use thiserror::Error;
 use super::file::ConfigFile;
 use super::parser::expand_tilde;
 use super::size::{format_size, parse_size};
-use crate::dds::DdsFormat;
 
 /// Display value used in place of any [`ConfigKey::is_sensitive`] value
 /// when the call site has no business showing the raw secret (notably
@@ -54,7 +53,6 @@ pub enum ConfigKey {
     CacheDdsDiskRatio,
 
     // Texture settings
-    TextureFormat,
     TextureCompressor,
     TextureGpuDevice,
 
@@ -141,7 +139,6 @@ impl FromStr for ConfigKey {
             "cache.disk_size" => Ok(ConfigKey::CacheDiskSize),
             "cache.dds_disk_ratio" => Ok(ConfigKey::CacheDdsDiskRatio),
 
-            "texture.format" => Ok(ConfigKey::TextureFormat),
             "texture.compressor" => Ok(ConfigKey::TextureCompressor),
             "texture.gpu_device" => Ok(ConfigKey::TextureGpuDevice),
 
@@ -213,7 +210,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => "cache.memory_size",
             ConfigKey::CacheDiskSize => "cache.disk_size",
             ConfigKey::CacheDdsDiskRatio => "cache.dds_disk_ratio",
-            ConfigKey::TextureFormat => "texture.format",
             ConfigKey::TextureCompressor => "texture.compressor",
             ConfigKey::TextureGpuDevice => "texture.gpu_device",
             ConfigKey::GenerationThreads => "generation.threads",
@@ -307,7 +303,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => format_size(config.cache.memory_size),
             ConfigKey::CacheDiskSize => format_size(config.cache.disk_size),
             ConfigKey::CacheDdsDiskRatio => config.cache.dds_disk_ratio.to_string(),
-            ConfigKey::TextureFormat => config.texture.format.to_string().to_lowercase(),
             ConfigKey::TextureCompressor => config.texture.compressor.clone(),
             ConfigKey::TextureGpuDevice => config.texture.gpu_device.clone(),
             ConfigKey::GenerationThreads => config.generation.threads.to_string(),
@@ -438,13 +433,6 @@ impl ConfigKey {
             }
             ConfigKey::CacheDdsDiskRatio => {
                 config.cache.dds_disk_ratio = value.parse().unwrap();
-            }
-            ConfigKey::TextureFormat => {
-                config.texture.format = match value.to_lowercase().as_str() {
-                    "bc1" => DdsFormat::BC1,
-                    "bc3" => DdsFormat::BC3,
-                    _ => DdsFormat::BC1, // Validation prevents this
-                };
             }
             ConfigKey::TextureCompressor => {
                 config.texture.compressor = value.to_lowercase();
@@ -610,7 +598,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
             ConfigKey::CacheDdsDiskRatio => Box::new(FloatRangeSpec::new(0.0, 1.0)),
-            ConfigKey::TextureFormat => Box::new(OneOfSpec::new(&["bc1", "bc3"])),
             ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
@@ -681,7 +668,6 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize,
             ConfigKey::CacheDiskSize,
             ConfigKey::CacheDdsDiskRatio,
-            ConfigKey::TextureFormat,
             ConfigKey::TextureCompressor,
             ConfigKey::TextureGpuDevice,
             ConfigKey::GenerationThreads,
@@ -976,6 +962,8 @@ mod tests {
             ConfigKey::PackagesLibraryUrl
         );
         assert!("invalid.key".parse::<ConfigKey>().is_err());
+        // Retired in #395: BC1 is the only format.
+        assert!("texture.format".parse::<ConfigKey>().is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use xearthlayer::config::{format_size, ControlPlaneSettings, TextureConfig};
+use xearthlayer::dds::DdsFormat;
 use xearthlayer::manager::LocalPackageStore;
 use xearthlayer::panic as panic_handler;
 use xearthlayer::service::{
@@ -12,7 +13,7 @@ use xearthlayer::service::{
 use xearthlayer::xplane::XPlaneEnvironment;
 use xearthlayer_package::PackageType;
 
-use super::common::{resolve_dds_format, resolve_provider, DdsCompression, ProviderType};
+use super::common::{resolve_provider, ProviderType};
 use crate::error::CliError;
 use crate::signals::{terminal_gone, Signal, SignalWatch};
 use crate::tui_app::{run_headless, run_tui, TuiAppConfig};
@@ -29,7 +30,6 @@ pub struct RunArgs {
     pub provider: Option<ProviderType>,
     pub google_api_key: Option<String>,
     pub mapbox_token: Option<String>,
-    pub dds_format: Option<DdsCompression>,
     pub timeout: Option<u64>,
     pub no_cache: bool,
     pub no_prefetch: bool,
@@ -80,7 +80,6 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         args.mapbox_token,
         config,
     )?;
-    let format = resolve_dds_format(args.dds_format, config);
     let chunk_request_timeout_secs =
         resolve_chunk_timeout_secs(args.timeout, config.executor.request_timeout_secs);
 
@@ -88,7 +87,8 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     // Mipmap levels are left unset so the encoder emits the full chain for the
     // texture size — a truncated chain makes X-Plane clamp sampling and band
     // sloped terrain at grazing angles.
-    let texture_config = TextureConfig::new(format)
+    // BC1 is the only format XEarthLayer encodes (#395).
+    let texture_config = TextureConfig::new(DdsFormat::BC1)
         .with_compressor(config.texture.compressor.clone())
         .with_gpu_device(config.texture.gpu_device.clone());
     let dds_format = texture_config.format();

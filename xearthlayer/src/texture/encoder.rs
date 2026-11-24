@@ -85,7 +85,7 @@ pub trait TextureEncoder: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Encoder name (e.g., "DDS BC1", "DDS BC3").
+    /// Encoder name (e.g., "DDS BC1").
     fn name(&self) -> &str;
 }
 

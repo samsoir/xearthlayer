@@ -3,12 +3,56 @@
 use std::fmt;
 
 /// DDS compression format.
+///
+/// Every encoder interface takes a `DdsFormat` ([`ImageCompressor`],
+/// [`MipmapCompressor`], [`DdsEncoder`]), and that parameter is the extension
+/// point for formats XEarthLayer may support later. **Only BC1 is implemented
+/// today** (#395): every other value is rejected with
+/// [`DdsError::UnsupportedFormat`] when the service builds its encoder
+/// (`service::builder::create_encoder`, so a wrong format fails at startup)
+/// and at every encode entry point (`DdsEncoder::encode` and
+/// `encode_with_mipmaps`, each compressor's `compress`, and the GPU channel
+/// before it sends). Constructors such as `DdsEncoder::new` do not reject. [`DdsFormat::is_supported`] is the one statement of
+/// what is supported.
+///
+/// The variants beyond BC1 name formats without implementing them; their
+/// format facts (block size, FourCC) stay in [`DdsHeader`] because they
+/// describe the format and encode nothing. Adding a format means a kernel in
+/// every backend, a format-aware expected tile size for the FUSE read gate and
+/// the DDS disk cache validator, a placeholder in that format, and a
+/// user-facing setting. See `docs/dev/dds-implementation.md`.
+///
+/// [`ImageCompressor`]: crate::dds::ImageCompressor
+/// [`MipmapCompressor`]: crate::dds::MipmapCompressor
+/// [`DdsEncoder`]: crate::dds::DdsEncoder
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DdsFormat {
-    /// BC1/DXT1 compression (4:1, no alpha or 1-bit alpha)
+    /// BC1/DXT1 compression (4:1, no alpha or 1-bit alpha). The only
+    /// supported format.
     BC1,
-    /// BC3/DXT5 compression (4:1, 8-bit alpha)
+    /// BC3/DXT5 compression (4:1, 8-bit alpha). Not supported: rejected with
+    /// [`DdsError::UnsupportedFormat`]. Retired in #395: twice the size of
+    /// BC1 for an alpha channel opaque imagery does not use.
     BC3,
+}
+
+impl DdsFormat {
+    /// Whether XEarthLayer can encode this format. Only BC1.
+    pub const fn is_supported(self) -> bool {
+        matches!(self, DdsFormat::BC1)
+    }
+
+    /// `Ok` for a supported format, else [`DdsError::UnsupportedFormat`]
+    /// naming it. Every encode entry point calls this before doing any work.
+    pub fn ensure_supported(self) -> Result<(), DdsError> {
+        if self.is_supported() {
+            Ok(())
+        } else {
+            Err(DdsError::UnsupportedFormat(format!(
+                "{self}: XEarthLayer encodes BC1 only"
+            )))
+        }
+    }
 }
 
 impl fmt::Display for DdsFormat {
@@ -139,6 +183,25 @@ pub const DDSCAPS_TEXTURE: u32 = 0x1000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_bc1_is_supported() {
+        assert!(DdsFormat::BC1.is_supported());
+        assert!(!DdsFormat::BC3.is_supported());
+    }
+
+    #[test]
+    fn ensure_supported_accepts_bc1() {
+        assert_eq!(DdsFormat::BC1.ensure_supported(), Ok(()));
+    }
+
+    #[test]
+    fn ensure_supported_rejects_every_other_format() {
+        assert!(matches!(
+            DdsFormat::BC3.ensure_supported(),
+            Err(DdsError::UnsupportedFormat(msg)) if msg.contains("BC3")
+        ));
+    }
 
     #[test]
     fn test_dds_format_equality() {

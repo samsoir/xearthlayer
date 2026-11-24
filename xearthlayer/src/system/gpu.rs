@@ -197,6 +197,44 @@ pub fn disown_display() {
     }
 }
 
+/// The Vulkan loader's variable that names layers it must not load.
+const LAYERS_DISABLE_VARIABLE: &str = "VK_LOADER_LAYERS_DISABLE";
+
+/// Keep the Vulkan loader from loading implicit layers into this process
+/// (#397).
+///
+/// The loader injects every enabled implicit layer into any process that
+/// creates a Vulkan instance, and XEarthLayer creates one whenever it
+/// enumerates GPUs. Implicit layers are overlays and capture tools meant for
+/// games (MangoHud, OBS vkcapture, gamescope's WSI layer, the Steam overlay)
+/// and the vendors' device-ordering layers (Mesa's device select, NVIDIA's
+/// Optimus). XEarthLayer is a headless compute process that selects its own
+/// adapter by `texture.gpu_device`, so it needs none of them, and MangoHud,
+/// enabled system-wide with `MANGOHUD=1`, aborted the process with a double
+/// free in its own thread. On a hybrid Radeon 890M and RTX 5070 laptop the
+/// adapters listed, and their order, are the same with implicit layers off.
+///
+/// A value the user has set is left alone, as `configure_allocator` defers to
+/// the user's `MALLOC_*` settings (#227). Loaders older than 1.3.234 ignore
+/// the variable. Call it before any other thread exists, like
+/// [`disown_display`].
+pub fn exclude_implicit_vulkan_layers() {
+    let current = std::env::var_os(LAYERS_DISABLE_VARIABLE);
+    if let Some(value) = implicit_layers_setting(current.as_deref()) {
+        std::env::set_var(LAYERS_DISABLE_VARIABLE, value);
+    }
+}
+
+/// What [`exclude_implicit_vulkan_layers`] sets `VK_LOADER_LAYERS_DISABLE`
+/// to, given its current value: `~implicit~` (the loader's name for every
+/// implicit layer) when the user has not set it, else nothing.
+fn implicit_layers_setting(current: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    match current {
+        Some(_) => None,
+        None => Some("~implicit~"),
+    }
+}
+
 /// Enumerate all GPU adapters as live `wgpu::Adapter` handles.
 ///
 /// Most callers should prefer [`enumerate`] which returns metadata-only
@@ -345,18 +383,26 @@ mod tests {
         );
     }
 
+    // `disown_display` and `exclude_implicit_vulkan_layers` change the
+    // process environment, which other tests in this binary read through C
+    // libraries while they run: their tests live in
+    // `tests/process_environment.rs`, a process of their own (#397).
+
     #[test]
-    fn disowning_the_display_removes_both_display_variables() {
-        // #358: the Vulkan loader's device-select layer and the NVIDIA ICD
-        // open the display at instance creation whatever backends wgpu asks
-        // for. With no display named there is nothing to connect to.
-        std::env::set_var("DISPLAY", ":9");
-        std::env::set_var("WAYLAND_DISPLAY", "wayland-9");
+    fn implicit_layers_are_disabled_when_the_user_has_not_chosen() {
+        assert_eq!(implicit_layers_setting(None), Some("~implicit~"));
+    }
 
-        disown_display();
-
-        assert_eq!(std::env::var_os("DISPLAY"), None);
-        assert_eq!(std::env::var_os("WAYLAND_DISPLAY"), None);
+    #[test]
+    fn a_users_own_layer_setting_is_left_alone() {
+        // Including an empty value: the user set it, so it is theirs.
+        for value in ["~all~", "VK_LAYER_KHRONOS_validation", ""] {
+            assert_eq!(
+                implicit_layers_setting(Some(std::ffi::OsStr::new(value))),
+                None,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

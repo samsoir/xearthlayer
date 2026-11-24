@@ -543,7 +543,7 @@ The `DdsHandler` generates the texture using:
 1. Parse (row, col, zoom) from filename
 2. Download 256 imagery chunks from provider
 3. Assemble into 4096×4096 image
-4. Encode to BC1/BC3 DDS with mipmaps
+4. Encode to BC1 DDS with mipmaps
 5. Cache and return
 
 ---

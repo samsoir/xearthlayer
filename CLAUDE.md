@@ -47,8 +47,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300)
 
 4. **DDS Compression** (`xearthlayer/src/dds/`)
-   - BC1/BC3 (DXT1/DXT5) compression
-   - 5-level mipmap chain generation
+   - BC1 (DXT1) only (#395): the encoder interfaces keep their `format: DdsFormat` parameter as the extension point; any other format (`DdsFormat::BC3` stays as a named, unsupported value) is rejected with `DdsError::UnsupportedFormat` at `create_encoder`, `DdsEncoder::encode` and every backend entry point, `DdsFormat::is_supported()` being the one statement of what is supported. `texture.format` and `run --dds-format` are retired. What adding a format takes: `docs/dev/dds-implementation.md` "Supported formats"
+   - Full mipmap chain generation (13 levels for a 4096×4096 tile, 11,184,952 bytes)
    - `ImageCompressor` trait for single-level backends:
      - `SoftwareCompressor` — Pure-Rust fallback
      - `IspcCompressor` — SIMD-optimized via Intel ISPC (default)
@@ -57,10 +57,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)
    - `system::encoder_policy` (#203): `EncoderPolicy` chooses the backend from a `HardwareProfile` (the adapters wgpu enumerated). `DefaultEncoderPolicy` honours an explicit `texture.compressor`, warns (log and an amber Status-pane line) when `gpu` is honoured on a host whose only GPU is the one X-Plane renders with (every Apple Silicon Mac, any single-GPU PC), and picks ISPC with no preference; GPU is never auto-selected. The runtime encoder and the wizard's GPU step both go through it, and the profile comes from the one enumeration the GPU path already does (`GpuSelection.host`), never a second one
    - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
-   - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
+   - The worker drives `block_compression`'s `GpuBlockCompressor` (ISPC kernels ported to WGSL compute shaders); there is no single-level GPU `ImageCompressor` (`WgpuCompressor` was deleted in #384)
    - Worker-side tile processing: one channel round-trip per tile, GPU buffer reuse across mipmap levels
-   - `create_gpu_resources()` — shared factory for device/queue/compressor creation (DRY); returns the selected `GpuAdapter`, which reaches the dashboard's Status pane via `EncoderComponents::gpu_adapter` and `ServiceOrchestrator::gpu_adapter()` (never re-enumerate adapters for display: enumeration can take ~30s)
+   - `create_gpu_resources()` — the factory for the worker's device/queue/compressor; returns the selected `GpuAdapter`, which reaches the dashboard's Status pane via `EncoderComponents::gpu_adapter` and `ServiceOrchestrator::gpu_adapter()` (never re-enumerate adapters for display: enumeration can take ~30s)
    - The process never talks to a display server: `main` calls `system::disown_display()` (removes `DISPLAY` and `WAYLAND_DISPLAY`) before any thread exists (#358). The probe excludes GL (#255), but Mesa's `VK_LAYER_MESA_device_select` and the NVIDIA ICD open the display inside `vkCreateInstance` whatever wgpu asks for, and libxcb writes the server's refusal straight to fd 2, onto the dashboard. XEL selects its own adapter, so the display's answer was never used
+   - Nor does it load the Vulkan loader's implicit layers (#397): `main` then calls `system::exclude_implicit_vulkan_layers()`, which sets `VK_LOADER_LAYERS_DISABLE=~implicit~` unless the user already set it. Implicit layers are game overlays and capture tools (MangoHud, enabled system-wide with `MANGOHUD=1`, aborted the process with a double free in its own thread) and the vendors' device-ordering layers, none of which a headless compute process that picks its own adapter needs. Test binaries never run `main`, so `.cargo/config.toml` `[env]` sets the same for every process Cargo runs. Tests of functions that change the process environment live in `tests/process_environment.rs`, a process of their own: C libraries read the environment without a lock, so no unit test may change it
    - GPU pipeline hardening:
      - `map_async` errors propagated via `std::sync::mpsc` (not silently ignored)
      - Worker panic recovery via `catch_unwind` (logs error, sends failure, drains queue, breaks loop)
@@ -457,7 +458,7 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
-| `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
+| `xearthlayer/src/tasks/` | Task implementations (CachedTileProbe, DownloadChunks, BuildAndCacheDds, CacheGcBatch) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
 | `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
@@ -525,7 +526,7 @@ Key sections:
 - `[provider]` - Imagery source (bing/google)
 - `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
-- `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
+- `[texture]` - Compressor backend (software/ispc/gpu), GPU device selection. No format key: BC1 only, `texture.format` retired and in `DEPRECATED_KEYS` (#395)
 - `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`

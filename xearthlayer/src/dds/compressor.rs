@@ -9,9 +9,10 @@
 //! - [`IspcCompressor`] — SIMD-optimized via Intel ISPC (default, 5-10× faster)
 //! - [`SoftwareCompressor`] — Pure-Rust fallback (no external dependencies)
 //!
-//! # Future Implementations
-//!
-//! - GPU compressor via `wgpu` compute shaders (planned)
+//! GPU encoding does not implement [`ImageCompressor`]: it owns the whole mip
+//! chain through [`MipmapCompressor`], implemented by
+//! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel), whose worker
+//! gets its device from [`create_gpu_resources`].
 
 use super::types::{DdsError, DdsFormat};
 use image::RgbaImage;
@@ -90,7 +91,9 @@ pub trait ImageCompressor: Send + Sync {
     /// # Arguments
     ///
     /// * `image` - Source RGBA image (dimensions should be multiples of 4)
-    /// * `format` - Target compression format (BC1 or BC3)
+    /// * `format` - Target compression format. Only BC1 is supported; any
+    ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
+    ///   (see [`DdsFormat`]).
     ///
     /// # Returns
     ///
@@ -125,7 +128,9 @@ pub trait MipmapCompressor: Send + Sync {
     /// # Arguments
     ///
     /// * `image` - Source RGBA image (ownership transferred, no clones)
-    /// * `format` - Target compression format (BC1 or BC3)
+    /// * `format` - Target compression format. Only BC1 is supported; any
+    ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
+    ///   before any work is done (see [`DdsFormat`]).
     /// * `mipmap_count` - Number of mipmap levels to generate (including original)
     fn compress_mipmap_chain(
         &self,
@@ -154,6 +159,7 @@ pub struct IspcCompressor;
 
 impl ImageCompressor for IspcCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+        format.ensure_supported()?;
         let width = image.width();
         let height = image.height();
 
@@ -171,12 +177,8 @@ impl ImageCompressor for IspcCompressor {
             stride,
         };
 
-        let compressed = match format {
-            DdsFormat::BC1 => intel_tex_2::bc1::compress_blocks(&surface),
-            DdsFormat::BC3 => intel_tex_2::bc3::compress_blocks(&surface),
-        };
-
-        Ok(compressed)
+        // BC1 is the only supported format (checked above).
+        Ok(intel_tex_2::bc1::compress_blocks(&surface))
     }
 
     fn name(&self) -> &str {
@@ -188,7 +190,7 @@ impl ImageCompressor for IspcCompressor {
 // Software compressor (pure Rust fallback)
 // =============================================================================
 
-/// Pure-Rust block compressor using hand-rolled BC1/BC3 encoding.
+/// Pure-Rust block compressor using hand-rolled BC1 encoding.
 ///
 /// This compressor processes blocks one at a time without SIMD acceleration.
 /// It exists as a fallback for platforms where ISPC prebuilt kernels are not
@@ -197,6 +199,7 @@ pub struct SoftwareCompressor;
 
 impl ImageCompressor for SoftwareCompressor {
     fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
+        format.ensure_supported()?;
         let width = image.width();
         let height = image.height();
 
@@ -207,20 +210,14 @@ impl ImageCompressor for SoftwareCompressor {
         let blocks_wide = width.div_ceil(4);
         let blocks_high = height.div_ceil(4);
 
-        let block_size: u32 = match format {
-            DdsFormat::BC1 => 8,
-            DdsFormat::BC3 => 16,
-        };
-
-        let mut output = Vec::with_capacity((blocks_wide * blocks_high * block_size) as usize);
+        // BC1 is the only supported format (checked above): 8 bytes a block.
+        const BC1_BLOCK_BYTES: u32 = 8;
+        let mut output = Vec::with_capacity((blocks_wide * blocks_high * BC1_BLOCK_BYTES) as usize);
 
         for block_y in 0..blocks_high {
             for block_x in 0..blocks_wide {
                 let block = extract_block(image, block_x, block_y);
-                let compressed = match format {
-                    DdsFormat::BC1 => super::bc1::Bc1Encoder::compress_block(&block).to_vec(),
-                    DdsFormat::BC3 => super::bc3::Bc3Encoder::compress_block(&block).to_vec(),
-                };
+                let compressed = super::bc1::Bc1Encoder::compress_block(&block).to_vec();
                 output.extend_from_slice(&compressed);
             }
         }
@@ -266,70 +263,18 @@ pub fn default_compressor() -> Arc<dyn ImageCompressor> {
 }
 
 // =============================================================================
-// GPU compressor (wgpu compute shaders)
+// GPU resources (wgpu device for the GPU pipeline worker)
 // =============================================================================
 
 mod gpu {
     use super::*;
-    use block_compression::{CompressionVariant, GpuBlockCompressor};
-
-    /// GPU-accelerated block compressor using wgpu compute shaders.
-    ///
-    /// Uses the `block_compression` crate to dispatch BC1/BC3 compression
-    /// on a GPU via wgpu. The `GpuBlockCompressor` is wrapped in a `Mutex`
-    /// because it holds internal mutable state and is not `Send + Sync`.
-    ///
-    /// # Device Selection
-    ///
-    /// The constructor accepts a device selector string:
-    /// - `"integrated"` — selects an integrated GPU (e.g., AMD iGPU)
-    /// - `"discrete"` — selects a discrete GPU (e.g., NVIDIA)
-    /// - Any other string — case-insensitive substring match on adapter name
-    pub struct WgpuCompressor {
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-        compressor: std::sync::Mutex<GpuBlockCompressor>,
-        adapter_name: String,
-    }
-
-    // Safety: wgpu::Device and wgpu::Queue are internally Arc'd and thread-safe.
-    // GpuBlockCompressor is protected by Mutex for exclusive access.
-    unsafe impl Send for WgpuCompressor {}
-    unsafe impl Sync for WgpuCompressor {}
-
-    impl WgpuCompressor {
-        /// Returns the name of the selected GPU adapter.
-        pub fn adapter_name(&self) -> &str {
-            &self.adapter_name
-        }
-
-        /// Create a new GPU compressor, selecting an adapter by device type or name.
-        ///
-        /// # Arguments
-        ///
-        /// * `gpu_device` - Device selector: "integrated", "discrete", or adapter name substring
-        ///
-        /// # Errors
-        ///
-        /// Returns `DdsError::CompressionFailed` if no matching adapter is found or
-        /// device creation fails.
-        pub fn try_new(gpu_device: &str) -> Result<Self, DdsError> {
-            let (device, queue, compressor, selection) = create_gpu_resources(gpu_device)?;
-
-            Ok(Self {
-                device,
-                queue,
-                compressor: std::sync::Mutex::new(compressor),
-                adapter_name: selection.adapter.to_string(),
-            })
-        }
-    }
+    use block_compression::GpuBlockCompressor;
 
     /// Create GPU resources for block compression.
     ///
     /// Initializes a wgpu device, queue, and `GpuBlockCompressor` for the
-    /// selected GPU adapter. This is the shared factory used by both
-    /// `WgpuCompressor` (standalone) and the pipeline worker.
+    /// selected GPU adapter, for the GPU pipeline worker
+    /// ([`crate::dds::gpu_channel`]).
     ///
     /// # Arguments
     ///
@@ -383,171 +328,9 @@ mod gpu {
 
         Ok((device, queue, compressor, selected))
     }
-
-    impl ImageCompressor for WgpuCompressor {
-        fn compress(&self, image: &RgbaImage, format: DdsFormat) -> Result<Vec<u8>, DdsError> {
-            let width = image.width();
-            let height = image.height();
-
-            if width == 0 || height == 0 {
-                return Err(DdsError::InvalidDimensions(width, height));
-            }
-
-            let variant = match format {
-                DdsFormat::BC1 => CompressionVariant::BC1,
-                DdsFormat::BC3 => CompressionVariant::BC3,
-            };
-
-            let block_size: u32 = match format {
-                DdsFormat::BC1 => 8,
-                DdsFormat::BC3 => 16,
-            };
-
-            let blocks_wide = width.div_ceil(4);
-            let blocks_high = height.div_ceil(4);
-            let output_size = (blocks_wide * blocks_high * block_size) as u64;
-
-            // Create GPU texture
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("dds-input"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            // Upload pixel data
-            let rgba_data = image.as_raw();
-            let bytes_per_row = width * 4;
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-
-            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            // Create output buffer for compressed data
-            let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dds-output"),
-                size: output_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-
-            // Create readback buffer
-            let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dds-readback"),
-                size: output_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            // Run compression
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dds-compress"),
-                });
-
-            {
-                let mut compressor = self.compressor.lock().map_err(|e| {
-                    DdsError::CompressionFailed(format!("GPU compressor lock poisoned: {e}"))
-                })?;
-
-                compressor.add_compression_task(
-                    variant,
-                    &texture_view,
-                    width,
-                    height,
-                    &output_buffer,
-                    None,
-                    None,
-                );
-
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("dds-compute"),
-                    timestamp_writes: None,
-                });
-
-                compressor.compress(&mut pass);
-            }
-
-            // Copy output to readback buffer
-            encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback_buffer, 0, output_size);
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-
-            // Map and read back
-            let buffer_slice = readback_buffer.slice(..);
-            let (sender, receiver) = std::sync::mpsc::channel();
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                sender.send(result).unwrap();
-            });
-            let _ = self.device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_secs(10)),
-            });
-            receiver
-                .recv()
-                .map_err(|e| {
-                    DdsError::CompressionFailed(format!("GPU readback channel error: {e}"))
-                })?
-                .map_err(|e| {
-                    DdsError::CompressionFailed(format!("GPU buffer mapping failed: {e}"))
-                })?;
-
-            let data = buffer_slice.get_mapped_range().map_err(|e| {
-                DdsError::CompressionFailed(format!("GPU mapped range unavailable: {e}"))
-            })?;
-            let result = data.to_vec();
-            drop(data);
-            readback_buffer.unmap();
-
-            Ok(result)
-        }
-
-        fn name(&self) -> &str {
-            "gpu"
-        }
-    }
 }
 
-pub use gpu::{create_gpu_resources, WgpuCompressor};
-
-/// Create a GPU-accelerated block compressor using wgpu compute shaders.
-///
-/// # Arguments
-///
-/// * `gpu_device` - Device selector: "integrated", "discrete", or adapter name substring
-///
-/// # Errors
-///
-/// Returns `DdsError::CompressionFailed` if no matching adapter is found.
-pub fn create_wgpu_compressor(gpu_device: &str) -> Result<WgpuCompressor, DdsError> {
-    WgpuCompressor::try_new(gpu_device)
-}
+pub use gpu::create_gpu_resources;
 
 // =============================================================================
 // Tests
@@ -567,12 +350,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ispc_compress_4x4_bc3() {
-        let image = RgbaImage::new(4, 4);
-        let compressor = IspcCompressor;
-        let result = compressor.compress(&image, DdsFormat::BC3).unwrap();
-        // 1 block × 16 bytes
-        assert_eq!(result.len(), 16);
+    fn ispc_rejects_unsupported_format() {
+        let result = IspcCompressor.compress(&RgbaImage::new(4, 4), DdsFormat::BC3);
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
+    }
+
+    #[test]
+    fn software_rejects_unsupported_format() {
+        let result = SoftwareCompressor.compress(&RgbaImage::new(4, 4), DdsFormat::BC3);
+        assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
     }
 
     #[test]
@@ -582,15 +368,6 @@ mod tests {
         let result = compressor.compress(&image, DdsFormat::BC1).unwrap();
         // 64×64 blocks × 8 bytes
         assert_eq!(result.len(), 32768);
-    }
-
-    #[test]
-    fn test_ispc_compress_256x256_bc3() {
-        let image = RgbaImage::new(256, 256);
-        let compressor = IspcCompressor;
-        let result = compressor.compress(&image, DdsFormat::BC3).unwrap();
-        // 64×64 blocks × 16 bytes
-        assert_eq!(result.len(), 65536);
     }
 
     #[test]
@@ -644,79 +421,6 @@ mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
-
-    #[test]
-    fn test_wgpu_compressor_name() {
-        let compressor = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return, // Skip if no GPU
-        };
-        assert_eq!(compressor.name(), "gpu");
-    }
-
-    #[test]
-    fn test_wgpu_compress_4x4_bc1() {
-        let compressor = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let image = RgbaImage::new(4, 4);
-        let result = compressor.compress(&image, DdsFormat::BC1).unwrap();
-        assert_eq!(result.len(), 8);
-    }
-
-    #[test]
-    fn test_wgpu_compress_256x256_bc1() {
-        let compressor = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let image = RgbaImage::new(256, 256);
-        let result = compressor.compress(&image, DdsFormat::BC1).unwrap();
-        assert_eq!(result.len(), 32768);
-    }
-
-    #[test]
-    fn test_wgpu_compress_256x256_bc3() {
-        let compressor = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let image = RgbaImage::new(256, 256);
-        let result = compressor.compress(&image, DdsFormat::BC3).unwrap();
-        assert_eq!(result.len(), 65536);
-    }
-
-    #[test]
-    fn test_wgpu_and_ispc_same_output_size() {
-        let gpu = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let ispc = IspcCompressor;
-        let image = RgbaImage::new(256, 256);
-        let gpu_result = gpu.compress(&image, DdsFormat::BC1).unwrap();
-        let ispc_result = ispc.compress(&image, DdsFormat::BC1).unwrap();
-        assert_eq!(gpu_result.len(), ispc_result.len());
-    }
-
-    #[test]
-    fn test_wgpu_compress_zero_dimensions() {
-        let compressor = match WgpuCompressor::try_new("integrated") {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let image = RgbaImage::new(0, 0);
-        assert!(compressor.compress(&image, DdsFormat::BC1).is_err());
-    }
-
-    #[test]
-    fn test_wgpu_invalid_device_returns_error() {
-        // "nonexistent_device_12345" should never match any adapter
-        let result = WgpuCompressor::try_new("nonexistent_device_12345");
-        // This should either fail with no matching adapter, or on CI with no GPU at all
-        assert!(result.is_err());
-    }
 
     #[test]
     fn test_create_gpu_resources_invalid_device() {

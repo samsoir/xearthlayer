@@ -17,6 +17,7 @@
 //! Returns the DDS data via `TaskOutput` key "dds_data" (`Vec<u8>`).
 //! Cache write is fire-and-forget (spawned async task).
 
+use super::download_chunks::OUTPUT_KEY_CHUNKS;
 use crate::coord::TileCoord;
 use crate::executor::{
     BlockingExecutor, ChunkResults, DdsDiskCache, MemoryCache, ResourceType, Task, TaskContext,
@@ -44,7 +45,7 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 ///
 /// This task combines three sequential operations:
 /// 1. Assemble chunks into a 4096×4096 RGBA image
-/// 2. Encode the image to DDS format with BC1/BC3 compression
+/// 2. Encode the image to DDS format with BC1 compression
 /// 3. Spawn fire-and-forget cache write (non-blocking)
 ///
 /// # Inputs
@@ -156,7 +157,8 @@ where
                 let metrics = ctx.metrics_clone();
 
                 // Step 1: Get chunks from previous task (returns owned clone)
-                let chunks: ChunkResults = match ctx.get_output("DownloadChunks", "chunks") {
+                let chunks: ChunkResults = match ctx.get_output("DownloadChunks", OUTPUT_KEY_CHUNKS)
+                {
                     Some(c) => c,
                     None => {
                         return TaskResult::Failed(TaskError::missing_input("chunks"));
@@ -357,7 +359,7 @@ where
 }
 
 // ============================================================================
-// Internal implementation - lifted from assemble_image.rs
+// Chunk assembly
 // ============================================================================
 
 /// Synchronous chunk assembly (runs in spawn_blocking).

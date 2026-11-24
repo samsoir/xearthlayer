@@ -48,7 +48,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
   - On by default; switch off with `prefetch.enabled = false` or `run --no-prefetch`
 - Two-tier caching for instant repeat visits
-- High-quality BC1/BC3 DDS textures with mipmaps
+- High-quality BC1 DDS textures with mipmaps
 - **Multiple compression backends**: ISPC SIMD (default) or GPU-accelerated via wgpu compute shaders
 - Real-time TUI dashboard showing cache, download, and prefetch status
 - Works with OXO and Ortho4XP-generated scenery

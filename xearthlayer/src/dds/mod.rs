@@ -1,12 +1,11 @@
 //! DDS (DirectX Surface) texture encoding for X-Plane compatibility.
 //!
 //! This module provides functionality to encode RGBA images into DDS format
-//! with BC1/BC3 (DXT1/DXT5) compression and mipmap generation.
+//! with BC1 (DXT1) compression and mipmap generation.
 //!
 //! # Features
 //!
 //! - **BC1/DXT1 Compression**: 4:1 compression for RGB(A) textures
-//! - **BC3/DXT5 Compression**: 4:1 compression with full 8-bit alpha channel
 //! - **Mipmap Generation**: Automatic mipmap chain creation with box filtering
 //! - **Flexible API**: Support for custom mipmap chains and various configurations
 //!
@@ -36,17 +35,17 @@
 //! - Alpha: 1-bit or none
 //! - Best for: Opaque textures, simple transparency
 //!
-//! ## BC3 (DXT5)
+//! ## Other formats
 //!
-//! - Block size: 16 bytes per 4×4 pixels (1 byte per pixel)
-//! - Color: Same as BC1 (8 bytes)
-//! - Alpha: Two endpoints + 3-bit indices (8 bytes)
-//! - Best for: Textures with smooth alpha gradients
+//! Every encoder interface takes a [`DdsFormat`], the extension point for
+//! future formats, but only BC1 is implemented: any other format is rejected
+//! with [`DdsError::UnsupportedFormat`] (see [`DdsFormat`]). BC3 (DXT5) was
+//! retired in #395.
 //!
 //! # Performance
 //!
-//! The default ISPC SIMD encoder compresses a 4096×4096 image with 5 mipmap
-//! levels significantly faster than the pure-Rust fallback, using AVX2/SSE4
+//! The default ISPC SIMD encoder compresses a 4096×4096 image with its full
+//! 13-level mipmap chain significantly faster than the pure-Rust fallback, using AVX2/SSE4
 //! SIMD instructions to process multiple blocks simultaneously.
 //!
 //! Two compressor traits serve different backend models:
@@ -67,7 +66,6 @@
 //! - Most DDS viewing/editing tools
 
 mod bc1;
-mod bc3;
 mod compressor;
 mod conversion;
 mod encoder;
@@ -78,8 +76,8 @@ mod types;
 
 // Public API
 pub use compressor::{
-    create_gpu_resources, create_wgpu_compressor, default_compressor, ImageCompressor,
-    IspcCompressor, MipmapCompressor, SoftwareCompressor, WgpuCompressor,
+    create_gpu_resources, default_compressor, ImageCompressor, IspcCompressor, MipmapCompressor,
+    SoftwareCompressor,
 };
 pub use encoder::DdsEncoder;
 pub use gpu_channel::create_gpu_encoder_channel;

@@ -101,6 +101,14 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
     use crate::dds::{IspcCompressor, SoftwareCompressor};
     use crate::system::{CompressorKind, DefaultEncoderPolicy, EncoderPolicy};
 
+    // Before anything else, the GPU device in particular: an unsupported
+    // format fails at startup rather than once per tile (#395).
+    config
+        .texture()
+        .format()
+        .ensure_supported()
+        .map_err(|e| ServiceError::ConfigError(format!("Texture format: {e}")))?;
+
     let backend = CompressorKind::parse(config.texture().compressor()).ok_or_else(|| {
         ServiceError::ConfigError(format!(
             "Unknown texture compressor '{}'. Valid options: software, ispc, gpu",
@@ -177,6 +185,26 @@ mod tests {
             .build();
         let components = create_encoder(&config).unwrap();
         assert_eq!(components.encoder.format(), DdsFormat::BC1);
+    }
+
+    /// An unsupported format fails when the encoder is built, for every
+    /// backend, and before the GPU path enumerates or opens a device: the
+    /// error names the format whether or not this host has a GPU.
+    #[tokio::test]
+    async fn test_create_encoder_rejects_unsupported_format() {
+        for compressor in ["software", "ispc", "gpu"] {
+            let config = ServiceConfig::builder()
+                .texture(TextureConfig::new(DdsFormat::BC3).with_compressor(compressor.to_string()))
+                .build();
+            match create_encoder(&config) {
+                Err(ServiceError::ConfigError(msg)) => assert!(
+                    msg.contains("BC3") && msg.contains("BC1"),
+                    "{compressor}: the error names the format: {msg}"
+                ),
+                Err(other) => panic!("{compressor}: expected a config error, got {other:?}"),
+                Ok(_) => panic!("{compressor}: an unsupported format must be refused"),
+            }
+        }
     }
 
     #[test]

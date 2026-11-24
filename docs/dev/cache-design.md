@@ -2,792 +2,381 @@
 
 ## Overview
 
-XEarthLayer implements a two-tier caching system to minimize expensive satellite imagery downloads and DDS encoding operations. The cache architecture balances performance, memory constraints, and persistent storage across flight simulator sessions.
+Generating an ortho tile costs 256 chunk downloads, a 4096×4096 assembly and a
+BC1 encode. The cache keeps each of those results so the work is done once.
+There are three tiers for ortho imagery, plus a separate disk tier for night
+lighting:
 
-## Architecture
+| Tier | Holds | Key | Where | Bounded by | Eviction |
+|------|-------|-----|-------|------------|----------|
+| Memory | Encoded DDS tiles | `tile:{zoom}:{row}:{col}` | Process memory | `cache.memory_size` | moka, TinyLFU |
+| DDS disk | Encoded DDS tiles | `tile:{zoom}:{row}:{col}` | `{cache_dir}/{provider}/dds/` | share of `cache.disk_size` | LRU, GC job |
+| Chunk disk | Raw imagery chunks as downloaded | `chunk:{zoom}:{tile_row}:{tile_col}:{chunk_row}:{chunk_col}` | `{cache_dir}/` | share of `cache.disk_size` | LRU, GC job |
+| Lit disk (night lighting only) | Generated lit payloads and road extractions | `lit:{zoom}:{row}:{col}`, `roads:{lat}:{lon}:{hex16}` | `{cache_dir}/night/` | 5% of `cache.disk_size` | LRU, GC job |
 
-### Two-Tier Cache System
+The memory tier is a staging buffer for active FUSE reads. The DDS disk tier is
+the retention layer: a hit there serves a tile without re-encoding it. The chunk
+disk tier saves the downloads when a tile has to be encoded again. A tile that is
+in none of them is downloaded.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     FUSE Read Request                       │
-│                  (e.g., +37-122_BI15.dds)                   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-         ┌─────────────────────────────┐
-         │   Inode Cache Lookup        │
-         │   (inode → coordinates)     │
-         └─────────────┬───────────────┘
-                       │
-                       ▼
-         ┌─────────────────────────────┐
-         │   Memory Cache Check        │
-         │   (HashMap<u64, Vec<u8>>)   │
-         └─────────────┬───────────────┘
-                       │
-            ┌──────────┴──────────┐
-            │                     │
-            ▼                     ▼
-    ┌───────────────┐     ┌──────────────────┐
-    │  MEMORY HIT   │     │   MEMORY MISS    │
-    │               │     │                  │
-    │ Return data   │     │ Check disk cache │
-    │ Update stats  │     └────────┬─────────┘
-    │               │              │
-    │ ✓ <1ms        │    ┌─────────┴──────────┐
-    └───────────────┘    │                    │
-                         ▼                    ▼
-                 ┌──────────────┐     ┌─────────────────┐
-                 │   DISK HIT   │     │   DISK MISS     │
-                 │              │     │                 │
-                 │ 1. Read file │     │ 1. Convert to   │
-                 │ 2. Add to    │     │    tile coords  │
-                 │    memory    │     │ 2. Download     │
-                 │ 3. Return    │     │    (256 chunks) │
-                 │              │     │ 3. Encode DDS   │
-                 │ ✓ ~10-50ms   │     │ 4. Cache (both) │
-                 └──────────────┘     │ 5. Return data  │
-                                      │                 │
-                                      │ ⏱ ~2 seconds   │
-                                      └─────────────────┘
-```
+`{zoom}`, `{row}` and `{col}` in `tile:` and `chunk:` keys are tile coordinates:
+X-Plane's file `25312_10528_BI16.dds` names chunk coordinates at zoom 16, and
+`fuse::fuse3::chunk_to_tile_coords` turns it into tile (1582, 658) at zoom 12
+(`CHUNK_ZOOM_OFFSET` is 4). `lit:` keys use the file's own coordinates.
 
-## Design Decisions
+Every disk tier is the same type, `DiskCacheProvider`, with a validator chosen by
+its `DiskTier`. The memory tier is `MemoryCacheProvider`. Both implement the
+`Cache` trait (string keys, `Bytes` values) and run inside a `CacheService`.
 
-### Provider-Specific Caching
+## Read Path
 
-**Decision**: Cache tiles separately for each imagery provider (Bing, Google, etc.)
+FUSE sends a demand request through `DdsClient` to the demand lane's
+`ExecutorDaemon`. Prefetch and prewarm submit to the prefetch lane's daemon. Both
+daemons check the same memory and DDS disk tiers before they create a job
+(`executor/daemon.rs`):
 
-**Rationale**:
-1. **Correctness**: Same geographic coordinates from different providers yield different imagery
-   - Bing Maps: Aerial photography (may be older, different seasons, different resolution)
-   - Google Maps: Satellite imagery (different processing, quality, coverage)
-2. **No cache poisoning**: Switching providers doesn't serve stale imagery from the wrong provider
-3. **Quality comparison**: Users can maintain caches for multiple providers simultaneously
-4. **Clear semantics**: Easy to manage and understand which provider generated which tiles
-
-**Trade-off**: Uses more disk space if user experiments with multiple providers, but disk space is cheap and correctness is critical for visual consistency in flight simulation.
-
-### Cache Key Strategy
-
-**Decision**: Hierarchical directory structure based on tile coordinates
-
-**Structure**:
-```
-<cache_dir>/               # Default: ~/.cache/xearthlayer
-  <provider>/              # "bing", "google", etc.
-    <format>/              # "BC1" or "BC3"
-      <zoom>/              # Zoom level (e.g., "15")
-        <row>/             # Tile row (e.g., "12754")
-          <format>_<zoom>_<row>_<col>.dds
+```text
+DDS request (FUSE, prefetch or prewarm)
+  |
+  +-- memory tier hit ----------------------------> serve
+  |
+  +-- DDS disk hit -------------------------------> serve, and promote to memory
+  |                                                 (spawned, fire-and-forget)
+  |
+  +-- same tile already generating on this lane --> wait for that job (coalescer)
+  |
+  +-- new DdsGenerateJob
+        DownloadChunksTask, per chunk:
+          chunk disk hit -> use it
+          miss           -> download, then write to chunk disk (spawned)
+        BuildAndCacheDdsTask:
+          assemble, encode, then write memory + DDS disk (spawned)
+          if every chunk was obtained (#180)
+        -> serve the encoded bytes from the job result
 ```
 
-**Example**:
-```
-~/.cache/xearthlayer/
-  bing/
-    BC1/
-      15/
-        12754/
-          BC1_15_12754_5279.dds
-          BC1_15_12754_5280.dds
-  google/
-    BC1/
-      15/
-        12754/
-          BC1_15_12754_5279.dds
-```
+The job returns the encoded tile in its output. The requester never reads it back
+from the memory tier, because the memory write is spawned and may not have landed.
 
-**Rationale**:
-1. **Filesystem-friendly**: Distributes files across directories (~360 files per directory max)
-2. **Self-documenting**: Filenames include format, zoom, and coordinates
-3. **Easy management**: Clear specific regions (`rm -rf cache/bing/BC1/15/12754/`)
-4. **Natural hierarchy**: Matches internal TileCoord structure
-5. **Portable**: Files can be moved/shared with full context preserved in filename
+Prefetch-lane tile jobs start with `CachedTileProbeTask`
+(`tasks/cached_tile_probe.rs`). It checks memory and the DDS disk index when the
+job is admitted, and on a hit the download and build tasks return at once (#296).
+A job can wait in the prefetch queue while FUSE generates the same tile, so this
+check turns the queued copy into a no-op.
 
-## Cache Tier 1: Memory Cache
+The prefetch coordinator checks the memory tier and the DDS disk tier before it
+submits a tile; prewarm checks the memory tier. The DDS disk check,
+`DdsDiskCacheBridge::tile_exists_blocking`, answers from the LRU index without
+touching the filesystem.
 
-### Purpose
-Fast, in-memory storage of recently accessed DDS tiles to serve repeated requests without disk I/O.
+## Write Path
 
-### Implementation
-```rust
-struct MemoryCache {
-    /// Cache mapping inode to complete DDS file data
-    cache: Arc<Mutex<HashMap<u64, CacheEntry>>>,
-    /// Configuration
-    config: MemoryCacheConfig,
-    /// Statistics
-    stats: Arc<Mutex<CacheStats>>,
-}
+Each tier has its own completeness rule.
 
-struct CacheEntry {
-    data: Vec<u8>,
-    last_accessed: Instant,
-    access_count: u64,
-}
+**Chunk disk.** `DownloadChunksTask` writes a chunk after a successful HTTP
+download, in a spawned task (`spawn_cache_write`). A chunk that failed every
+attempt is never written, so the next request for that tile retries it. Chunks
+already downloaded when a job is killed keep their writes (#300).
 
-struct MemoryCacheConfig {
-    max_size_bytes: usize,        // Default: 2GB (2_147_483_648)
-    max_entries: usize,            // Calculated: ~180 tiles @ 11MB each
-    eviction_policy: EvictionPolicy,
-}
+**Memory and DDS disk.** `BuildAndCacheDdsTask` writes both, in two spawned tasks,
+only when `ChunkResults::is_complete()` is true: 256 chunks obtained and no
+failures. A tile with any failed chunk has magenta regions. It is served to
+X-Plane so the sim does not stall, and never persisted (#180). Completeness counts
+chunks obtained, not chunks decoded: a chunk that is present but fails to decode
+is drawn magenta in a tile that is still written.
 
-enum EvictionPolicy {
-    LRU,  // Least Recently Used (default)
-}
-```
+**Promotion.** A DDS disk hit in the daemon is written back to the memory tier.
 
-### Characteristics
+**Lit disk.** Written by `NightLitSource` and the road service, not by the ortho
+executor. See [night-lighting-design.md](night-lighting-design.md) for when a lit
+payload is kept.
 
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Default Size** | 2 GB | Configurable via `--memory-cache-size` |
-| **Max Tiles (BC1)** | ~180 tiles | 11 MB per tile |
-| **Max Tiles (BC3)** | ~90 tiles | 22 MB per tile |
-| **Eviction** | LRU | Evict oldest on size limit |
-| **Hit Time** | <1 ms | Direct memory access |
-| **Miss Penalty** | 10-2000 ms | Depends on disk/network |
+Nothing waits for a spawned write. The writes do not go through the executor's
+resource pools. `tokio::fs` runs them on the blocking pool, whose size is capped
+(#227).
 
-### Eviction Strategy
+## On-Disk Layout
 
-**When**: Memory cache exceeds `max_size_bytes`
+A disk entry's file name is its key with `:` replaced by `_` and `.cache`
+appended (`LruIndex::key_to_filename`). The file lives in a 1°×1° region
+directory named like an X-Plane DSF tile (`lru_index::key_to_region`):
 
-**How**: LRU (Least Recently Used) on `put()`
-1. When adding a new entry would exceed the limit
-2. Sort entries by `last_accessed` timestamp
-3. Evict oldest entries until space is available
-4. Log eviction statistics
+- `tile:`, `chunk:` and `lit:` keys: the region holding the centre of the tile
+  the key names. A chunk lands in the same region as its tile.
+- `roads:{lat}:{lon}:...` keys: the DSF tile the key names.
 
-**Trigger**: Eviction happens synchronously during `put()` operations. This is efficient because:
-- Memory operations are fast (<1ms to sort and evict)
-- No separate daemon thread needed for memory cache
-- Cache size is always maintained under limit
-- Stale entries remain valid until space is needed
+For the tile in the example above, with Bing:
 
-## Cache Tier 2: Disk Cache
-
-### Purpose
-Persistent storage of DDS tiles across sessions to avoid re-downloading and re-encoding.
-
-### Directory Structure
-
-```
-<cache_dir>/               # Default: ~/.cache/xearthlayer
-  bing/                    # Provider name
-    BC1/                   # DDS format (BC1 or BC3)
-      15/                  # Zoom level
-        12754/             # Tile row
-          BC1_15_12754_5279.dds    # Format_Zoom_Row_Col.dds
-          BC1_15_12754_5280.dds
-          BC1_15_12754_5281.dds
-        12755/
-          BC1_15_12755_5279.dds
-          ...
-      16/
-        25508/
-          BC1_16_25508_10376.dds
-          ...
-    BC3/                   # Separate tree for BC3 format
-      15/
-        12754/
-          BC3_15_12754_5279.dds
-          ...
-  google/                  # Separate tree for Google provider
-    BC1/
-      15/
-        12754/
-          BC1_15_12754_5279.dds
-          ...
+```text
+{cache_dir}/
+  Bing Maps/
+    dds/
+      +37-123/
+        tile_12_1582_658.cache            DDS disk tier, 11,184,952 bytes
+  +37-123/
+    chunk_12_1582_658_0_0.cache           chunk disk tier, one file per chunk
+    ...
+    chunk_12_1582_658_15_15.cache
+  night/                                  lit disk tier, night.enabled only
+    +37-123/
+      lit_16_25312_10528.cache
 ```
 
-### Filename Format
-
-**Pattern**: `<FORMAT>_<ZOOM>_<ROW>_<COL>.dds`
-
-**Examples**:
-- `BC1_15_12754_5279.dds` - BC1, zoom 15, row 12754, col 5279
-- `BC3_16_25508_10376.dds` - BC3, zoom 16, row 25508, col 10376
-
-**Benefits**:
-- Self-documenting (format, zoom, coordinates visible in filename)
-- Portable (files can be moved/shared with context preserved)
-- Debuggable (easy to identify what each file represents)
-- Provider implicit from directory path (cleaner filenames)
-
-### Path Construction
-
-```rust
-fn cache_path(
-    cache_dir: &Path,
-    provider: &str,
-    tile: &TileCoord,
-    format: DdsFormat,
-) -> PathBuf {
-    let format_str = match format {
-        DdsFormat::BC1 => "BC1",
-        DdsFormat::BC3 => "BC3",
-    };
-
-    cache_dir
-        .join(provider)
-        .join(format_str)
-        .join(tile.zoom.to_string())
-        .join(tile.row.to_string())
-        .join(format!(
-            "{}_{}_{}_{}.dds",
-            format_str, tile.zoom, tile.row, tile.col
-        ))
-}
-
-// Example: ~/.cache/xearthlayer/bing/BC1/15/12754/BC1_15_12754_5279.dds
-```
-
-### Implementation
-
-```rust
-struct DiskCache {
-    /// Cache directory root
-    cache_dir: PathBuf,
-    /// Active provider
-    provider: String,
-    /// Index of cached tiles (inode → path)
-    index: Arc<Mutex<HashMap<u64, PathBuf>>>,
-    /// Configuration
-    config: DiskCacheConfig,
-    /// Channel for async writes
-    write_tx: mpsc::Sender<DiskWriteRequest>,
-    /// Statistics
-    stats: Arc<Mutex<CacheStats>>,
-}
-
-struct DiskCacheConfig {
-    max_size_bytes: usize,        // Default: 20GB (21_474_836_480)
-    cache_dir: PathBuf,            // Default: ~/.cache/xearthlayer
-    max_age_days: Option<u32>,     // Optional: clear tiles older than N days
-}
-
-struct DiskWriteRequest {
-    inode: u64,
-    provider: String,
-    tile: TileCoord,
-    format: DdsFormat,
-    data: Vec<u8>,
-}
-```
-
-### Characteristics
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Default Size** | 20 GB | Configurable via `--disk-cache-size` |
-| **Max Tiles (BC1)** | ~1,800 tiles/provider | 11 MB per tile |
-| **Max Tiles (BC3)** | ~900 tiles/provider | 22 MB per tile |
-| **Eviction** | LRU + Age | Oldest files first |
-| **Hit Time** | 10-50 ms | SSD: ~10ms, HDD: ~50ms |
-| **Miss Penalty** | ~2 seconds | Network + encode |
-| **Persistence** | Across sessions | Survives FUSE unmount |
-
-### Write Strategy
-
-**Approach**: Write-through (immediate, asynchronous)
-
-**Flow**:
-1. Tile is generated (downloaded + encoded)
-2. Added to memory cache
-3. Sent to disk write queue (non-blocking channel)
-4. Background thread writes to disk
-5. Index updated on successful write
-
-**Benefits**:
-- FUSE read remains responsive (write is async)
-- No data loss on crash (written immediately)
-- No "dirty" tracking needed (always consistent)
-- DDS files are expensive to regenerate (~2s), worth preserving immediately
-
-### Eviction Strategy
-
-**When**: Disk cache exceeds `max_size_bytes`
-
-**How**:
-1. Sort cached files by modification time (oldest first)
-2. Delete oldest files until cache is at 90% of limit
-3. Update index and statistics
-4. Log eviction activity
-
-**Trigger**: Two mechanisms ensure disk cache stays under limit:
-
-1. **Startup Eviction**: When `DiskCache` is created, it scans the cache directory and immediately evicts if over limit. This handles cleanup from previous sessions before the simulator starts requesting tiles.
-
-2. **Background Daemon**: A `DiskCacheDaemon` thread runs every 60 seconds (configurable via `daemon_interval_secs`), checking the cache size and evicting LRU entries if needed. This keeps eviction off the critical path of serving tiles to X-Plane.
-
-**Rationale for Background GC**:
-- Disk I/O for eviction is slow (scanning directories, deleting files)
-- Eviction during `put()` would block tile delivery to X-Plane
-- Background thread allows eviction to happen asynchronously
-- 60-second interval is sufficient since tiles are ~11MB each
-
-## Async Architecture
-
-### Design Decision
-
-**Decision**: Memory cache uses moka's automatic LRU eviction; disk cache uses a self-contained service with internal GC daemon.
-
-**Rationale**:
-- Memory cache: `moka::future::Cache` provides efficient, lock-free LRU eviction
-- Disk eviction is slow (filesystem I/O) - must not block tile delivery
-- **Self-contained GC**: `DiskCacheProvider` owns its GC daemon internally, spawned during `CacheService::start()`
-- This ensures GC runs regardless of application mode (CLI, TUI, etc.)
-- Clean shutdown via `CancellationToken` for graceful termination
-
-### FUSE Async Operations
-- Handles FUSE operations asynchronously via fuse3
-- Queries memory cache (moka provides sub-millisecond access)
-- Triggers disk reads via async I/O with concurrency limiting
-- Writes to disk asynchronously (write-through strategy)
-
-### Self-Contained Cache Service Architecture
-
-The cache system uses a self-contained service architecture (implemented in `xearthlayer/src/cache/`):
-
-```
-XEarthLayerApp
-├── CacheService (memory)
-│   └── MemoryCacheProvider (moka-based LRU)
-└── CacheService (disk)
-    └── DiskCacheProvider
-        └── GC Daemon (spawned internally on start())
-```
-
-**Key Components**:
-- `Cache` trait: Generic cache interface with async set/get/delete/gc methods
-- `CacheService`: Lifecycle wrapper with start/shutdown management
-- `DiskCacheProvider`: Implements `Cache` trait, owns its GC daemon internally
-- `MemoryCacheProvider`: Implements `Cache` trait using moka
-
-### Disk Cache GC Daemon
-- Spawned internally by `DiskCacheProvider::start()` - not wired externally
-- Runs eviction check every 60 seconds (configurable via `DEFAULT_GC_INTERVAL_SECS`)
-- Uses `CancellationToken` for clean shutdown signaling
-- Filesystem operations wrapped in `spawn_blocking` to avoid blocking the async runtime
-- LRU eviction based on file modification time (mtime)
-- Evicts to 90% of limit to provide headroom for new writes
-
-### Implementation
-
-```rust
-/// Application bootstrap with self-contained cache services.
-impl XEarthLayerApp {
-    pub async fn start(config: AppConfig) -> Result<Self, AppError> {
-        // 1. Start memory cache service
-        let memory_cache_service = CacheService::start(memory_config).await?;
-
-        // 2. Start disk cache service (spawns internal GC daemon!)
-        let disk_cache_service = CacheService::start(disk_config).await?;
-
-        // 3. Create bridge adapters for executor integration
-        let memory_bridge = MemoryCacheBridge::new(memory_cache_service.cache());
-        let disk_bridge = DiskCacheBridge::new(disk_cache_service.cache());
-
-        Ok(Self { memory_cache_service, disk_cache_service, ... })
-    }
-}
-
-/// DiskCacheProvider owns its GC daemon internally.
-impl DiskCacheProvider {
-    pub async fn start(config: DiskCacheConfig) -> Result<Self, CacheError> {
-        let shutdown = CancellationToken::new();
-
-        // Spawn internal GC daemon immediately
-        let gc_handle = tokio::spawn(Self::run_gc_daemon(
-            config.clone(),
-            shutdown.clone(),
-        ));
-
-        Ok(Self { gc_handle, shutdown, ... })
-    }
-}
-```
-
-### Lifecycle
-
-1. **Startup**: `XEarthLayerApp::start()` creates cache services; `DiskCacheProvider` spawns its own GC daemon
-2. **Initial Check**: GC daemon immediately evicts if over limit on startup
-3. **Running**: Daemon wakes every 60s, checks disk size, evicts if needed
-4. **Shutdown**: `XEarthLayerApp::shutdown()` signals `CancellationToken`, daemon stops gracefully
-
-### Benefits of Self-Contained Architecture
-
-The previous architecture wired the GC daemon externally in CLI code (`run.rs`), which had a critical bug: GC never ran in TUI mode because `get_service()` returned `None` before mounting. By having `DiskCacheProvider` own its GC daemon internally, GC **always** runs regardless of application mode.
-
-## Cache Statistics
-
-### Tracked Metrics
-
-```rust
-struct CacheStats {
-    // Memory cache
-    memory_hits: u64,
-    memory_misses: u64,
-    memory_size_bytes: usize,
-    memory_entry_count: usize,
-    memory_evictions: u64,
-
-    // Disk cache
-    disk_hits: u64,
-    disk_misses: u64,
-    disk_size_bytes: usize,
-    disk_entry_count: usize,
-    disk_evictions: u64,
-    disk_writes: u64,
-    disk_write_failures: u64,
-
-    // Downloads
-    downloads: u64,
-    download_failures: u64,
-    bytes_downloaded: u64,
-
-    // Timing
-    last_updated: Instant,
-}
-
-impl CacheStats {
-    fn memory_hit_rate(&self) -> f64 {
-        let total = self.memory_hits + self.memory_misses;
-        if total == 0 { 0.0 } else { self.memory_hits as f64 / total as f64 }
-    }
-
-    fn overall_hit_rate(&self) -> f64 {
-        let hits = self.memory_hits + self.disk_hits;
-        let total = hits + self.disk_misses;
-        if total == 0 { 0.0 } else { hits as f64 / total as f64 }
-    }
-}
-```
-
-### Statistics Reporting
-
-**1. Startup Banner**
-```
-XEarthLayer FUSE Server v0.1.0
-=======================
-
-Mountpoint: /tmp/xearthlayer-mount
-DDS Format: BC1
-Mipmap Levels: 5
-
-Cache Configuration:
-  Memory: 2.0 GB (max ~180 tiles)
-  Disk:   20.0 GB (max ~1,800 tiles) at ~/.cache/xearthlayer
-
-Provider: Bing Maps (no API key required)
-
-Mounting filesystem...
-```
-
-**2. Periodic Logging (every 60s)**
-```
-[STATS] Memory: 45 tiles (512 MB), hits: 1,234 (89.2%), evictions: 12
-[STATS] Disk: 156 tiles (1.7 GB), hits: 89 (12.1%), writes: 67, evictions: 3
-[STATS] Downloads: 23 (252 MB), failures: 2
-[STATS] Overall hit rate: 98.3%
-```
-
-**3. Virtual Stats File**
-
-**Decision**: Provide `/stats` virtual file in FUSE filesystem for real-time monitoring
-
-```bash
-# User can read at any time
-cat /tmp/xearthlayer-mount/stats
-
-XEarthLayer Cache Statistics
-Generated: 2025-11-25 18:45:32
-Provider: bing
-
-MEMORY CACHE
-  Entries:     45 / 180
-  Size:        512 MB / 2.0 GB (25.6%)
-  Hits:        1,234
-  Misses:      149
-  Hit Rate:    89.2%
-  Evictions:   12
-
-DISK CACHE
-  Entries:     156 / 1,800
-  Size:        1.7 GB / 20.0 GB (8.5%)
-  Hits:        89
-  Misses:      23
-  Hit Rate:    79.5%
-  Writes:      67
-  Failures:    0
-  Evictions:   3
-
-DOWNLOADS
-  Total:       23
-  Failures:    2
-  Bytes:       252 MB
-
-OVERALL
-  Hit Rate:    98.3%
-  Uptime:      2h 15m
-```
+`{cache_dir}` is `cache.directory`. Its default is the platform cache directory
+(`paths::tile_cache_dir()`; see [directory-layout.md](../directory-layout.md)).
+
+`{provider}` is the provider's display name, as returned by `name()`: `Bing Maps`,
+`Google GO2`, `Google Maps`, `Apple Maps`, `ArcGIS`, `MapBox` or `USGS`. It is not
+the `provider.type` value.
+
+The chunk tier's directory is `{cache_dir}` itself, so its region directories sit
+beside the provider and `night/` directories, and its keys carry no provider. The
+chunk tier is shared by every provider. (`CacheLayer::new`'s doc comment says
+`{cache_dir}/{provider}/`; the code passes `{cache_dir}`.)
+
+A DDS tile is 11,184,952 bytes: 4096×4096 BC1 with the full 13-level mipmap chain
+(`integrity::EXPECTED_DDS_SIZE`). BC1 is the only format (#395). A chunk is the
+provider's 256×256 image as downloaded, on the order of 14 KB.
+
+The same directory also holds files that are not cache tiers: the scenery index
+cache, the ortho union index cache and, by default, the package download staging
+directory `tmp/` (`paths::temp_dir()`). These paths come from the platform cache
+directory, not from `cache.directory`, so they share it only when
+`cache.directory` is left at its default.
+
+## Budgets
+
+`service/cache_layer.rs` `disk_budgets` splits `cache.disk_size`:
+
+1. With `night.enabled`, the lit tier takes `LIT_DISK_SHARE` (5%) first.
+2. `cache.dds_disk_ratio` (default 0.6) of the rest goes to the DDS disk tier.
+3. The remainder goes to the chunk disk tier.
+
+With the defaults (`disk_size` 20 GiB, `night.enabled` true) that is 1 GiB lit,
+about 11.4 GiB DDS (about 1,094 tiles) and about 7.6 GiB chunks. With night
+lighting off it is 12 GiB DDS and 8 GiB chunks. The lit share is taken whenever
+`night.enabled` is set, whether or not lit textures end up being served.
+
+The memory tier is `cache.memory_size`, default 512 MiB (`DEFAULT_MEMORY_CACHE_SIZE`),
+weighted by entry size: about 47 tiles. Sizes in the config file use binary
+units (`GB` is 2^30 bytes).
+
+Night lighting keeps its own in-memory caches (lit payloads, road tiles) outside
+`cache.memory_size`; see [night-lighting-design.md](night-lighting-design.md).
+
+## Eviction
+
+### Memory tier
+
+`MemoryCacheProvider` wraps `moka::future::Cache` with a weigher that charges
+each entry its byte length and `max_capacity` set to the budget. No eviction
+policy is configured, so moka uses its default, TinyLFU: LRU eviction combined
+with an admission filter based on each key's estimated access frequency. When
+the cache is full a new entry can be refused in favour of a more popular one.
+A refused tile is still written to the DDS disk tier.
+
+### Disk tiers
+
+Each `DiskCacheProvider` keeps an in-memory `LruIndex` (`cache/lru_index.rs`): a
+`DashMap` from key to size and last access time, plus atomic totals. `set`
+records an entry, `get` touches it, and `delete`, a validator rejection or a
+`NotFound` read removes it. `contains` answers from the index alone, with no
+filesystem call (#172); a stale entry is corrected by the next `get`.
+
+The index is rebuilt at every start with each file's mtime as its last access
+time. Accesses are not written to disk, so across restarts the order is by write
+time.
+
+Garbage collection runs on the executor, not inside the provider:
+
+- `XEarthLayerService::start` (`service/facade.rs`) spawns one
+  `GcSchedulerDaemon` (`cache/gc_scheduler.rs`) per disk tier: chunk, DDS, and
+  lit when it exists.
+- Every 60 seconds (`DEFAULT_CHECK_INTERVAL_SECS`; the first check comes one
+  interval after start) the daemon compares the index total with the tier's
+  budget. Above 95% (`DEFAULT_TRIGGER_THRESHOLD`) it submits a `CacheGcJob` with
+  a target of 80% (`DEFAULT_TARGET_RATIO`).
+- `CacheGcJob` (`jobs/cache_gc.rs`) takes the least recently used entries that
+  were last accessed at least 60 seconds ago (`DEFAULT_MIN_AGE_SECS`) until it has
+  enough bytes, and splits them into `CacheGcBatchTask`s of 25
+  (`DEFAULT_BATCH_SIZE`). Each batch is a `DiskIO` task that deletes its files,
+  removes them from the index and checks for cancellation between files. The
+  job's priority is `HOUSEKEEPING` and its error policy `ContinueOnError`.
+- The job is submitted with `try_submit` to the prefetch lane's local executor
+  (`LocalPrefetchLane::job_submitter`). GC never uses the demand lane's pools, and
+  a GC job waits for admission while demand holds the prefetch lane's admission
+  gate closed. If the queue is full, the round is skipped and the next check
+  tries again.
+
+GC deletes files only. Empty region directories stay.
+
+A cache over budget at start is not trimmed before the first check.
+
+## Lifecycle
+
+`XEarthLayerService::start` builds the metrics system first, then
+`CacheLayer::new` (`service/cache_layer.rs`), which:
+
+1. starts the memory `CacheService`;
+2. computes the disk budgets;
+3. starts the DDS disk service at `{cache_dir}/{provider}/dds/`, the chunk disk
+   service at `{cache_dir}/`, and with night lighting the lit service at
+   `{cache_dir}/night/`;
+4. wraps the memory, DDS disk and chunk disk caches in the bridge adapters
+   `MemoryCacheBridge`, `DdsDiskCacheBridge` and `DiskCacheBridge`
+   (`cache/adapters/`). They implement the executor's `MemoryCache`,
+   `DdsDiskCache` and `DiskCache` traits, translating coordinates into keys
+   through `TileCacheClient` and `ChunkCacheClient` (`cache/clients/`).
+
+Starting a disk service creates its directory and runs
+`LruIndex::populate_from_disk`: the subdirectories of the tier's directory are
+listed, each taken to be a region, then scanned in parallel with rayon inside
+`spawn_blocking`. Only regular files directly inside one of them and named
+`*.cache` are indexed. A file anywhere else is not counted against the budget
+and never evicted.
+
+`CacheLayer::scan_disk_cache_size` then reads the DDS and chunk totals from
+their indexes (no second scan) for the dashboard's initial disk size. The service
+builds the runtime with the three bridges, shared by both lanes, and spawns the
+GC scheduler daemons. The lit cache reaches `NightLitSource` and its
+`RoadService` through `XEarthLayerService::lit_disk_cache` when the mount is set
+up (`manager/mounts.rs`).
+
+`CacheLayer::shutdown` stops the services in reverse order (lit, chunk, DDS,
+memory). It does not wait for spawned writes.
+
+## Integrity
+
+Every disk tier treats a bad entry as a miss (#253). `DiskCacheProvider::get`
+validates what it reads:
+
+- DDS: magic `DDS ` and exactly `EXPECTED_DDS_SIZE` bytes;
+- chunk: not empty;
+- lit: magic `XELL`. The night code also checks the fingerprint and the payload
+  length (`night/disk.rs`).
+
+A rejected entry is deleted (`integrity::discard`), removed from the index and
+reported as a miss, so the request regenerates it. A read error other than
+`NotFound` is logged and also treated as a miss.
+
+`DiskCacheProvider::set` writes `tokio::fs::write` to a sibling `.tmp` file and
+renames it over the entry. A reader never sees a half-written file at the live
+path, but the data is not fsynced before the rename, and a failed write leaves
+its `.tmp` file. `.tmp` files are not indexed. The disk tiers do not use
+`integrity::write_atomic`.
+
+[cache-integrity-design.md](cache-integrity-design.md) has the full model.
+
+## Memory Notes
+
+- Values are `bytes::Bytes` end to end (#237). Encoding hands its `Vec<u8>` to
+  `Bytes::from` without a copy, and every cache write, promotion and FUSE read
+  after that shares the allocation.
+- An open virtual DDS handle memoises its tile (#234). That tile stays in memory
+  while the handle is open, even after moka evicts it. The bytes pinned this way
+  are bounded separately by `PinnedTileBudget` (`pinned_budget.rs`, default
+  ceiling 512 MiB, #236). Process memory for tiles is the memory tier plus the
+  pinned handles.
+- [memory-telemetry.md](memory-telemetry.md) explains how to read memory in the
+  field.
+
+## Coherency
+
+**Provider change.** The memory tier lives only for one run, with one provider.
+The DDS disk tier is per provider, so tiles from different providers never mix
+there. The chunk disk tier is not: after a provider change, chunks cached from
+the previous provider are used for any tile that has to be encoded again.
+
+**Format.** XEarthLayer encodes BC1 only and has no format setting (#395).
+Neither the memory key nor the DDS disk path carries a format. A second format
+would need it in both, and a format-aware size in the DDS validator and the FUSE
+size gate (see [dds-implementation.md](dds-implementation.md), "Supported
+formats").
+
+**Imagery updates.** Entries have no age limit. A tile leaves the cache only by
+GC or by deletion.
+
+**Night lighting inputs.** Every lit entry carries a SHA-256 fingerprint of its
+inputs, so a changed input makes the stored entry a miss.
 
 ## Configuration
 
-### CLI Arguments
+`[cache]` in `config.ini`:
 
-```bash
-xearthlayer start \
-  --source /path/to/scenery \
-  --provider bing \                      # Imagery provider
-  --memory-cache-size 2G \               # Memory cache size (default: 2G)
-  --disk-cache-size 20G \                # Disk cache size (default: 20G)
-  --cache-dir ~/.cache/xearthlayer \     # Cache directory (default: ~/.cache/xearthlayer)
-  --disk-cache-max-age 30                # Optional: evict files older than 30 days
-```
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `directory` | platform cache directory | Root of every disk tier |
+| `memory_size` | `512MB` | Memory tier budget |
+| `disk_size` | `20GB` | Budget shared by the disk tiers |
+| `dds_disk_ratio` | `0.6` | DDS share of the disk budget left after the lit share (0.0 to 1.0) |
 
-### Environment Variables
+`night.enabled` (default true) decides whether the lit tier exists. Read and
+change the keys with `xearthlayer config get|set cache.<key>`. There are no
+command-line options or environment variables for the cache.
 
-```bash
-XEARTHLAYER_MEMORY_CACHE_SIZE=2G
-XEARTHLAYER_DISK_CACHE_SIZE=20G
-XEARTHLAYER_CACHE_DIR=~/.cache/xearthlayer
-```
+`run --no-cache` sets `ServiceConfig::cache_enabled` and makes the startup banner
+print `Cache: Disabled`, but no cache reads that flag: every tier still runs.
 
-## Cache Coherency
-
-### Scenario: Format Change
-
-**Problem**: User switches from BC1 to BC3
-
-**Solution**: Separate directory trees
-- BC1 tiles cached in `cache/<provider>/BC1/`
-- BC3 tiles cached in `cache/<provider>/BC3/`
-- Both can coexist
-- No conflicts
-
-### Scenario: Provider Change
-
-**Problem**: User switches from Bing to Google
-
-**Solution**: Provider-specific directories
-- Bing tiles in `cache/bing/`
-- Google tiles in `cache/google/`
-- Both preserved simultaneously
-- No cache clearing needed
-- Can switch back and forth instantly
-- Enables quality comparison
-
-### Scenario: Tile Update
-
-**Problem**: Satellite imagery updated by provider
-
-**Solution**: Age-based eviction (optional)
-- `--disk-cache-max-age 30` clears tiles older than 30 days
-- User can manually clear: `rm -rf ~/.cache/xearthlayer/bing/BC1/15/`
-- Future: Could add tile versioning
-
-### Scenario: Corruption
-
-**Problem**: Partial write or corrupted file
-
-**Solution**:
-- Verify file size matches expected size on read
-- On read error, delete corrupted file and re-download
-- Log corruption events
-
-## Performance Expectations
-
-### Cold Start (Empty Cache)
-```
-Request: +37-122_BI15.dds
-├─ Memory: MISS
-├─ Disk:   MISS
-└─ Download + Encode: ~2 seconds
-   ├─ Download: ~1.5s (256 chunks)
-   └─ Encode:   ~0.3s (BC1)
-Result: 2 seconds
-```
-
-### Warm Cache (In Memory)
-```
-Request: +37-122_BI15.dds
-└─ Memory: HIT
-Result: <1 ms
-```
-
-### Disk Cache Hit
-```
-Request: +37-122_BI15.dds
-├─ Memory: MISS
-└─ Disk:   HIT (~10-50ms read)
-   └─ Add to memory cache
-Result: ~10-50 ms
-```
-
-### Typical Session (Flying over San Francisco)
-```
-Tiles in view: ~9 tiles (3×3 grid at zoom 15)
-First load:    ~18 seconds (9 × 2s)
-Memory hits:   ~100+ requests (camera panning, zoom changes)
-Performance:   <1ms per request after initial load
-```
-
-## Provider Comparison Use Case
-
-A key design goal is enabling users to compare imagery quality between providers:
-
-```bash
-# Day 1: Try Bing Maps (free)
-xearthlayer start --source /path/to/scenery --provider bing
-# Flies around Bay Area, caches 100 tiles (~1.1 GB)
-
-# Day 2: Compare with Google Maps
-xearthlayer start --source /path/to/scenery --provider google
-# Bing cache preserved at cache/bing/
-# Google tiles cached to cache/google/
-# Can instantly switch back to Bing without re-downloading
-
-# Cleanup: Prefer Google, remove Bing cache
-rm -rf ~/.cache/xearthlayer/bing/
-# Frees 1.1 GB
-```
-
-## Implementation Status
-
-### Phase 1: Basic Memory Cache ✅
-- ✅ In-memory cache using moka::future::Cache
-- ✅ CacheKey with provider/format/tile coordinates
-
-### Phase 2: Memory Cache with LRU ✅
-- ✅ Memory size limits (2GB default, configurable)
-- ✅ Automatic LRU eviction via moka weigher
-- ✅ Statistics tracking (hits, misses, evictions)
-
-### Phase 3: Disk Cache ✅
-- ✅ Hierarchical disk cache structure (provider/format/zoom/row)
-- ✅ Async disk writes with concurrency limiting
-- ✅ Disk cache with size limits (20GB default, configurable)
-- ✅ LRU eviction based on file mtime
-- ✅ Startup eviction (immediate check before simulator starts)
-- ✅ Background eviction daemon (60-second interval, async tokio task)
-- ✅ Clean daemon shutdown via CancellationToken
-- ✅ Eviction to 90% of limit (10% headroom)
-
-### Phase 4: Self-Contained Cache Service Architecture ✅
-- ✅ Generic `Cache` trait for cache backend abstraction
-- ✅ `CacheService` lifecycle wrapper with start/shutdown
-- ✅ `DiskCacheProvider` with internal GC daemon (fixes TUI mode GC bug)
-- ✅ `MemoryCacheProvider` wrapping moka
-- ✅ Bridge adapters (`MemoryCacheBridge`, `DiskCacheBridge`) for executor integration
-- ✅ `XEarthLayerApp` bootstrap pattern ensuring proper initialization order
-- ✅ GC runs in all modes (CLI, TUI) - no more external wiring dependency
-
-### Phase 5: Advanced Features (Partial)
-- ❌ Virtual `/stats` file (planned)
-- ✅ Configurable cache sizes via config.ini
-- ❌ Age-based eviction (config exists, not implemented)
-- ❌ Corruption detection/recovery (not implemented)
-- ✅ Cache pre-warming via `--airport` flag
-
-## Directory Size Estimates
-
-### Example: Regional Flying (San Francisco Bay Area)
-
-**Coverage**: 1° latitude × 1° longitude at zoom 15
-
-**Calculation**:
-- At zoom 15, 1° ≈ 512 tiles (equator)
-- Bay Area: ~500 tiles needed
-- BC1 size: 500 × 11 MB = 5.5 GB
-- BC3 size: 500 × 22 MB = 11 GB
-
-**Cache Requirements**:
-- Memory (2GB): Holds ~180 tiles (enough for active flying area)
-- Disk (20GB): Holds entire region + additional areas
-- Can cache both Bing and Google (40GB total) if desired
-
-### Example: Cross-Country Flight (Coast to Coast)
-
-**Coverage**: 40° longitude × 10° latitude at zoom 15
-
-**Calculation**:
-- ~20,000 tiles
-- BC1 size: 20,000 × 11 MB = 220 GB
-- BC3 size: 20,000 × 22 MB = 440 GB
-
-**Cache Requirements**:
-- Needs larger disk cache (configure with `--disk-cache-size 250G`)
-- Or use selective caching (only cache tiles actually viewed)
-- Memory cache (2GB) still sufficient for active area
+The GC check interval, thresholds and batch size are constants, not settings.
 
 ## Maintenance
 
-### Manual Cache Management
+- `xearthlayer cache stats` counts the files and bytes under `cache.directory`,
+  recursively.
+- `xearthlayer cache clear` deletes everything inside `cache.directory`. When
+  that is the default directory, this includes the scenery and ortho union index
+  caches (rebuilt at the next start) and the default package staging directory
+  `tmp/`. Run it while neither `xearthlayer run` nor a package operation is
+  active: a running process's indexes are not told about the deletion.
+
+By hand, with XEarthLayer stopped, any region directory or `.cache` file can be
+deleted; the indexes are rebuilt from disk at the next start. For example:
 
 ```bash
-# View total cache size
-du -sh ~/.cache/xearthlayer
+# DDS tiles of one provider
+rm -rf "$CACHE_DIR/Bing Maps/dds"
 
-# View per-provider size
-du -sh ~/.cache/xearthlayer/*/
+# Night lighting tier
+rm -rf "$CACHE_DIR/night"
 
-# Clear all cache
-rm -rf ~/.cache/xearthlayer
+# Everything cached for one 1x1 degree region
+rm -rf "$CACHE_DIR"/+37-123 "$CACHE_DIR"/*/dds/+37-123 "$CACHE_DIR/night/+37-123"
 
-# Clear specific provider
-rm -rf ~/.cache/xearthlayer/bing
-
-# Clear specific zoom level (e.g., Bing BC1 zoom 15)
-rm -rf ~/.cache/xearthlayer/bing/BC1/15
-
-# Clear specific region (e.g., row 12754)
-rm -rf ~/.cache/xearthlayer/bing/BC1/15/12754
-
-# Find largest directories
-du -sh ~/.cache/xearthlayer/*/* | sort -h
+# Leftover temporary files from interrupted writes
+find "$CACHE_DIR" -name '*.tmp' -delete
 ```
 
-### Automated Cleanup
+`$CACHE_DIR` stands for `cache.directory` (`xearthlayer config get
+cache.directory`). Chunk files are not separated by provider, so there is no
+per-provider chunk directory to delete.
 
-The disk cache GC daemon runs automatically as part of the self-contained cache service:
+## Code Not on the Production Path
 
-**On Startup**:
-- `XEarthLayerApp::start()` initializes cache services
-- `DiskCacheProvider` spawns its internal GC daemon during `start()`
-- Immediate eviction check before the 60-second loop begins
-- Evicts to 90% of limit if over, leaving headroom for new writes
-- Logs scan results: files collected, collectable size, target size
+These remain in `xearthlayer/src/cache/` and `executor/` but are not used by
+`XEarthLayerService`:
 
-**Background Daemon** (every 60 seconds):
-- Checks if cache exceeds `max_size_bytes`
-- Collects all cache files and sorts by mtime (oldest first)
-- Deletes oldest files until at 90% of limit
-- Cleans up empty directories after eviction
-- Logs eviction statistics: files deleted, bytes freed, duration
-- Uses minimal CPU when cache is under limit (just stat calls)
+- `cache::path::cache_path`, `row_directory` and `provider_directory`: the old
+  `{provider}/{format}/{zoom}/{row}/` layout. `cache/path.rs` is still used for
+  `clear_disk_cache` and `disk_cache_stats`.
+- `cache::MemoryCache` and `CacheKey` (`cache/memory.rs`, `cache/types.rs`), with
+  `ExecutorCacheAdapter`, `executor::adapters::DiskCacheAdapter` and
+  `RuntimeBuilder::build`. Production builds the runtime with
+  `RuntimeBuilder::build_with_cache_service`.
+- `MemoryCacheConfig` and `DiskCacheConfig` (including `max_age_days`).
+- `DiskProviderConfig::gc_interval`, filled from
+  `ServiceConfig::disk_gc_interval_secs`: logged, but the GC daemons use
+  `DEFAULT_CHECK_INTERVAL_SECS`.
+- `DiskCacheProvider::gc`, which returns an empty result.
 
-**On Shutdown**:
-- `XEarthLayerApp` drop or explicit `shutdown()` signals `CancellationToken`
-- GC daemon completes current operation and exits cleanly
-- No orphaned tasks or resources
+## Related Documents
 
-## Future Enhancements
-
-1. **Compression**: Store DDS files compressed on disk (zstd) to reduce size
-2. **Chunk caching**: Cache JPEG chunks instead of DDS (like AutoOrtho) for format flexibility
-3. **Predictive loading**: Pre-fetch tiles based on flight path and velocity
-4. **Network sync**: Share cache across machines on local network
-5. **Smart eviction**: Weight eviction by access frequency, not just recency
-6. **Tile versioning**: Track provider updates and invalidate old imagery
-7. **HTTP cache server**: Serve cached tiles to other XEarthLayer instances
-8. **Cache import/export**: Share caches between users (scenery pack style)
-
-## References
-
-- AutoOrtho cache implementation: `getortho.py` (TileCacher class)
-- Web Mercator projection: https://en.wikipedia.org/wiki/Web_Mercator_projection
-- LRU cache algorithms: https://en.wikipedia.org/wiki/Cache_replacement_policies#LRU
-- Filesystem performance: https://en.wikipedia.org/wiki/Comparison_of_file_systems
+- [cache-integrity-design.md](cache-integrity-design.md): validation, discard,
+  bounded reads, atomic writes.
+- [cache-service-design.md](cache-service-design.md): the `Cache` trait and the
+  domain clients. Its sections on garbage collection describe a GC daemon inside
+  `DiskCacheProvider`, which `GcSchedulerDaemon` and `CacheGcJob` replaced.
+- [night-lighting-design.md](night-lighting-design.md): the lit tier, its
+  fingerprint and the road extraction entries.
+- [job-executor-design.md](job-executor-design.md): lanes, priorities and the
+  admission gate the GC job runs under.
+- [memory-telemetry.md](memory-telemetry.md): memory sampling in the field.

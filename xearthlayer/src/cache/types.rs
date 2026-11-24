@@ -14,7 +14,7 @@ use thiserror::Error;
 pub struct CacheKey {
     /// Provider name (e.g., "bing", "google")
     pub provider: String,
-    /// DDS compression format (BC1 or BC3)
+    /// DDS compression format (only BC1 is supported, #395)
     pub format: DdsFormat,
     /// Tile coordinates
     pub tile: TileCoord,

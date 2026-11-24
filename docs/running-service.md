@@ -93,7 +93,6 @@ Press Ctrl+C to stop.
 |--------|-------------|
 | `--airport <ICAO>` | Pre-warm cache around an airport before X-Plane loads (e.g., `KJFK`, `EGLL`) |
 | `--provider <TYPE>` | Override imagery provider: `bing`, `go2`, `google` |
-| `--dds-format <FMT>` | Override texture format: `bc1` or `bc3` |
 | `--timeout <SECS>` | Override `executor.request_timeout_secs`, the per-chunk HTTP timeout |
 | `--no-cache` | Disable caching (not recommended) |
 
@@ -137,7 +136,6 @@ This creates a mount point at `/path/to/scenery_xel`.
 | `--source <PATH>` | Source scenery folder to overlay (required) |
 | `--mountpoint <PATH>` | Custom mount point (default: `<source>_xel`) |
 | `--provider <TYPE>` | Imagery provider: `bing`, `go2`, `google` |
-| `--dds-format <FMT>` | Texture format: `bc1` or `bc3` |
 | `--no-cache` | Disable caching (not recommended) |
 
 ### Example

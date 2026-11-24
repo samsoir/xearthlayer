@@ -26,7 +26,7 @@ Features:
 - Small regional packages (megabytes, not gigabytes)
 - On-demand texture streaming from Bing Maps or Google Maps
 - Two-tier caching for instant repeat visits
-- High-quality BC1/BC3 DDS textures with mipmaps
+- High-quality BC1 DDS textures with mipmaps
 - Works with Ortho4XP-generated scenery
 - Linux and macOS support (Windows planned)
 

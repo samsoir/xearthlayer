@@ -2,14 +2,14 @@
 
 ## Overview
 
-Successfully implemented complete DDS (DirectX Surface) texture encoding with BC1/BC3 compression and mipmap generation, integrated into the CLI for X-Plane compatibility testing.
+Successfully implemented complete DDS (DirectX Surface) texture encoding with BC1 compression and mipmap generation, integrated into the CLI for X-Plane compatibility testing. BC1 is the only format XEarthLayer encodes; see [Supported formats](#supported-formats).
 
 ## Implementation Statistics
 
 - **Total Tests**: 161 passing (93 new DDS tests)
 - **Test Coverage**: ~90% for DDS module
-- **Encoding Performance**: 0.21s for 4096×4096 BC1, 0.32s for BC3 (well under 1s target)
-- **File Sizes**: BC1 ~11MB, BC3 ~21MB (with 5 mipmaps)
+- **Encoding Performance**: 0.21s for 4096×4096 BC1 (well under 1s target)
+- **File Size**: 11,184,952 bytes for a 4096×4096 BC1 tile with the full 13-level mipmap chain
 
 ## Module Structure
 
@@ -19,11 +19,55 @@ xearthlayer/src/dds/
 ├── conversion.rs   - RGB565 conversion, color distance, interpolation
 ├── header.rs       - DDS header construction and serialization
 ├── bc1.rs          - BC1/DXT1 compression (8 bytes per block)
-├── bc3.rs          - BC3/DXT5 compression (16 bytes per block)
+├── compressor.rs   - ImageCompressor, MipmapCompressor, IspcCompressor, SoftwareCompressor
+├── gpu_channel.rs  - GpuEncoderChannel (GPU worker)
 ├── mipmap.rs       - Mipmap chain generation with box filtering
 ├── encoder.rs      - Main DDS encoder API
 └── mod.rs          - Public API exports
 ```
+
+## Supported formats
+
+XEarthLayer encodes BC1 (DXT1) only (#395). BC3 (DXT5) was retired: a BC3 tile is
+twice the size of a BC1 tile (22,369,776 against 11,184,952 bytes for a 4096×4096
+full chain) for an alpha channel that opaque ortho imagery does not use, and VRAM is
+the binding constraint. BC3 also never worked end to end, because the FUSE read gate
+validates every tile against the BC1 size and served the magenta placeholder in its
+place. There is no user setting for the format: the `texture.format` key and
+`run --dds-format` were removed.
+
+The encoder interfaces keep their `format` parameter (`DdsFormat`) as the extension
+point for future formats:
+
+- `ImageCompressor::compress(image, format)`
+- `MipmapCompressor::compress_mipmap_chain(image, format, count)`
+- `DdsEncoder::new(format)`
+- `TextureConfig::new(format)`
+
+Only BC1 is implemented behind them. `DdsFormat::BC3` remains as a named but
+unsupported format, and `DdsFormat::is_supported()` is the one statement of what is
+supported. Any value other than BC1 is rejected with `DdsError::UnsupportedFormat`:
+
+- when the encoder is built at service start (`create_encoder` in
+  `service/builder.rs`), so a wrong format fails at startup and not once per tile;
+- at the top of `DdsEncoder::encode`, before any work;
+- at each backend entry point: `IspcCompressor`, `SoftwareCompressor`, and
+  `GpuEncoderChannel`, which rejects before the request is sent to the GPU worker.
+
+The format facts (block size of 8 or 16 bytes, FourCC `DXT1` or `DXT5`) stay in
+`DdsHeader`: they describe the format and encode nothing. `EXPECTED_DDS_SIZE`, the
+FUSE read gate (`validate_dds_or_placeholder`), the DDS disk validator and the magenta
+placeholder are BC1-only by construction, which is correct because only BC1 can be
+encoded.
+
+Adding a format requires:
+
+1. A kernel arm in each backend: ISPC, software and GPU.
+2. A format-aware expected size for FUSE `st_size`, the read gate
+   (`validate_dds_or_placeholder`) and the DDS disk validator.
+3. A magenta placeholder in that format.
+4. Adding the format to `DdsFormat::is_supported`.
+5. A user-facing switch: a config key and its validation.
 
 ## Compression Formats
 
@@ -35,68 +79,26 @@ xearthlayer/src/dds/
 - **Best For**: Opaque satellite imagery
 - **Performance**: ~10.5 MB for 4096×4096 with 5 mipmaps
 
-### BC3 (DXT5)
-- **Compression**: 4:1 (1 byte per pixel)
-- **Block Size**: 16 bytes per 4×4 pixels
-- **Color**: BC1 RGB (8 bytes)
-- **Alpha**: Two endpoints + 3-bit indices (8 bytes)
-- **Best For**: Textures with smooth alpha gradients
-- **Performance**: ~21 MB for 4096×4096 with 5 mipmaps
-
 ## CLI Integration
 
-### New Command-Line Options
-
-```bash
---format <FORMAT>          # Output format: jpeg, dds (auto-detected from extension)
---dds-format <FORMAT>      # DDS compression: bc1, bc3 (default: bc1)
---mipmap-count <COUNT>     # Number of mipmap levels (default: 5)
-```
-
-### Usage Examples
-
-```bash
-# BC1 format (auto-detected from .dds extension)
-./target/release/xearthlayer \
-  --lat 37.7749 \
-  --lon=-122.4194 \
-  --zoom 15 \
-  --output sf_tile.dds
-
-# BC3 format with explicit flag
-./target/release/xearthlayer \
-  --lat 40.7128 \
-  --lon=-74.0060 \
-  --zoom 15 \
-  --dds-format bc3 \
-  --mipmap-count 5 \
-  --output nyc_tile.dds
-
-# JPEG format (default behavior)
-./target/release/xearthlayer \
-  --lat 51.5074 \
-  --lon=-0.1278 \
-  --zoom 15 \
-  --output london.jpg
-```
+The encoder has no command-line options. XEarthLayer always encodes BC1 with the full
+mipmap chain; `texture.compressor` chooses the backend (`software`, `ispc` or `gpu`).
+See `docs/configuration.md`.
 
 ## Test Results
 
 ### Format Validation
 - ✅ BC1/DXT1 format confirmed by `file` command
-- ✅ BC3/DXT5 format confirmed by `file` command
 - ✅ ImageMagick can read and identify format
 - ✅ Mipmap chain correctly embedded
 
 ### Performance Benchmarks
 - **Download**: 2-3 seconds for 256 chunks
 - **BC1 Encoding**: 0.21s for 4096×4096
-- **BC3 Encoding**: 0.32s for 4096×4096
 - **Total Pipeline**: <3.5 seconds end-to-end
 
 ### Size Comparison (4096×4096 with 5 mipmaps)
 - BC1 DDS: ~11 MB
-- BC3 DDS: ~21 MB (exactly 2× BC1, as expected)
 - JPEG: ~8.8 MB (90% quality)
 
 ## Technical Details
@@ -138,7 +140,7 @@ For 4096×4096 with 5 levels:
 3. **Hex Dump Verification**
    ```bash
    hexdump -C output.dds | head -5
-   # Shows: Magic "DDS ", FourCC "DXT1" or "DXT5"
+   # Shows: Magic "DDS ", FourCC "DXT1"
    ```
 
 ## Next Steps
@@ -152,24 +154,23 @@ For 4096×4096 with 5 levels:
 ## Files Generated
 
 Test script available at `/tmp/test_dds_output.sh` which:
-- Tests BC1 and BC3 formats
+- Tests the BC1 format
 - Verifies file format with `file` command
 - Compares sizes against expected values
 - Generates sample files for manual inspection
 
 Sample files:
 - `/tmp/sf_bc1.dds` - San Francisco, BC1 format
-- `/tmp/nyc_bc3.dds` - New York City, BC3 format
 - `/tmp/london.jpg` - London, JPEG format (comparison)
 
 ## Conclusion
 
 The DDS implementation is **production-ready** with:
-- ✅ Complete BC1/BC3 compression
+- ✅ Complete BC1 compression
 - ✅ Mipmap generation
 - ✅ CLI integration
 - ✅ 93 comprehensive tests passing
-- ✅ Performance under target (0.21-0.32s vs 1s target)
+- ✅ Performance under target (0.21s vs 1s target)
 - ✅ X-Plane compatible format
 - ✅ Verified with multiple tools
 

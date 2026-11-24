@@ -3,7 +3,6 @@
 //! Each struct represents one `[section]` of the INI config file.
 //! These are pure data types with no parsing or serialization logic.
 
-use crate::dds::DdsFormat;
 use std::path::PathBuf;
 
 /// Complete application configuration loaded from config.ini.
@@ -92,8 +91,6 @@ pub struct CacheSettings {
 /// Texture configuration.
 #[derive(Debug, Clone)]
 pub struct TextureSettings {
-    /// DDS format: BC1 or BC3
-    pub format: DdsFormat,
     /// Compressor backend: "software", "ispc", or "gpu"
     pub compressor: String,
     /// GPU device selector: "integrated", "discrete", or adapter name substring

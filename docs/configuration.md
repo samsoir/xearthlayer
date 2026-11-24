@@ -155,26 +155,19 @@ disk_size = 50GB
 
 ### [texture]
 
-Controls DDS texture output format and compression backend.
+Controls the DDS compression backend. XEarthLayer encodes BC1 (DXT1) textures, about 11 MB per 4096x4096 tile with its full mipmap chain. There is no format setting: BC3 was retired, and `texture.format` is no longer read (#395).
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `format` | string | `bc1` | DDS compression: `bc1` (smaller, opaque) or `bc3` (larger, with alpha) |
-| `mipmaps` | integer | `5` | Number of mipmap levels (1-10) |
 | `compressor` | string | `ispc` | Compression backend: `software`, `ispc` (SIMD), or `gpu` (wgpu compute) |
 | `gpu_device` | string | `integrated` | GPU adapter: `integrated`, `discrete`, or adapter name substring |
 
 **Example:**
 ```ini
 [texture]
-format = bc1
 compressor = gpu
 gpu_device = integrated
 ```
-
-**Format Comparison:**
-- **BC1 (DXT1)**: 4:1 compression, ~11MB per 4096x4096 tile. Best for satellite imagery.
-- **BC3 (DXT5)**: 4:1 compression with alpha, ~22MB per tile. Use if transparency is needed.
 
 **Compressor Backends:**
 - **software**: Pure-Rust block compression. Slowest, no external dependencies.
@@ -191,7 +184,7 @@ gpu_device = integrated
 
 The `gpu` backend is ideal for systems with both an integrated and discrete GPU. Configure `gpu_device = integrated` to use the iGPU for encoding while the discrete GPU handles X-Plane rendering. This eliminates CPU contention between encoding and the simulator.
 
-On a machine with one GPU, X-Plane renders on that GPU, so `gpu` encoding competes with the simulator for it. That covers every Apple Silicon Mac (one unified GPU, and no Apple-native BC1/BC3 encoder to make the contention worthwhile) and any PC with only an integrated or only a discrete GPU. XEarthLayer honours the setting, but logs a warning at startup and marks the Tile Processing Engine line on the dashboard's Status pane with an amber `!`; the setup wizard never selects `gpu` on such a machine. The ISPC default ships prebuilt kernels for x86-64 and Apple Silicon, so it needs nothing extra on either.
+On a machine with one GPU, X-Plane renders on that GPU, so `gpu` encoding competes with the simulator for it. That covers every Apple Silicon Mac (one unified GPU, and no Apple-native BC1 encoder to make the contention worthwhile) and any PC with only an integrated or only a discrete GPU. XEarthLayer honours the setting, but logs a warning at startup and marks the Tile Processing Engine line on the dashboard's Status pane with an amber `!`; the setup wizard never selects `gpu` on such a machine. The ISPC default ships prebuilt kernels for x86-64 and Apple Silicon, so it needs nothing extra on either.
 
 **GPU Device Selection:**
 - `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
@@ -565,7 +558,6 @@ memory_size = 4GB
 disk_size = 50GB
 
 [texture]
-format = bc1
 ; compressor = ispc       ; software, ispc (default), or gpu
 ; gpu_device = integrated  ; integrated, discrete, or adapter name substring
 
@@ -724,7 +716,6 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
 | `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks, plus 5% for night lighting when enabled) |
 | `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0), after any night lighting share |
-| `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
 | `generation.threads` | positive integer | Worker threads |
@@ -766,22 +757,19 @@ Most configuration settings can be overridden via CLI arguments:
 
 ```bash
 # Override provider
-xearthlayer start --source ./scenery --provider google --google-api-key YOUR_KEY
+xearthlayer run --provider google --google-api-key YOUR_KEY
 
 # Use MapBox with token
-xearthlayer start --source ./scenery --provider mapbox --mapbox-token YOUR_TOKEN
+xearthlayer run --provider mapbox --mapbox-token YOUR_TOKEN
 
 # Use Apple Maps (no key needed)
-xearthlayer start --source ./scenery --provider apple
-
-# Override DDS format
-xearthlayer start --source ./scenery --dds-format bc3
+xearthlayer run --provider apple
 
 # Override download timeout
-xearthlayer start --source ./scenery --timeout 60
+xearthlayer run --timeout 60
 
 # Disable caching
-xearthlayer start --source ./scenery --no-cache
+xearthlayer run --no-cache
 ```
 
 ## Regenerating Config

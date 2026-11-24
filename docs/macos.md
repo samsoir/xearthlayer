@@ -216,7 +216,7 @@ and adaptive scenery loading work normally through it.
 ### Texture encoding stays on the CPU
 
 Apple Silicon has one GPU, shared with X-Plane's Metal renderer, and no
-Apple-native BC1/BC3 encoder. XEarthLayer therefore encodes DDS textures with
+Apple-native BC1 encoder. XEarthLayer therefore encodes DDS textures with
 the ISPC backend by default (`texture.compressor = ispc`), which ships prebuilt
 Apple Silicon kernels. Setting `texture.compressor = gpu` is honoured, but
 XEarthLayer logs a warning at startup and the dashboard's Status pane marks the

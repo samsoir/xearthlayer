@@ -29,7 +29,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use commands::cache::CacheAction;
-use commands::common::{DdsCompression, ProviderType};
+use commands::common::ProviderType;
 use commands::scenery_index::SceneryIndexAction;
 use logging_init::{init_cli_logging, LogTarget};
 use xearthlayer::config::ConfigFile;
@@ -179,10 +179,6 @@ enum Commands {
         #[arg(long)]
         mapbox_token: Option<String>,
 
-        /// DDS compression format (default: from config)
-        #[arg(long, value_enum)]
-        dds_format: Option<DdsCompression>,
-
         /// Per-chunk download timeout in seconds (default: executor.request_timeout_secs)
         #[arg(long)]
         timeout: Option<u64>,
@@ -283,6 +279,10 @@ fn main() -> ExitCode {
     // never presents to a display, but the Vulkan stack opens one when it is
     // named, and the display server's refusal lands on the dashboard (#358).
     xearthlayer::system::disown_display();
+    // Nor does it want the overlays and other implicit layers the Vulkan
+    // loader injects into every process that creates an instance: MangoHud,
+    // enabled system-wide, aborted it with a double free (#397).
+    xearthlayer::system::exclude_implicit_vulkan_layers();
 
     let cli = Cli::parse();
 
@@ -334,7 +334,6 @@ fn main() -> ExitCode {
             provider,
             google_api_key,
             mapbox_token,
-            dds_format,
             timeout,
             no_cache,
             no_prefetch,
@@ -344,7 +343,6 @@ fn main() -> ExitCode {
                 provider,
                 google_api_key,
                 mapbox_token,
-                dds_format,
                 timeout,
                 no_cache,
                 no_prefetch,
@@ -404,6 +402,23 @@ mod tests {
             &["xearthlayer", "patches", "list"],
         ] {
             assert_eq!(target_of(argv), LogTarget::None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn run_has_no_dds_format_option() {
+        // BC1 is the only format (#395): the option that chose it is gone.
+        for argv in [
+            ["xearthlayer", "run", "--dds-format", "bc1"],
+            ["xearthlayer", "run", "--dds-format", "bc3"],
+        ] {
+            let Err(err) = Cli::try_parse_from(argv) else {
+                panic!("{argv:?} must not parse");
+            };
+            assert!(
+                err.to_string().contains("--dds-format"),
+                "the error should name the removed option: {err}"
+            );
         }
     }
 
