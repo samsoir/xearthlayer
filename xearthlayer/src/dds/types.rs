@@ -8,8 +8,11 @@ use std::fmt;
 /// [`MipmapCompressor`], [`DdsEncoder`]), and that parameter is the extension
 /// point for formats XEarthLayer may support later. **Only BC1 is implemented
 /// today** (#395): every other value is rejected with
-/// [`DdsError::UnsupportedFormat`] when the encoder is built and at every
-/// encode entry point. [`DdsFormat::is_supported`] is the one statement of
+/// [`DdsError::UnsupportedFormat`] when the service builds its encoder
+/// (`service::builder::create_encoder`, so a wrong format fails at startup)
+/// and at every encode entry point (`DdsEncoder::encode` and
+/// `encode_with_mipmaps`, each compressor's `compress`, and the GPU channel
+/// before it sends). Constructors such as `DdsEncoder::new` do not reject. [`DdsFormat::is_supported`] is the one statement of
 /// what is supported.
 ///
 /// The variants beyond BC1 name formats without implementing them; their
