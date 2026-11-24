@@ -108,7 +108,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// # Garbage Collection
 ///
 /// Each provider manages its own GC strategy:
-/// - Memory providers use automatic LRU eviction (moka)
+/// - Memory providers use moka's automatic eviction (TinyLFU for the DDS tier, #405)
 /// - Disk providers run periodic background eviction daemons
 /// - The `gc()` method allows manual triggering when needed
 ///

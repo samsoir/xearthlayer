@@ -182,11 +182,23 @@ Night lighting keeps its own in-memory caches (lit payloads, road tiles) outside
 ### Memory tier
 
 `MemoryCacheProvider` wraps `moka::future::Cache` with a weigher that charges
-each entry its byte length and `max_capacity` set to the budget. No eviction
-policy is configured, so moka uses its default, TinyLFU: LRU eviction combined
-with an admission filter based on each key's estimated access frequency. When
-the cache is full a new entry can be refused in favour of a more popular one.
-A refused tile is still written to the DDS disk tier.
+each entry its byte length and `max_capacity` set to the budget. Its eviction
+policy is TinyLFU, set explicitly (#405): LRU eviction combined with an
+admission filter based on each key's estimated access frequency, so when the
+cache is full a new entry is admitted only if it is read more often than the
+entry it would evict.
+
+That is deliberate, not moka's default left in place. Both executor lanes
+write every finished tile into this tier, prefetch included, hundreds a cycle
+against a tier of about 47 tiles. Under LRU each prefetch burst would push out
+the tiles X-Plane is still re-reading; TinyLFU keeps the one-off tiles out. At
+production size, 47 tiles read six times all survive 300 tiles read once under
+TinyLFU and none survive under LRU
+(`re_read_tiles_survive_a_run_of_tiles_read_once` pins it). A refused tile is
+still on the DDS disk tier.
+
+The night lighting payload and recipe caches are the opposite case and use LRU
+(#387): nothing floods them, and an entry they refuse can cost a regeneration.
 
 ### Disk tiers
 

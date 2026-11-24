@@ -270,12 +270,12 @@ impl ChunkCacheClient {
 
 ### Memory Cache Provider
 
-Wraps moka with automatic LRU eviction.
+Wraps moka with automatic TinyLFU eviction, set deliberately (see [cache-design.md](cache-design.md), "Memory tier"; #405).
 
 ```rust
 /// Memory cache provider using moka.
 ///
-/// Moka handles LRU eviction automatically, so gc() is a no-op.
+/// Moka handles eviction automatically, so gc() is a no-op.
 pub struct MemoryCacheProvider {
     cache: moka::future::Cache<String, Bytes>,
 }

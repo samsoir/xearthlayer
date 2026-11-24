@@ -21,6 +21,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
+use moka::policy::EvictionPolicy;
 use tracing::{debug, warn};
 
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
@@ -317,10 +318,7 @@ impl NightLitSource {
             setting,
             lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
-            payloads: moka::future::Cache::builder()
-                .max_capacity(LIT_PAYLOAD_CACHE_BYTES)
-                .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
-                .build(),
+            payloads: payload_cache(LIT_PAYLOAD_CACHE_BYTES),
             generations: tokio::sync::Semaphore::new(lit_generation_permits(
                 std::thread::available_parallelism().map_or(1, |n| n.get()),
             )),
@@ -711,6 +709,20 @@ impl NightLitSource {
     }
 }
 
+/// The memory cache of generated payloads, holding up to `max_bytes` of them.
+///
+/// LRU, not moka's default TinyLFU: once the cache is full, admission by
+/// popularity would reject a payload just generated (asked for once) in
+/// favour of payloads read more often, and X-Plane's next read of its
+/// levels would load or generate it again.
+fn payload_cache(max_bytes: u64) -> moka::future::Cache<(u32, u32, u8), Bytes> {
+    moka::future::Cache::builder()
+        .eviction_policy(EvictionPolicy::lru())
+        .max_capacity(max_bytes)
+        .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+        .build()
+}
+
 /// The cached part of `name` in `cache`, loaded by `load` on a miss, which
 /// concurrent callers share; `None` (black) when the load gave nothing.
 async fn shared(
@@ -831,6 +843,47 @@ mod tests {
             map_type: "BI".into(),
             kind: TextureKind::Lit,
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_payload_cache_keeps_a_new_payload_and_drops_the_least_recently_read() {
+        // moka's default TinyLFU admits a new entry into a full cache only
+        // when it has been asked for more often than the entry it would
+        // evict: a payload just generated has been asked for once, so it lost
+        // to payloads read more than once and was generated again on the
+        // next read (#387).
+        const PAYLOAD_BYTES: usize = 1024;
+        const HELD: u32 = 4;
+        let cache = payload_cache(PAYLOAD_BYTES as u64 * u64::from(HELD));
+        let name = |row: u32| DdsFilename { row, ..lit() };
+        let key = |row: u32| (row, lit().col, lit().zoom);
+        let read = |row: u32| {
+            let cache = &cache;
+            async move {
+                let load = async { Ok(Bytes::from(vec![0xAB; PAYLOAD_BYTES])) };
+                assert!(shared(cache, &name(row), load).await.is_some());
+            }
+        };
+
+        for row in 0..HELD {
+            read(row).await;
+        }
+        cache.run_pending_tasks().await; // full: moka counts reads from here
+        for _ in 0..2 {
+            for row in 0..HELD {
+                read(row).await;
+            }
+        }
+        cache.run_pending_tasks().await;
+        read(HELD).await;
+        cache.run_pending_tasks().await;
+
+        assert!(cache.contains_key(&key(HELD)), "the new payload is kept");
+        assert!(
+            !cache.contains_key(&key(0)),
+            "the least recently read payload makes room"
+        );
+        assert_eq!(cache.entry_count(), u64::from(HELD));
     }
 
     #[test]

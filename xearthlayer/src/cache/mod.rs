@@ -8,7 +8,7 @@
 //!
 //! - [`CacheService`] - Lifecycle wrapper for starting/stopping caches
 //! - [`Cache`] trait - Generic key-value interface (string keys, byte values)
-//! - [`MemoryCacheProvider`] - In-memory LRU cache using moka
+//! - [`MemoryCacheProvider`] - In-memory cache using moka, TinyLFU eviction (#405)
 //! - [`DiskCacheProvider`] - On-disk cache with **internal GC daemon**
 //!
 //! ```ignore
@@ -36,7 +36,7 @@
 //! - [`MemoryCache`] - Original moka wrapper (domain-specific CacheKey)
 //!
 //! The async pipeline uses:
-//! - `MemoryCache` for DDS tiles (LRU eviction, thread-safe)
+//! - `MemoryCacheProvider` (through `MemoryCacheBridge`) for DDS tiles (TinyLFU eviction, thread-safe)
 //! - `DiskCacheProvider` for chunks with `GcSchedulerDaemon` for periodic eviction
 
 // New cache service architecture (Phase 1)

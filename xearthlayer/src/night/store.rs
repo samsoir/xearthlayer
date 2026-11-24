@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashSet;
+use moka::policy::EvictionPolicy;
 use moka::sync::Cache;
 use tracing::warn;
 
@@ -62,6 +63,18 @@ struct Loaded {
     region: LedRegion,
 }
 
+impl Loaded {
+    /// The cache weight: the recipe's cells, or 1 for no recipe.
+    fn weight(&self) -> u32 {
+        match &self.recipe {
+            Some(r) => (r.class.cells.len() + r.brightness.cells.len())
+                .try_into()
+                .unwrap_or(u32::MAX),
+            None => 1,
+        }
+    }
+}
+
 /// The LED region of an ortho source: a regional package's code, or
 /// `Unknown` for a patch.
 fn source_region(source: &OrthoSource) -> LedRegion {
@@ -72,7 +85,8 @@ fn source_region(source: &OrthoSource) -> LedRegion {
     }
 }
 
-/// Recipes per tile, loaded lazily and evicted by size. Absence is cached.
+/// Recipes per tile, loaded lazily and, over the byte budget, evicted least
+/// recently used first. Absence is cached.
 pub struct RecipeStore {
     roots: Vec<(PathBuf, LedRegion)>,
     cache: Cache<(i32, i32), Loaded>,
@@ -92,14 +106,19 @@ impl RecipeStore {
 
     /// Like `new`, with the LED region of each root.
     pub fn with_regions(roots: Vec<(PathBuf, LedRegion)>) -> Self {
+        Self::with_cache_budget(roots, RECIPE_CACHE_BYTES)
+    }
+
+    /// Like `with_regions`, caching up to `cache_bytes` of decoded recipes.
+    fn with_cache_budget(roots: Vec<(PathBuf, LedRegion)>, cache_bytes: u64) -> Self {
+        // LRU, not moka's default TinyLFU: once the cache is full, admission
+        // by popularity would reject a recipe just loaded (asked for once) in
+        // favour of recipes read more often, and every probe and generation
+        // of its tile would read and parse it again.
         let cache = Cache::builder()
-            .max_capacity(RECIPE_CACHE_BYTES)
-            .weigher(|_, v: &Loaded| match &v.recipe {
-                Some(r) => (r.class.cells.len() + r.brightness.cells.len())
-                    .try_into()
-                    .unwrap_or(u32::MAX),
-                None => 1,
-            })
+            .eviction_policy(EvictionPolicy::lru())
+            .max_capacity(cache_bytes)
+            .weigher(|_, v: &Loaded| v.weight())
             .build();
         Self {
             roots,
@@ -347,6 +366,71 @@ mod tests {
         let path = recipe_path(root, lat, lon);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// urban.oxn as the recipe of tile `(lat, -123)`, `lat` a two-digit
+    /// latitude: the tile name is rewritten in place at the same length, so
+    /// the recipe still parses and weighs what urban.oxn weighs.
+    fn urban_at(lat: i32) -> Vec<u8> {
+        let from = tile_name(37, -123).into_bytes();
+        let to = tile_name(lat, -123).into_bytes();
+        assert_eq!(from.len(), to.len());
+        let mut bytes = URBAN.to_vec();
+        for at in 0..=bytes.len() - from.len() {
+            if bytes[at..at + from.len()] == from[..] {
+                bytes[at..at + from.len()].copy_from_slice(&to);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_full_cache_keeps_a_new_recipe_and_drops_the_least_recently_read() {
+        // moka's default TinyLFU admits a new entry into a full cache only
+        // when it has been asked for more often than the entry it would
+        // evict: a recipe just loaded has been asked for once, so it lost to
+        // recipes read more than once and was read and parsed again on every
+        // probe and generation (#387).
+        const HELD: i32 = 4;
+        const FIRST: i32 = 30;
+        let temp = TempDir::new().unwrap();
+        for lat in FIRST..=FIRST + HELD {
+            put(temp.path(), lat, -123, &urban_at(lat));
+        }
+        let weight = Loaded {
+            recipe: Some(Arc::new(parse_recipe(URBAN).unwrap())),
+            identity: None,
+            region: LedRegion::Unknown,
+        }
+        .weight();
+        let store = RecipeStore::with_cache_budget(
+            vec![(temp.path().to_path_buf(), LedRegion::Unknown)],
+            u64::from(weight) * HELD as u64,
+        );
+        let read = |lat: i32| assert!(store.get(lat, -123).is_some(), "+{lat}-123");
+
+        for lat in FIRST..FIRST + HELD {
+            read(lat);
+        }
+        store.cache.run_pending_tasks(); // full: moka counts reads from here
+        for _ in 0..2 {
+            for lat in FIRST..FIRST + HELD {
+                read(lat);
+            }
+        }
+        store.cache.run_pending_tasks();
+        read(FIRST + HELD);
+        store.cache.run_pending_tasks();
+
+        assert!(
+            store.cache.contains_key(&(FIRST + HELD, -123)),
+            "the new recipe is kept"
+        );
+        assert!(
+            !store.cache.contains_key(&(FIRST, -123)),
+            "the least recently read recipe makes room"
+        );
+        assert_eq!(store.cache.entry_count(), HELD as u64);
     }
 
     fn identity_len(store: &RecipeStore) -> u64 {
