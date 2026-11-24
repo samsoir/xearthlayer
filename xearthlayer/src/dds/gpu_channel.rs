@@ -10,6 +10,7 @@ mod inner {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::dds::compressor::MipmapCompressor;
+    use crate::dds::layout;
     use crate::dds::{DdsError, DdsFormat};
 
     /// Bounded channel capacity for GPU encode requests.
@@ -102,23 +103,21 @@ mod inner {
     // Full-tile processing internals
     // =========================================================================
 
-    /// The `block_compression` variant and compressed block size in bytes for
-    /// a supported [`DdsFormat`]; [`DdsError::UnsupportedFormat`] otherwise.
-    /// `compress_mipmap_chain` refuses an unsupported format before sending,
-    /// so the worker only reaches the error if called directly.
-    fn format_params(format: DdsFormat) -> Result<(CompressionVariant, u32), DdsError> {
+    /// The `block_compression` variant for a supported [`DdsFormat`];
+    /// [`DdsError::UnsupportedFormat`] otherwise. `compress_mipmap_chain`
+    /// refuses an unsupported format before sending, so the worker only
+    /// reaches the error if called directly.
+    fn compression_variant(format: DdsFormat) -> Result<CompressionVariant, DdsError> {
         format.ensure_supported()?;
         match format {
-            DdsFormat::BC1 => Ok((CompressionVariant::BC1, 8)),
+            DdsFormat::BC1 => Ok(CompressionVariant::BC1),
             other => Err(DdsError::UnsupportedFormat(other.to_string())),
         }
     }
 
-    /// Compressed output size in bytes for a given image at the specified format.
-    fn compressed_size(width: u32, height: u32, block_size: u32) -> u64 {
-        let blocks_wide = width.div_ceil(4);
-        let blocks_high = height.div_ceil(4);
-        (blocks_wide * blocks_high * block_size) as u64
+    /// Compressed bytes of one `width` x `height` level, as a GPU buffer size.
+    fn compressed_size(width: u32, height: u32, format: DdsFormat) -> u64 {
+        layout::level_len(width, height, format) as u64
     }
 
     /// Process a full tile: generate mipmaps, compress each level on GPU,
@@ -137,11 +136,11 @@ mod inner {
     ) -> Result<Vec<u8>, DdsError> {
         let width = image.width();
         let height = image.height();
-        let (variant, block_size) = format_params(format)?;
+        let variant = compression_variant(format)?;
 
         // Pre-allocate output and readback buffers for level 0 (largest).
         // Smaller levels reuse the same buffers.
-        let max_output_size = compressed_size(width, height, block_size);
+        let max_output_size = compressed_size(width, height, format);
 
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile-output"),
@@ -168,7 +167,7 @@ mod inner {
             let level = crate::dds::compressor::pad_to_block_multiple(&level);
             let lw = level.width();
             let lh = level.height();
-            let level_output_size = compressed_size(lw, lh, block_size);
+            let level_output_size = compressed_size(lw, lh, format);
 
             // Create texture for this level (textures are immutable in size)
             let texture = device.create_texture(&wgpu::TextureDescriptor {

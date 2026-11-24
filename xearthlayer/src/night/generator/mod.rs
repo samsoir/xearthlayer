@@ -20,6 +20,7 @@ use super::laminar::LitPattern;
 use super::recipe::Recipe;
 use super::roads::field::RoadField;
 use super::roads::RoadModel;
+use crate::dds::{layout, DdsFormat};
 use crate::fuse::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
@@ -132,16 +133,15 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
 /// The BC1 blocks of `levels`, in order, without the DDS header, each level
 /// repaired where its endpoints tint dim texels ([`bc1_repair`]).
 fn bc1_levels(levels: &[RgbaImage]) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let mut dds =
-        crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(levels)?;
-    let mut at = DDS_HEADER_LEN;
+    let mut dds = crate::dds::DdsEncoder::new(DdsFormat::BC1).encode_with_mipmaps(levels)?;
+    let mut at = layout::HEADER_LEN;
     for level in levels {
-        let len = bc1_repair::level_len(level.width(), level.height());
+        let len = layout::level_len(level.width(), level.height(), DdsFormat::BC1);
         bc1_repair::repair_level(&mut dds[at..at + len], level);
         at += len;
     }
     debug_assert_eq!(at, dds.len(), "the encoder writes the levels in order");
-    Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
+    Ok(bytes::Bytes::from(dds).slice(layout::HEADER_LEN..))
 }
 
 /// Scales a level's stored R, G and B by `gain`, then turns black every
@@ -201,9 +201,6 @@ fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
     }
     chain
 }
-
-/// Bytes of a DDS header (magic plus the 124-byte header).
-const DDS_HEADER_LEN: usize = 128;
 
 #[cfg(test)]
 mod tests {
@@ -277,7 +274,7 @@ mod tests {
             let mut rgba = [0u8; 4 * 4 * 4];
             bcdec_rs::bc1(&payload[at..at + 8], &mut rgba, 16);
             reds.push(rgba[0]);
-            at += (size.div_ceil(4) * size.div_ceil(4) * 8) as usize;
+            at += layout::level_len(size, size, DdsFormat::BC1);
             size /= 2;
         }
         reds
@@ -305,7 +302,7 @@ mod tests {
             let mut rgba = [0u8; 4 * 4 * 4];
             bcdec_rs::bc1(&payload[at..at + 8], &mut rgba, 16);
             rgbs.push([rgba[0], rgba[1], rgba[2]]);
-            at += (size.div_ceil(4) * size.div_ceil(4) * 8) as usize;
+            at += layout::level_len(size, size, DdsFormat::BC1);
             size /= 2;
         }
         rgbs
@@ -420,7 +417,7 @@ mod tests {
         let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1)
             .encode_with_mipmaps(std::slice::from_ref(level))
             .unwrap();
-        dds[DDS_HEADER_LEN..].to_vec()
+        dds[layout::HEADER_LEN..].to_vec()
     }
 
     #[test]
@@ -438,7 +435,7 @@ mod tests {
         let payload = encode_visible(img).unwrap();
         let mut at = 0;
         for (n, level) in chain.iter().enumerate() {
-            let len = bc1_repair::level_len(level.width(), level.height());
+            let len = layout::level_len(level.width(), level.height(), DdsFormat::BC1);
             assert_eq!(
                 bc1_repair::tests::introduced_tints(&payload[at..at + len], level),
                 0,

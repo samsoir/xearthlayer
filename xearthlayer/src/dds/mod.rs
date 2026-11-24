@@ -42,6 +42,12 @@
 //! with [`DdsError::UnsupportedFormat`] (see [`DdsFormat`]). BC3 (DXT5) was
 //! retired in #395.
 //!
+//! # File geometry
+//!
+//! [`layout`] owns the arithmetic of a DDS file: the header length, the bytes
+//! of a level, the levels of a full chain and the length of a file. Every
+//! site that sizes a DDS takes its numbers from there.
+//!
 //! # Performance
 //!
 //! The default ISPC SIMD encoder compresses a 4096×4096 image with its full
@@ -71,6 +77,7 @@ mod conversion;
 mod encoder;
 pub mod gpu_channel;
 mod header;
+pub mod layout;
 mod mipmap;
 mod types;
 

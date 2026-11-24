@@ -78,8 +78,8 @@ impl VirtualDdsConfig {
 
 impl Default for VirtualDdsConfig {
     fn default() -> Self {
-        // Default DDS size: 4096x4096 BC1 with mipmaps ≈ 11MB
-        Self::new(11_184_952)
+        // A 4096x4096 BC1 tile with its full mip chain.
+        Self::new(crate::fuse::EXPECTED_DDS_SIZE as u64)
     }
 }
 
