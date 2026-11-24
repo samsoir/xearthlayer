@@ -523,14 +523,15 @@ Controls how hard XEarthLayer pushes your local network.
 |---------|---------|-------------|
 | `connections` | high | How many network connections to open: `max`, `high` or `low` |
 
-XEarthLayer downloads each scenery tile as 256 image chunks in parallel, and keeps many connections open to the imagery servers. Some home routers and modems cannot track that many connections and drop the whole network rather than refusing new ones. `max` opens every connection XEarthLayer is designed for, `high` two thirds as many and `low` one third:
+XEarthLayer downloads each scenery tile as 256 image chunks in parallel, and keeps many connections open to the imagery servers. Some home routers and modems cannot track that many connections and drop the whole network rather than refusing new ones. `max` opens every connection XEarthLayer is designed for, `high` 80% as many and `low` 65%, rounded up:
 
 | Limit | `max` | `high` | `low` |
 |-------|-------|--------|-------|
-| Imagery requests X-Plane is waiting on | 1024 | 683 | 342 |
-| Imagery requests for prefetch | 1024 | 683 | 342 |
-| Idle connections kept per imagery server | 1024 | 683 | 342 |
-| Package part downloads (`packages.concurrent_downloads` = 5) | 5 | 4 | 2 |
+| Imagery requests X-Plane is waiting on | 1024 | 820 | 666 |
+| Imagery requests for prefetch | 1024 | 820 | 666 |
+| Idle connections kept per imagery server | 1024 | 820 | 666 |
+| Package part downloads (`packages.concurrent_downloads` = 5) | 5 | 4 | 4 |
+| Package part downloads (`packages.concurrent_downloads` = 10) | 10 | 8 | 7 |
 
 | Level | For |
 |-------|-----|
@@ -633,7 +634,7 @@ brightness = 1.0
 symbols = auto
 
 [network]
-; Network connections: max, high (two thirds) or low (one third)
+; Network connections: max, high (80%) or low (65%)
 connections = high
 ```
 

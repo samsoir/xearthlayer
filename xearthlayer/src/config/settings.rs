@@ -286,7 +286,7 @@ pub struct TuiSettings {
 #[derive(Debug, Clone)]
 pub struct NetworkSettings {
     /// How many of XEarthLayer's usual connections to open: all of them,
-    /// two thirds or one third. Covers imagery downloads on both executor
+    /// 80% or 65%. Covers imagery downloads on both executor
     /// lanes and package downloads.
     pub connections: super::network::NetworkLevel,
 }

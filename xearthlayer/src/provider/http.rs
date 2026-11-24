@@ -467,8 +467,8 @@ pub mod tests {
             pool_max_idle_per_host(NetworkLevel::Max),
             DEFAULT_POOL_MAX_IDLE_PER_HOST
         );
-        assert_eq!(pool_max_idle_per_host(NetworkLevel::High), 683);
-        assert_eq!(pool_max_idle_per_host(NetworkLevel::Low), 342);
+        assert_eq!(pool_max_idle_per_host(NetworkLevel::High), 820);
+        assert_eq!(pool_max_idle_per_host(NetworkLevel::Low), 666);
         for level in NetworkLevel::ALL {
             assert!(AsyncReqwestClient::at_network_level(level).is_ok());
         }

@@ -430,8 +430,8 @@ mod tests {
         assert_eq!(ServiceConfig::default().network_level(), NetworkLevel::High);
         for (level, permits) in [
             (NetworkLevel::Max, DEFAULT_MAX_CONCURRENT_HTTP),
-            (NetworkLevel::High, 683),
-            (NetworkLevel::Low, 342),
+            (NetworkLevel::High, 820),
+            (NetworkLevel::Low, 666),
         ] {
             let config = ServiceConfig::builder().network_level(level).build();
             assert_eq!(config.network_level(), level);

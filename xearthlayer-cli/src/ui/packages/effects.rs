@@ -2086,12 +2086,13 @@ mod tests {
     fn queue_downloads_follow_the_network_level() {
         // #367: the queue downloads packages.concurrent_downloads parts at the
         // network.connections level; the setting itself keeps its value.
+        // 10 parts: 80% is 8 at high (the default), 65% is 6.5, rounded up to 7.
         let mut config = ConfigFile::default();
-        config.packages.concurrent_downloads = 5;
-        assert_eq!(Settings::from_config(&config).concurrent_downloads, 4);
+        config.packages.concurrent_downloads = 10;
+        assert_eq!(Settings::from_config(&config).concurrent_downloads, 8);
         config.network.connections = xearthlayer::config::NetworkLevel::Low;
-        assert_eq!(Settings::from_config(&config).concurrent_downloads, 2);
-        assert_eq!(config.packages.concurrent_downloads, 5);
+        assert_eq!(Settings::from_config(&config).concurrent_downloads, 7);
+        assert_eq!(config.packages.concurrent_downloads, 10);
     }
 
     #[test]
