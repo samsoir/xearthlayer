@@ -118,8 +118,14 @@ impl RunActive {
     /// a `run` that exits and its pid may be reused, so a stale lock is
     /// named for the user to delete.
     pub fn message(&self) -> String {
+        self.refusal("updating or removing packages")
+    }
+
+    /// The refusal of another command, which would have been `doing`
+    /// ("clearing the cache").
+    pub fn refusal(&self, doing: &str) -> String {
         format!(
-            "XEarthLayer is running (pid {}): stop it before updating or removing packages, \
+            "XEarthLayer is running (pid {}): stop it before {doing}, \
              or delete {} if XEarthLayer is not running",
             self.pid,
             self.lock.display()
@@ -463,6 +469,21 @@ mod tests {
         assert_eq!(
             run.message(),
             "XEarthLayer is running (pid 4242): stop it before updating or removing packages, \
+             or delete /state/xearthlayer.lock if XEarthLayer is not running"
+        );
+    }
+
+    /// Other commands refused while `run` is active say what they would
+    /// have done.
+    #[test]
+    fn the_refusal_names_what_was_refused() {
+        let run = RunActive {
+            pid: 4242,
+            lock: PathBuf::from("/state/xearthlayer.lock"),
+        };
+        assert_eq!(
+            run.refusal("clearing the cache"),
+            "XEarthLayer is running (pid 4242): stop it before clearing the cache, \
              or delete /state/xearthlayer.lock if XEarthLayer is not running"
         );
     }

@@ -45,6 +45,7 @@ pub mod gc_scheduler;
 pub mod integrity;
 pub mod layout;
 pub mod lru_index;
+pub mod maintenance;
 pub mod providers;
 mod service;
 mod traits;
@@ -83,7 +84,10 @@ pub use stats::{CacheStatistics, CacheStats};
 pub use types::{CacheError, CacheKey, DiskCacheConfig, DiskTier, MemoryCacheConfig};
 
 // Re-export path utilities for convenience
-pub use path::{
-    cache_path, clear_disk_cache, disk_cache_stats, provider_directory, row_directory,
-    ClearCacheResult,
+pub use path::{cache_path, provider_directory, row_directory};
+
+// `cache clear` and `cache stats` (#399)
+pub use maintenance::{
+    clear_disk_cache, disk_cache_stats, find_tiers, CacheTier, DiskCacheUsage, TierDirectories,
+    TierUsage,
 };

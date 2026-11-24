@@ -52,6 +52,34 @@ impl QueueLock {
     }
 }
 
+/// The lock file a queue on `temp_dir` holds.
+pub fn queue_lock_file(temp_dir: &Path) -> PathBuf {
+    temp_dir.join(LOCK_FILE_NAME)
+}
+
+/// Whether a package operation (a running queue, from the CLI or the
+/// package manager) holds the lock on `temp_dir`.
+///
+/// It tries the lock and drops it at once, so for that instant a queue
+/// starting in this directory would be refused as busy. A missing lock file
+/// means no queue ever ran here; nothing is created to find that out.
+pub fn queue_in_use(temp_dir: &Path) -> ManagerResult<bool> {
+    let path = queue_lock_file(temp_dir);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(ManagerError::ReadFailed { path, source: e }),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(_probe) => Ok(false),
+        Err((_, Errno::EWOULDBLOCK)) => Ok(true),
+        Err((_, errno)) => Err(ManagerError::ReadFailed {
+            path,
+            source: std::io::Error::from(errno),
+        }),
+    }
+}
+
 /// Clean up after a run that was killed. Call only while holding the lock.
 /// Install temp directories, staging folders and removed folders are
 /// deleted; a removed folder is a package part way through deletion, so it
@@ -136,6 +164,45 @@ mod tests {
 
         drop(first);
         assert!(QueueLock::acquire(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn the_probe_says_busy_while_a_queue_holds_the_lock_and_free_after() {
+        let temp = TempDir::new().unwrap();
+        let held = QueueLock::acquire(temp.path()).unwrap();
+
+        assert!(queue_in_use(temp.path()).unwrap());
+
+        drop(held);
+        assert!(!queue_in_use(temp.path()).unwrap());
+        // The probe did not keep the lock.
+        assert!(QueueLock::acquire(temp.path()).is_ok());
+    }
+
+    /// Asking must not create the temp directory or its lock file: a
+    /// `cache clear` probe should leave no trace where nothing ran.
+    #[test]
+    fn the_probe_says_free_and_creates_nothing_where_no_queue_ever_ran() {
+        let temp = TempDir::new().unwrap();
+        let tmp = temp.path().join("tmp");
+
+        assert!(!queue_in_use(&tmp).unwrap());
+        assert!(!tmp.exists());
+
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(!queue_in_use(&tmp).unwrap());
+        assert!(!queue_lock_file(&tmp).exists());
+    }
+
+    #[test]
+    fn the_lock_file_is_the_one_the_queue_locks() {
+        let temp = TempDir::new().unwrap();
+        let _held = QueueLock::acquire(temp.path()).unwrap();
+        assert!(queue_lock_file(temp.path()).is_file());
+        assert_eq!(
+            queue_lock_file(temp.path()),
+            temp.path().join(LOCK_FILE_NAME)
+        );
     }
 
     #[test]
