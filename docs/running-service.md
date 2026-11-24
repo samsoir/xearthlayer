@@ -94,7 +94,7 @@ Press Ctrl+C to stop.
 | `--airport <ICAO>` | Pre-warm cache around an airport before X-Plane loads (e.g., `KJFK`, `EGLL`) |
 | `--provider <TYPE>` | Override imagery provider: `bing`, `go2`, `google` |
 | `--timeout <SECS>` | Override `executor.request_timeout_secs`, the per-chunk HTTP timeout |
-| `--no-cache` | Disable caching (not recommended) |
+| `--no-cache` | Do not read or write the disk caches this session; tiles are cached in memory only |
 
 ### No Packages Installed
 
@@ -136,7 +136,7 @@ This creates a mount point at `/path/to/scenery_xel`.
 | `--source <PATH>` | Source scenery folder to overlay (required) |
 | `--mountpoint <PATH>` | Custom mount point (default: `<source>_xel`) |
 | `--provider <TYPE>` | Imagery provider: `bing`, `go2`, `google` |
-| `--no-cache` | Disable caching (not recommended) |
+| `--no-cache` | Do not read or write the disk caches this session; tiles are cached in memory only |
 
 ### Example
 
@@ -258,22 +258,24 @@ count and is not configurable. See the `[executor]` section of
 
 | Cache | Location | Default Size |
 |-------|----------|--------------|
-| Memory | RAM | 2 GB |
-| Disk | `~/.cache/xearthlayer/` | 20 GB |
+| Memory | RAM | 512 MB (`cache.memory_size`) |
+| Disk | `cache.directory` (`~/.cache/xearthlayer/` on Linux) | 20 GB (`cache.disk_size`) |
 
 ### Cache Structure
 
 ```
-~/.cache/xearthlayer/
-├── Bing Maps/
-│   └── <zoom>/<row>/<col>_bc1.dds
-└── Google Maps/
-    └── <zoom>/<row>/<col>_bc1.dds
+<cache directory>/
+├── Bing Maps/            one directory per imagery provider
+│   ├── dds/<region>/     encoded tiles
+│   └── chunks/<region>/  downloaded imagery chunks
+└── night/                night lighting textures
 ```
+
+The cache directory is `cache.directory` (`xearthlayer config get cache.directory`). It can also hold files that are not cached tiles, such as the scenery index caches and the package download folder `tmp/`; the cache commands leave those alone.
 
 ### Managing Cache
 
-View cache statistics:
+View cache statistics, per provider and tier:
 
 ```bash
 xearthlayer cache stats
@@ -285,11 +287,9 @@ Clear the cache:
 xearthlayer cache clear
 ```
 
-Clear only disk cache (preserve memory):
+`cache clear` deletes the cached tiles, imagery chunks and night lighting textures, and nothing else in the cache directory. It refuses, and deletes nothing, while `xearthlayer run` is running or a package install, update or removal is in progress: stop that first.
 
-```bash
-xearthlayer cache clear --disk
-```
+To run a session without the disk cache, leaving it as it is, use `xearthlayer run --no-cache`.
 
 ### Scenery Index Cache
 
