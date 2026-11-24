@@ -73,8 +73,8 @@ pub use mounts::{
     ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder, ORTHO_MOUNT_FOLDER,
 };
 pub use queue::{
-    CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
-    JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
+    queue_in_use, queue_lock_file, CancelResult, Canceller, Capacity, InstallContext, InstallQueue,
+    Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
 };
 pub use symlinks::{
     consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,

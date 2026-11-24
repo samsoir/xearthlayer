@@ -46,9 +46,10 @@ use xearthlayer::config::ConfigFile;
 use crate::error::CliError;
 use crate::signals::{ActiveQueue, SignalWatch};
 
-/// Load config or return default.
-fn load_config() -> ConfigFile {
-    ConfigFile::load().unwrap_or_default()
+/// Load the configuration; a file that does not parse is an error, never
+/// the defaults, which would install or remove in the wrong directory.
+fn load_config() -> Result<ConfigFile, CliError> {
+    super::common::load_config()
 }
 
 /// Get the default installation directory.
@@ -118,7 +119,7 @@ fn open_tui(stdin_tty: bool, stdout_tty: bool) -> bool {
 
 /// Open the package manager, and print what it did once it exits.
 pub fn open_manager() -> Result<(), CliError> {
-    let summary = crate::ui::packages::runner::run_manager(&load_config())?;
+    let summary = crate::ui::packages::runner::run_manager(&load_config()?)?;
     println!("{summary}");
     Ok(())
 }
@@ -147,7 +148,7 @@ pub fn run(command: Option<PackagesCommands>) -> Result<(), CliError> {
     };
 
     // Load config once for all commands
-    let config = load_config();
+    let config = load_config()?;
 
     // Create production context
     let output = ConsoleOutput::new();

@@ -225,9 +225,10 @@ impl OrchestratorConfig {
         self.prefetch.enabled
     }
 
-    /// Check if cache is enabled.
-    pub fn cache_enabled(&self) -> bool {
-        self.service.cache_enabled()
+    /// Whether the disk cache tiers run this session (`run --no-cache` turns
+    /// them off; the memory tier always runs).
+    pub fn disk_cache_enabled(&self) -> bool {
+        self.service.disk_cache_enabled()
     }
 
     /// Get the provider name.

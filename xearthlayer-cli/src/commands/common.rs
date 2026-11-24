@@ -93,3 +93,56 @@ pub fn resolve_provider(
 
     provider.to_config(api_key, mapbox_token)
 }
+
+/// Load the configuration file.
+///
+/// A missing file gives the defaults. A file that does not parse is an
+/// error naming it, never the defaults: a command acting on the defaults
+/// would use the wrong cache and package directories without saying so, and
+/// one that saves would replace every setting in the file with its default
+/// (#401 made a hand-edited `cache.dds_disk_ratio` of 1.5 such a file).
+pub fn load_config() -> Result<ConfigFile, CliError> {
+    load_config_from(&xearthlayer::config::config_file_path())
+}
+
+/// [`load_config`] for the file at `path`.
+pub fn load_config_from(path: &std::path::Path) -> Result<ConfigFile, CliError> {
+    ConfigFile::load_from(path).map_err(|e| {
+        CliError::Config(format!(
+            "{} could not be read: {e}. Correct that setting in the file; \
+             nothing was changed.",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_config_file_gives_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_config_from(&dir.path().join("config.ini")).unwrap();
+        assert_eq!(
+            config.provider.provider_type,
+            ConfigFile::default().provider.provider_type
+        );
+    }
+
+    #[test]
+    fn a_config_file_that_does_not_parse_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(
+            &path,
+            "[provider]\ntype = go2\n\n[cache]\ndds_disk_ratio = 1.5\n",
+        )
+        .unwrap();
+
+        let err = load_config_from(&path).expect_err("must not fall back to the defaults");
+        let message = err.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("dds_disk_ratio"), "{message}");
+    }
+}

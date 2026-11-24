@@ -213,6 +213,14 @@ pub const DEPRECATED_VALUES: &[DeprecatedValue] = &[
         value: super::defaults::ALPHA_STAGING_LIBRARY_URL,
         replacement: super::defaults::DEFAULT_LIBRARY_URL,
     },
+    // The default from #98 until #125 raised it to 7.0. It was below the
+    // range `config set` has always enforced, so the files written in
+    // between carry a value the range check on read would refuse.
+    DeprecatedValue {
+        key: "prefetch.box_extent",
+        value: "6.5",
+        replacement: "7.0",
+    },
 ];
 
 /// Look up the retired-value entry for `key = value`, if there is one.
@@ -792,6 +800,21 @@ type = bing
         assert!(summary.contains("2 new setting(s)"));
         assert!(summary.contains("1 deprecated setting(s)"));
         assert!(summary.contains("1 retired value(s)"));
+    }
+
+    #[test]
+    fn the_former_default_box_extent_is_a_retired_value() {
+        let retired = deprecated_value("prefetch.box_extent", "6.5").expect("6.5 is retired");
+        assert_eq!(retired.replacement, "7.0");
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        std::fs::write(&config_path, "[prefetch]\nbox_extent = 6.5\n").unwrap();
+        let analysis = analyze_config(&config_path).unwrap();
+        assert!(analysis
+            .migrated_values
+            .iter()
+            .any(|v| v.key == "prefetch.box_extent"));
     }
 
     #[test]

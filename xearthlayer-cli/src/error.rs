@@ -23,6 +23,8 @@ pub enum CliError {
     CacheClear(String),
     /// Failed to get cache stats
     CacheStats(String),
+    /// The cache was not cleared because something is using it (#399)
+    CacheInUse(String),
     /// Package manager error
     Packages(String),
     /// No packages installed
@@ -160,6 +162,7 @@ impl fmt::Display for CliError {
             CliError::Serve(e) => write!(f, "FUSE server error: {}", e),
             CliError::CacheClear(msg) => write!(f, "Failed to clear cache: {}", msg),
             CliError::CacheStats(msg) => write!(f, "Failed to get cache stats: {}", msg),
+            CliError::CacheInUse(msg) => write!(f, "Cache not cleared: {}", msg),
             CliError::Packages(msg) => write!(f, "Package manager error: {}", msg),
             CliError::NoPackages { .. } => write!(f, "No ortho packages installed"),
             CliError::SceneryIndex(msg) => write!(f, "Scenery index error: {}", msg),

@@ -11,7 +11,7 @@ lighting:
 |------|-------|-----|-------|------------|----------|
 | Memory | Encoded DDS tiles | `tile:{zoom}:{row}:{col}` | Process memory | `cache.memory_size` | moka, TinyLFU |
 | DDS disk | Encoded DDS tiles | `tile:{zoom}:{row}:{col}` | `{cache_dir}/{provider}/dds/` | share of `cache.disk_size` | LRU, GC job |
-| Chunk disk | Raw imagery chunks as downloaded | `chunk:{zoom}:{tile_row}:{tile_col}:{chunk_row}:{chunk_col}` | `{cache_dir}/` | share of `cache.disk_size` | LRU, GC job |
+| Chunk disk | Raw imagery chunks as downloaded | `chunk:{zoom}:{tile_row}:{tile_col}:{chunk_row}:{chunk_col}` | `{cache_dir}/{provider}/chunks/` | share of `cache.disk_size` | LRU, GC job |
 | Lit disk (night lighting only) | Generated lit payloads and road extractions | `lit:{zoom}:{row}:{col}`, `roads:{lat}:{lon}:{hex16}` | `{cache_dir}/night/` | 5% of `cache.disk_size` | LRU, GC job |
 
 The memory tier is a staging buffer for active FUSE reads. The DDS disk tier is
@@ -105,7 +105,10 @@ directory named like an X-Plane DSF tile (`lru_index::key_to_region`):
   the key names. A chunk lands in the same region as its tile.
 - `roads:{lat}:{lon}:...` keys: the DSF tile the key names.
 
-For the tile in the example above, with Bing:
+`cache::layout` (`cache/layout.rs`) is the one statement of where each tier
+lives; the code that creates the tiers and the code that finds them again
+(`cache clear`, `cache stats`, the legacy cleanup) both use it. For the tile in
+the example above, with Bing:
 
 ```text
 {cache_dir}/
@@ -113,10 +116,11 @@ For the tile in the example above, with Bing:
     dds/
       +37-123/
         tile_12_1582_658.cache            DDS disk tier, 11,184,952 bytes
-  +37-123/
-    chunk_12_1582_658_0_0.cache           chunk disk tier, one file per chunk
-    ...
-    chunk_12_1582_658_15_15.cache
+    chunks/
+      +37-123/
+        chunk_12_1582_658_0_0.cache       chunk disk tier, one file per chunk
+        ...
+        chunk_12_1582_658_15_15.cache
   night/                                  lit disk tier, night.enabled only
     +37-123/
       lit_16_25312_10528.cache
@@ -129,10 +133,19 @@ For the tile in the example above, with Bing:
 `Google GO2`, `Google Maps`, `Apple Maps`, `ArcGIS`, `MapBox` or `USGS`. It is not
 the `provider.type` value.
 
-The chunk tier's directory is `{cache_dir}` itself, so its region directories sit
-beside the provider and `night/` directories, and its keys carry no provider. The
-chunk tier is shared by every provider. (`CacheLayer::new`'s doc comment says
-`{cache_dir}/{provider}/`; the code passes `{cache_dir}`.)
+Each provider has its own DDS and chunk tiers; chunk keys carry no provider, the
+directory does (#398). Before 0.5.1 the chunk tier was `{cache_dir}` itself:
+region directories directly in the cache root, shared by every provider. Those
+are no longer indexed, so `CacheLayer::spawn_legacy_chunk_cleanup` deletes them
+(`cache::legacy::remove_legacy_chunk_regions`) on a blocking thread at each start
+with disk caching on, without delaying startup. It removes only directories in
+the root whose names are region names (`layout::is_region_dir_name`, the shape
+`coord::format_dsf_name` writes) and that hold nothing but `*.cache` and `*.tmp`
+files (`layout::holds_only_cache_entries`), never follows a symbolic link, logs
+"Removed legacy chunk cache regions from the cache root" at info, and treats a
+failed deletion as a warning. A region-named directory holding anything else is
+left alone: `cache.directory` may also hold the user's own folders, scenery
+among them.
 
 A DDS tile is 11,184,952 bytes: 4096×4096 BC1 with the full 13-level mipmap chain
 (`integrity::EXPECTED_DDS_SIZE`). BC1 is the only format (#395). A chunk is the
@@ -219,8 +232,9 @@ A cache over budget at start is not trimmed before the first check.
 
 1. starts the memory `CacheService`;
 2. computes the disk budgets;
-3. starts the DDS disk service at `{cache_dir}/{provider}/dds/`, the chunk disk
-   service at `{cache_dir}/`, and with night lighting the lit service at
+3. with disk caching on, starts the DDS disk service at
+   `{cache_dir}/{provider}/dds/`, the chunk disk service at
+   `{cache_dir}/{provider}/chunks/`, and with night lighting the lit service at
    `{cache_dir}/night/`;
 4. wraps the memory, DDS disk and chunk disk caches in the bridge adapters
    `MemoryCacheBridge`, `DdsDiskCacheBridge` and `DiskCacheBridge`
@@ -237,8 +251,9 @@ and never evicted.
 
 `CacheLayer::scan_disk_cache_size` then reads the DDS and chunk totals from
 their indexes (no second scan) for the dashboard's initial disk size. The service
-builds the runtime with the three bridges, shared by both lanes, and spawns the
-GC scheduler daemons. The lit cache reaches `NightLitSource` and its
+builds the runtime with the three bridges, shared by both lanes
+(`CacheLayer::executor_disk_caches`, `RuntimeBuilder::build_with_cache_service`),
+spawns the GC scheduler daemons and starts the legacy chunk cleanup. The lit cache reaches `NightLitSource` and its
 `RoadService` through `XEarthLayerService::lit_disk_cache` when the mount is set
 up (`manager/mounts.rs`).
 
@@ -283,9 +298,9 @@ its `.tmp` file. `.tmp` files are not indexed. The disk tiers do not use
 ## Coherency
 
 **Provider change.** The memory tier lives only for one run, with one provider.
-The DDS disk tier is per provider, so tiles from different providers never mix
-there. The chunk disk tier is not: after a provider change, chunks cached from
-the previous provider are used for any tile that has to be encoded again.
+The DDS and chunk disk tiers are per provider, so tiles and chunks from
+different providers never mix, and a tile is never assembled from another
+provider's chunks (#398).
 
 **Format.** XEarthLayer encodes BC1 only and has no format setting (#395).
 Neither the memory key nor the DDS disk path carries a format. A second format
@@ -308,47 +323,83 @@ inputs, so a changed input makes the stored entry a miss.
 | `directory` | platform cache directory | Root of every disk tier |
 | `memory_size` | `512MB` | Memory tier budget |
 | `disk_size` | `20GB` | Budget shared by the disk tiers |
-| `dds_disk_ratio` | `0.6` | DDS share of the disk budget left after the lit share (0.0 to 1.0) |
+| `dds_disk_ratio` | `0.6` | DDS share of the disk budget left after the lit share (0.0 to 1.0; anything else, including `inf` and `NaN`, is refused when the file is read, #401) |
 
 `night.enabled` (default true) decides whether the lit tier exists. Read and
 change the keys with `xearthlayer config get|set cache.<key>`. There are no
-command-line options or environment variables for the cache.
+environment variables for the cache.
 
-`run --no-cache` sets `ServiceConfig::cache_enabled` and makes the startup banner
-print `Cache: Disabled`, but no cache reads that flag: every tier still runs.
+`run --no-cache` turns off the disk tiers for one session (#400). It sets
+`ServiceConfig::disk_cache_enabled` to false, and then:
+
+- `CacheLayer` starts only the memory tier: no DDS, chunk or lit disk service,
+  and no tier under `cache.directory` is created, read, written or deleted
+  (no startup scan, no legacy cleanup). The scenery and ortho union index
+  caches are not tiers: they load and save as usual, and on a default
+  installation they sit in the same directory;
+- `executor_disk_caches()` returns `ExecutorDiskCaches::Off`, so both lanes get
+  `NullDdsDiskCache` and `NullDiskCache`, which always miss and drop writes;
+  demand, prefetch, `CachedTileProbeTask` and prewarm see every tile as not on
+  disk, and the prefetch coordinator's DDS disk filter is not installed;
+- no GC scheduler daemon is spawned;
+- night lighting runs without its disk tier;
+- prefetch does not run (`run.rs` `prefetch_off_reason`, which also applies
+  `--no-prefetch`), because its tiles would reach only the memory tier and be
+  evicted long before they are flown over, and clap refuses `--airport` with
+  `--no-cache` for the same reason.
+
+The memory tier works as usual, because FUSE serving, the coalescer and the
+open-handle memo depend on it. The startup banner says
+`Cache: <memory> memory, disk caching off (--no-cache)` and the dashboard shows
+the DDS and chunk tiers as off.
 
 The GC check interval, thresholds and batch size are constants, not settings.
 
 ## Maintenance
 
-- `xearthlayer cache stats` counts the files and bytes under `cache.directory`,
-  recursively.
-- `xearthlayer cache clear` deletes everything inside `cache.directory`. When
-  that is the default directory, this includes the scenery and ortho union index
-  caches (rebuilt at the next start) and the default package staging directory
-  `tmp/`. Run it while neither `xearthlayer run` nor a package operation is
-  active: a running process's indexes are not told about the deletion.
+`cache::maintenance` (#399) finds the tier directories through `cache::layout`
+(`find_tiers`): each provider directory's `dds/` and `chunks/`, `night/`, and any
+pre-0.5.1 region directories still in the root. It trusts content, not names: a
+directory is a tier only if it holds nothing but region directories of `*.cache`
+and `*.tmp` files (`layout::looks_like_tier_dir`), so a user's own `dds` or
+`chunks` folder is never taken for one. Symbolic links are never followed. Everything else in `cache.directory` is outside the tiers: the package
+staging directory `tmp/` (with `.queue.lock`), `scenery_index.cache`,
+`ortho_union_index.cache`, and any other file or directory, including other
+contents of a provider directory.
 
-By hand, with XEarthLayer stopped, any region directory or `.cache` file can be
-deleted; the indexes are rebuilt from disk at the next start. For example:
+- `xearthlayer cache stats` counts the tier directories only, one line per tier
+  (DDS and chunks per provider, old shared chunks if any, night lighting) and a
+  total. It only reads.
+- `xearthlayer cache clear` deletes the tier directories only and keeps the
+  provider directories themselves. It refuses, deletes nothing and exits 1 while
+  `xearthlayer run` is active (the instance lock, as the package commands check
+  it) or while a package install, update or removal holds the queue lock in the
+  package temp directory (`manager::queue_in_use`). The check is made when the
+  command starts.
+
+By hand, with XEarthLayer stopped, any region directory or `.cache` file in a
+tier can be deleted; the indexes are rebuilt from disk at the next start. For
+example:
 
 ```bash
 # DDS tiles of one provider
 rm -rf "$CACHE_DIR/Bing Maps/dds"
 
+# Imagery chunks of one provider
+rm -rf "$CACHE_DIR/Bing Maps/chunks"
+
 # Night lighting tier
 rm -rf "$CACHE_DIR/night"
 
 # Everything cached for one 1x1 degree region
-rm -rf "$CACHE_DIR"/+37-123 "$CACHE_DIR"/*/dds/+37-123 "$CACHE_DIR/night/+37-123"
+rm -rf "$CACHE_DIR"/*/dds/+37-123 "$CACHE_DIR"/*/chunks/+37-123 "$CACHE_DIR/night/+37-123"
 
 # Leftover temporary files from interrupted writes
 find "$CACHE_DIR" -name '*.tmp' -delete
 ```
 
 `$CACHE_DIR` stands for `cache.directory` (`xearthlayer config get
-cache.directory`). Chunk files are not separated by provider, so there is no
-per-provider chunk directory to delete.
+cache.directory`).
 
 ## Code Not on the Production Path
 
@@ -356,8 +407,7 @@ These remain in `xearthlayer/src/cache/` and `executor/` but are not used by
 `XEarthLayerService`:
 
 - `cache::path::cache_path`, `row_directory` and `provider_directory`: the old
-  `{provider}/{format}/{zoom}/{row}/` layout. `cache/path.rs` is still used for
-  `clear_disk_cache` and `disk_cache_stats`.
+  `{provider}/{format}/{zoom}/{row}/` layout.
 - `cache::MemoryCache` and `CacheKey` (`cache/memory.rs`, `cache/types.rs`), with
   `ExecutorCacheAdapter`, `executor::adapters::DiskCacheAdapter` and
   `RuntimeBuilder::build`. Production builds the runtime with

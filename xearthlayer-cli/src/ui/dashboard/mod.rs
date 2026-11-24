@@ -239,6 +239,7 @@ impl Dashboard {
             memory_max_bytes: self.config.memory_cache_max,
             dds_disk_max_bytes: self.config.dds_disk_cache_max,
             chunk_disk_max_bytes: self.config.chunk_disk_cache_max,
+            disk_caching: self.config.disk_caching,
         };
 
         // Get prefetch status if available

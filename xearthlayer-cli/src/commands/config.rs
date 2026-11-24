@@ -66,7 +66,7 @@ fn run_get(key: &str) -> Result<(), CliError> {
         ))
     })?;
 
-    let config = ConfigFile::load().unwrap_or_default();
+    let config = super::common::load_config()?;
     let value = config_key.get(&config);
 
     if value.is_empty() {
@@ -87,20 +87,28 @@ fn run_set(key: &str, value: &str) -> Result<(), CliError> {
         ))
     })?;
 
-    let mut config = ConfigFile::load().unwrap_or_default();
+    set_in(&config_file_path(), key, value)?;
+    println!("Set {} = {}", config_key.name(), value);
+    Ok(())
+}
+
+/// Set `key` to `value` in the configuration file at `path`. A file that does
+/// not parse is left as it is (#401).
+fn set_in(path: &std::path::Path, key: &str, value: &str) -> Result<(), CliError> {
+    let config_key: ConfigKey = key
+        .parse()
+        .map_err(|_| CliError::Config(format!("Unknown configuration key '{key}'")))?;
+    let mut config = super::common::load_config_from(path)?;
     config_key
         .set(&mut config, value)
         .map_err(|e| CliError::Config(e.to_string()))?;
-    config.save()?;
-
-    println!("Set {} = {}", config_key.name(), value);
-
+    config.save_to(path)?;
     Ok(())
 }
 
 /// List all configuration settings.
 fn run_list() -> Result<(), CliError> {
-    let config = ConfigFile::load().unwrap_or_default();
+    let config = super::common::load_config()?;
 
     println!("Configuration Settings");
     println!("======================");
@@ -249,4 +257,36 @@ fn run_upgrade(dry_run: bool) -> Result<(), CliError> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #401: a file the parser refuses must not be replaced by the defaults
+    /// with one setting changed, which is what `config set` did when it
+    /// loaded with `unwrap_or_default` and saved.
+    #[test]
+    fn set_leaves_a_config_file_that_does_not_parse_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let original = "[provider]\ntype = go2\n\n[cache]\ndds_disk_ratio = 1.5\n";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(set_in(&path, "cache.dds_disk_ratio", "0.6").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn set_keeps_every_other_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[provider]\ntype = go2\n").unwrap();
+
+        set_in(&path, "cache.dds_disk_ratio", "0.5").unwrap();
+
+        let config = ConfigFile::load_from(&path).unwrap();
+        assert_eq!(config.provider.provider_type, "go2");
+        assert_eq!(config.cache.dds_disk_ratio, 0.5);
+    }
 }

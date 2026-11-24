@@ -237,6 +237,8 @@ pub struct DashboardConfig {
     pub dds_disk_cache_max: usize,
     /// Chunk disk cache max size.
     pub chunk_disk_cache_max: usize,
+    /// Whether the disk cache tiers run this session (`false` with `--no-cache`).
+    pub disk_caching: bool,
     /// Provider name for display (e.g., "Bing", "Google", "Go2").
     pub provider_name: String,
     /// Prefetch lane sizing and the FUSE generation timeout, for the prefetch panel.
@@ -260,6 +262,7 @@ impl Default for DashboardConfig {
             memory_cache_max: 2 * 1024 * 1024 * 1024,
             dds_disk_cache_max: 12 * 1024 * 1024 * 1024,
             chunk_disk_cache_max: 8 * 1024 * 1024 * 1024,
+            disk_caching: true,
             provider_name: "Unknown".to_string(),
             prefetch_lane: PrefetchLaneConfig {
                 group: 0,

@@ -146,7 +146,14 @@ impl XEarthLayerService {
         // 3. Create CacheLayer WITH metrics for GC reporting
         let cache_layer = CacheLayer::new(&config, &provider_name, metrics_client.clone()).await?;
 
-        // 4. Scan initial disk cache size and report to metrics
+        // The chunk tier's pre-#398 regions in the cache root are no longer
+        // indexed, so never counted or evicted: delete them in the
+        // background. Detached: startup never waits for it, and it logs its
+        // own outcome. Nothing runs with disk caching off.
+        drop(cache_layer.spawn_legacy_chunk_cleanup());
+
+        // 4. Scan initial disk cache size and report to metrics (0, without
+        // a scan, with disk caching off)
         let initial_disk_size = cache_layer.scan_disk_cache_size().await;
         metrics_client.disk_cache_initial_size(initial_disk_size);
 
@@ -180,13 +187,13 @@ impl XEarthLayerService {
         .with_network_level(config.network_level())
         .build_with_cache_service(
             cache_layer.memory_bridge(),
-            cache_layer.dds_disk_bridge(),
-            cache_layer.disk_bridge(),
+            cache_layer.executor_disk_caches(),
         );
 
         let dds_client = xel_runtime.dds_client();
 
-        // 7. Create and spawn GC scheduler daemons (one per disk tier).
+        // 7. Create and spawn GC scheduler daemons (one per disk tier that
+        // runs; none with disk caching off).
         // GC is housekeeping, so it runs on the prefetch lane and never
         // competes with FUSE for the demand lane's pools.
         let gc_shutdown = CancellationToken::new();
@@ -247,8 +254,14 @@ impl XEarthLayerService {
             tracing::info!("Lit disk GC scheduler daemon started");
         }
 
+        // With disk caching off there is no disk provider, so no daemon was
+        // spawned: nothing to collect.
         let gc_scheduler_shutdown = if gc_scheduler_handles.is_empty() {
-            tracing::warn!("No disk providers available, GC schedulers not started");
+            if cache_layer.disk_caching() {
+                tracing::warn!("No disk providers available, GC schedulers not started");
+            } else {
+                tracing::info!("Disk caching off: no GC schedulers");
+            }
             None
         } else {
             Some(gc_shutdown)
@@ -292,9 +305,10 @@ impl XEarthLayerService {
         self.max_zoom
     }
 
-    /// Check if caching is enabled.
-    pub fn cache_enabled(&self) -> bool {
-        self.config.cache_enabled()
+    /// Whether the disk cache tiers run this session (`run --no-cache` turns
+    /// them off; the memory tier always runs).
+    pub fn disk_cache_enabled(&self) -> bool {
+        self.config.disk_cache_enabled()
     }
 
     /// Get the service configuration.
@@ -384,7 +398,8 @@ impl XEarthLayerService {
     /// Returns the `MemoryCacheBridge` that implements `executor::MemoryCache` trait.
     /// Used by the prefetch and prewarm systems to check if tiles are already cached.
     ///
-    /// Returns `None` if caching is disabled.
+    /// Present whenever the service is started: the memory tier runs even
+    /// with disk caching off.
     pub fn memory_cache_bridge(&self) -> Option<Arc<MemoryCacheBridge>> {
         self.memory_cache_bridge.clone()
     }
@@ -395,11 +410,15 @@ impl XEarthLayerService {
     /// Used by the prefetch system to verify whether tiles were generated when
     /// evaluating stale InProgress regions.
     ///
-    /// Returns `None` if caching is disabled.
+    /// Returns `None` when disk caching is off (`run --no-cache`): the
+    /// prefetch coordinator then skips its DDS disk filter, so no tile is
+    /// taken as cached on disk, and leaves region claims unanswered rather
+    /// than promoting or striking them.
     pub fn dds_disk_checker(&self) -> Option<Arc<dyn crate::executor::DdsDiskCacheChecker>> {
-        self.cache_layer.as_ref().map(|cl| {
-            Arc::clone(&cl.dds_disk_bridge()) as Arc<dyn crate::executor::DdsDiskCacheChecker>
-        })
+        self.cache_layer
+            .as_ref()
+            .and_then(|cl| cl.dds_disk_bridge())
+            .map(|bridge| bridge as Arc<dyn crate::executor::DdsDiskCacheChecker>)
     }
 
     /// The GPU encoding textures, or `None` when a CPU encoder is in use.
@@ -571,7 +590,7 @@ mod tests {
     #[test]
     fn test_service_config_default() {
         let config = ServiceConfig::default();
-        assert!(config.cache_enabled());
+        assert!(config.disk_cache_enabled());
         assert_eq!(config.texture().format(), DdsFormat::BC1);
         assert_eq!(config.texture().mipmap_count(), None);
     }
@@ -588,6 +607,45 @@ mod tests {
         let err = ServiceError::RuntimeError("failed to spawn".to_string());
         assert!(err.to_string().contains("Runtime error"));
         assert!(err.to_string().contains("failed to spawn"));
+    }
+
+    /// #400: a service started with disk caching off (`run --no-cache`)
+    /// creates nothing under `cache.directory`, offers prefetch no DDS disk
+    /// checker and night lighting no lit disk tier, and keeps its memory
+    /// tier. Runs on its own runtime for the reason given on the test below.
+    #[test]
+    fn disk_caching_off_touches_no_cache_directory() {
+        use crate::provider::ProviderConfig;
+        use tempfile::tempdir;
+
+        std::thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let temp_dir = tempdir().unwrap();
+                let cache_dir = temp_dir.path().join("cache");
+                let config = ServiceConfig::builder()
+                    .cache_directory(cache_dir.clone())
+                    .cache_memory_size(1_000_000)
+                    .night_enabled(true)
+                    .disk_cache_enabled(false)
+                    .build();
+
+                let mut service = XEarthLayerService::start(config, ProviderConfig::bing())
+                    .await
+                    .expect("a Bing service starts offline");
+
+                assert!(!service.disk_cache_enabled());
+                assert!(service.memory_cache_bridge().is_some());
+                assert!(service.dds_disk_checker().is_none());
+                assert!(service.lit_disk_cache().is_none());
+                assert!(service.gc_scheduler_handles.is_empty());
+
+                service.shutdown_cache().await;
+                assert!(!cache_dir.exists());
+            });
+        })
+        .join()
+        .expect("test thread panicked");
     }
 
     /// Regression test: `start()` must be callable from within a `block_on()` context.

@@ -26,6 +26,8 @@ pub struct CacheConfig {
     pub dds_disk_max_bytes: usize,
     /// Maximum chunk disk cache size in bytes.
     pub chunk_disk_max_bytes: usize,
+    /// Whether the disk tiers run this session (`false` with `--no-cache`).
+    pub disk_caching: bool,
 }
 
 impl Default for CacheConfig {
@@ -34,8 +36,25 @@ impl Default for CacheConfig {
             memory_max_bytes: 2 * 1024 * 1024 * 1024,
             dds_disk_max_bytes: 12 * 1024 * 1024 * 1024,
             chunk_disk_max_bytes: 8 * 1024 * 1024 * 1024,
+            disk_caching: true,
         }
     }
+}
+
+/// Render a disk tier that does not exist this session (`--no-cache`).
+fn render_tier_off(buf: &mut Buffer, area: Rect, label: &str) {
+    if area.height < 2 || area.width < 10 {
+        return;
+    }
+    let line1 = Line::from(vec![
+        Span::styled(format!(" {} ", label), Style::default().fg(Color::White)),
+        Span::styled("off", Style::default().fg(Color::DarkGray)),
+    ]);
+    let line2 = Line::from(Span::styled(
+        " --no-cache",
+        Style::default().fg(Color::DarkGray),
+    ));
+    Paragraph::new(vec![line1, line2]).render(area, buf);
 }
 
 /// Get color for hit rate based on threshold.
@@ -173,6 +192,14 @@ impl Widget for CacheWidgetCompact<'_> {
             },
         );
 
+        // Without disk caching (`--no-cache`) the disk tiers do not exist:
+        // say so rather than draw a budget nothing is using (#400).
+        if !self.config.disk_caching {
+            render_tier_off(buf, columns[1], "DDS Disk");
+            render_tier_off(buf, columns[2], "Chunks");
+            return;
+        }
+
         // DDS Disk tier — FUSE-only counts/rate (see #171).
         render_cache_tier(
             buf,
@@ -235,6 +262,37 @@ mod tests {
         assert!(output.contains("Memory"), "Should contain Memory label");
         assert!(output.contains("DDS Disk"), "Should contain DDS Disk label");
         assert!(output.contains("Chunks"), "Should contain Chunks label");
+    }
+
+    /// #400: with `--no-cache` the disk tiers do not exist, so the widget
+    /// must not draw a size bar or budget for them.
+    #[test]
+    fn disk_tiers_show_off_without_disk_caching() {
+        let snapshot = TelemetrySnapshot::default();
+        let area = Rect::new(0, 0, 120, 2);
+        let mut buf = Buffer::empty(area);
+        CacheWidgetCompact::new(&snapshot)
+            .with_config(CacheConfig {
+                disk_caching: false,
+                ..CacheConfig::default()
+            })
+            .render(area, &mut buf);
+        let output: String = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        assert!(output.contains("Memory"), "{output}");
+        assert!(output.contains("DDS Disk off"), "{output}");
+        assert!(output.contains("Chunks off"), "{output}");
+        assert!(output.contains("--no-cache"), "{output}");
+        // The default budgets, 12 GiB and 8 GiB, as `format_bytes` writes them.
+        assert!(!output.contains("12.88 GB"), "no DDS budget: {output}");
+        assert!(!output.contains("8.59 GB"), "no chunk budget: {output}");
     }
 
     #[test]

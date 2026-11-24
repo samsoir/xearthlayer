@@ -183,7 +183,7 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Disable caching (always generate tiles fresh)
+        /// Do not read or write the disk caches this session (memory cache only)
         #[arg(long)]
         no_cache: bool,
 
@@ -194,8 +194,9 @@ enum Commands {
         /// ICAO airport code for cold-start pre-warming (e.g., LFBO, KJFK)
         ///
         /// When specified, pre-loads tiles around the airport before starting.
-        /// Useful for pre-warming the cache before a flight.
-        #[arg(long)]
+        /// Useful for pre-warming the cache before a flight. Not with
+        /// --no-cache: only the memory cache would hold the tiles.
+        #[arg(long, conflicts_with = "no_cache")]
         airport: Option<String>,
     },
 }
@@ -403,6 +404,26 @@ mod tests {
         ] {
             assert_eq!(target_of(argv), LogTarget::None, "{argv:?}");
         }
+    }
+
+    /// Pre-warming fills the cache around an airport before the flight; with
+    /// the disk tiers off only the memory tier would hold it, a few dozen
+    /// tiles, so the combination is refused rather than silently wasted.
+    #[test]
+    fn airport_prewarm_cannot_be_combined_with_no_cache() {
+        let Err(err) =
+            Cli::try_parse_from(["xearthlayer", "run", "--no-cache", "--airport", "KJFK"])
+        else {
+            panic!("--airport with --no-cache must not parse");
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("--no-cache") && message.contains("--airport"),
+            "{message}"
+        );
+
+        assert!(Cli::try_parse_from(["xearthlayer", "run", "--airport", "KJFK"]).is_ok());
+        assert!(Cli::try_parse_from(["xearthlayer", "run", "--no-cache"]).is_ok());
     }
 
     #[test]

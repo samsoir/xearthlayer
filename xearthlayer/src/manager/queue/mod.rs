@@ -23,6 +23,7 @@ use crate::manager::installer::InstallResult;
 
 pub use job::{CancelResult, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummary, QueueObserver};
 pub use ledger::Capacity;
+pub use lock::{queue_in_use, queue_lock_file};
 pub use stages::{InstallContext, Stages};
 
 #[cfg(test)]

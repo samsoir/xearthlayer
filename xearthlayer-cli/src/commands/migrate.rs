@@ -11,8 +11,8 @@ use clap::Subcommand;
 
 use crate::error::CliError;
 use crate::preflight;
+use xearthlayer::paths;
 use xearthlayer::preflight::{Preflight, RunOutcome, Runner, Status};
-use xearthlayer::{config::ConfigFile, paths};
 
 /// Migration action subcommands.
 #[derive(Debug, Subcommand)]
@@ -81,7 +81,7 @@ fn layout(dry_run: bool) -> Result<(), CliError> {
 }
 
 fn status() -> Result<(), CliError> {
-    let config = ConfigFile::load().unwrap_or_default();
+    let config = super::common::load_config()?;
     let legacy = preflight::legacy_install_dir();
 
     println!("Layout");

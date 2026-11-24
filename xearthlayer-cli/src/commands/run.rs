@@ -108,7 +108,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .chunk_max_retries(config.executor.max_retries)
         .prefetch_capacity_share(config.prefetch.capacity_share)
         .network_level(config.network.connections)
-        .cache_enabled(!args.no_cache)
+        .disk_cache_enabled(!args.no_cache)
         .cache_directory(config.cache.directory.clone())
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
@@ -139,22 +139,23 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         }
         println!();
 
-        // Print cache info
-        if !args.no_cache {
-            println!(
-                "Cache: {} memory, {} disk",
-                format_size(config.cache.memory_size),
-                format_size(config.cache.disk_size)
-            );
-        } else {
-            println!("Cache: Disabled");
-        }
+        println!(
+            "{}",
+            cache_banner(
+                config.cache.memory_size,
+                config.cache.disk_size,
+                args.no_cache
+            )
+        );
     }
 
     // Print prefetch status (details printed later after prefetcher starts)
-    let prefetch_enabled = config.prefetch.enabled && !args.no_prefetch;
-    if !use_tui && !prefetch_enabled {
-        println!("Prefetch: Disabled");
+    let prefetch_off =
+        prefetch_off_reason(config.prefetch.enabled, args.no_prefetch, args.no_cache);
+    if !use_tui {
+        if let Some(line) = prefetch_banner(prefetch_off) {
+            println!("{line}");
+        }
     }
     if !use_tui {
         println!();
@@ -172,6 +173,10 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
     );
     // X-World Pro (#213): preflight contributed the detection when
     // packages.xworld_pro is on; overlay consolidation leaves those continents out.
+    // The session's decision, not the file's: `--no-prefetch` and
+    // `--no-cache` turn prefetch off (before this, `--no-prefetch` reached
+    // only the banner and prefetch ran anyway).
+    orch_config.prefetch.enabled = prefetch_off.is_none();
     orch_config.xworld_pro = ctx
         .xworld_pro()
         .map(xearthlayer::xworld_pro::OverlayCoverage::from_detection);
@@ -335,6 +340,52 @@ fn outcome(received: Option<Signal>, front_end_error: Option<CliError>) -> Resul
     }
 }
 
+/// Why prefetch does not run this session, or `None` when it does.
+///
+/// `--no-cache` turns it off as well: prefetch fills the disk cache ahead of
+/// the aircraft, and with the disk tiers off (#400) its tiles would reach only
+/// the memory tier, to be evicted long before they are flown over, while its
+/// regions were never confirmed.
+fn prefetch_off_reason(
+    config_enabled: bool,
+    no_prefetch: bool,
+    no_cache: bool,
+) -> Option<&'static str> {
+    if no_prefetch {
+        Some("--no-prefetch")
+    } else if no_cache {
+        Some("--no-cache: prefetched tiles would reach only the memory cache")
+    } else if !config_enabled {
+        Some("prefetch.enabled = false")
+    } else {
+        None
+    }
+}
+
+/// The banner's prefetch line when prefetch is off; nothing when it runs
+/// (its details are printed once it starts).
+fn prefetch_banner(off_reason: Option<&str>) -> Option<String> {
+    off_reason.map(|reason| format!("Prefetch: Disabled ({reason})"))
+}
+
+/// The banner's cache line. `--no-cache` turns off the disk tiers only (the
+/// memory tier always runs), so the line names what is still on and what is
+/// off rather than claiming caching is disabled (#400).
+fn cache_banner(memory_size: usize, disk_size: usize, no_cache: bool) -> String {
+    if no_cache {
+        format!(
+            "Cache: {} memory, disk caching off (--no-cache)",
+            format_size(memory_size)
+        )
+    } else {
+        format!(
+            "Cache: {} memory, {} disk",
+            format_size(memory_size),
+            format_size(disk_size)
+        )
+    }
+}
+
 /// Resolve the per-chunk HTTP timeout from the `--timeout` flag and config.
 ///
 /// The flag wins when given, otherwise `executor.request_timeout_secs` applies.
@@ -350,6 +401,58 @@ fn resolve_chunk_timeout_secs(flag: Option<u64>, configured: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_line_names_both_tiers() {
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(
+            cache_banner(2 * gb, 40 * gb, false),
+            "Cache: 2 GB memory, 40 GB disk"
+        );
+    }
+
+    #[test]
+    fn prefetch_runs_only_when_the_config_enables_it_and_no_flag_stops_it() {
+        assert_eq!(prefetch_off_reason(true, false, false), None);
+        assert_eq!(
+            prefetch_off_reason(false, false, false),
+            Some("prefetch.enabled = false")
+        );
+        // --no-prefetch reached only the banner, so prefetch kept running.
+        assert_eq!(
+            prefetch_off_reason(true, true, false),
+            Some("--no-prefetch")
+        );
+    }
+
+    /// Prefetch fills the disk cache ahead of the aircraft. With the disk
+    /// tiers off (#400) its tiles reach only the memory tier, where they are
+    /// evicted long before they are flown over, and its regions are never
+    /// confirmed.
+    #[test]
+    fn no_cache_turns_prefetch_off() {
+        assert!(prefetch_off_reason(true, false, true)
+            .is_some_and(|reason| reason.contains("--no-cache")));
+    }
+
+    #[test]
+    fn the_prefetch_line_names_why_it_is_off() {
+        assert_eq!(prefetch_banner(None), None);
+        assert_eq!(
+            prefetch_banner(Some("--no-prefetch")).as_deref(),
+            Some("Prefetch: Disabled (--no-prefetch)")
+        );
+    }
+
+    /// #400: `--no-cache` turns off the disk tiers only, and the line says so.
+    #[test]
+    fn the_cache_line_says_disk_caching_is_off() {
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(
+            cache_banner(2 * gb, 40 * gb, true),
+            "Cache: 2 GB memory, disk caching off (--no-cache)"
+        );
+    }
 
     #[test]
     fn chunk_timeout_falls_back_to_the_configured_value() {

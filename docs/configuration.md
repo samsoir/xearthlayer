@@ -133,7 +133,7 @@ Controls tile caching behavior.
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
 | `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
 | `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). With `night.enabled`, 5% goes to the night lighting texture cache first and the rest is split as below. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
-| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. With `night.enabled` it splits the 95% left after the night lighting share. |
+| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. With `night.enabled` it splits the 95% left after the night lighting share. A value outside 0.0 to 1.0 is refused when the file is read. |
 
 **Example:**
 ```ini
@@ -146,12 +146,16 @@ disk_size = 50GB
 
 **Cache Structure:**
 ```
-~/.cache/xearthlayer/
-├── Bing Maps/
-│   └── <zoom>/<row>/<col>_bc1.dds
-└── Google Maps/
-    └── <zoom>/<row>/<col>_bc1.dds
+<directory>/
+├── Bing Maps/            one directory per imagery provider
+│   ├── dds/+37-123/...   encoded tiles, by 1x1 degree region
+│   └── chunks/+37-123/...  downloaded imagery chunks
+├── Google GO2/
+│   └── ...
+└── night/                night lighting textures (with night.enabled)
 ```
+
+Each provider keeps its own tiles and chunks, so switching provider never mixes imagery. Before 0.5.1 the chunks of every provider were shared, in region directories directly in the cache directory; XEarthLayer deletes those once at startup. `xearthlayer cache clear` removes these directories and nothing else in the cache directory; see [Running the Service](running-service.md#managing-cache).
 
 ### [texture]
 
@@ -293,7 +297,9 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 | `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 
-`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file.
+`enabled` is the only switch. `xearthlayer run --no-prefetch` turns prefetch off for one run without changing the file, and so does `xearthlayer run --no-cache`, because without the disk cache prefetched tiles would be dropped before they are needed.
+
+Every setting given a range in these tables is checked when `config.ini` is read, by the same rule as `xearthlayer config set`; a value outside it stops XEarthLayer with a message naming the setting and its range. `box_extent = 6.5`, the default before 7.0, is read as 7.0, and `xearthlayer config upgrade` rewrites it.
 
 `mode` was removed in v0.5.0. Its values `opportunistic` and `aggressive` once chose between two triggers that belonged to earlier designs, and both had come to behave the same; `disabled` did what `enabled = false` does. A file that still has a `mode` line keeps working: `mode = disabled` is read as `enabled = false`, any other value is ignored, and `xearthlayer config upgrade` writes `enabled = false` for `disabled` and removes the line.
 
@@ -768,7 +774,7 @@ xearthlayer run --provider apple
 # Override download timeout
 xearthlayer run --timeout 60
 
-# Disable caching
+# Do not read or write the disk caches this session (memory cache only)
 xearthlayer run --no-cache
 ```
 
