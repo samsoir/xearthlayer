@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### Textures
+
+- **Mipmap levels are built about twice as fast** ([#389](https://github.com/samsoir/xearthlayer/issues/389)): Each scenery tile carries its full chain of smaller mipmap levels, and each level is built from the one above it. That step now works on the image's bytes a row at a time instead of pixel by pixel, which takes it from about 13 ms to about 6 ms per tile on one CPU core. The textures are byte for byte the same. The gain is largest with `texture.compressor = gpu`, where this step runs on the single GPU worker thread for every tile.
+
 #### License
 
 - **XEarthLayer is now licensed under the GNU General Public License, version 3 or later** ([#376](https://github.com/samsoir/xearthlayer/issues/376)): Releases up to and including 0.5.1-beta.2 were MIT and remain available under MIT; this and every later release are GPL-3.0-or-later. The GPL keeps XEarthLayer and the work built on it open, and lets XEarthLayer use GPL components such as the WinFsp crates a Windows port needs. Every past contributor agreed to the change. Nothing changes in how XEarthLayer works: the `LICENSE` file, the crate and Linux package metadata, and the license the macOS installer shows now carry the GPL, and `xearthlayer --version` and `xearthlayer-publish --version` print the copyright and license notice.
