@@ -279,6 +279,10 @@ fn main() -> ExitCode {
     // never presents to a display, but the Vulkan stack opens one when it is
     // named, and the display server's refusal lands on the dashboard (#358).
     xearthlayer::system::disown_display();
+    // Nor does it want the overlays and other implicit layers the Vulkan
+    // loader injects into every process that creates an instance: MangoHud,
+    // enabled system-wide, aborted it with a double free (#397).
+    xearthlayer::system::exclude_implicit_vulkan_layers();
 
     let cli = Cli::parse();
 

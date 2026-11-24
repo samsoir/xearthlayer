@@ -1,0 +1,8 @@
+# Environment for every process Cargo runs, test binaries included.
+[env]
+# Test binaries never run `main`, where XEarthLayer keeps the Vulkan loader's
+# implicit layers (overlays such as MangoHud, enabled system-wide on many
+# gaming distributions) out of its own process. Tests that enumerate GPUs need
+# the same, or the overlay can abort the test binary (#397). `force` is not
+# set, so a value already in the environment wins, as it does in `main`.
+VK_LOADER_LAYERS_DISABLE = "~implicit~"
