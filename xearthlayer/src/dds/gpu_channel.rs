@@ -33,8 +33,9 @@
 //! back too ([`HangRule::waited_out`]); that is not a miss and never fails
 //! the GPU. So no demand caller waits much longer than the deadline plus one
 //! tile: the tile that was in progress when its wait passed the deadline, or
-//! its own. Prefetch callers have no deadline (see below). The one tile already inside the processor when the GPU failed is
-//! lost and fails as before.
+//! its own. Prefetch callers have no deadline (see below). The one tile
+//! already inside the processor when the GPU failed is lost and fails as
+//! before.
 //!
 //! # Two lanes, one GPU (#421)
 //!
@@ -708,11 +709,7 @@ mod inner {
             format.ensure_supported()?;
             // A failed GPU takes nothing more: not sent at all.
             if let Some(reason) = self.health.failure() {
-                self.stats.record_fallback();
-                return Ok(ChainOutcome::Returned {
-                    image,
-                    reason: reason.to_string(),
-                });
+                return Ok(self.handed_back(image, reason.to_string(), &cancel));
             }
             let sender = &self.sender;
 
@@ -751,7 +748,6 @@ mod inner {
             drop(in_channel);
             let (result, timing) = match sent {
                 Sent::Refused(image) => {
-                    self.stats.record_fallback();
                     // The worker closes its channel when it is shut down or
                     // after failing the health. Neither: it stopped
                     // unexpectedly (a panic outside the loop's
@@ -761,10 +757,7 @@ mod inner {
                         self.health.fail(WORKER_STOPPED);
                     }
                     let reason = self.health.failure().unwrap_or("GPU worker is not running");
-                    return Ok(ChainOutcome::Returned {
-                        image,
-                        reason: reason.to_string(),
-                    });
+                    return Ok(self.handed_back(image, reason.to_string(), &cancel));
                 }
                 Sent::Dropped => {
                     self.stats.record_failed();
@@ -782,9 +775,8 @@ mod inner {
                     return Ok(ChainOutcome::Cancelled);
                 }
                 Sent::Replied(GpuEncodeReply::Returned { image, reason }) => {
-                    self.stats.record_fallback();
                     tracing::debug!(width, height, reason = %reason, "GPU encode: tile handed back");
-                    return Ok(ChainOutcome::Returned { image, reason });
+                    return Ok(self.handed_back(image, reason, &cancel));
                 }
                 Sent::Replied(GpuEncodeReply::Processed { result, timing }) => (result, timing),
             };
@@ -812,6 +804,26 @@ mod inner {
                 "GPU encode: tile stages"
             );
             result.map(ChainOutcome::Compressed)
+        }
+
+        /// An image the GPU did not take, answered and counted: for the
+        /// caller's fallback to encode on the CPU, or, when its job is
+        /// already cancelled, as `Cancelled`, since the CPU encode is not
+        /// paid for either (`DdsEncoder::encode_awaiting`) and counting it
+        /// as a fallback would count an encode that never runs.
+        fn handed_back(
+            &self,
+            image: RgbaImage,
+            reason: String,
+            cancel: &CancellationToken,
+        ) -> ChainOutcome {
+            if cancel.is_cancelled() {
+                self.stats.record_cancelled();
+                ChainOutcome::Cancelled
+            } else {
+                self.stats.record_fallback();
+                ChainOutcome::Returned { image, reason }
+            }
         }
     }
 
@@ -3332,9 +3344,13 @@ mod tests {
             (Demand, true, IN_TIME, fresh(), Skip),
             (Prefetch, true, LATE, fresh(), Skip),
             (Demand, true, LATE, fresh(), Skip),
+            (Prefetch, true, IN_TIME, fresh(), Skip),
             // Its caller left first.
             (Demand, false, IN_TIME, left(), CallerLeft),
             (Prefetch, false, LATE, left(), CallerLeft),
+            // Waited out is decided before the claim: handed back, though
+            // nobody waits for it.
+            (Demand, false, LATE, left(), HandBack),
         ] {
             assert_eq!(
                 admit(lane, cancelled, wait, &RULE, &claim),
@@ -3572,6 +3588,63 @@ mod tests {
         ));
         processed(reply_of(next).await).0.unwrap();
         assert_eq!(*started.lock().unwrap(), [8]);
+    }
+
+    /// An image handed back to a job already cancelled is not encoded on
+    /// the CPU (`DdsEncoder::encode_awaiting` skips it), so the channel
+    /// answers `Cancelled` and counts it as cancelled, not as a fallback:
+    /// whether the worker handed it back, or the GPU had failed before the
+    /// send.
+    #[tokio::test]
+    async fn an_image_handed_back_to_a_cancelled_job_counts_as_cancelled() {
+        let clock = FakeClock::new();
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let channel = handle(tx).with_clock(clock.shared());
+        let cancel = CancellationToken::new();
+        let mut caller = Box::pin(channel.submit_mipmap_chain(
+            RgbaImage::new(8, 4),
+            DdsFormat::BC1,
+            1,
+            file(8, 4, 1),
+            cancel.clone(),
+        ));
+        assert!(futures::poll!(&mut caller).is_pending(), "sent");
+        // The worker hands it back, and the job is cancelled before its
+        // caller reads the reply.
+        let request = rx.try_recv().expect("the request was sent");
+        request
+            .response
+            .send(GpuEncodeReply::Returned {
+                image: request.image,
+                reason: "a GPU tile ahead of it missed its deadline".to_string(),
+            })
+            .unwrap();
+        cancel.cancel();
+        let outcome = caller.await;
+        assert!(
+            matches!(outcome, Ok(ChainOutcome::Cancelled)),
+            "{outcome:?}"
+        );
+
+        // The GPU failed: nothing is sent, and the job is cancelled.
+        channel.health().fail("device lost");
+        let outcome = channel
+            .submit_mipmap_chain(
+                RgbaImage::new(8, 4),
+                DdsFormat::BC1,
+                1,
+                file(8, 4, 1),
+                cancel,
+            )
+            .await;
+        assert!(
+            matches!(outcome, Ok(ChainOutcome::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(rx.try_recv().is_err(), "never sent");
+
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.fallback, s.cancelled), (0, 2));
     }
 
     /// The acceptance test of #422: an encode waiting on the worker

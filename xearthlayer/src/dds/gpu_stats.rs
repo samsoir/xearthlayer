@@ -3,16 +3,17 @@
 //!
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel) records
 //! every request it is given, in stats of its own, so each lane's channel
-//! (#421) has its own queue depth and queue wait: the stages of each encoded tile, a count of
-//! the requests that came back without one, and a count of the images the
-//! GPU did not take, which the encoder's fallback encodes on the CPU (#420). In the service, a task started
-//! by `service::builder::create_encoder` for each lane closes the window
-//! every `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
-//! logs one `GPU encode sample` line, with the lane. Anything else holding a channel must
-//! call [`GpuEncodeStats::take_sample`] itself; until it does, each window
-//! keeps at most [`WINDOW_CAP`] tiles. The numbers go to the log and, as
-//! spans, to the profile trace only: no metric events, telemetry or
-//! dashboard.
+//! (#421) has its own queue depth and queue wait: the stages of each
+//! encoded tile, a count of the requests that came back without one, and a
+//! count of the images the GPU did not take, which the encoder's fallback
+//! encodes on the CPU (#420). In the service, a task started by
+//! `service::builder::create_encoder` for each lane closes the window every
+//! `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and logs
+//! one `GPU encode sample` line, with the lane. Anything else holding a
+//! channel must call [`GpuEncodeStats::take_sample`] itself; until it does,
+//! each window keeps at most [`WINDOW_CAP`] tiles. The numbers go to the
+//! log and, as spans, to the profile trace only: no metric events,
+//! telemetry or dashboard.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
@@ -71,8 +72,10 @@ pub struct GpuSample {
     /// nor failures.
     pub fallback: u64,
     /// Requests whose job was cancelled before the worker started the tile
-    /// (#422): the caller left, or the worker skipped it. Not encoded, and
-    /// neither tiles, failures nor fallbacks.
+    /// (#422): the caller left, the worker skipped it, or its image came
+    /// back to a job already cancelled, which encodes it on neither the GPU
+    /// nor the CPU. Not encoded, and neither tiles, failures nor
+    /// fallbacks.
     pub cancelled: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).
@@ -153,6 +156,12 @@ impl GpuEncodeStats {
     /// Requests in the channel now: buffered, waiting in their send on a
     /// full channel, and in progress. The channel's own
     /// `max_capacity() - capacity()` sees only the buffered ones.
+    ///
+    /// It counts callers, not requests: a caller that leaves on a cancel
+    /// (#422) stops counting at once, though its request may still be
+    /// buffered until the worker takes and drops it. So it can read lower
+    /// than the channel's own count while cancelled requests wait to be
+    /// taken.
     pub fn depth(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
     }

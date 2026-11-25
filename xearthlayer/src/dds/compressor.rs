@@ -329,8 +329,10 @@ pub enum ChainOutcome {
         reason: String,
     },
     /// The job was cancelled before the backend started on the image, so it
-    /// was not encoded: it is not paid for yet (#422). Only
-    /// [`MipmapCompressor::submit_mipmap_chain`] answers it.
+    /// was not encoded: it is not paid for yet (#422). That includes an
+    /// image the backend would otherwise hand back, as the CPU encode is not
+    /// paid for either. Only [`MipmapCompressor::submit_mipmap_chain`]
+    /// answers it.
     Cancelled,
 }
 
