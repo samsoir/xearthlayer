@@ -102,11 +102,21 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
     use image::RgbaImage;
     use tokio_util::sync::CancellationToken;
     use xearthlayer::dds::gpu_channel::{
-        spawn_tile_worker, GpuEncoderChannel, GpuTileTiming, HangRule, TileProcessor,
-        CHANNEL_CAPACITY,
+        spawn_tile_worker_with_clock, Clock, GpuEncoderChannel, GpuTileTiming, HangRule,
+        SharedClock, TileProcessor, CHANNEL_CAPACITY,
     };
     use xearthlayer::dds::gpu_health::SharedGpuHealth;
     use xearthlayer::dds::{DdsEncoder, DdsError, DdsFormat, IspcCompressor, MipmapCompressor};
+
+    /// A clock that never moves, shared by the channel and its worker: the
+    /// tile is never waited out, however slowly the test runs.
+    struct Frozen(Instant);
+
+    impl Clock for Frozen {
+        fn now(&self) -> Instant {
+            self.0
+        }
+    }
 
     struct LosesTheDevice;
 
@@ -129,25 +139,26 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
         .build()
         .expect("runtime builds");
 
+    let clock: SharedClock = Arc::new(Frozen(Instant::now()));
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let health = SharedGpuHealth::new();
-    let channel = Arc::new(GpuEncoderChannel::new(
-        tx,
-        health.clone(),
-        CancellationToken::new(),
-    ));
+    let channel = Arc::new(
+        GpuEncoderChannel::new(tx, health.clone(), CancellationToken::new())
+            .with_clock(Arc::clone(&clock)),
+    );
     let encoder = Arc::new(DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),
     ));
     let worker = {
         let _guard = runtime.enter();
-        spawn_tile_worker(
+        spawn_tile_worker_with_clock(
             LosesTheDevice,
             rx,
             CancellationToken::new(),
             health.clone(),
             HangRule::default(),
+            clock,
         )
     };
 

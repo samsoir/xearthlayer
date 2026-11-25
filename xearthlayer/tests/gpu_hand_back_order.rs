@@ -13,8 +13,10 @@
 //! Here a global subscriber sees every thread, and nothing else runs.
 //!
 //! No GPU is needed: the real worker loop runs around a processor that
-//! overruns its deadline.
+//! overruns its deadline on a fake clock, so the tile is late because the
+//! test says so, never because the machine was slow.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,8 +24,8 @@ use image::RgbaImage;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xearthlayer::dds::gpu_channel::{
-    spawn_tile_worker, GpuEncodeReply, GpuEncodeRequest, GpuTileTiming, HangRule, TileProcessor,
-    CHANNEL_CAPACITY,
+    spawn_tile_worker_with_clock, Clock, GpuEncodeReply, GpuEncodeRequest, GpuTileTiming, HangRule,
+    TileProcessor, CHANNEL_CAPACITY,
 };
 use xearthlayer::dds::gpu_health::SharedGpuHealth;
 use xearthlayer::dds::{DdsError, DdsFormat};
@@ -43,8 +45,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AtHandBack {
     }
 }
 
-/// Every tile takes longer than the rule's deadline.
-struct Overruns;
+/// A clock that moves only when advanced; clones share the time.
+#[derive(Clone)]
+struct FakeClock {
+    base: Instant,
+    offset_ns: Arc<AtomicU64>,
+}
+
+impl FakeClock {
+    fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset_ns: Arc::default(),
+        }
+    }
+
+    fn advance(&self, by: Duration) {
+        self.offset_ns
+            .fetch_add(by.as_nanos() as u64, Ordering::SeqCst);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Instant {
+        self.base + Duration::from_nanos(self.offset_ns.load(Ordering::SeqCst))
+    }
+}
+
+/// Every tile takes 1 ms past the rule's deadline, on the fake clock.
+struct Overruns(FakeClock, HangRule);
 
 impl TileProcessor for Overruns {
     fn process(
@@ -55,18 +84,18 @@ impl TileProcessor for Overruns {
         _deadline: Instant,
         _timing: &mut GpuTileTiming,
     ) -> Result<Vec<u8>, DdsError> {
-        std::thread::sleep(Duration::from_millis(60));
+        self.0.advance(self.1.deadline + Duration::from_millis(1));
         Ok(vec![0; 8])
     }
 }
 
-fn request(width: u32) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) {
+fn request(clock: &FakeClock, width: u32) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) {
     let (response, reply) = oneshot::channel();
     let request = GpuEncodeRequest {
         image: RgbaImage::new(width, 4),
         format: DdsFormat::BC1,
         mipmap_count: 1,
-        sent_at: Instant::now(),
+        sent_at: clock.now(),
         response,
     };
     (request, reply)
@@ -76,9 +105,10 @@ fn request(width: u32) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) 
 async fn the_queue_is_handed_back_before_the_late_tile_is_answered() {
     use tracing_subscriber::layer::SubscriberExt;
 
+    let clock = FakeClock::new();
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let (late, late_reply) = request(4);
-    let (queued, queued_reply) = request(8);
+    let (late, late_reply) = request(&clock, 4);
+    let (queued, queued_reply) = request(&clock, 8);
     tx.try_send(late).unwrap();
     tx.try_send(queued).unwrap();
     // The worker serves what is buffered, then ends.
@@ -91,16 +121,14 @@ async fn the_queue_is_handed_back_before_the_late_tile_is_answered() {
     )
     .expect("the only subscriber in this process");
 
-    let rule = HangRule {
-        deadline: Duration::from_millis(40),
-        misses: 3,
-    };
-    spawn_tile_worker(
-        Overruns,
+    let rule = HangRule::default();
+    spawn_tile_worker_with_clock(
+        Overruns(clock.clone(), rule),
         rx,
         CancellationToken::new(),
         SharedGpuHealth::new(),
         rule,
+        Arc::new(clock),
     )
     .await
     .expect("the loop never panics");

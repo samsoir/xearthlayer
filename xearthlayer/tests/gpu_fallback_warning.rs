@@ -18,8 +18,8 @@ use image::RgbaImage;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use xearthlayer::dds::gpu_channel::{
-    spawn_tile_worker, GpuEncodeRequest, GpuEncoderChannel, GpuTileTiming, HangRule, TileProcessor,
-    CHANNEL_CAPACITY,
+    spawn_tile_worker_with_clock, Clock, GpuEncodeRequest, GpuEncoderChannel, GpuTileTiming,
+    HangRule, SharedClock, TileProcessor, CHANNEL_CAPACITY,
 };
 use xearthlayer::dds::gpu_health::{device_lost, SharedGpuHealth};
 use xearthlayer::dds::{DdsEncoder, DdsError, DdsFormat, IspcCompressor, MipmapCompressor};
@@ -48,6 +48,16 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
     }
 }
 
+/// A clock that never moves, shared by the channel and its worker: no
+/// request is ever waited out, however slowly the test runs.
+struct Frozen(Instant);
+
+impl Clock for Frozen {
+    fn now(&self) -> Instant {
+        self.0
+    }
+}
+
 /// Panics on every tile, as `Device::poll` does on a lost device.
 struct Panics;
 
@@ -73,23 +83,24 @@ async fn a_gpu_failure_logs_one_warning_however_many_tiles_fall_back() {
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(warnings.clone()))
         .expect("the only subscriber in this process");
 
+    let clock: SharedClock = Arc::new(Frozen(Instant::now()));
     let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
     let health = SharedGpuHealth::new();
-    let channel = Arc::new(GpuEncoderChannel::new(
-        tx,
-        health.clone(),
-        CancellationToken::new(),
-    ));
+    let channel = Arc::new(
+        GpuEncoderChannel::new(tx, health.clone(), CancellationToken::new())
+            .with_clock(Arc::clone(&clock)),
+    );
     let encoder = Arc::new(DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),
     ));
-    let worker = spawn_tile_worker(
+    let worker = spawn_tile_worker_with_clock(
         Panics,
         rx,
         CancellationToken::new(),
         health.clone(),
         HangRule::default(),
+        clock,
     );
 
     // A burst: one tile meets the panic, the others are queued or sent
