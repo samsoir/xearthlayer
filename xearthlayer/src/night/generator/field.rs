@@ -7,10 +7,13 @@
 use std::sync::Arc;
 
 use super::gain::gain;
-use super::noise::value_noise;
 use super::RecipeLookup;
 use crate::night::footprint::Footprint;
 use crate::night::recipe::{Grid, RadianceCurve, Recipe};
+
+mod sampler;
+
+pub use sampler::FieldSampler;
 
 /// How far beyond a footprint sampling can reach, in degrees: bilinear
 /// neighbours and the class warp stay well inside it.
@@ -51,6 +54,8 @@ pub struct RecipeField {
     lats: i64,
     lons: i64,
     slots: Vec<Option<Arc<Recipe>>>,
+    /// The tile `(lat0, lon0)` of each slot.
+    tiles: Vec<(i32, i32)>,
     class_dims: Option<(usize, usize)>,
     brightness_dims: Option<(usize, usize)>,
     /// The brightness scale's curve, its logarithm taken once.
@@ -80,7 +85,11 @@ impl RecipeField {
         // is the smallest (lat, lon) key.
         let first = slots.iter().flatten().next();
         let dims = |g: &Grid| (g.height, g.width);
+        let tiles = (0..lats * lons)
+            .map(|i| ((south0 + i / lons) as i32, (west0 + i % lons) as i32))
+            .collect();
         Self {
+            tiles,
             footprint: *footprint,
             class_dims: first.map(|r| dims(&r.class)),
             brightness_dims: first.map(|r| dims(&r.brightness)),
@@ -110,6 +119,11 @@ impl RecipeField {
         let (dy, dx) = (lat0 - self.south0, lon0 - self.west0);
         ((0..self.lats).contains(&dy) && (0..self.lons).contains(&dx))
             .then(|| (dy * self.lons + dx) as usize)
+    }
+
+    /// The tile `(lat0, lon0)` of `slot` (below `slot_count`).
+    fn slot_tile(&self, slot: usize) -> (i32, i32) {
+        self.tiles[slot]
     }
 
     fn slot_recipe(&self, slot: usize) -> Option<&Arc<Recipe>> {
@@ -153,6 +167,14 @@ impl RecipeField {
         ))
     }
 
+    /// The slot and value of global cell `(row, col)` of `layer` at the
+    /// field's grid; `None` without a grid, a recipe, or when that tile's
+    /// grid differs.
+    fn layer_cell(&self, layer: Layer, row: i64, col: i64) -> Option<(usize, u8)> {
+        let (ny, nx) = self.dims(layer)?;
+        self.slot_cell(layer, ny, nx, row, col)
+    }
+
     /// The value of global cell `(row, col)` of a layer with `ny` x `nx` cells
     /// per degree; `None` without a recipe or when that tile's grid differs.
     pub(crate) fn cell(
@@ -166,26 +188,6 @@ impl RecipeField {
         self.slot_cell(layer, ny, nx, row, col).map(|(_, v)| v)
     }
 
-    /// The brightness byte at a point, bilinear between cell centres; 0 where
-    /// no recipe covers a neighbour.
-    fn brightness_byte(&self, lat: f64, lon: f64) -> f64 {
-        let Some((ny, nx)) = self.dims(Layer::Brightness) else {
-            return 0.0;
-        };
-        let u = (lon + 180.0) * nx as f64 - 0.5;
-        let v = (90.0 - lat) * ny as f64 - 0.5;
-        let (c0, r0) = (u.floor(), v.floor());
-        let (fx, fy) = (u - c0, v - r0);
-        let (c0, r0) = (c0 as i64, r0 as i64);
-        let at = |r: i64, c: i64| {
-            self.cell(Layer::Brightness, ny, nx, r, c)
-                .map_or(0.0, f64::from)
-        };
-        let top = at(r0, c0) * (1.0 - fx) + at(r0, c0 + 1) * fx;
-        let bottom = at(r0 + 1, c0) * (1.0 - fx) + at(r0 + 1, c0 + 1) * fx;
-        top * (1.0 - fy) + bottom * fy
-    }
-
     /// Radiance of a (possibly fractional) brightness byte; 0 for none.
     fn radiance_of(&self, b: f64) -> f64 {
         if b <= 0.0 {
@@ -194,9 +196,11 @@ impl RecipeField {
         self.curve.radiance_at(b)
     }
 
-    /// Radiance (nW/cm2/sr) at a point; 0 where no recipe contributes.
+    /// Radiance (nW/cm2/sr) at a point: the brightness byte, bilinear
+    /// between cell centres; 0 where no recipe contributes. For one point; a
+    /// texture samples through a [`FieldSampler`], which gives the same bits.
     pub fn radiance(&self, lat: f64, lon: f64) -> f64 {
-        self.radiance_of(self.brightness_byte(lat, lon))
+        FieldSampler::new(self, &[lon], &[lat]).radiance(0, 0)
     }
 }
 
@@ -246,46 +250,11 @@ impl RecipeField {
     /// four class cell centres around the warped position, merged per class.
     /// Class 0 and cells without a recipe carry no entry, so the weights sum
     /// to less than 1 near the edge of classified ground.
+    ///
+    /// For one point; a texture samples through a [`FieldSampler`], which
+    /// gives the same bits.
     pub fn class_weights(&self, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
-        out.clear();
-        let Some((ny, nx)) = self.dims(Layer::Class) else {
-            return;
-        };
-        let gx = (lon + 180.0) * nx as f64;
-        let gy = (90.0 - lat) * ny as f64;
-        let (wx, wy) = (gx / WARP_WAVELENGTH_CELLS, gy / WARP_WAVELENGTH_CELLS);
-        let u = gx + WARP_AMPLITUDE_CELLS * value_noise(wx, wy, WARP_SEED_X) - 0.5;
-        let v = gy + WARP_AMPLITUDE_CELLS * value_noise(wx, wy, WARP_SEED_Y) - 0.5;
-        let (c0, r0) = (u.floor(), v.floor());
-        let (fx, fy) = (u - c0, v - r0);
-        let (c0, r0) = (c0 as i64, r0 as i64);
-        for (dr, dc, w) in [
-            (0, 0, (1.0 - fx) * (1.0 - fy)),
-            (0, 1, fx * (1.0 - fy)),
-            (1, 0, (1.0 - fx) * fy),
-            (1, 1, fx * fy),
-        ] {
-            if w <= 0.0 {
-                continue;
-            }
-            let (row, col) = (r0 + dr, c0 + dc);
-            let (slot, index) = match self.slot_cell(Layer::Class, ny, nx, row, col) {
-                Some((s, i)) if i != 0 => (s, i),
-                _ => continue,
-            };
-            match out.iter_mut().find(|e| e.slot == slot && e.index == index) {
-                Some(e) => e.weight += w,
-                None => {
-                    let (lat0, lon0) = tile_of(row, col, ny as i64, nx as i64);
-                    out.push(ClassWeight {
-                        tile: (lat0 as i32, lon0 as i32),
-                        slot,
-                        index,
-                        weight: w,
-                    });
-                }
-            }
-        }
+        FieldSampler::new(self, &[lon], &[lat]).class_weights(0, 0, out);
     }
 
     /// True when the generator may light some texel of the footprint (R7:
@@ -746,29 +715,36 @@ mod tests {
 
     /// Asserts that the class weights and the radiance at every point of
     /// the `lats` x `lons` grid are those of the code before #437, bit for
-    /// bit. Returns the number of points with a class weight.
-    pub(crate) fn assert_matches_reference(
-        field: &RecipeField,
-        lats: &[f64],
-        lons: &[f64],
-    ) -> usize {
-        let (mut got, mut want) = (Vec::new(), Vec::new());
+    /// bit: through a sampler over the grid (its cell tables), and through
+    /// the per-point calls (one-point samplers, which read the field).
+    /// Returns the number of points with a class weight.
+    fn assert_matches_reference(field: &RecipeField, lats: &[f64], lons: &[f64]) -> usize {
+        let mut sampler = FieldSampler::new(field, lons, lats);
+        let (mut got, mut point, mut want) = (Vec::new(), Vec::new(), Vec::new());
         let mut weighted = 0;
-        for &lat in lats {
-            for &lon in lons {
-                field.class_weights(lat, lon, &mut got);
+        for (i, &lat) in lats.iter().enumerate() {
+            for (j, &lon) in lons.iter().enumerate() {
                 lookup_reference::class_weights(field, lat, lon, &mut want);
+                sampler.class_weights(i, j, &mut got);
                 assert_eq!(
                     weight_bits(&got),
                     weight_bits(&want),
                     "weights at {lat}, {lon}"
                 );
+                field.class_weights(lat, lon, &mut point);
+                assert_eq!(weight_bits(&point), weight_bits(&want), "at {lat}, {lon}");
                 weighted += usize::from(!want.is_empty());
-                let (r, reference) = (
-                    field.radiance(lat, lon),
-                    lookup_reference::radiance(field, lat, lon),
+                let reference = lookup_reference::radiance(field, lat, lon).to_bits();
+                assert_eq!(
+                    sampler.radiance(i, j).to_bits(),
+                    reference,
+                    "at {lat}, {lon}"
                 );
-                assert_eq!(r.to_bits(), reference.to_bits(), "radiance at {lat}, {lon}");
+                assert_eq!(
+                    field.radiance(lat, lon).to_bits(),
+                    reference,
+                    "at {lat}, {lon}"
+                );
             }
         }
         weighted
@@ -815,11 +791,29 @@ mod tests {
         let field = mixed_field();
         let lats = axis(-0.62, 0.42, 420, &[0.0, -0.5, 0.25]);
         let lons = axis(-0.52, 1.42, 780, &[0.0, 1.0, -0.25]);
+        assert_eq!(
+            FieldSampler::new(&field, &lons, &lats).has_tables(),
+            (true, true)
+        );
         let weighted = assert_matches_reference(&field, &lats, &lons);
         assert!(
             weighted > lats.len() * lons.len() / 3,
             "{weighted} weighted"
         );
+    }
+
+    #[test]
+    fn sampling_without_tables_matches_the_code_before_437() {
+        // Texels much coarser than the grid: the sampler reads the field.
+        let field = mixed_field();
+        let lats = axis(-0.62, 0.42, 30, &[0.0]);
+        let lons = axis(-0.52, 1.42, 30, &[0.0, 1.0]);
+        assert_eq!(
+            FieldSampler::new(&field, &lons, &lats).has_tables(),
+            (false, true),
+            "no class table; the 8 cell brightness grid still fits"
+        );
+        assert!(assert_matches_reference(&field, &lats, &lons) > 0);
     }
 
     #[test]

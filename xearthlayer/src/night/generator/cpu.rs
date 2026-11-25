@@ -18,7 +18,7 @@ use std::sync::Arc;
 use image::{Rgba, RgbaImage};
 use tracing::debug;
 
-use super::field::RecipeField;
+use super::field::{FieldSampler, RecipeField};
 use super::led::{self, LedRegion, TonePath};
 use super::noise::floor_i64;
 use super::tiling::{sample_cached, CornerCache};
@@ -50,6 +50,7 @@ impl CpuLitGenerator {
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
+        let mut sampler = FieldSampler::new(&field, &lons, &lats);
         // Patterns by (tile slot, palette index), resolved on first use.
         let mut patterns: Vec<Option<Option<Arc<LitPattern>>>> =
             vec![None; field.slot_count() * PALETTE_SLOTS];
@@ -78,11 +79,11 @@ impl CpuLitGenerator {
             let road_row = roads.row(i as u32);
             for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
                 let road = road_row.map_or(0.0, |r| r[j]);
-                field.class_weights(lat, lon, &mut weights);
+                sampler.class_weights(i, j, &mut weights);
                 if weights.is_empty() && road <= 0.0 {
                     continue;
                 }
-                let radiance = field.radiance(lat, lon);
+                let radiance = sampler.radiance(i, j);
                 // No class here: only the road can light the texel, and the
                 // gain is not needed.
                 let g = if weights.is_empty() {
@@ -428,13 +429,19 @@ mod tests {
         let n = name_at(37.20, -122.725);
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(&n, 128);
         let field = RecipeField::new(&Footprint::from_name(&n), &golden);
+        let mut sampler = FieldSampler::new(&field, &lons, &lats);
+        assert_eq!(
+            sampler.has_tables(),
+            (true, true),
+            "the fixture reads tables"
+        );
         let pattern = speckled("lib/g10/terrain10/urban_tmp_sdry3.ter").unwrap();
         let (mut cache, mut reference_cache) = (CornerCache::default(), CornerCache::default());
         let (mut got, mut want) = (Vec::new(), Vec::new());
         let mut weighted = 0;
-        for (&lat, &y) in lats.iter().zip(&ys) {
-            for (&lon, &x) in lons.iter().zip(&xs) {
-                field.class_weights(lat, lon, &mut got);
+        for (i, (&lat, &y)) in lats.iter().zip(&ys).enumerate() {
+            for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
+                sampler.class_weights(i, j, &mut got);
                 lookup_reference::class_weights(&field, lat, lon, &mut want);
                 let bits = |w: &[super::super::field::ClassWeight]| {
                     w.iter()
@@ -442,7 +449,7 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(bits(&got), bits(&want), "weights at {lat}, {lon}");
-                let radiance = field.radiance(lat, lon);
+                let radiance = sampler.radiance(i, j);
                 let reference = lookup_reference::radiance(&field, lat, lon);
                 assert_eq!(radiance.to_bits(), reference.to_bits(), "at {lat}, {lon}");
                 for _ in &want {
