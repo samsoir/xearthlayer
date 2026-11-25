@@ -82,8 +82,22 @@ where
 
 /// Write the panic report: banner, location, message, and what becomes of
 /// the scenery mount.
+///
+/// The report reaches `out` in one write: panics on two threads at once share
+/// the sink, and a report written piece by piece interleaves with the other.
 fn write_report<W: Write>(
     out: &mut W,
+    location: Option<&Location<'_>>,
+    payload: &(dyn Any + Send),
+) -> io::Result<()> {
+    let mut report = Vec::new();
+    format_report(&mut report, location, payload)?;
+    out.write_all(&report)
+}
+
+/// The report [`write_report`] writes, built in `out`.
+fn format_report(
+    out: &mut Vec<u8>,
     location: Option<&Location<'_>>,
     payload: &(dyn Any + Send),
 ) -> io::Result<()> {
@@ -159,6 +173,30 @@ mod tests {
         let mut out = Vec::new();
         write_report(&mut out, location, payload).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_report_reaches_the_writer_in_one_write() {
+        // Two threads panicking at once share the sink: a report written in
+        // pieces interleaves with the other one, splitting "Message: " from
+        // its message (the flaky `panic_hook` integration test).
+        struct Writes(Vec<Vec<u8>>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.push(buf.to_vec());
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let payload = payload_of(|| panic!("tile decode failed"));
+        let mut out = Writes(Vec::new());
+
+        write_report(&mut out, Some(Location::caller()), payload.as_ref()).unwrap();
+
+        assert_eq!(out.0.len(), 1);
+        assert!(String::from_utf8_lossy(&out.0[0]).contains("Message: tile decode failed"));
     }
 
     #[test]
