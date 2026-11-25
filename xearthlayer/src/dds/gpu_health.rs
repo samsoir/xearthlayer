@@ -96,7 +96,9 @@ pub fn device_lost(health: &SharedGpuHealth, reason: wgpu::DeviceLostReason, mes
             health.fail(format!("GPU device lost: {message}"));
         }
         wgpu::DeviceLostReason::Destroyed => {
-            tracing::info!(message, "GPU device destroyed");
+            // Not the shorthand `message`: that field is the event's own
+            // message, and wgpu's would replace "GPU device destroyed".
+            tracing::info!(detail = message, "GPU device destroyed");
         }
     }
 }
@@ -204,11 +206,27 @@ pub(crate) mod tests {
         assert_eq!(health.failure(), Some("GPU device lost: driver reset"));
     }
 
+    /// A destroyed device is logged, with wgpu's message beside the
+    /// event's own, and leaves the GPU healthy.
     #[test]
     fn a_destroyed_device_does_not_fail_the_gpu() {
         let health = SharedGpuHealth::new();
-        let (_, events) = capture(|| device_lost(&health, wgpu::DeviceLostReason::Destroyed, ""));
+        let (_, events) = capture(|| {
+            device_lost(
+                &health,
+                wgpu::DeviceLostReason::Destroyed,
+                "Device dropped.",
+            )
+        });
         assert_eq!(health.health(), GpuHealth::Healthy);
         assert!(warnings(&events).is_empty());
+        let destroyed = events
+            .iter()
+            .find(|e| e.message() == Some("GPU device destroyed"))
+            .unwrap_or_else(|| panic!("the destroy is logged: {events:?}"));
+        assert_eq!(
+            destroyed.fields.get("detail").map(String::as_str),
+            Some("Device dropped.")
+        );
     }
 }

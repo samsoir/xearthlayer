@@ -1012,14 +1012,23 @@ mod gpu_tests {
 
     /// The device-lost callback is registered: destroying the device calls
     /// it with `Destroyed`, which is logged and leaves the GPU healthy (#420).
+    /// `XEL_TEST_GPU_DEVICE` picks the adapter as `texture.gpu_device` does
+    /// (default `integrated`).
     #[test]
     #[ignore] // Requires GPU hardware
     fn create_gpu_resources_registers_the_device_lost_callback() {
+        let gpu_device =
+            std::env::var("XEL_TEST_GPU_DEVICE").unwrap_or_else(|_| "integrated".to_string());
         let health = SharedGpuHealth::new();
-        let Ok((device, _queue, _compressor, _)) = create_gpu_resources("integrated", &health)
-        else {
-            return; // No GPU available
-        };
+        let (device, _queue, _compressor, selection) =
+            match create_gpu_resources(&gpu_device, &health) {
+                Ok(resources) => resources,
+                Err(e) => {
+                    eprintln!("Skipping: no usable GPU ({e})");
+                    return;
+                }
+            };
+        eprintln!("Destroying the device of {}", selection.adapter);
         let (_, events) = crate::dds::gpu_health::tests::capture(|| {
             device.destroy();
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
