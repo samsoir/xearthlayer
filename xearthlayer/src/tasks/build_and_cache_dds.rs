@@ -1580,10 +1580,13 @@ mod tests {
             _levels: usize,
             _deadline: Instant,
             _timing: &mut GpuTileTiming,
-        ) -> Result<Vec<u8>, DdsError> {
+            payload: &mut [u8],
+        ) -> Result<(), DdsError> {
             let _ = self.starts.send(image.width());
             self.release.recv().unwrap();
-            Ok(vec![0; 8])
+            // A complete chain, as far as the encoder can tell.
+            payload.fill(0xA5);
+            Ok(())
         }
     }
 
@@ -1648,6 +1651,7 @@ mod tests {
             RgbaImage::new(width, 4),
             DdsFormat::BC1,
             1,
+            vec![0; crate::dds::layout::file_len(width, 4, 1, DdsFormat::BC1)],
             Instant::now(),
             CancellationToken::new(),
         );

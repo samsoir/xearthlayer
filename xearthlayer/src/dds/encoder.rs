@@ -220,17 +220,18 @@ impl DdsEncoder {
             backend = compressor.name(),
             "Awaiting the mipmap chain from MipmapCompressor"
         );
+        let output = self.file_buffer(width, height, count);
         match compressor
-            .submit_mipmap_chain(image, self.format, count, cancel.clone())
+            .submit_mipmap_chain(image, self.format, count, output, cancel.clone())
             .await?
         {
-            ChainOutcome::Compressed(compressed) => Ok(AwaitedEncode::Encoded(self.assemble(
+            ChainOutcome::Compressed(file) => Ok(AwaitedEncode::Encoded(self.backend_file(
                 compressor.name(),
                 width,
                 height,
                 count,
-                compressed,
-            ))),
+                file,
+            )?)),
             ChainOutcome::Returned { image, reason } => {
                 debug!(
                     backend = compressor.name(),
@@ -304,10 +305,8 @@ impl DdsEncoder {
         count: usize,
     ) -> Result<Vec<u8>, DdsError> {
         // `count` is a level count `layout::chain_levels` resolved, a u32.
-        let levels = count as u32;
-        let mut output = vec![0; layout::file_len(width, height, levels, self.format)];
-        let (header, payload) = output.split_at_mut(layout::HEADER_LEN);
-        header.copy_from_slice(&DdsHeader::new(width, height, levels, self.format).to_bytes());
+        let mut output = self.file_buffer(width, height, count);
+        let payload = &mut output[layout::HEADER_LEN..];
 
         debug!(
             width,
@@ -330,6 +329,45 @@ impl DdsEncoder {
         );
 
         Ok(output)
+    }
+
+    /// The DDS file of a `width` x `height` encode with `count` levels,
+    /// allocated once at its exact size ([`layout::file_len`]) with the
+    /// header written: the levels are written into it in place, by the CPU
+    /// (#393) or a mipmap backend (#423), so its `Vec` has no spare capacity
+    /// and `Bytes::from` adopts it whole.
+    fn file_buffer(&self, width: u32, height: u32, count: usize) -> Vec<u8> {
+        // `count` is a level count `layout::chain_levels` resolved, a u32.
+        let levels = count as u32;
+        let mut output = vec![0; layout::file_len(width, height, levels, self.format)];
+        output[..layout::HEADER_LEN]
+            .copy_from_slice(&DdsHeader::new(width, height, levels, self.format).to_bytes());
+        output
+    }
+
+    /// The file a mipmap backend returned: the one it was given, filled.
+    /// Any other length is an error, never a file (#423).
+    fn backend_file(
+        &self,
+        backend: &str,
+        width: u32,
+        height: u32,
+        count: usize,
+        file: Vec<u8>,
+    ) -> Result<Vec<u8>, DdsError> {
+        let expected = layout::file_len(width, height, count as u32, self.format);
+        if file.len() != expected {
+            return Err(DdsError::CompressionFailed(format!(
+                "{backend} returned a {}-byte file for a {expected}-byte DDS",
+                file.len()
+            )));
+        }
+        debug!(
+            backend,
+            total_dds_bytes = file.len(),
+            "MipmapCompressor encode complete"
+        );
+        Ok(file)
     }
 
     /// Resolve the number of mipmap levels to generate for an image of the
@@ -372,8 +410,9 @@ impl DdsEncoder {
             "Delegating mipmap chain to MipmapCompressor"
         );
 
-        let compressed = match compressor.compress_mipmap_chain(image, self.format, count)? {
-            ChainOutcome::Compressed(compressed) => compressed,
+        let output = self.file_buffer(width, height, count);
+        let file = match compressor.compress_mipmap_chain(image, self.format, count, output)? {
+            ChainOutcome::Compressed(file) => file,
             ChainOutcome::Returned { image, reason } => {
                 debug!(
                     backend = compressor.name(),
@@ -391,38 +430,7 @@ impl DdsEncoder {
                 )))
             }
         };
-        Ok(self.assemble(compressor.name(), width, height, count, compressed))
-    }
-
-    /// The DDS file of a mipmap backend's `compressed` chain: the header,
-    /// then the chain.
-    fn assemble(
-        &self,
-        backend: &str,
-        width: u32,
-        height: u32,
-        count: usize,
-        compressed: Vec<u8>,
-    ) -> Vec<u8> {
-        // Timed for the GPU path's stages (#419): the copy behind the header
-        // is the whole payload.
-        let assembly = tracing::debug_span!(target: "profiling", "dds_header_assembly").entered();
-        let started = std::time::Instant::now();
-        let header = DdsHeader::new(width, height, count as u32, self.format);
-        let mut output = header.to_bytes();
-        output.extend_from_slice(&compressed);
-        let assemble_us = started.elapsed().as_micros() as u64;
-        drop(assembly);
-
-        debug!(
-            backend,
-            total_dds_bytes = output.len(),
-            compressed_bytes = compressed.len(),
-            assemble_us,
-            "MipmapCompressor encode complete"
-        );
-
-        output
+        self.backend_file(compressor.name(), width, height, count, file)
     }
 }
 
@@ -434,43 +442,84 @@ impl DdsEncoder {
 /// resolves. Should they ever disagree, this is an error: never a panic, and
 /// never a file whose header declares a level its payload holds only as
 /// zeros.
-fn compress_chain_into(
+pub(crate) fn compress_chain_into(
     compressor: &dyn ImageCompressor,
     levels: impl Iterator<Item = RgbaImage>,
     format: DdsFormat,
     payload: &mut [u8],
 ) -> Result<(), DdsError> {
-    let total = payload.len();
-    let mut offset = 0;
-    for (index, level) in levels.enumerate() {
+    let mut slots = LevelSlots::new(payload, format);
+    for level in levels {
         let (width, height) = level.dimensions();
-        let len = layout::level_len(width, height, format);
-        let slot = payload.get_mut(offset..offset + len).ok_or_else(|| {
-            DdsError::CompressionFailed(format!(
-                "level {index} ({width}x{height}) runs past the {total}-byte payload at {offset}"
-            ))
-        })?;
+        let slot = slots.next(width, height)?;
+        let len = slot.len();
         compress_level_into(compressor, &level, format, slot)?;
 
         debug!(
-            level = index,
+            level = slots.written() - 1,
             level_width = width,
             level_height = height,
             uncompressed_bytes = width as usize * height as usize * 4,
             compressed_bytes = len,
             "Compressed mipmap level"
         );
-
-        offset += len;
         // `level` dropped here — memory reclaimed before next iteration
     }
+    slots.finish()
+}
 
-    if offset != total {
-        return Err(DdsError::CompressionFailed(format!(
-            "the mipmap chain filled {offset} of the {total}-byte payload"
-        )));
+/// A DDS payload handed out one level's slot at a time, largest level
+/// first, each [`layout::level_len`] bytes after the ones before it: where
+/// the CPU compresses each level (#393) and the GPU worker copies each level
+/// out of its mapped buffer (#423). A level that runs past the payload, and
+/// a chain that does not fill it exactly, are errors, never a file whose
+/// header declares a level its payload holds only as zeros.
+pub(crate) struct LevelSlots<'a> {
+    payload: &'a mut [u8],
+    format: DdsFormat,
+    offset: usize,
+    levels: usize,
+}
+
+impl<'a> LevelSlots<'a> {
+    pub(crate) fn new(payload: &'a mut [u8], format: DdsFormat) -> Self {
+        Self {
+            payload,
+            format,
+            offset: 0,
+            levels: 0,
+        }
     }
-    Ok(())
+
+    /// The slot of the next level, `width` x `height`.
+    pub(crate) fn next(&mut self, width: u32, height: u32) -> Result<&mut [u8], DdsError> {
+        let (index, offset, total) = (self.levels, self.offset, self.payload.len());
+        let len = layout::level_len(width, height, self.format);
+        let slot = self.payload.get_mut(offset..offset + len).ok_or_else(|| {
+            DdsError::CompressionFailed(format!(
+                "level {index} ({width}x{height}) runs past the {total}-byte payload at {offset}"
+            ))
+        })?;
+        self.offset += len;
+        self.levels += 1;
+        Ok(slot)
+    }
+
+    /// Levels handed out so far.
+    pub(crate) fn written(&self) -> usize {
+        self.levels
+    }
+
+    /// Whether the levels handed out fill the payload exactly.
+    pub(crate) fn finish(&self) -> Result<(), DdsError> {
+        let (offset, total) = (self.offset, self.payload.len());
+        if offset != total {
+            return Err(DdsError::CompressionFailed(format!(
+                "the mipmap chain filled {offset} of the {total}-byte payload"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -533,9 +582,10 @@ mod tests {
                 _image: RgbaImage,
                 _format: DdsFormat,
                 _mipmap_count: usize,
+                output: Vec<u8>,
             ) -> Result<ChainOutcome, DdsError> {
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(ChainOutcome::Compressed(Vec::new()))
+                Ok(ChainOutcome::Compressed(output))
             }
             fn name(&self) -> &str {
                 "recording"
@@ -713,11 +763,13 @@ mod tests {
                 image: RgbaImage,
                 format: DdsFormat,
                 mipmap_count: usize,
+                mut output: Vec<u8>,
             ) -> Result<ChainOutcome, DdsError> {
                 assert_eq!(image.dimensions(), (256, 256));
                 assert_eq!(format, DdsFormat::BC1);
                 assert_eq!(mipmap_count, 5);
-                Ok(ChainOutcome::Compressed(self.expected_bc1_data.clone()))
+                output[crate::dds::layout::HEADER_LEN..].copy_from_slice(&self.expected_bc1_data);
+                Ok(ChainOutcome::Compressed(output))
             }
 
             fn name(&self) -> &str {
@@ -765,12 +817,14 @@ mod tests {
                 image: RgbaImage,
                 format: DdsFormat,
                 mipmap_count: usize,
+                mut output: Vec<u8>,
             ) -> Result<ChainOutcome, DdsError> {
                 let sw = SoftwareCompressor;
-                let mut output = Vec::new();
+                let mut offset = crate::dds::layout::HEADER_LEN;
                 for level in MipmapStream::new(image, mipmap_count) {
                     let compressed = sw.compress(&level, format)?;
-                    output.extend_from_slice(&compressed);
+                    output[offset..offset + compressed.len()].copy_from_slice(&compressed);
+                    offset += compressed.len();
                 }
                 Ok(ChainOutcome::Compressed(output))
             }
@@ -811,6 +865,7 @@ mod tests {
             image: RgbaImage,
             _format: DdsFormat,
             _mipmap_count: usize,
+            _output: Vec<u8>,
         ) -> Result<ChainOutcome, DdsError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(ChainOutcome::Returned {
@@ -1259,6 +1314,41 @@ mod tests {
             "4096 tile, ISPC, full chain, {RUNS} runs each: appending {}; DdsEncoder {}",
             summary(&before),
             summary(&after)
+        );
+    }
+
+    // =========================================================================
+    // Level slots (#393, #423)
+    // =========================================================================
+
+    /// Given a payload and a chain of levels, each level's slot follows the
+    /// ones before it, and a chain that fills it exactly finishes.
+    #[test]
+    fn level_slots_follow_one_another_and_a_full_chain_finishes() {
+        let len = crate::dds::layout::chain_len(8, 8, 4, DdsFormat::BC1);
+        let mut payload = vec![0u8; len];
+        let mut slots = LevelSlots::new(&mut payload, DdsFormat::BC1);
+        for (w, h, bytes) in [(8, 8, 32), (4, 4, 8), (2, 2, 8), (1, 1, 8)] {
+            assert_eq!(slots.next(w, h).unwrap().len(), bytes, "{w}x{h}");
+        }
+        assert_eq!(slots.written(), 4);
+        assert!(slots.finish().is_ok());
+    }
+
+    /// A level past the payload's end, and a chain that leaves part of it
+    /// unwritten, are errors, never a file.
+    #[test]
+    fn level_slots_refuse_an_overrun_and_a_short_chain() {
+        let mut payload = vec![0u8; 40];
+        let mut slots = LevelSlots::new(&mut payload, DdsFormat::BC1);
+        slots.next(8, 8).unwrap();
+        assert!(slots.finish().is_err(), "32 of 40 bytes");
+        slots.next(4, 4).unwrap();
+        assert!(slots.finish().is_ok());
+        let overrun = slots.next(4, 4).unwrap_err().to_string();
+        assert!(
+            overrun.contains("runs past the 40-byte payload"),
+            "{overrun}"
         );
     }
 }

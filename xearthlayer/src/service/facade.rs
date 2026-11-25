@@ -83,11 +83,9 @@ pub struct XEarthLayerService {
     gc_scheduler_handles: Vec<JoinHandle<()>>,
     /// GC scheduler shutdown token for graceful shutdown (shared by all daemons).
     gc_scheduler_shutdown: Option<CancellationToken>,
-    /// GPU pipeline worker handle (when `texture.compressor = gpu`).
-    /// Awaited during shutdown to ensure GPU resources are released cleanly.
-    gpu_worker_handle: Option<JoinHandle<()>>,
-    /// Shutdown token for the GPU pipeline worker.
-    gpu_shutdown: Option<CancellationToken>,
+    /// The GPU pipeline worker (when `texture.compressor = gpu`), stopped
+    /// at shutdown so the GPU's resources are released cleanly (#423).
+    gpu_worker_handle: Option<crate::dds::gpu_channel::GpuWorkerHandle>,
     /// The GPU the encoder selected (when `texture.compressor = gpu`).
     gpu_adapter: Option<crate::system::GpuAdapter>,
     /// The GPU encoder's health (when `texture.compressor = gpu`, #420).
@@ -175,7 +173,6 @@ impl XEarthLayerService {
         let dds_encoder = encoder_components.encoder;
         let prefetch_encoder = encoder_components.prefetch_encoder;
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
-        let gpu_shutdown = encoder_components.gpu_shutdown;
         let gpu_adapter = encoder_components.gpu_adapter;
         let gpu_health = encoder_components.gpu_health;
         let gpu_warning = encoder_components.gpu_warning;
@@ -300,7 +297,6 @@ impl XEarthLayerService {
             gc_scheduler_handles,
             gc_scheduler_shutdown,
             gpu_worker_handle,
-            gpu_shutdown,
             gpu_adapter,
             gpu_health,
             gpu_warning,
@@ -485,17 +481,14 @@ impl XEarthLayerService {
             }
         }
 
-        // Shutdown GPU pipeline worker (if running).
-        // The worker exits when all GpuEncoderChannel (mpsc::Sender) references
-        // are dropped. We await the handle to ensure GPU resources (wgpu Device,
-        // Queue) are fully released before the process exits.
-        if let Some(handle) = self.gpu_worker_handle.take() {
-            tracing::info!("Waiting for GPU pipeline worker to shut down");
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => tracing::info!("GPU pipeline worker shut down cleanly"),
-                Ok(Err(e)) => tracing::warn!(error = %e, "GPU pipeline worker task failed"),
-                Err(_) => tracing::warn!("GPU pipeline worker did not stop within 5s"),
-            }
+        // Stop the GPU pipeline worker (if running) and wait for it, so the
+        // GPU's resources (wgpu Device, Queue) are released before the
+        // process exits. Its channels stay open while the runtime holds the
+        // encoders, so it is stopped, not waited out (#423): it ends after
+        // the tile in progress.
+        if let Some(mut handle) = self.gpu_worker_handle.take() {
+            tracing::info!("Stopping the GPU pipeline worker");
+            log_gpu_worker_end(handle.stop(GPU_WORKER_STOP).await);
         }
 
         // Then shutdown cache layer
@@ -763,31 +756,27 @@ mod tests {
     }
 }
 
+/// How long shutdown waits for the GPU worker to end after stopping it: it
+/// finishes the tile in progress first, bounded by the tile's deadline.
+const GPU_WORKER_STOP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Logs how the GPU worker ended, `None` if it had not within
+/// [`GPU_WORKER_STOP`]: its thread is then left to the process exit.
+fn log_gpu_worker_end(ended: Option<std::thread::Result<()>>) {
+    match ended {
+        Some(Ok(())) => tracing::info!("GPU pipeline worker shut down cleanly"),
+        Some(Err(_)) => tracing::warn!("GPU pipeline worker thread panicked"),
+        None => tracing::warn!("GPU pipeline worker did not stop within 5s"),
+    }
+}
+
 impl Drop for XEarthLayerService {
     fn drop(&mut self) {
-        // Signal the GPU worker to stop via its cancellation token.
-        // The worker checks this token between requests and exits promptly.
-        // This is necessary because spawn_blocking threads are not cancelled
-        // by tokio runtime shutdown, and the mpsc channel may not close in
-        // time (other Arc refs to the encoder may still be alive).
-        if let Some(token) = self.gpu_shutdown.take() {
-            token.cancel();
-        }
-
-        // Wait for the GPU worker to finish resource cleanup.
-        if let Some(handle) = self.gpu_worker_handle.take() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-
-            while std::time::Instant::now() < deadline {
-                if handle.is_finished() {
-                    tracing::info!("GPU pipeline worker shut down cleanly");
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-
-            tracing::warn!("GPU pipeline worker did not stop within 5s, aborting");
-            handle.abort();
+        // Stop the GPU worker and wait for it, as `shutdown_cache` does:
+        // its thread is not the runtime's, so nothing else ends it while
+        // an encoder is alive.
+        if let Some(mut handle) = self.gpu_worker_handle.take() {
+            log_gpu_worker_end(handle.stop_blocking(GPU_WORKER_STOP));
         }
     }
 }

@@ -234,9 +234,10 @@ pub trait ImageCompressor: Send + Sync {
 ///
 /// # Returns
 ///
-/// [`ChainOutcome::Compressed`]: the compressed data of every mipmap level
-/// (without DDS header), level 0 (full resolution) first, then each
-/// successively halved level. Or [`ChainOutcome::Returned`]: the backend did
+/// [`ChainOutcome::Compressed`]: the DDS file it was given, with the
+/// compressed data of every mipmap level written after the header, level 0
+/// (full resolution) first, then each successively halved level, in place
+/// (#423). Or [`ChainOutcome::Returned`]: the backend did
 /// not take the image, and hands it back for the caller to encode another way
 /// (#420). Or, from [`submit_mipmap_chain`](Self::submit_mipmap_chain) only,
 /// [`ChainOutcome::Cancelled`] (#422).
@@ -266,11 +267,17 @@ pub trait MipmapCompressor: Send + Sync {
     ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
     ///   before any work is done (see [`DdsFormat`]).
     /// * `mipmap_count` - Number of mipmap levels to generate (including original)
+    /// * `output` - The DDS file, allocated once at its exact size
+    ///   ([`layout::file_len`]) with the header written: the backend writes
+    ///   the chain into `output[layout::HEADER_LEN..]`, each level in its
+    ///   slot, and returns the same buffer as [`ChainOutcome::Compressed`]
+    ///   (#423). A chain that does not fill it exactly is an error.
     fn compress_mipmap_chain(
         &self,
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
+        output: Vec<u8>,
     ) -> Result<ChainOutcome, DdsError>;
 
     /// Compress a full mipmap chain from the source image, awaited (#422).
@@ -288,6 +295,7 @@ pub trait MipmapCompressor: Send + Sync {
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
+        output: Vec<u8>,
         cancel: CancellationToken,
     ) -> BoxFuture<'_, Result<ChainOutcome, DdsError>> {
         let _ = cancel;
@@ -295,6 +303,7 @@ pub trait MipmapCompressor: Send + Sync {
             image,
             format,
             mipmap_count,
+            output,
         )))
     }
 
@@ -304,7 +313,8 @@ pub trait MipmapCompressor: Send + Sync {
 
 /// What a [`MipmapCompressor`] did with an image.
 pub enum ChainOutcome {
-    /// Every level, compressed back to back, largest first.
+    /// The DDS file the backend was given, every level compressed back to
+    /// back after the header, largest first.
     Compressed(Vec<u8>),
     /// The backend did not take the image, so it comes back unchanged for
     /// the caller to encode another way: [`DdsEncoder`] encodes it with its
@@ -1103,8 +1113,10 @@ mod gpu_tests {
             _image: RgbaImage,
             _format: DdsFormat,
             _mipmap_count: usize,
+            mut output: Vec<u8>,
         ) -> Result<ChainOutcome, DdsError> {
-            Ok(ChainOutcome::Compressed(vec![0xAA, 0xBB]))
+            output.extend_from_slice(&[0xAA, 0xBB]);
+            Ok(ChainOutcome::Compressed(output))
         }
 
         fn name(&self) -> &str {
@@ -1122,7 +1134,7 @@ mod gpu_tests {
     fn test_mipmap_compressor_returns_data() {
         let compressor = MockMipmapCompressor;
         let image = RgbaImage::new(256, 256);
-        let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5);
+        let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5, Vec::new());
         assert!(matches!(result, Ok(ChainOutcome::Compressed(data)) if data == [0xAA, 0xBB]));
     }
 

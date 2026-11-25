@@ -746,8 +746,9 @@ mod tests {
                 other.try_recv().is_err(),
                 "{lane}: nothing on the other lane"
             );
+            // The worker's answer: the file it was sent, filled in place.
             let _ = request.response.send(GpuEncodeReply::Processed {
-                result: Ok(vec![0; 8]),
+                result: Ok(request.output),
                 timing: GpuTileTiming::default(),
             });
             let dds = caller.await.unwrap().expect("the reply is the tile");

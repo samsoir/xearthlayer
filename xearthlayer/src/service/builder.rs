@@ -64,9 +64,12 @@ pub struct EncoderComponents {
     /// prefetch channel, which the worker reads only while the demand
     /// channel is empty.
     pub prefetch_encoder: Arc<DdsTextureEncoder>,
-    /// GPU worker handle (present when `texture.compressor = gpu`).
-    /// Must be awaited during shutdown to ensure GPU resources are released.
-    pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The GPU worker (present when `texture.compressor = gpu`): its
+    /// thread and shutdown token. Stop it at shutdown
+    /// ([`GpuWorkerHandle::stop`](crate::dds::gpu_channel::GpuWorkerHandle::stop))
+    /// so the GPU's resources are released: the channels stay open while
+    /// anything holds an encoder, so the worker does not end by itself.
+    pub gpu_worker_handle: Option<crate::dds::gpu_channel::GpuWorkerHandle>,
     /// The GPU the encoder selected (present when `texture.compressor = gpu`).
     pub gpu_adapter: Option<crate::system::GpuAdapter>,
     /// The GPU encoder's health (present when `texture.compressor = gpu`):
@@ -77,11 +80,6 @@ pub struct EncoderComponents {
     /// only GPU is the one X-Plane renders with (#203). Logged at creation
     /// and shown on the dashboard's Status pane.
     pub gpu_warning: Option<String>,
-    /// Shutdown token for the GPU worker (present when `texture.compressor = gpu`).
-    /// Cancelling this token causes the worker to exit its loop regardless of
-    /// the channel state. Required because `spawn_blocking` threads are not
-    /// cancelled by tokio runtime shutdown.
-    pub gpu_shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Apply an explicit mipmap level override, if the config carries one.
@@ -169,7 +167,6 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
             gpu_adapter: None,
             gpu_health: None,
             gpu_warning: None,
-            gpu_shutdown: None,
         }
     };
 
@@ -220,7 +217,6 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                 gpu_adapter: Some(selection.adapter),
                 gpu_health: Some(gpu_health),
                 gpu_warning: decision.warning,
-                gpu_shutdown: Some(shutdown_token),
             })
         }
         CompressorKind::Software => Ok(cpu_components(Arc::new(SoftwareCompressor))),
@@ -337,26 +333,22 @@ mod tests {
             Err(_) => return, // No GPU available
         };
 
-        let worker_handle = components
+        let mut worker_handle = components
             .gpu_worker_handle
             .expect("GPU compressor should return a worker handle");
 
-        // Drop the encoder — this drops the GpuEncoderChannel (sender),
-        // closing the mpsc channel and causing the worker to exit.
+        // Drop both lanes' encoders: this drops both GpuEncoderChannels
+        // (senders), closing the channels and causing the worker to exit.
         drop(components.encoder);
+        drop(components.prefetch_encoder);
 
-        // The worker handle must complete within a reasonable timeout.
-        // If it doesn't, GPU resources are leaked and the process will hang.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), worker_handle).await;
-
-        assert!(
-            result.is_ok(),
-            "GPU worker should complete within 5s after channel close"
-        );
-        assert!(
-            result.unwrap().is_ok(),
-            "GPU worker should not panic during shutdown"
-        );
+        // The worker must end within a reasonable bound. If it doesn't, GPU
+        // resources are leaked and the process will hang.
+        let ended = worker_handle
+            .wait(std::time::Duration::from_secs(5))
+            .await
+            .expect("GPU worker should complete within 5s after channel close");
+        assert!(ended.is_ok(), "GPU worker should not panic during shutdown");
     }
 
     /// With a CPU encoder both lanes encode on their own CPU pools, so they

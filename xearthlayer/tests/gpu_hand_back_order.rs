@@ -83,9 +83,10 @@ impl TileProcessor for Overruns {
         _levels: usize,
         _deadline: Instant,
         _timing: &mut GpuTileTiming,
-    ) -> Result<Vec<u8>, DdsError> {
+        _payload: &mut [u8],
+    ) -> Result<(), DdsError> {
         self.0.advance(self.1.deadline + Duration::from_millis(1));
-        Ok(vec![0; 8])
+        Ok(())
     }
 }
 
@@ -94,6 +95,7 @@ fn request(clock: &FakeClock, width: u32) -> (GpuEncodeRequest, oneshot::Receive
         RgbaImage::new(width, 4),
         DdsFormat::BC1,
         1,
+        vec![0; xearthlayer::dds::layout::file_len(width, 4, 1, DdsFormat::BC1)],
         clock.now(),
         CancellationToken::new(),
     )
@@ -128,7 +130,9 @@ async fn the_queue_is_handed_back_before_the_late_tile_is_answered() {
         rule,
         Arc::new(clock),
     )
+    .wait(Duration::from_secs(5))
     .await
+    .expect("the loop ends within the guard")
     .expect("the loop never panics");
 
     assert_eq!(

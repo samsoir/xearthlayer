@@ -436,6 +436,7 @@ mod tests {
                 image: RgbaImage,
                 _format: DdsFormat,
                 _mipmap_count: usize,
+                _output: Vec<u8>,
             ) -> Result<ChainOutcome, DdsError> {
                 Ok(ChainOutcome::Returned {
                     image,
@@ -483,8 +484,9 @@ mod tests {
                 _image: RgbaImage,
                 _format: DdsFormat,
                 _mipmap_count: usize,
+                output: Vec<u8>,
             ) -> Result<ChainOutcome, DdsError> {
-                Ok(ChainOutcome::Compressed(Vec::new()))
+                Ok(ChainOutcome::Compressed(output))
             }
             fn name(&self) -> &str {
                 "backend"

@@ -222,6 +222,7 @@ mod tests {
             image: image::RgbaImage,
             _format: DdsFormat,
             _mipmap_count: usize,
+            _output: Vec<u8>,
         ) -> Result<ChainOutcome, crate::dds::DdsError> {
             Ok(ChainOutcome::Returned {
                 image,

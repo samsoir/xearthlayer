@@ -86,7 +86,18 @@ mod gpu_stress {
         })
     }
 
-    /// The GPU's chain; a tile handed back to the CPU fails the test.
+    /// The DDS file of a `size` x `size` BC1 encode of `levels` levels, its
+    /// header written: what the encoder hands the GPU to fill (#423).
+    fn file(size: u32, levels: usize) -> Vec<u8> {
+        use xearthlayer::dds::{layout, DdsHeader};
+        let levels = levels as u32;
+        let mut file = vec![0; layout::file_len(size, size, levels, DdsFormat::BC1)];
+        file[..layout::HEADER_LEN]
+            .copy_from_slice(&DdsHeader::new(size, size, levels, DdsFormat::BC1).to_bytes());
+        file
+    }
+
+    /// The GPU's file; a tile handed back to the CPU fails the test.
     fn gpu_bytes(outcome: ChainOutcome) -> Vec<u8> {
         match outcome {
             ChainOutcome::Compressed(data) => data,
@@ -157,7 +168,7 @@ mod gpu_stress {
         let device = gpu_device();
 
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (channels, _worker, selection) =
+        let (channels, mut worker, selection) =
             match create_gpu_encoder_channels(&device, CHANNEL_CAPACITY, shutdown) {
                 Ok(r) => r,
                 Err(e) => {
@@ -184,7 +195,7 @@ mod gpu_stress {
             let ch = Arc::clone(&channel);
             let img = (*source).clone();
             tokio::task::spawn_blocking(move || {
-                ch.compress_mipmap_chain(img, DdsFormat::BC1, levels)
+                ch.compress_mipmap_chain(img, DdsFormat::BC1, levels, file(image_size, levels))
             })
             .await
             .unwrap()
@@ -198,7 +209,7 @@ mod gpu_stress {
             let ch = Arc::clone(&channel);
             let img = (*source).clone();
             tokio::task::spawn_blocking(move || {
-                ch.compress_mipmap_chain(img, DdsFormat::BC1, levels)
+                ch.compress_mipmap_chain(img, DdsFormat::BC1, levels, file(image_size, levels))
             })
             .await
             .unwrap()
@@ -245,7 +256,12 @@ mod gpu_stress {
                 let ch = Arc::clone(&channel);
                 handles.push(tokio::task::spawn_blocking(move || {
                     let t = Instant::now();
-                    let result = ch.compress_mipmap_chain(img, DdsFormat::BC1, levels);
+                    let result = ch.compress_mipmap_chain(
+                        img,
+                        DdsFormat::BC1,
+                        levels,
+                        file(image_size, levels),
+                    );
                     (result, t.elapsed())
                 }));
             }
@@ -373,6 +389,9 @@ mod gpu_stress {
             depth_left_after_bursts, 0,
             "every complete burst must leave the queue depth at zero"
         );
+        // The worker's thread is not the runtime's: end it before the
+        // process does, so the driver is not torn down under it.
+        worker.stop(std::time::Duration::from_secs(10)).await;
     }
 
     /// The same tile through ISPC on this machine, for comparison: the full
@@ -479,14 +498,15 @@ mod gpu_stress {
             };
         let killer = device.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
-        let worker = spawn_gpu_worker(
+        let mut worker = spawn_gpu_worker(
             device,
             queue,
             compressor,
             rx,
             tokio_util::sync::CancellationToken::new(),
             health.clone(),
-        );
+        )
+        .expect("a worker thread");
         let channel = Arc::new(GpuEncoderChannel::new(
             tx,
             health.clone(),
@@ -622,5 +642,6 @@ mod gpu_stress {
         assert!(health.is_failed(), "the GPU is failed for the session");
         assert_eq!(after_failed, 0, "the run ends in fallback encodes");
         assert_eq!(after.fallback, 5, "every later tile is a fallback encode");
+        worker.stop(std::time::Duration::from_secs(10)).await;
     }
 }
