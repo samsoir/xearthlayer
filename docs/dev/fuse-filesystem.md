@@ -396,6 +396,35 @@ X-Plane 12/Custom Scenery/
 6. Remove overlay symlinks (optional)
 ```
 
+### Panics and the Mount
+
+The process-wide panic hook (`xearthlayer::panic`, installed first thing in `run`) writes a
+report (banner, location, message) to stderr, which is the flight log while the dashboard
+runs, and **never unmounts** (#418). A hook runs at the panic, before the stack unwinds and
+before any `catch_unwind` or tokio's own catching sees it, so it cannot know whether the
+panic will be caught, and nearly every panic during a session is: a panic in a tokio task,
+a FUSE handler or a `spawn_blocking` closure becomes a `JoinError`, and the GPU worker
+catches its own. When the hook used to unmount, one such panic left XEarthLayer running
+with nothing mounted.
+
+The mount is removed only as the process ends:
+
+- A panic on the main thread during `run` unwinds through it and drops `ServiceOrchestrator`,
+  whose `MountManager` drops its ortho session first: `SpawnedMountHandle::unmount_sync`
+  signals the FUSE task, waits up to 5 s, then escalates through `system::unmount_fuse`
+  (`fusermount3 -u`, then `-uz`, on Linux; `umount -f` on macOS).
+- Under the dashboard, startup (mount, overlays, scenery index, prefetch) runs on a scoped
+  thread. `tui_app.rs` `wait_for_init` joins it and resumes its panic on the main thread,
+  which then unwinds as above. Before, the wait never ended and the process could only be
+  killed.
+- A panic on any other thread does not touch the mount.
+- A panic during that unwind (a double panic) aborts, and `SIGKILL` gives no chance to
+  clean up. Either leaves a stale mount, which `recover_stale_fuse_mount` clears at the next
+  `run`.
+
+Tests install the hook through `panic::install(sink)` with their own writer
+(`xearthlayer/tests/panic_hook.rs`, a binary of its own because the hook is process-wide).
+
 ### Runtime Management
 
 ```bash
