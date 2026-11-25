@@ -12,11 +12,13 @@
 //! uploads included: X-Plane's own objects light the ground there. With a
 //! road service attached, roads light footprints too: the probe
 //! counts a footprint whose glow reach holds a road as lit, and generation
-//! rasters the roads into the texture.
+//! rasters the roads into the texture. `LitStats` counts what serving did
+//! and logs `Night lighting: summary` every minute.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
@@ -30,8 +32,12 @@ use super::layout::minimal_black_dds;
 use super::roads::field::{reach_deg, RoadField};
 use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
 use super::roads::RoadModel;
+use super::stats::{
+    DiskMiss, GenerationRecord, LitStats, PayloadLookup, ProbeAnswer, ProbeRecord, ReadOutcome,
+    WriteBackSkip,
+};
 use super::{
-    decode_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
+    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
     FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
     TextureSettingSource,
 };
@@ -230,6 +236,12 @@ type FootprintRecipes = HashMap<(i32, i32), (Option<Arc<Recipe>>, LedRegion)>;
 /// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
 const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Between two `Night lighting: summary` lines.
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Generated visible levels by footprint `(row, col, zoom)`.
+type PayloadCache = moka::future::Cache<(u32, u32, u8), Bytes>;
+
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
@@ -252,8 +264,9 @@ pub struct NightLitSource {
     /// Generated visible levels by footprint. Evicting is safe: a payload
     /// regenerates to the same bytes (R13), or to none (black) once one of its
     /// recipes has been given up on, and never changes the size. A payload is
-    /// only built from a complete set of recipes.
-    payloads: moka::future::Cache<(u32, u32, u8), Bytes>,
+    /// only built from a complete set of recipes. In an `Arc` so the summary
+    /// task can hold it weakly.
+    payloads: Arc<PayloadCache>,
     generations: tokio::sync::Semaphore,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
@@ -268,6 +281,10 @@ pub struct NightLitSource {
     /// Road lights; `None` leaves every answer and payload as without them.
     roads: Option<Arc<RoadService>>,
     road_model: RoadModel,
+    /// Shared with the payload cache's eviction listener and the
+    /// write-backs; the summary task holds it weakly.
+    stats: Arc<LitStats>,
+    summary_started: AtomicBool,
 }
 
 /// A generated part of a footprint, and how complete its roads were.
@@ -278,7 +295,7 @@ struct Generated {
 
 /// Whether a generation had every road tile it could draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoadsState {
+pub(crate) enum RoadsState {
     Complete,
     /// A tile was still building at the deadline: a later generation may
     /// have it, so the payload is kept nowhere.
@@ -300,6 +317,29 @@ impl RoadsState {
     }
 }
 
+/// Why a payload generated with `roads`, a lit disk tier present, is not
+/// written back, if it is not: the first reason that applies, in
+/// [`WriteBackSkip`]'s order. Roads still building make it a payload kept
+/// nowhere (a later generation may have them). Without a fingerprint there
+/// is no safe disk entry. A failed road tile has no roads this session, but
+/// a later session may read it. An art file that failed to read this
+/// session may make the payload differ from a later session's under the
+/// same fingerprint. `art_failed` is asked only when the rest allow a
+/// write-back.
+fn write_back_skip(
+    roads: RoadsState,
+    fingerprinted: bool,
+    art_failed: impl FnOnce() -> bool,
+) -> Option<WriteBackSkip> {
+    match roads {
+        RoadsState::TimedOut => Some(WriteBackSkip::RoadsLate),
+        _ if !fingerprinted => Some(WriteBackSkip::NoFingerprint),
+        RoadsState::Failed => Some(WriteBackSkip::RoadFailed),
+        RoadsState::Complete if art_failed() => Some(WriteBackSkip::ArtFailed),
+        RoadsState::Complete => None,
+    }
+}
+
 /// A payload served but not kept in the memory cache, or `None` (black):
 /// moka shares it with every caller waiting on the same load and caches
 /// nothing.
@@ -312,13 +352,14 @@ impl NightLitSource {
         art: Arc<LaminarArt>,
         setting: Arc<dyn TextureSettingSource>,
     ) -> Self {
+        let stats = Arc::new(LitStats::default());
         Self {
             recipes: Arc::new(SessionRecipes::new(store)),
             art,
             setting,
             lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
-            payloads: payload_cache(LIT_PAYLOAD_CACHE_BYTES),
+            payloads: Arc::new(payload_cache(LIT_PAYLOAD_CACHE_BYTES, Arc::clone(&stats))),
             generations: tokio::sync::Semaphore::new(lit_generation_permits(
                 std::thread::available_parallelism().map_or(1, |n| n.get()),
             )),
@@ -329,6 +370,8 @@ impl NightLitSource {
             session: tokio::sync::OnceCell::new(),
             roads: None,
             road_model: RoadModel::DEFAULT,
+            stats,
+            summary_started: AtomicBool::new(false),
         }
     }
 
@@ -384,23 +427,53 @@ impl NightLitSource {
     }
 
     /// The generated visible levels of a lit footprint, or `None` (black)
-    /// when generation fails or a recipe cannot be read. Concurrent callers
-    /// for one key share one load or generation. A failure is not cached,
-    /// nor a payload whose roads were late: the next read generates again.
-    async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
-        let load = self.load_or_generate(name.clone(), layout.clone());
-        shared(&self.payloads, name, load).await
+    /// when generation fails or a recipe cannot be read, and where they came
+    /// from. Concurrent callers for one key share one load or generation. A
+    /// failure is not cached, nor a payload whose roads were late: the next
+    /// read generates again.
+    async fn served_payload(
+        &self,
+        name: &DdsFilename,
+        layout: &LitLayout,
+    ) -> (Option<Bytes>, ReadOutcome) {
+        // A call whose load did not run found the payload cached, or joined
+        // another call's load in flight. `contains_key` records no read, so
+        // the LRU order is as without it.
+        let cached = self.payloads.contains_key(&(name.row, name.col, name.zoom));
+        let (loaded, from_disk) = (AtomicBool::new(false), AtomicBool::new(false));
+        let load = async {
+            loaded.store(true, Ordering::Relaxed);
+            self.load_or_generate(name.clone(), layout.clone(), &from_disk)
+                .await
+        };
+        let payload = shared(&self.payloads, name, load).await;
+        let lookup = match (loaded.load(Ordering::Relaxed), cached) {
+            (true, _) => PayloadLookup::Loaded,
+            (false, true) => PayloadLookup::Hit,
+            (false, false) => PayloadLookup::Joined,
+        };
+        self.stats.record_payload_lookup(lookup);
+        let outcome = match (&payload, lookup, from_disk.load(Ordering::Relaxed)) {
+            (None, _, _) => ReadOutcome::Black,
+            (Some(_), PayloadLookup::Hit, _) => ReadOutcome::MemoryHit,
+            (Some(_), PayloadLookup::Joined, _) => ReadOutcome::Joined,
+            (Some(_), PayloadLookup::Loaded, true) => ReadOutcome::DiskHit,
+            (Some(_), PayloadLookup::Loaded, false) => ReadOutcome::Generated,
+        };
+        (payload, outcome)
     }
 
     /// Disk first, then generation; a generated payload is written back
     /// without waiting, unless an art file failed to read this session or a
     /// road tile was missing. `Err` is a payload not to keep in memory:
     /// black, or generated while a road tile was late. Without a disk tier
-    /// this is `generate`.
+    /// this is `generate`. Sets `from_disk` when the payload is read from
+    /// the disk tier.
     async fn load_or_generate(
         &self,
         name: DdsFilename,
         layout: LitLayout,
+        from_disk: &AtomicBool,
     ) -> Result<Bytes, Uncached> {
         let Some(disk) = self.disk.clone() else {
             return memory_only(self.generate(name, &layout).await);
@@ -408,54 +481,57 @@ impl NightLitSource {
         let key = lit_cache_key(&name);
         // The disk permit covers the fingerprint and the read, and is released
         // before generating: a lit task never holds two permits at once.
+        let asked = Instant::now();
         let Ok(permit) = self.disk_io.acquire().await else {
             return Err(Uncached(None));
         };
+        let permit_wait = asked.elapsed();
         let fp = self.fingerprint(&name).await;
         let stored = match &fp {
             Some(fp) => match disk.get(&key).await {
-                Ok(Some(entry)) => decode_entry(entry, fp, layout.payload_len()),
-                _ => None,
+                Ok(Some(entry)) => check_entry(entry, fp, layout.payload_len()).map_err(Into::into),
+                Ok(None) => Err(DiskMiss::Absent),
+                Err(_) => Err(DiskMiss::ReadError),
             },
-            None => None,
+            None => Err(DiskMiss::NoFingerprint),
         };
         drop(permit);
-        if let Some(payload) = stored {
+        self.stats
+            .record_disk_lookup(permit_wait, stored.as_ref().err().copied());
+        if let Ok(payload) = stored {
             debug!(
                 row = name.row,
                 col = name.col,
                 zoom = name.zoom,
                 "Night lighting: lit texture read from disk"
             );
+            from_disk.store(true, Ordering::Relaxed);
             return Ok(payload);
         }
-        let Some(fp) = fp else {
-            // No fingerprint, no safe disk entry: generate and keep it in memory only.
-            return memory_only(self.generate(name, &layout).await);
-        };
         let generated = self.generate(name, &layout).await;
-        let Some(Generated {
-            bytes: payload,
-            roads: RoadsState::Complete,
-        }) = generated
+        let skip = generated
+            .as_ref()
+            .and_then(|g| write_back_skip(g.roads, fp.is_some(), || self.art.had_failure()));
+        if let Some(skip) = skip {
+            self.stats.record_write_back_skipped(skip);
+        }
+        let (Some(fp), None, Some(Generated { bytes: payload, .. })) = (&fp, skip, &generated)
         else {
             return memory_only(generated);
         };
-        if self.art.had_failure() {
-            // An art file failed to read this session: the payload may
-            // differ from a later session's under the same fingerprint, so
-            // it stays in memory only.
-            return Ok(payload);
-        }
-        let entry = encode_entry(&fp, &payload);
-        let disk_io = Arc::clone(&self.disk_io);
+        let entry = encode_entry(fp, payload);
+        let payload = payload.clone();
+        // Pending from here, so a write-back spawned but not yet run counts.
+        let (disk_io, pending) = (Arc::clone(&self.disk_io), self.stats.write_back());
         tokio::spawn(async move {
             let Ok(_permit) = disk_io.acquire().await else {
                 return;
             };
-            if let Err(e) = disk.set(&key, entry).await {
+            let written = disk.set(&key, entry).await;
+            if let Err(e) = &written {
                 debug!(error = %e, key, "Night lighting: lit disk write failed");
             }
+            pending.finished(written.is_ok());
         });
         Ok(payload)
     }
@@ -522,7 +598,14 @@ impl NightLitSource {
         let found = self.footprint_roads(&name, size, Purpose::Generate).await;
         let roads_state = RoadsState::of(&found);
         let road_tiles = found.tiles;
-        let _permit = self.generations.acquire().await.ok()?;
+        let asked = Instant::now();
+        let _permit = {
+            let _waiting = self.stats.generations_waiting.enter();
+            self.generations.acquire().await.ok()?
+        };
+        let permit_wait = asked.elapsed();
+        let roads_ready_at_permit =
+            roads_state == RoadsState::TimedOut && self.road_tiles_ready(&name, size);
         let started = Instant::now();
         let (recipes, art, generator, owned, size, brightness, road_model) = (
             Arc::clone(&self.recipes),
@@ -564,7 +647,7 @@ impl NightLitSource {
             Some((super::generator::encode_visible(image), roads.stats))
         })
         .await;
-        match generated {
+        let result = match generated {
             Ok(None) => {
                 // Warned once, when the tile was given up on.
                 debug!(
@@ -581,6 +664,7 @@ impl NightLitSource {
                     col = name.col,
                     zoom = name.zoom,
                     ms = started.elapsed().as_millis() as u64,
+                    permit_wait_ms = permit_wait.as_millis() as u64,
                     road_segments = road.segments,
                     road_raster_us = road.raster_us,
                     road_texels = road.lit_texels,
@@ -602,7 +686,25 @@ impl NightLitSource {
                 warn!("Night lighting: lit generation failed; texture served black");
                 None
             }
-        }
+        };
+        self.stats.record_generation(&GenerationRecord {
+            permit_wait,
+            generation: started.elapsed(),
+            roads: roads_state,
+            roads_ready_at_permit,
+            payload: result.is_some(),
+        });
+        result
+    }
+
+    /// Whether every road tile that can light `name` at `size` texels is in
+    /// the road service's tile cache now (without touching its LRU order).
+    fn road_tiles_ready(&self, name: &DdsFilename, size: u32) -> bool {
+        self.roads.as_ref().is_some_and(|roads| {
+            self.road_tiles(name, size)
+                .into_iter()
+                .all(|tile| roads.is_ready(tile))
+        })
     }
 
     async fn has_light(&self, name: &DdsFilename) -> bool {
@@ -615,6 +717,7 @@ impl NightLitSource {
         }
         // Roads before the permit: a lit task never waits for roads while
         // holding one.
+        let road_started = Instant::now();
         let FootprintRoads {
             tiles: road_tiles,
             complete: roads_complete,
@@ -622,14 +725,21 @@ impl NightLitSource {
         } = self
             .footprint_roads(name, self.layout(name).first_visible, Purpose::Probe)
             .await;
+        let road_wait = self.roads.is_some().then(|| road_started.elapsed());
         let started = Instant::now();
         let Ok(_permit) = self.probes.acquire().await else {
             return false;
         };
-        if let Some(hit) = self.lit.get(&key) {
-            return *hit; // another probe answered while we waited
+        let permit_wait = started.elapsed();
+        if let Some(hit) = self.lit.get(&key).map(|hit| *hit) {
+            // Another probe answered while we waited: its waits count too.
+            self.stats.record_probe(&ProbeRecord {
+                road_wait,
+                permit_wait,
+                committed: None,
+            });
+            return hit;
         }
-        let wait_ms = started.elapsed().as_millis() as u64;
         let probe_started = Instant::now();
         let (recipes, art) = (Arc::clone(&self.recipes), Arc::clone(&self.art));
         let footprint = Footprint::from_name(name);
@@ -640,19 +750,24 @@ impl NightLitSource {
         } else {
             reach_deg(name, self.layout(name).first_visible, &self.road_model)
         };
-        let lit = match tokio::task::spawn_blocking(move || {
+        let answer = match tokio::task::spawn_blocking(move || {
             // The field reads every tile the generator could read for this
             // footprint, once each; an unreadable one counts as dark.
             let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
-            RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some())
-                || road_tiles.iter().any(|roads| {
-                    roads.crosses(
-                        footprint.south - reach,
-                        footprint.west - reach,
-                        footprint.north + reach,
-                        footprint.east + reach,
-                    )
-                })
+            if RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some()) {
+                ProbeAnswer::Recipe
+            } else if road_tiles.iter().any(|roads| {
+                roads.crosses(
+                    footprint.south - reach,
+                    footprint.west - reach,
+                    footprint.north + reach,
+                    footprint.east + reach,
+                )
+            }) {
+                ProbeAnswer::Road
+            } else {
+                ProbeAnswer::Dark
+            }
         })
         .await
         {
@@ -662,10 +777,15 @@ impl NightLitSource {
                 // resort, and it remembers the dark answer so size and read
                 // keep agreeing.
                 warn!("Night lighting: lit probe failed; footprint stays dark this session");
-                false
+                ProbeAnswer::Dark
             }
         };
-        let (lit, committed) = self.commit(key, lit);
+        let (lit, committed) = self.commit(key, answer.is_lit());
+        self.stats.record_probe(&ProbeRecord {
+            road_wait,
+            permit_wait,
+            committed: committed.then_some(answer),
+        });
         if committed && !lit && roads_timed_out {
             // A road still building could have lit it; the answer stands
             // for the session (R7).
@@ -678,7 +798,9 @@ impl NightLitSource {
             col = name.col,
             zoom = name.zoom,
             lit,
-            wait_ms,
+            answer = answer.label(),
+            wait_ms = permit_wait.as_millis() as u64,
+            road_wait_ms = road_wait.map(|w| w.as_millis() as u64),
             probe_ms = probe_started.elapsed().as_millis() as u64,
             roads_complete,
             roads_timed_out,
@@ -707,26 +829,60 @@ impl NightLitSource {
     fn layout(&self, name: &DdsFilename) -> LitLayout {
         LitLayout::new(name.zoom, self.setting.texture_setting())
     }
+
+    /// Starts the minute summary once, on the first call inside a Tokio
+    /// runtime. The task holds the statistics and the payload cache only
+    /// weakly, so it ends at the first tick after the source is dropped.
+    fn start_summary(&self) {
+        if self.summary_started.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.summary_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let (stats, payloads) = (Arc::downgrade(&self.stats), Arc::downgrade(&self.payloads));
+        runtime.spawn(log_summaries(stats, payloads));
+    }
 }
 
-/// The memory cache of generated payloads, holding up to `max_bytes` of them.
+/// Logs `Night lighting: summary` every [`SUMMARY_INTERVAL`] until the
+/// source is dropped.
+async fn log_summaries(stats: Weak<LitStats>, payloads: Weak<PayloadCache>) {
+    let mut tick = tokio::time::interval(SUMMARY_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        let (Some(stats), Some(payloads)) = (stats.upgrade(), payloads.upgrade()) else {
+            break;
+        };
+        stats.log_summary(payloads.entry_count(), payloads.weighted_size());
+    }
+}
+
+/// The memory cache of generated payloads, holding up to `max_bytes` of them,
+/// counting its evictions into `stats`.
 ///
 /// LRU, not moka's default TinyLFU: once the cache is full, admission by
 /// popularity would reject a payload just generated (asked for once) in
 /// favour of payloads read more often, and X-Plane's next read of its
 /// levels would load or generate it again.
-fn payload_cache(max_bytes: u64) -> moka::future::Cache<(u32, u32, u8), Bytes> {
+fn payload_cache(max_bytes: u64, stats: Arc<LitStats>) -> PayloadCache {
     moka::future::Cache::builder()
         .eviction_policy(EvictionPolicy::lru())
         .max_capacity(max_bytes)
         .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+        .eviction_listener(move |_, _, cause| stats.record_payload_removal(cause))
         .build()
 }
 
 /// The cached part of `name` in `cache`, loaded by `load` on a miss, which
 /// concurrent callers share; `None` (black) when the load gave nothing.
 async fn shared(
-    cache: &moka::future::Cache<(u32, u32, u8), Bytes>,
+    cache: &PayloadCache,
     name: &DdsFilename,
     load: impl std::future::Future<Output = Result<Bytes, Uncached>>,
 ) -> Option<Bytes> {
@@ -768,6 +924,7 @@ fn memory_only(generated: Option<Generated>) -> Result<Bytes, Uncached> {
 impl LitTextureSource for NightLitSource {
     fn size<'a>(&'a self, name: &'a DdsFilename) -> BoxFuture<'a, u64> {
         Box::pin(async move {
+            self.start_summary();
             if self.has_light(name).await {
                 self.layout(name).total_len
             } else {
@@ -778,6 +935,8 @@ impl LitTextureSource for NightLitSource {
 
     fn read<'a>(&'a self, name: &'a DdsFilename, offset: u64, len: u32) -> BoxFuture<'a, Bytes> {
         Box::pin(async move {
+            let asked = Instant::now();
+            self.start_summary();
             if self.has_light(name).await {
                 let layout = self.layout(name);
                 // The header and the levels above the visible ones are
@@ -785,13 +944,15 @@ impl LitTextureSource for NightLitSource {
                 // ground under the uploaded top level); the visible levels
                 // are generated only by a read that reaches them.
                 let reached = layout.reaches_payload(offset, len);
-                let payload = if reached {
-                    self.payload(name, &layout).await
+                let (payload, outcome) = if reached {
+                    self.served_payload(name, &layout).await
                 } else {
-                    None
+                    (None, ReadOutcome::Blank)
                 };
                 let part = read_part(reached, payload.is_some());
                 let bytes = layout.read_lit(offset, len, payload.as_ref());
+                let elapsed = asked.elapsed();
+                self.stats.record_read(outcome, elapsed);
                 // The order X-Plane reads a lit file in shows whether it
                 // loads the small levels (at the end) before the top.
                 debug!(
@@ -803,11 +964,15 @@ impl LitTextureSource for NightLitSource {
                     payload_start = layout.payload_start(),
                     total = layout.total_len,
                     part,
+                    from = outcome.label(),
+                    us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
                     "Night lighting: lit read"
                 );
                 bytes
             } else {
-                BlackLitSource.read(name, offset, len).await
+                let bytes = BlackLitSource.read(name, offset, len).await;
+                self.stats.record_read(ReadOutcome::Dark, asked.elapsed());
+                bytes
             }
         })
     }
@@ -854,7 +1019,7 @@ mod tests {
         // next read (#387).
         const PAYLOAD_BYTES: usize = 1024;
         const HELD: u32 = 4;
-        let cache = payload_cache(PAYLOAD_BYTES as u64 * u64::from(HELD));
+        let cache = payload_cache(PAYLOAD_BYTES as u64 * u64::from(HELD), Arc::default());
         let name = |row: u32| DdsFilename { row, ..lit() };
         let key = |row: u32| (row, lit().col, lit().zoom);
         let read = |row: u32| {
@@ -1067,7 +1232,7 @@ mod tests {
             if !set_recipe_readable(&temp, false) {
                 return;
             }
-            assert_eq!(source.payload(&name, &layout).await, None);
+            assert_eq!(source.served_payload(&name, &layout).await.0, None);
             assert_eq!(source.payloads.entry_count(), 0, "nothing cached");
             source.payloads.run_pending_tasks().await;
             assert!(source
@@ -1299,7 +1464,7 @@ mod tests {
             let key = crate::night::lit_cache_key(&name);
             let entry = d.get(&key).await.unwrap().expect("the payload is written");
             let fp = source.fingerprint(&name).await.unwrap();
-            assert!(crate::night::decode_entry(entry, &fp, layout.payload_len()).is_some());
+            assert!(crate::night::check_entry(entry, &fp, layout.payload_len()).is_ok());
             // The memory provider's count is eventually consistent (moka
             // applies a write on its next housekeeping pass, at most 300 ms
             // after an operation): keep operating until it has caught up.
@@ -1432,8 +1597,8 @@ mod tests {
             let key = crate::night::lit_cache_key(&name);
             for _ in 0..50 {
                 let entry = disk.get(&key).await.unwrap().unwrap();
-                if crate::night::decode_entry(entry, &b_fp, LitLayout::new(16, 4).payload_len())
-                    .is_some()
+                if crate::night::check_entry(entry, &b_fp, LitLayout::new(16, 4).payload_len())
+                    .is_ok()
                 {
                     break;
                 }
@@ -1477,7 +1642,7 @@ mod tests {
             let mut overwritten = false;
             for _ in 0..50 {
                 let entry = disk.get(&key).await.unwrap().unwrap();
-                if crate::night::decode_entry(entry, &b_fp, layout.payload_len()).is_some() {
+                if crate::night::check_entry(entry, &b_fp, layout.payload_len()).is_ok() {
                     overwritten = true;
                     break;
                 }
@@ -1485,7 +1650,7 @@ mod tests {
             }
             assert!(overwritten, "the entry carries the new fingerprint");
             let entry = disk.get(&key).await.unwrap().unwrap();
-            assert!(crate::night::decode_entry(entry, &a_fp, layout.payload_len()).is_none());
+            assert!(crate::night::check_entry(entry, &a_fp, layout.payload_len()).is_err());
         }
 
         #[tokio::test]
@@ -1543,7 +1708,7 @@ mod tests {
                 .set_modified(mtime + std::time::Duration::from_secs(10))
                 .unwrap();
 
-            assert!(a.payload(&name, &layout).await.is_some());
+            assert!(a.served_payload(&name, &layout).await.0.is_some());
             settle(&disk, &name).await;
             assert!(disk
                 .get(&crate::night::lit_cache_key(&name))
@@ -1555,7 +1720,7 @@ mod tests {
             let b = source_in(&temp)
                 .with_generator(second.clone())
                 .with_disk_cache(disk.clone());
-            b.payload(&name, &layout).await;
+            b.served_payload(&name, &layout).await;
             assert_eq!(calls(&second), 1, "regenerated, not decoded");
         }
 
@@ -1573,7 +1738,7 @@ mod tests {
             .unwrap();
             let layout = LitLayout::new(16, 4);
             assert!(
-                source.payload(&name, &layout).await.is_some(),
+                source.served_payload(&name, &layout).await.0.is_some(),
                 "still served from memory"
             );
             settle(&disk, &name).await;
@@ -1620,7 +1785,11 @@ mod tests {
             // Straight to the payload: a read would answer dark at the probe
             // and never reach generation.
             let layout = LitLayout::new(16, 4);
-            assert_eq!(source.payload(&name, &layout).await, None, "served black");
+            assert_eq!(
+                source.served_payload(&name, &layout).await.0,
+                None,
+                "served black"
+            );
             settle(&disk, &name).await;
             assert!(disk
                 .get(&crate::night::lit_cache_key(&name))
@@ -1749,7 +1918,8 @@ mod tests {
             let names: Vec<_> = (0..8)
                 .map(|i| name_at(37.20, -122.725 + f64::from(i) * 0.02))
                 .collect();
-            futures::future::join_all(names.iter().map(|n| source.payload(n, &layout))).await;
+            futures::future::join_all(names.iter().map(|n| source.served_payload(n, &layout)))
+                .await;
             // Wait for the write-backs through the uncounted inner cache.
             for name in &names {
                 let key = crate::night::lit_cache_key(name);
@@ -1995,14 +2165,17 @@ mod tests {
                 .with_disk_cache(d.clone());
             let name = lit_name();
             let layout = LitLayout::new(16, 4);
-            assert!(source.payload(&name, &layout).await.is_some(), "served");
+            assert!(
+                source.served_payload(&name, &layout).await.0.is_some(),
+                "served"
+            );
             settle(&d, &name).await;
             assert!(d
                 .get(&crate::night::lit_cache_key(&name))
                 .await
                 .unwrap()
                 .is_none());
-            assert!(source.payload(&name, &layout).await.is_some());
+            assert!(source.served_payload(&name, &layout).await.0.is_some());
             assert_eq!(calls(&white), 1, "the failed tile is final: from memory");
         }
 
@@ -2025,11 +2198,14 @@ mod tests {
                 .with_roads(roads.clone());
             let layout = LitLayout::new(16, 4);
             // The gate is shut: the generation times out on its roads.
-            assert!(source.payload(&name, &layout).await.is_some(), "served");
+            assert!(
+                source.served_payload(&name, &layout).await.0.is_some(),
+                "served"
+            );
             assert_eq!(roads.stats_snapshot().generate_timeouts, 1);
             source.payloads.run_pending_tasks().await;
             assert_eq!(source.payloads.entry_count(), 0, "not in memory");
-            assert!(source.payload(&name, &layout).await.is_some());
+            assert!(source.served_payload(&name, &layout).await.0.is_some());
             assert_eq!(calls(&white), 2, "generated again");
             settle(&d, &name).await;
             assert!(d
@@ -2040,8 +2216,8 @@ mod tests {
             // Once the roads are ready the payload is complete and kept.
             gate.add_permits(1);
             until_ready(&roads, TILE).await;
-            assert!(source.payload(&name, &layout).await.is_some());
-            assert!(source.payload(&name, &layout).await.is_some());
+            assert!(source.served_payload(&name, &layout).await.0.is_some());
+            assert!(source.served_payload(&name, &layout).await.0.is_some());
             assert_eq!(calls(&white), 3, "kept once complete");
             settle(&d, &name).await;
             assert!(d
@@ -2130,8 +2306,9 @@ mod tests {
                 .with_generator(Arc::new(White::default()))
                 .with_disk_cache(d.clone());
             assert!(source
-                .payload(&name, &LitLayout::new(16, 4))
+                .served_payload(&name, &LitLayout::new(16, 4))
                 .await
+                .0
                 .is_some());
             settle(&d, &name).await;
             assert!(d
@@ -2159,7 +2336,10 @@ mod tests {
             let (source, _) = source_with_roads(&temp, Some(road_across(&lit_name())));
             let seen = Arc::new(SeesRoads::default());
             let source = source.with_generator(seen.clone());
-            let _ = source.payload(&lit_name(), &LitLayout::new(16, 4)).await;
+            let _ = source
+                .served_payload(&lit_name(), &LitLayout::new(16, 4))
+                .await
+                .0;
             assert!(seen.0.load(std::sync::atomic::Ordering::SeqCst));
         }
 
@@ -2312,17 +2492,331 @@ mod tests {
                 .map(|i| name_at(37.20, -122.725 + 0.05 * i as f64))
                 .collect();
             let (_, ()) = tokio::join!(
-                futures::future::join_all(waiting.iter().map(|n| source.payload(n, &layout))),
+                futures::future::join_all(
+                    waiting.iter().map(|n| source.served_payload(n, &layout))
+                ),
                 async {
                     let payload = tokio::time::timeout(
                         Duration::from_secs(5),
-                        source.payload(&other, &LitLayout::new(18, 4)),
+                        source.served_payload(&other, &LitLayout::new(18, 4)),
                     )
                     .await;
-                    assert!(payload.is_ok_and(|p| p.is_some()));
+                    assert!(payload.is_ok_and(|p| p.0.is_some()));
                     gate.add_permits(1);
                 }
             );
+        }
+
+        // Statistics (#426).
+
+        /// Waits until `done` holds for the source's counters.
+        async fn counted(
+            source: &NightLitSource,
+            done: impl Fn(&crate::night::stats::LitStatsSnapshot) -> bool,
+        ) -> crate::night::stats::LitStatsSnapshot {
+            for _ in 0..200 {
+                let snap = source.stats.snapshot();
+                if done(&snap) {
+                    return snap;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("never counted: {:?}", source.stats.snapshot());
+        }
+
+        #[tokio::test]
+        async fn a_second_read_of_a_payload_counts_a_memory_hit() {
+            let (_t, source) = fixture();
+            let source = source.with_generator(Arc::new(White::default()));
+            let name = lit_name();
+            let start = LitLayout::new(16, 4).payload_start();
+            source.read(&name, start, 4096).await;
+            source.read(&name, start, 4096).await;
+            source.read(&name, 0, 128).await;
+            source.read(&dark_name(), 0, 128).await;
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.reads(ReadOutcome::Generated), 1);
+            assert_eq!(snap.reads(ReadOutcome::MemoryHit), 1);
+            assert_eq!(snap.reads(ReadOutcome::Blank), 1);
+            assert_eq!(snap.reads(ReadOutcome::Dark), 1);
+            assert_eq!((snap.payload_hits, snap.payload_misses), (1, 1));
+            assert_eq!(snap.generations(), 1);
+            assert_eq!(snap.generation_roads(RoadsState::Complete), 1);
+            let w = source.stats.take_window().unwrap();
+            assert_eq!(w.read(ReadOutcome::MemoryHit).unwrap().count, 1);
+            assert_eq!(w.generation.unwrap().count, 1);
+        }
+
+        #[tokio::test]
+        async fn a_read_that_joins_another_reads_load_counts_as_joined() {
+            let (_t, source) = fixture();
+            let source = source.with_generator(Arc::new(White::default()));
+            let name = lit_name();
+            let start = LitLayout::new(16, 4).payload_start();
+            // The probe answered first, so each read goes straight to the
+            // payload in its first poll.
+            assert_eq!(source.size(&name).await, source.layout(&name).total_len);
+            let all = source.generations.available_permits() as u32;
+            let held = source.generations.acquire_many(all).await.unwrap();
+            // The first read runs the load and waits for a generation permit;
+            // the second, polled next, finds the load in flight and joins it.
+            let (first, second, ()) = tokio::join!(
+                source.read(&name, start, 4096),
+                source.read(&name, start, 4096),
+                async {
+                    counted(&source, |_| source.stats.generations_waiting.now() == 1).await;
+                    drop(held);
+                }
+            );
+            assert_eq!(first, second);
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.reads(ReadOutcome::Generated), 1);
+            assert_eq!(snap.reads(ReadOutcome::Joined), 1);
+            assert_eq!(snap.reads(ReadOutcome::MemoryHit), 0);
+            assert_eq!(
+                (snap.payload_hits, snap.payload_joins, snap.payload_misses),
+                (0, 1, 1)
+            );
+            // Now cached: a true hit.
+            source.read(&name, start, 4096).await;
+            assert_eq!(source.stats.snapshot().payload_hits, 1);
+        }
+
+        #[test]
+        fn a_write_back_is_skipped_for_the_first_reason_that_applies() {
+            use RoadsState::{Complete, Failed, TimedOut};
+            use WriteBackSkip::{ArtFailed, NoFingerprint, RoadFailed, RoadsLate};
+            let never = || -> bool { panic!("art asked although the rest skip") };
+            assert_eq!(write_back_skip(TimedOut, false, never), Some(RoadsLate));
+            assert_eq!(write_back_skip(Failed, false, never), Some(NoFingerprint));
+            assert_eq!(write_back_skip(Complete, false, never), Some(NoFingerprint));
+            assert_eq!(write_back_skip(Failed, true, never), Some(RoadFailed));
+            assert_eq!(write_back_skip(Complete, true, || true), Some(ArtFailed));
+            assert_eq!(write_back_skip(Complete, true, || false), None);
+        }
+
+        #[tokio::test]
+        async fn a_probe_without_road_lights_records_no_road_wait() {
+            let (_t, source) = fixture();
+            source.size(&dark_name()).await;
+            let w = source.stats.take_window().unwrap();
+            assert_eq!(w.probe_road_wait, None);
+            assert_eq!(w.probe_permit_wait.unwrap().count, 1);
+        }
+
+        #[tokio::test]
+        async fn a_payload_evicted_for_size_counts_an_eviction() {
+            const PAYLOAD_BYTES: usize = 1024;
+            let stats = Arc::new(crate::night::stats::LitStats::default());
+            let cache = payload_cache(2 * PAYLOAD_BYTES as u64, stats.clone());
+            for row in 0..3 {
+                let name = DdsFilename { row, ..lit_name() };
+                let load = async { Ok(Bytes::from(vec![0xAB; PAYLOAD_BYTES])) };
+                assert!(shared(&cache, &name, load).await.is_some());
+                cache.run_pending_tasks().await;
+            }
+            assert_eq!(stats.snapshot().payload_evictions, 1);
+            assert_eq!(cache.entry_count(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_disk_entry_with_another_fingerprint_counts_a_fingerprint_miss() {
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = lit_name();
+            let layout = LitLayout::new(16, 4);
+            let stale = vec![0u8; layout.payload_len() as usize];
+            d.set(
+                &crate::night::lit_cache_key(&name),
+                crate::night::encode_entry(&crate::night::LitFingerprint([9; 32]), &stale),
+            )
+            .await
+            .unwrap();
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(d.clone());
+            source.read(&name, layout.payload_start(), 4096).await;
+            let snap = counted(&source, |s| s.disk_writes == 1).await;
+            assert_eq!(snap.disk_misses(DiskMiss::Fingerprint), 1);
+            assert_eq!(snap.disk_misses, [0, 0, 0, 1, 0, 0], "and no other");
+            assert_eq!(snap.disk_hits, 0);
+            assert_eq!(snap.reads(ReadOutcome::Generated), 1);
+            let w = source.stats.take_window().unwrap();
+            assert_eq!(w.disk_permit_wait.unwrap().count, 1);
+            assert_eq!(w.write_backs_pending_peak, 1);
+
+            // The next session reads the rewritten entry.
+            let next = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(d.clone());
+            next.read(&name, layout.payload_start(), 4096).await;
+            let snap = next.stats.snapshot();
+            assert_eq!(snap.disk_hits, 1);
+            assert_eq!(snap.reads(ReadOutcome::DiskHit), 1);
+            assert_eq!((snap.generations(), snap.disk_writes), (0, 0));
+        }
+
+        #[tokio::test]
+        async fn an_absent_disk_entry_counts_an_absent_miss() {
+            let temp = TempDir::new().unwrap();
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk());
+            let layout = LitLayout::new(16, 4);
+            source.served_payload(&lit_name(), &layout).await;
+            assert_eq!(source.stats.snapshot().disk_misses(DiskMiss::Absent), 1);
+        }
+
+        #[tokio::test]
+        async fn an_art_read_failure_counts_a_skipped_write_back() {
+            let temp = TempDir::new().unwrap();
+            let source = source_in(&temp).with_disk_cache(disk());
+            std::fs::write(
+                temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds"),
+                b"DDS ",
+            )
+            .unwrap();
+            assert!(source
+                .served_payload(&lit_name(), &LitLayout::new(16, 4))
+                .await
+                .0
+                .is_some());
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.write_backs_skipped(WriteBackSkip::ArtFailed), 1);
+            assert_eq!(snap.write_backs_skipped, [0, 0, 0, 1], "and no other");
+        }
+
+        #[tokio::test]
+        async fn a_failed_road_tile_counts_a_memory_only_payload() {
+            let temp = TempDir::new().unwrap();
+            let (source, _) = source_with_roads(&temp, None); // unreadable DSF
+            let source = source
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk());
+            assert!(source
+                .served_payload(&lit_name(), &LitLayout::new(16, 4))
+                .await
+                .0
+                .is_some());
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.write_backs_skipped(WriteBackSkip::RoadFailed), 1);
+            assert_eq!(snap.generation_roads(RoadsState::Failed), 1);
+        }
+
+        #[tokio::test]
+        async fn a_black_generation_is_counted_and_not_a_skipped_write_back() {
+            let (_t, source) = fixture();
+            let source = source
+                .with_generator(Arc::new(Unencodable::default()))
+                .with_disk_cache(disk());
+            let layout = LitLayout::new(16, 4);
+            source.read(&lit_name(), layout.payload_start(), 4096).await;
+            let snap = source.stats.snapshot();
+            assert_eq!((snap.generations(), snap.generations_black), (1, 1));
+            assert_eq!(snap.reads(ReadOutcome::Black), 1);
+            assert_eq!(snap.write_backs_skipped, [0; 4]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_generation_waits_for_its_permit_as_long_as_the_permits_are_held() {
+            const HELD: Duration = Duration::from_millis(200);
+            let (_t, source) = fixture();
+            let source = source.with_generator(Arc::new(White::default()));
+            let all = source.generations.available_permits() as u32;
+            let held = source.generations.acquire_many(all).await.unwrap();
+            let (name, layout) = (lit_name(), LitLayout::new(16, 4));
+            let ((payload, _), ()) =
+                tokio::join!(source.served_payload(&name, &layout), async move {
+                    tokio::time::sleep(HELD).await;
+                    drop(held);
+                });
+            assert!(payload.is_some());
+            let w = source.stats.take_window().unwrap();
+            let wait = w.generation_permit_wait.unwrap();
+            assert!(wait.max_us >= HELD.as_micros() as u64, "{wait:?}");
+            assert_eq!(w.generations_waiting_peak, 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn roads_ready_while_a_generation_waits_for_its_permit_are_counted() {
+            // #427: the generation timed out on its roads, which were ready by
+            // the time it held its permit.
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let gate = shut();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                LONG,
+                30,
+                Some(gate.clone()),
+            );
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_roads(roads.clone());
+            let tiles = road_tiles(&name, 1024, &RoadModel::DEFAULT);
+            let all = source.generations.available_permits() as u32;
+            let held = source.generations.acquire_many(all).await.unwrap();
+            let layout = LitLayout::new(16, 4);
+            let ((payload, _), ()) = tokio::join!(source.served_payload(&name, &layout), async {
+                // Past the generation's road wait: it now waits for a permit.
+                counted(&source, |_| source.stats.generations_waiting.now() == 1).await;
+                gate.add_permits(tiles.len());
+                for tile in &tiles {
+                    until_ready(&roads, *tile).await;
+                }
+                drop(held);
+            });
+            assert!(payload.is_some());
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.generation_roads(RoadsState::TimedOut), 1);
+            assert_eq!(snap.roads_ready_at_permit, 1);
+        }
+
+        #[tokio::test]
+        async fn a_footprint_lit_only_by_a_road_counts_a_road_answer() {
+            let temp = TempDir::new().unwrap();
+            let name = dark_name();
+            let (source, _) = source_with_roads(&temp, Some(road_across(&name)));
+            assert_eq!(source.size(&name).await, source.layout(&name).total_len);
+            assert_eq!(
+                source.size(&lit_name()).await,
+                source.layout(&lit_name()).total_len
+            );
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.probes(ProbeAnswer::Road), 1);
+            assert_eq!(snap.probes(ProbeAnswer::Recipe), 1, "the recipe first");
+            assert_eq!(snap.probes(ProbeAnswer::Dark), 0);
+            let w = source.stats.take_window().unwrap();
+            assert_eq!(w.probe_road_wait.unwrap().count, 2);
+            assert_eq!(w.probe_permit_wait.unwrap().count, 2);
+        }
+
+        #[tokio::test]
+        async fn a_dark_footprint_counts_a_dark_answer_once() {
+            let (_t, source) = fixture();
+            assert_eq!(source.size(&dark_name()).await, 152);
+            assert_eq!(source.size(&dark_name()).await, 152, "remembered");
+            assert_eq!(source.stats.snapshot().probes, [0, 0, 1]);
+        }
+
+        #[tokio::test]
+        async fn the_summary_task_does_not_keep_the_source_alive() {
+            let (_t, source) = fixture();
+            source.size(&dark_name()).await;
+            assert!(source.summary_started.load(Ordering::Relaxed));
+            let stats = Arc::downgrade(&source.stats);
+            let payloads = Arc::downgrade(&source.payloads);
+            drop(source);
+            tokio::task::yield_now().await;
+            assert!(stats.upgrade().is_none());
+            assert!(payloads.upgrade().is_none());
+        }
+
+        #[test]
+        fn outside_a_runtime_no_summary_is_started() {
+            let (_t, source) = fixture();
+            source.start_summary();
+            assert!(!source.summary_started.load(Ordering::Relaxed));
         }
     }
 }
