@@ -24,17 +24,39 @@
 //! catches, on a lost device (the callback `create_gpu_resources` registers)
 //! and on [`MISSES_BEFORE_FAILED`] tiles in a row that missed: past their
 //! [`TILE_DEADLINE`], or failed in time, as every tile does on a destroyed
-//! device ([`HangRule`]). Then the worker hands its whole queue
-//! back (close the channel, answer every request in it) and
-//! ends, and the channel hands every later image back without sending it. A
-//! tile past its deadline on a GPU not yet failed hands back only the
-//! requests queued behind it. A request the worker takes after it waited
+//! device ([`HangRule`]). Then the worker hands its whole queue back, both
+//! lanes' (close both channels, answer every request in them) and ends, and
+//! the channels hand every later image back without sending it. A tile past
+//! its deadline on a GPU not yet failed hands back only the demand requests
+//! queued behind it. A demand request the worker takes after it waited
 //! longer than the deadline in the queue, from its caller's send, is handed
 //! back too ([`HangRule::waited_out`]); that is not a miss and never fails
-//! the GPU. So no caller waits much longer than the deadline plus one tile:
-//! the tile that was in progress when its wait passed the deadline, or its
-//! own. The one tile already inside the processor when the GPU failed is
+//! the GPU. So no demand caller waits much longer than the deadline plus one
+//! tile: the tile that was in progress when its wait passed the deadline, or
+//! its own. Prefetch callers have no deadline (see below). The one tile already inside the processor when the GPU failed is
 //! lost and fails as before.
+//!
+//! # Two lanes, one GPU (#421)
+//!
+//! The demand lane (FUSE) and the prefetch lane each send on a channel of
+//! their own ([`GpuLane`], [`gpu_lanes`]), built apart so nothing on the
+//! demand side can name the prefetch channel and no priority travels with a
+//! request. The worker reads both ([`WorkerQueues`]): whenever it is free it
+//! takes a demand request, and a prefetch request only while the demand
+//! channel is empty. The tile in progress is never preempted, so the most a
+//! prefetch tile can delay a demand tile is the one prefetch tile the
+//! worker may already be encoding when the demand tile arrives: that one
+//! tile is the residual of the no-harm contract in GPU mode. Prefetch may
+//! starve under sustained demand; that is the intended trade.
+//!
+//! The deadline machinery that exists for the FUSE timeout applies to the
+//! demand channel only: a demand request that waited past the deadline is
+//! handed back ([`HangRule::waited_out`]), and a late tile hands back the
+//! demand requests queued behind it. Prefetch has no deadline: a prefetch
+//! request waits for the GPU however long demand keeps it busy, bounded by
+//! its channel's capacity (the prefetch lane's CPU pool). When the GPU fails
+//! or the worker shuts down, both channels are closed and every request in
+//! either is answered.
 
 mod inner {
     use std::sync::Arc;
@@ -51,8 +73,182 @@ mod inner {
     use crate::dds::layout;
     use crate::dds::{DdsError, DdsFormat};
 
-    /// Bounded channel capacity for GPU encode requests.
+    /// Bounded channel capacity for the demand lane's GPU encode requests.
+    /// The prefetch lane's channel is bounded by its CPU pool instead
+    /// ([`gpu_lanes`]).
     pub const CHANNEL_CAPACITY: usize = 32;
+
+    /// Which executor lane a GPU channel serves (#421). The worker takes a
+    /// demand request whenever it is free, and a prefetch request only while
+    /// the demand channel is empty.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum GpuLane {
+        /// FUSE: X-Plane is waiting for the tile.
+        Demand,
+        /// Prefetch: nobody is waiting yet.
+        Prefetch,
+    }
+
+    impl GpuLane {
+        /// The lane's name in the log.
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::Demand => "demand",
+                Self::Prefetch => "prefetch",
+            }
+        }
+
+        /// Whether the lane's requests have a deadline: only demand, for
+        /// the FUSE timeout (#421). The queue-age valve
+        /// ([`HangRule::waited_out`]) and the hand-back of the queue behind
+        /// a late tile apply to such a lane only; a prefetch request waits
+        /// for the GPU.
+        pub fn has_deadline(self) -> bool {
+            matches!(self, Self::Demand)
+        }
+    }
+
+    /// What one of the worker's channels holds when it looks (#421).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum QueueState {
+        /// At least one request is buffered.
+        Ready,
+        /// Nothing buffered, and a sender may still send.
+        Empty,
+        /// Nothing buffered, and every sender is gone.
+        Closed,
+    }
+
+    /// What the worker does next, by [`next_take`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum NextTake {
+        /// Take the next request of this lane.
+        Take(GpuLane),
+        /// Wait for a request.
+        Wait,
+        /// Both lanes are closed and empty: the loop ends.
+        End,
+    }
+
+    /// The lane rule (#421): a demand request whenever one is buffered, a
+    /// prefetch request only while the demand channel holds none, and the
+    /// end once both channels are closed and empty.
+    pub fn next_take(demand: QueueState, prefetch: QueueState) -> NextTake {
+        match (demand, prefetch) {
+            (QueueState::Ready, _) => NextTake::Take(GpuLane::Demand),
+            (_, QueueState::Ready) => NextTake::Take(GpuLane::Prefetch),
+            (QueueState::Closed, QueueState::Closed) => NextTake::End,
+            _ => NextTake::Wait,
+        }
+    }
+
+    /// The worker's two inputs (#421): it takes from `demand` whenever it is
+    /// free, and from `prefetch` only while `demand` is empty.
+    pub struct WorkerQueues {
+        /// The demand lane's requests.
+        pub demand: mpsc::Receiver<GpuEncodeRequest>,
+        /// The prefetch lane's requests.
+        pub prefetch: mpsc::Receiver<GpuEncodeRequest>,
+    }
+
+    /// What [`WorkerQueues::take`] found.
+    enum Taken {
+        Request(GpuLane, GpuEncodeRequest),
+        /// Nothing queued, and at least one channel still open.
+        Empty,
+        /// Both channels closed and empty: every sender is gone.
+        Closed,
+    }
+
+    impl WorkerQueues {
+        /// The demand and prefetch receivers.
+        pub fn new(
+            demand: mpsc::Receiver<GpuEncodeRequest>,
+            prefetch: mpsc::Receiver<GpuEncodeRequest>,
+        ) -> Self {
+            Self { demand, prefetch }
+        }
+
+        /// The next request by the lane rule ([`next_take`]).
+        fn take(&mut self) -> Taken {
+            match next_take(state(&self.demand), state(&self.prefetch)) {
+                NextTake::Take(lane) => match self.lane(lane).try_recv() {
+                    Ok(request) => Taken::Request(lane, request),
+                    // The one reader: a buffered request is still there.
+                    Err(_) => Taken::Empty,
+                },
+                NextTake::Wait => Taken::Empty,
+                NextTake::End => Taken::Closed,
+            }
+        }
+
+        fn lane(&mut self, lane: GpuLane) -> &mut mpsc::Receiver<GpuEncodeRequest> {
+            match lane {
+                GpuLane::Demand => &mut self.demand,
+                GpuLane::Prefetch => &mut self.prefetch,
+            }
+        }
+
+        /// Closes both channels and gives every request in either to
+        /// `answer`, until no sender of either holds a slot (#464): both are
+        /// closed first, so no later send on either succeeds, then each is
+        /// read to its end. Returns how many requests were answered.
+        ///
+        /// Must be called on a blocking thread, as the worker is.
+        fn drain(&mut self, mut answer: impl FnMut(GpuEncodeRequest)) -> usize {
+            self.demand.close();
+            self.prefetch.close();
+            drain(&mut self.demand, &mut answer) + drain(&mut self.prefetch, &mut answer)
+        }
+    }
+
+    /// What `rx` holds now, without taking anything from it.
+    fn state(rx: &mpsc::Receiver<GpuEncodeRequest>) -> QueueState {
+        if !rx.is_empty() {
+            QueueState::Ready
+        } else if rx.is_closed() {
+            QueueState::Closed
+        } else {
+            QueueState::Empty
+        }
+    }
+
+    impl From<mpsc::Receiver<GpuEncodeRequest>> for WorkerQueues {
+        /// One demand channel and no prefetch: the prefetch queue is closed
+        /// from the start. For tests of the loop that need one lane only.
+        fn from(demand: mpsc::Receiver<GpuEncodeRequest>) -> Self {
+            let (_, prefetch) = mpsc::channel(1);
+            Self { demand, prefetch }
+        }
+    }
+
+    /// The two lanes' channel handles (#421), each with its own sender and
+    /// stats, sharing the worker's health and shutdown token.
+    pub struct GpuEncoderChannels {
+        /// What the demand lane's encoder sends on.
+        pub demand: GpuEncoderChannel,
+        /// What the prefetch lane's encoder sends on.
+        pub prefetch: GpuEncoderChannel,
+    }
+
+    /// Two channels for one worker (#421): the demand channel holds
+    /// [`CHANNEL_CAPACITY`] requests and the prefetch channel
+    /// `prefetch_capacity` (at least one), the prefetch lane's CPU pool in
+    /// the service, as no more of its tasks can be encoding at once. Returns
+    /// the handles and the worker's side.
+    pub fn gpu_lanes(
+        prefetch_capacity: usize,
+        health: SharedGpuHealth,
+        shutdown: CancellationToken,
+    ) -> (GpuEncoderChannels, WorkerQueues) {
+        let (demand_tx, demand_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (prefetch_tx, prefetch_rx) = mpsc::channel(prefetch_capacity.max(1));
+        let channels = GpuEncoderChannels {
+            demand: GpuEncoderChannel::new(demand_tx, health.clone(), shutdown.clone()),
+            prefetch: GpuEncoderChannel::new(prefetch_tx, health, shutdown),
+        };
+        (channels, WorkerQueues::new(demand_rx, prefetch_rx))
+    }
 
     /// The failure every request still queued at shutdown is answered with.
     const SHUT_DOWN: &str = "GPU worker shut down";
@@ -95,8 +291,10 @@ mod inner {
         /// caller starting the send, is handed back unprocessed when the
         /// worker takes it: past the [`deadline`](Self::deadline). Such a
         /// request is not a miss and does not fail the GPU; it bounds every
-        /// caller's wait to about the deadline plus one tile, however deep
-        /// the queue. The one place this threshold is decided.
+        /// demand caller's wait to about the deadline plus one tile, however
+        /// deep the queue. The worker applies it to the demand channel only:
+        /// it exists for the FUSE timeout, and a prefetch request has no
+        /// deadline (#421). The one place this threshold is decided.
         pub fn waited_out(&self, queue_wait: Duration) -> bool {
             queue_wait > self.deadline
         }
@@ -841,13 +1039,20 @@ mod inner {
     /// process's exit reclaims what is leaked.
     pub(super) fn run_worker_loop<P: TileProcessor>(
         mut processor: P,
-        mut rx: mpsc::Receiver<GpuEncodeRequest>,
+        mut queues: WorkerQueues,
         shutdown: CancellationToken,
         health: SharedGpuHealth,
         rule: HangRule,
         clock: SharedClock,
     ) {
-        let end = serve(&mut processor, &mut rx, &shutdown, &health, rule, &*clock);
+        let end = serve(
+            &mut processor,
+            &mut queues,
+            &shutdown,
+            &health,
+            rule,
+            &*clock,
+        );
         tracing::info!(?end, "GPU pipeline worker shutting down");
         match end.ending() {
             Ending::Release => drop(processor),
@@ -863,7 +1068,7 @@ mod inner {
     /// and [`LoopEnd::ending`]; this acts on them.
     fn serve<P: TileProcessor>(
         processor: &mut P,
-        rx: &mut mpsc::Receiver<GpuEncodeRequest>,
+        queues: &mut WorkerQueues,
         shutdown: &CancellationToken,
         health: &SharedGpuHealth,
         rule: HangRule,
@@ -873,7 +1078,7 @@ mod inner {
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("GPU pipeline worker: shutdown signal received");
-                let failed = drain(rx, |request| {
+                let failed = queues.drain(|request| {
                     let _ = request
                         .response
                         .send(GpuEncodeReply::failed(SHUT_DOWN, GpuTileTiming::default()));
@@ -885,22 +1090,24 @@ mod inner {
             }
             // Failed from outside the loop: the device was lost.
             if let Some(reason) = health.failure() {
-                hand_back_all(rx, reason);
+                hand_back_all(queues, reason);
                 return LoopEnd::DeviceLost;
             }
 
-            let request = match rx.try_recv() {
-                Ok(req) => req,
-                Err(mpsc::error::TryRecvError::Empty) => {
+            let (lane, request) = match queues.take() {
+                Taken::Request(lane, request) => (lane, request),
+                Taken::Empty => {
                     std::thread::sleep(IDLE_POLL);
                     continue;
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => return LoopEnd::Closed,
+                Taken::Closed => return LoopEnd::Closed,
             };
 
             let taken = clock.now();
             let queue_wait = taken.saturating_duration_since(request.sent_at);
-            if rule.waited_out(queue_wait) {
+            // The valve exists for the FUSE timeout: a prefetch request has
+            // no deadline and waits for the GPU (#421).
+            if lane.has_deadline() && rule.waited_out(queue_wait) {
                 // Not a miss: the GPU never saw it.
                 let waited_ms = queue_wait.as_millis() as u64;
                 tracing::debug!(
@@ -935,6 +1142,7 @@ mod inner {
                 width = image.width(),
                 height = image.height(),
                 mipmap_count,
+                lane = lane.name(),
                 "GPU pipeline: processing full tile"
             );
 
@@ -944,6 +1152,7 @@ mod inner {
                 width = image.width(),
                 height = image.height(),
                 levels = mipmap_count,
+                lane = lane.name(),
             )
             .entered();
             let deadline = taken + rule.deadline;
@@ -961,7 +1170,7 @@ mod inner {
                     health.fail(message.clone());
                     // The image was inside the processor: this tile is lost.
                     let _ = response.send(GpuEncodeReply::failed(message, timing));
-                    hand_back_all(rx, health.failure().unwrap_or_default());
+                    hand_back_all(queues, health.failure().unwrap_or_default());
                     return LoopEnd::Panicked;
                 }
             };
@@ -988,14 +1197,22 @@ mod inner {
                 Verdict::Missed { late } => {
                     if late {
                         // The queue behind a slow tile goes to the CPU now
-                        // rather than wait for the next one.
-                        hand_back_queued(rx, "a GPU tile ahead of it missed its deadline");
+                        // rather than wait for the next one, on the lanes
+                        // that have a deadline: prefetch waits (#421).
+                        for lane in [GpuLane::Demand, GpuLane::Prefetch] {
+                            if lane.has_deadline() {
+                                hand_back_queued(
+                                    queues.lane(lane),
+                                    "a GPU tile ahead of it missed its deadline",
+                                );
+                            }
+                        }
                     }
                     let _ = response.send(reply);
                 }
                 Verdict::Failed { reason, hung } => {
                     health.fail(reason);
-                    hand_back_all(rx, health.failure().unwrap_or_default());
+                    hand_back_all(queues, health.failure().unwrap_or_default());
                     let _ = response.send(reply);
                     return LoopEnd::Missed { hung };
                 }
@@ -1119,12 +1336,13 @@ mod inner {
         }
     }
 
-    /// Closes the channel and hands back every request in it ([`drain`]),
-    /// so no image is left behind with the receiver.
+    /// Closes both channels and hands back every request in either
+    /// ([`WorkerQueues::drain`]), so no image is left behind with the
+    /// receivers.
     ///
     /// Must be called on a blocking thread, as the worker is.
-    fn hand_back_all(rx: &mut mpsc::Receiver<GpuEncodeRequest>, reason: &str) {
-        let handed = drain(rx, |request| hand_back(request, reason));
+    fn hand_back_all(queues: &mut WorkerQueues, reason: &str) {
+        let handed = queues.drain(|request| hand_back(request, reason));
         tracing::debug!(handed, reason, "GPU worker handed its queue back");
     }
 
@@ -1142,7 +1360,7 @@ mod inner {
     /// Must be called on a blocking thread, as the worker is.
     fn drain(
         rx: &mut mpsc::Receiver<GpuEncodeRequest>,
-        mut answer: impl FnMut(GpuEncodeRequest),
+        answer: &mut impl FnMut(GpuEncodeRequest),
     ) -> usize {
         rx.close();
         let mut answered = 0;
@@ -1154,25 +1372,32 @@ mod inner {
     }
 
     /// Spawn the worker loop around `processor` on a dedicated blocking
-    /// thread. Each request is answered with the processor's result, or
-    /// with its own image ([`GpuEncodeReply::Returned`]) when the GPU does not
-    /// take it. The loop ends:
+    /// thread, reading `queues`: a demand request whenever the worker is
+    /// free, a prefetch request only while the demand channel is empty
+    /// (#421). A single receiver is a demand channel with no prefetch
+    /// ([`WorkerQueues`]'s `From`). Each request is answered with the
+    /// processor's result, or with its own image
+    /// ([`GpuEncodeReply::Returned`]) when the GPU does not take it. The
+    /// loop ends:
     ///
     /// - when the shutdown token is cancelled, between tiles: a tile in
-    ///   progress is finished and answered; every queued request, and every
-    ///   one whose sender already holds a slot, fails with "GPU worker shut
-    ///   down" (#464);
-    /// - when every sender is dropped, after the buffered requests;
+    ///   progress is finished and answered; every queued request of either
+    ///   lane, and every one whose sender already holds a slot, fails with
+    ///   "GPU worker shut down" (#464);
+    /// - when every sender of both channels is dropped, after the buffered
+    ///   requests;
     /// - when the GPU fails (#420): the processor panics (the request in
     ///   progress fails with the panic's message), `health` is failed from
     ///   outside (the device was lost), or `rule.misses` tiles in a row end
     ///   at or past `rule.deadline` or fail before it. `health` turns Failed
-    ///   with the reason, and every queued request is handed back.
+    ///   with the reason, and every queued request of either lane is handed
+    ///   back.
     ///
-    /// A tile past its deadline that does not fail the GPU hands back the
-    /// requests queued behind it, and a request taken after waiting past
-    /// the deadline in the queue is handed back unprocessed
-    /// ([`HangRule::waited_out`]).
+    /// On the demand channel only (#421), a tile past its deadline that
+    /// does not fail the GPU hands back the demand requests queued behind
+    /// it, and a demand request taken after waiting past the deadline in the
+    /// queue is handed back unprocessed ([`HangRule::waited_out`]). A
+    /// prefetch request is processed however long it waited.
     ///
     /// The processor is dropped when the loop ends, except after a GPU
     /// failed by a hang or a panic, when it is leaked so that its drop
@@ -1184,12 +1409,19 @@ mod inner {
     /// Returns a `JoinHandle` that resolves when the loop ends.
     pub fn spawn_tile_worker<P: TileProcessor + 'static>(
         processor: P,
-        rx: mpsc::Receiver<GpuEncodeRequest>,
+        queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
         health: SharedGpuHealth,
         rule: HangRule,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_tile_worker_with_clock(processor, rx, shutdown, health, rule, Arc::new(SystemClock))
+        spawn_tile_worker_with_clock(
+            processor,
+            queues,
+            shutdown,
+            health,
+            rule,
+            Arc::new(SystemClock),
+        )
     }
 
     /// [`spawn_tile_worker`] on `clock`: the loop measures each request's
@@ -1198,16 +1430,17 @@ mod inner {
     /// `sent_at` on the same clock ([`GpuEncoderChannel::with_clock`]).
     pub fn spawn_tile_worker_with_clock<P: TileProcessor + 'static>(
         processor: P,
-        rx: mpsc::Receiver<GpuEncodeRequest>,
+        queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
         health: SharedGpuHealth,
         rule: HangRule,
         clock: SharedClock,
     ) -> tokio::task::JoinHandle<()> {
+        let queues = queues.into();
         // spawn_blocking for a long-lived dedicated thread: the processor
         // stays on one thread for its whole life.
         tokio::task::spawn_blocking(move || {
-            run_worker_loop(processor, rx, shutdown, health, rule, clock)
+            run_worker_loop(processor, queues, shutdown, health, rule, clock)
         })
     }
 
@@ -1222,42 +1455,45 @@ mod inner {
         device: wgpu::Device,
         queue: wgpu::Queue,
         compressor: GpuBlockCompressor,
-        rx: mpsc::Receiver<GpuEncodeRequest>,
+        queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
         health: SharedGpuHealth,
     ) -> tokio::task::JoinHandle<()> {
         spawn_tile_worker(
             WgpuTileProcessor::new(device, queue, compressor),
-            rx,
+            queues,
             shutdown,
             health,
             HangRule::default(),
         )
     }
 
-    /// Create a [`GpuEncoderChannel`] with a full-tile streaming worker.
+    /// Create the two lanes' [`GpuEncoderChannel`]s ([`gpu_lanes`]) and the
+    /// one full-tile streaming worker that reads them (#421).
     ///
     /// Initializes GPU resources and spawns the worker thread. Returns the
-    /// channel handle, the worker `JoinHandle`, and the selection: the
+    /// channel handles, the worker `JoinHandle`, and the selection: the
     /// adapter chosen (for display; the worker owns the device) with the
-    /// host's other adapters for the encoder policy. The channel's
+    /// host's other adapters for the encoder policy. Both channels'
     /// [`health`](GpuEncoderChannel::health) is the one the worker and the
-    /// device's lost callback publish.
+    /// device's lost callback publish. The prefetch channel holds
+    /// `prefetch_capacity` requests.
     ///
-    /// Nothing else is started: the per-minute `GPU encode sample` line of
-    /// the channel's [`stats`](GpuEncoderChannel::stats) is started by the
+    /// Nothing else is started: the per-minute `GPU encode sample` lines of
+    /// the channels' [`stats`](GpuEncoderChannel::stats) are started by the
     /// service wiring (`service::builder::create_encoder`), so a test that
-    /// samples the stats itself loses nothing to it.
+    /// samples the stats itself loses nothing to them.
     ///
     /// # Errors
     ///
     /// Returns `DdsError` if GPU initialization fails.
-    pub fn create_gpu_encoder_channel(
+    pub fn create_gpu_encoder_channels(
         gpu_device: &str,
+        prefetch_capacity: usize,
         shutdown: CancellationToken,
     ) -> Result<
         (
-            GpuEncoderChannel,
+            GpuEncoderChannels,
             tokio::task::JoinHandle<()>,
             crate::system::GpuSelection,
         ),
@@ -1269,20 +1505,9 @@ mod inner {
 
         tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(
-            device,
-            queue,
-            compressor,
-            rx,
-            shutdown.clone(),
-            health.clone(),
-        );
-        Ok((
-            GpuEncoderChannel::new(tx, health, shutdown),
-            handle,
-            selection,
-        ))
+        let (channels, queues) = gpu_lanes(prefetch_capacity, health.clone(), shutdown.clone());
+        let handle = spawn_gpu_worker(device, queue, compressor, queues, shutdown, health);
+        Ok((channels, handle, selection))
     }
 }
 
@@ -1674,12 +1899,12 @@ mod tests {
     /// rule.
     fn spawn_with<P: TileProcessor + 'static>(
         processor: P,
-        rx: mpsc::Receiver<GpuEncodeRequest>,
+        queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
         health: SharedGpuHealth,
         clock: &FakeClock,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_tile_worker_with_clock(processor, rx, shutdown, health, RULE, clock.shared())
+        spawn_tile_worker_with_clock(processor, queues, shutdown, health, RULE, clock.shared())
     }
 
     /// A request stamped now on `clock`, whose image is `width` pixels wide
@@ -1852,13 +2077,13 @@ mod tests {
     /// The loop on this thread, as the worker's blocking thread runs it.
     fn run_worker_loop_here<P: TileProcessor>(
         processor: P,
-        rx: mpsc::Receiver<GpuEncodeRequest>,
+        queues: impl Into<WorkerQueues>,
         health: SharedGpuHealth,
         clock: &FakeClock,
     ) {
         super::inner::run_worker_loop(
             processor,
-            rx,
+            queues.into(),
             CancellationToken::new(),
             health,
             RULE,
@@ -2128,6 +2353,312 @@ mod tests {
             assert_eq!(t.process, TILE, "process is the call");
             assert_eq!(t.queue_wait, TILE * i as u32, "position {i}");
         }
+    }
+
+    // =========================================================================
+    // Two lanes, demand first (#421)
+    // =========================================================================
+
+    /// Raw senders for both lanes and the worker's side, each channel
+    /// holding [`CHANNEL_CAPACITY`] requests.
+    fn lanes() -> (
+        mpsc::Sender<GpuEncodeRequest>,
+        mpsc::Sender<GpuEncodeRequest>,
+        WorkerQueues,
+    ) {
+        let (demand_tx, demand_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (prefetch_tx, prefetch_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        (
+            demand_tx,
+            prefetch_tx,
+            WorkerQueues::new(demand_rx, prefetch_rx),
+        )
+    }
+
+    /// The widths of the tiles a processor started, in order.
+    type Started = Arc<std::sync::Mutex<Vec<u32>>>;
+
+    /// A processor that records each tile's width and succeeds at once.
+    fn recording() -> (impl TileProcessor, Started) {
+        let started = Started::default();
+        let seen = Arc::clone(&started);
+        let processor = FnProcessor(move |image: RgbaImage, _: &mut GpuTileTiming| {
+            seen.lock().unwrap().push(image.width());
+            Ok(vec![0; 8])
+        });
+        (processor, started)
+    }
+
+    /// Whether the worker has taken every request `tx` sent: none is left
+    /// buffered.
+    fn all_taken(tx: &mpsc::Sender<GpuEncodeRequest>) -> bool {
+        tx.capacity() == tx.max_capacity()
+    }
+
+    /// The lane rule, given each channel's state: demand whenever it holds
+    /// a request, prefetch only while demand holds none, the end only when
+    /// both are closed and empty.
+    #[test]
+    fn the_next_take_is_demand_first_and_prefetch_only_when_demand_is_empty() {
+        use QueueState::{Closed, Empty, Ready};
+        let demand = NextTake::Take(GpuLane::Demand);
+        let prefetch = NextTake::Take(GpuLane::Prefetch);
+        for (d, p, next) in [
+            (Ready, Ready, demand),
+            (Ready, Empty, demand),
+            (Ready, Closed, demand),
+            (Empty, Ready, prefetch),
+            (Closed, Ready, prefetch),
+            (Empty, Empty, NextTake::Wait),
+            (Empty, Closed, NextTake::Wait),
+            (Closed, Empty, NextTake::Wait),
+            (Closed, Closed, NextTake::End),
+        ] {
+            assert_eq!(next_take(d, p), next, "demand {d:?}, prefetch {p:?}");
+        }
+    }
+
+    /// Only demand has a deadline: the queue-age valve and the hand-back
+    /// behind a late tile are for the FUSE timeout (#421).
+    #[test]
+    fn only_the_demand_lane_has_a_deadline() {
+        assert!(GpuLane::Demand.has_deadline());
+        assert!(!GpuLane::Prefetch.has_deadline());
+    }
+
+    /// The acceptance test of #421, through the real loop: while the worker
+    /// is busy with a prefetch tile, 14 prefetch requests and then one
+    /// demand request are queued (14 is the prefetch lane's CPU pool at
+    /// reference sizing). The demand request is the next one processed: the
+    /// most it waited behind prefetch is the one tile in progress.
+    #[tokio::test]
+    async fn a_demand_request_is_taken_before_the_prefetch_queue_ahead_of_it() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let (inner, started) = recording();
+        let (processor, open) = gated(inner);
+        let mut replies = queue(&prefetch_tx, &clock, &[1000]);
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        waits_for("the busy tile is taken", || all_taken(&prefetch_tx)).await;
+
+        let prefetch: Vec<u32> = (1..=14).map(|i| 4 * i).collect();
+        replies.extend(queue(&prefetch_tx, &clock, &prefetch));
+        replies.extend(queue(&demand_tx, &clock, &[2000]));
+        drop(open);
+        for reply in replies {
+            processed(reply_of(reply).await).0.unwrap();
+        }
+
+        let order = started.lock().unwrap().clone();
+        let expected: Vec<u32> = [1000, 2000].into_iter().chain(prefetch).collect();
+        assert_eq!(
+            order, expected,
+            "the demand tile is next after the busy one"
+        );
+    }
+
+    /// The queue-age valve applies to the demand channel only (#421): a
+    /// prefetch request that waited past the deadline is still processed on
+    /// the GPU, while a demand request that waited as long is handed back.
+    #[tokio::test]
+    async fn a_prefetch_request_past_the_deadline_is_processed_and_a_demand_one_handed_back() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let (stale_demand, demand_reply) = request(&clock, 4);
+        let (stale_prefetch, prefetch_reply) = request(&clock, 8);
+        clock.advance(LATE);
+        demand_tx.try_send(stale_demand).unwrap();
+        prefetch_tx.try_send(stale_prefetch).unwrap();
+        let (processor, started) = recording();
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+
+        let (image, reason) = returned(reply_of(demand_reply).await);
+        assert_eq!(image.width(), 4);
+        assert!(reason.starts_with("waited "), "{reason}");
+        let (result, timing) = processed(reply_of(prefetch_reply).await);
+        assert!(result.is_ok(), "the prefetch tile is encoded");
+        assert_eq!(timing.queue_wait, LATE);
+        assert_eq!(
+            *started.lock().unwrap(),
+            [8],
+            "only prefetch reached the GPU"
+        );
+        assert_eq!(health.health(), GpuHealth::Healthy);
+    }
+
+    /// A late tile hands back the demand requests queued behind it, not the
+    /// prefetch ones: prefetch has no deadline and waits for the GPU (#421).
+    #[tokio::test]
+    async fn a_late_tile_hands_back_the_demand_queue_only() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let late = one(&demand_tx, &clock, 4);
+        let queued_demand = one(&demand_tx, &clock, 8);
+        let queued_prefetch = one(&prefetch_tx, &clock, 12);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_with(
+            taking(&clock, LATE, &calls),
+            queues,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+
+        processed(reply_of(late).await).0.unwrap();
+        let (image, reason) = returned(reply_of(queued_demand).await);
+        assert_eq!(
+            (image.width(), reason.as_str()),
+            (8, "a GPU tile ahead of it missed its deadline")
+        );
+        processed(reply_of(queued_prefetch).await).0.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(health.health(), GpuHealth::Healthy, "two misses, not three");
+    }
+
+    /// A GPU failure hands back the queue of both lanes (#420, #421): every
+    /// image comes back to its caller, and both channels are closed.
+    #[tokio::test]
+    async fn a_panic_hands_back_the_queues_of_both_lanes() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let mut replies = queue(&demand_tx, &clock, &[4, 8]).into_iter();
+        let prefetch_replies = queue(&prefetch_tx, &clock, &[12, 16]);
+        let handle = spawn_with(
+            FnProcessor(
+                |_: RgbaImage, _: &mut GpuTileTiming| -> Result<Vec<u8>, DdsError> {
+                    panic!("device lost")
+                },
+            ),
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        loop_ends(handle).await;
+
+        assert!(processed(reply_of(replies.next().unwrap()).await)
+            .0
+            .is_err());
+        for (reply, width) in replies.chain(prefetch_replies).zip([8, 12, 16]) {
+            let (image, reason) = returned(reply_of(reply).await);
+            assert_eq!(
+                (image.width(), reason.as_str()),
+                (width, "GPU worker panicked: device lost")
+            );
+        }
+        assert!(demand_tx.is_closed() && prefetch_tx.is_closed());
+    }
+
+    /// Shutdown fails the queue of both lanes, and answers a prefetch
+    /// request sent while the drain runs (#464 over two channels): its
+    /// sender reserved a slot before the drain began.
+    #[tokio::test]
+    async fn shutdown_answers_both_lanes_and_a_prefetch_request_sent_while_draining() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let permit = prefetch_tx
+            .clone()
+            .reserve_owned()
+            .await
+            .expect("a free slot");
+        let (inner, started) = recording();
+        let (processor, open) = gated(inner);
+        let in_progress = one(&demand_tx, &clock, 4);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_with(
+            processor,
+            queues,
+            shutdown.clone(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        waits_for("the tile is taken", || all_taken(&demand_tx)).await;
+        let queued_prefetch = one(&prefetch_tx, &clock, 8);
+        let queued_demand = one(&demand_tx, &clock, 12);
+
+        shutdown.cancel();
+        open.send(()).unwrap();
+        processed(reply_of(in_progress).await).0.unwrap();
+        for reply in [queued_demand, queued_prefetch] {
+            let (result, _) = processed(reply_of(reply).await);
+            assert_eq!(
+                error_text(&result),
+                "Compression failed: GPU worker shut down"
+            );
+        }
+        // The drain is now waiting on the reserved prefetch slot.
+        assert!(!handle.is_finished());
+        let (late, reply) = request(&clock, 16);
+        permit.send(late);
+        let (result, _) = processed(reply_of(reply).await);
+        assert_eq!(
+            error_text(&result),
+            "Compression failed: GPU worker shut down"
+        );
+        loop_ends(handle).await;
+        assert_eq!(*started.lock().unwrap(), [4], "nothing queued was started");
+    }
+
+    /// The loop ends when every sender of both channels is gone, not when
+    /// one lane's are: with the demand senders dropped it still serves
+    /// prefetch.
+    #[tokio::test]
+    async fn the_loop_ends_only_when_both_lanes_are_closed() {
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let (processor, _) = recording();
+        let handle = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        drop(demand_tx);
+
+        processed(reply_of(one(&prefetch_tx, &clock, 4)).await)
+            .0
+            .unwrap();
+        assert!(!handle.is_finished(), "the prefetch lane is still open");
+        drop(prefetch_tx);
+        loop_ends(handle).await;
+    }
+
+    /// The prefetch channel holds as many requests as the prefetch lane's
+    /// CPU pool (#421), and at least one; the demand channel holds
+    /// [`CHANNEL_CAPACITY`]. Both handles share the worker's health.
+    #[test]
+    fn the_prefetch_channel_is_bounded_by_its_capacity() {
+        let health = SharedGpuHealth::new();
+        let (channels, queues) = gpu_lanes(14, health.clone(), CancellationToken::new());
+        assert_eq!(queues.demand.max_capacity(), CHANNEL_CAPACITY);
+        assert_eq!(queues.prefetch.max_capacity(), 14);
+        health.fail("test");
+        assert!(channels.demand.health().is_failed());
+        assert!(channels.prefetch.health().is_failed());
+
+        let (_, queues) = gpu_lanes(0, SharedGpuHealth::new(), CancellationToken::new());
+        assert_eq!(queues.prefetch.max_capacity(), 1);
+    }
+
+    #[test]
+    fn the_lanes_are_named_in_the_log() {
+        assert_eq!(GpuLane::Demand.name(), "demand");
+        assert_eq!(GpuLane::Prefetch.name(), "prefetch");
     }
 
     /// The processor is given the deadline: the rule's deadline from when
@@ -3160,21 +3691,22 @@ mod tests {
 
     #[tokio::test]
     #[ignore] // Requires GPU hardware
-    async fn test_create_gpu_encoder_channel_convenience() {
+    async fn test_create_gpu_encoder_channels_convenience() {
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (channel, worker_handle, _adapter) =
-            match create_gpu_encoder_channel("integrated", shutdown) {
+        let (channels, worker_handle, _adapter) =
+            match create_gpu_encoder_channels(&test_gpu_device(), 4, shutdown) {
                 Ok(r) => r,
                 Err(_) => return,
             };
 
-        // Verify channel is connected
-        assert!(channel.is_connected());
-        assert!(!channel.health().is_failed());
+        // Verify both channels are connected
+        assert!(channels.demand.is_connected());
+        assert!(channels.prefetch.is_connected());
+        assert!(!channels.demand.health().is_failed());
 
-        // Drop channel, verify worker stops: 10 s only guards a hang, a
-        // real device's release may be slow.
-        drop(channel);
+        // Drop both channels, verify worker stops: 10 s only guards a
+        // hang, a real device's release may be slow.
+        drop(channels);
         tokio::time::timeout(std::time::Duration::from_secs(10), worker_handle)
             .await
             .expect("worker should stop within timeout")
@@ -3185,6 +3717,12 @@ mod tests {
     // Full-tile GPU pipeline tests (require GPU hardware)
     // =========================================================================
 
+    /// The adapter the hardware tests use, as `texture.gpu_device`:
+    /// `XEL_TEST_GPU_DEVICE`, `integrated` by default.
+    fn test_gpu_device() -> String {
+        std::env::var("XEL_TEST_GPU_DEVICE").unwrap_or_else(|_| "integrated".to_string())
+    }
+
     /// Helper to create GPU resources for pipeline tests.
     fn gpu_resources_or_skip() -> Option<(
         wgpu::Device,
@@ -3192,7 +3730,7 @@ mod tests {
         block_compression::GpuBlockCompressor,
     )> {
         use crate::dds::create_gpu_resources;
-        match create_gpu_resources("integrated", &SharedGpuHealth::new()) {
+        match create_gpu_resources(&test_gpu_device(), &SharedGpuHealth::new()) {
             Ok((device, queue, compressor, _name)) => Some((device, queue, compressor)),
             Err(_) => None, // Skip if no GPU
         }

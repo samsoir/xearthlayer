@@ -46,14 +46,19 @@ fn expected_bc1_payload(width: u32, height: u32, levels: usize) -> usize {
 #[ignore]
 async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let (channel, _worker, _adapter) =
-        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(&gpu_device(), shutdown) {
+    let (channels, _worker, _adapter) =
+        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channels(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::CHANNEL_CAPACITY,
+            shutdown,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping: no usable GPU ({e})");
                 return;
             }
         };
+    let channel = channels.demand;
 
     let levels = MipmapGenerator::full_chain_count(4096, 4096);
     assert_eq!(levels, 13, "4096x4096 must yield 13 levels");
@@ -111,8 +116,12 @@ async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
 #[ignore]
 async fn gpu_worker_survives_sub_block_levels() {
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let (channel, _worker, _adapter) =
-        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(&gpu_device(), shutdown) {
+    let (channels, _worker, _adapter) =
+        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channels(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::CHANNEL_CAPACITY,
+            shutdown,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping: no usable GPU ({e})");
@@ -120,7 +129,7 @@ async fn gpu_worker_survives_sub_block_levels() {
             }
         };
 
-    let channel = Arc::new(channel);
+    let channel = Arc::new(channels.demand);
 
     // 64x64 -> 7 levels, reaching 4x4, 2x2 and 1x1.
     let levels = MipmapGenerator::full_chain_count(64, 64);

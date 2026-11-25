@@ -2,12 +2,13 @@
 //! tile, and how many requests are in the channel.
 //!
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel) records
-//! every request it is given: the stages of each encoded tile, a count of
+//! every request it is given, in stats of its own, so each lane's channel
+//! (#421) has its own queue depth and queue wait: the stages of each encoded tile, a count of
 //! the requests that came back without one, and a count of the images the
 //! GPU did not take, which the encoder's fallback encodes on the CPU (#420). In the service, a task started
-//! by `service::builder::create_encoder` closes the window every
-//! `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
-//! logs one `GPU encode sample` line. Anything else holding a channel must
+//! by `service::builder::create_encoder` for each lane closes the window
+//! every `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
+//! logs one `GPU encode sample` line, with the lane. Anything else holding a channel must
 //! call [`GpuEncodeStats::take_sample`] itself; until it does, each window
 //! keeps at most [`WINDOW_CAP`] tiles. The numbers go to the log and, as
 //! spans, to the profile trace only: no metric events, telemetry or
@@ -19,7 +20,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::gpu_channel::GpuTileTiming;
+use super::gpu_channel::{GpuLane, GpuTileTiming};
 use super::gpu_health::SharedGpuHealth;
 use crate::metrics::{LatencySummary, LatencyWindow, MEMORY_SAMPLE_INTERVAL};
 
@@ -179,9 +180,9 @@ impl GpuEncodeStats {
         (!sample.is_idle()).then_some(sample)
     }
 
-    /// Logs the sample as `GPU encode sample`, with the GPU's `health`,
-    /// unless it was idle.
-    pub fn log_sample(&self, health: &SharedGpuHealth) {
+    /// Logs the sample as `GPU encode sample`, with the channel's `lane`
+    /// and the GPU's `health`, unless it was idle.
+    pub fn log_sample(&self, lane: GpuLane, health: &SharedGpuHealth) {
         let Some(s) = self.take_sample() else {
             return;
         };
@@ -200,6 +201,7 @@ impl GpuEncodeStats {
         let (readback_p50_ms, readback_p95_ms, readback_max_ms) = fig(s.readback);
         let (process_p50_ms, process_p95_ms, process_max_ms) = fig(s.process);
         tracing::info!(
+            lane = lane.name(),
             tiles = s.tiles(),
             unsampled = s.unsampled,
             failed = s.failed,
@@ -246,19 +248,21 @@ impl Drop for DepthGuard<'_> {
     }
 }
 
-/// Logs a sample of `stats`, with `health`, every [`MEMORY_SAMPLE_INTERVAL`]
-/// until `shutdown` is cancelled or the stats are dropped with their
-/// channel. Must be called inside a Tokio runtime.
+/// Logs a sample of `lane`'s `stats`, with `health`, every
+/// [`MEMORY_SAMPLE_INTERVAL`] until `shutdown` is cancelled or the stats are
+/// dropped with their channel. Must be called inside a Tokio runtime.
 pub(crate) fn start_sample_log(
+    lane: GpuLane,
     stats: Weak<GpuEncodeStats>,
     health: SharedGpuHealth,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    sample_log_every(MEMORY_SAMPLE_INTERVAL, stats, health, shutdown)
+    sample_log_every(MEMORY_SAMPLE_INTERVAL, lane, stats, health, shutdown)
 }
 
 fn sample_log_every(
     period: Duration,
+    lane: GpuLane,
     stats: Weak<GpuEncodeStats>,
     health: SharedGpuHealth,
     shutdown: CancellationToken,
@@ -275,7 +279,7 @@ fn sample_log_every(
             let Some(stats) = stats.upgrade() else {
                 break;
             };
-            stats.log_sample(&health);
+            stats.log_sample(lane, &health);
         }
     })
 }
@@ -421,12 +425,14 @@ mod tests {
         let stats = GpuEncodeStats::default();
         stats.record_encoded(&timing(1), Duration::from_micros(16_234));
 
-        let events = capture_events(|| stats.log_sample(&SharedGpuHealth::new()));
+        let events =
+            capture_events(|| stats.log_sample(GpuLane::Prefetch, &SharedGpuHealth::new()));
         let line = events
             .iter()
             .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
             .expect("a sample line");
         for (field, value) in [
+            ("lane", "\"prefetch\""),
             ("tiles", "1"),
             ("unsampled", "0"),
             ("failed", "0"),
@@ -455,7 +461,7 @@ mod tests {
         let health = SharedGpuHealth::new();
         health.fail("GPU worker panicked: test");
 
-        let events = capture_events(|| stats.log_sample(&health));
+        let events = capture_events(|| stats.log_sample(GpuLane::Demand, &health));
         let line = events
             .iter()
             .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
@@ -468,7 +474,10 @@ mod tests {
     #[test]
     fn an_idle_sample_logs_nothing() {
         let stats = GpuEncodeStats::default();
-        assert!(capture_events(|| stats.log_sample(&SharedGpuHealth::new())).is_empty());
+        assert!(
+            capture_events(|| stats.log_sample(GpuLane::Demand, &SharedGpuHealth::new()))
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -476,6 +485,7 @@ mod tests {
         let stats = Arc::new(GpuEncodeStats::default());
         let shutdown = CancellationToken::new();
         let task = start_sample_log(
+            GpuLane::Demand,
             Arc::downgrade(&stats),
             SharedGpuHealth::new(),
             shutdown.clone(),
@@ -493,6 +503,7 @@ mod tests {
         let period = Duration::from_millis(10);
         let task = sample_log_every(
             period,
+            GpuLane::Demand,
             Arc::downgrade(&stats),
             SharedGpuHealth::new(),
             CancellationToken::new(),

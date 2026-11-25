@@ -173,6 +173,7 @@ impl XEarthLayerService {
         // 5. Create texture encoder
         let encoder_components = builder::create_encoder(&config)?;
         let dds_encoder = encoder_components.encoder;
+        let prefetch_encoder = encoder_components.prefetch_encoder;
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
         let gpu_shutdown = encoder_components.gpu_shutdown;
         let gpu_adapter = encoder_components.gpu_adapter;
@@ -188,6 +189,7 @@ impl XEarthLayerService {
             config.texture().format(),
             Arc::clone(&dds_encoder),
         )
+        .with_prefetch_encoder(prefetch_encoder)
         .with_async_provider(Arc::clone(&async_provider))
         .with_runtime_handle(runtime_handle.clone())
         .with_metrics_client(metrics_client)

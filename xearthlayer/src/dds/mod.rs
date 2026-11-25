@@ -103,7 +103,7 @@ pub use compressor::{
     ImageCompressor, IspcCompressor, MipmapCompressor, SoftwareCompressor,
 };
 pub use encoder::DdsEncoder;
-pub use gpu_channel::create_gpu_encoder_channel;
+pub use gpu_channel::create_gpu_encoder_channels;
 pub use types::{DdsError, DdsFormat, DdsHeader};
 
 // Re-export for advanced usage

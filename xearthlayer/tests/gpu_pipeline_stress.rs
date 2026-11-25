@@ -156,15 +156,16 @@ mod gpu_stress {
         let device = gpu_device();
 
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let (channel, _worker, selection) = match create_gpu_encoder_channel(&device, shutdown) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Skipping stress test: {e}");
-                return;
-            }
-        };
+        let (channels, _worker, selection) =
+            match create_gpu_encoder_channels(&device, CHANNEL_CAPACITY, shutdown) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Skipping stress test: {e}");
+                    return;
+                }
+            };
 
-        let channel = Arc::new(channel);
+        let channel = Arc::new(channels.demand);
         let stats = Arc::clone(channel.stats());
         let source = Arc::new(test_image(image_size));
         let initial_rss = rss_mb();
