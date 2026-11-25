@@ -59,13 +59,16 @@ impl Default for BrightnessScale {
 }
 
 impl BrightnessScale {
-    /// `R = r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`.
-    pub fn radiance(&self, b: u8) -> f64 {
+    /// `R = r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`. In tests; the
+    /// generator reads radiance through a [`RadianceCurve`].
+    #[cfg(test)]
+    pub(crate) fn radiance(&self, b: u8) -> f64 {
         self.radiance_at(f64::from(b))
     }
 
     /// `radiance` for a fractional byte, as bilinear sampling produces.
-    pub fn radiance_at(&self, b: f64) -> f64 {
+    #[cfg(test)]
+    pub(crate) fn radiance_at(&self, b: f64) -> f64 {
         self.curve().radiance_at(b)
     }
 
@@ -80,7 +83,8 @@ impl BrightnessScale {
 
 /// A [`BrightnessScale`] with `ln(1 + rmax / r0)` computed once: the lit
 /// generator reads a radiance per texel, and the logarithm depends on the
-/// scale alone. Gives the bits `BrightnessScale::radiance_at` gives.
+/// scale alone. Gives the bits `r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`
+/// gives with the logarithm taken on every call.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RadianceCurve {
     scale: BrightnessScale,
@@ -95,11 +99,13 @@ impl Default for RadianceCurve {
 
 impl RadianceCurve {
     /// The scale the curve was made from.
-    pub fn scale(&self) -> BrightnessScale {
+    #[cfg(test)]
+    pub(crate) fn scale(&self) -> BrightnessScale {
         self.scale
     }
 
-    /// `BrightnessScale::radiance_at` without the logarithm.
+    /// `R = r0 * (exp(b / 255 * span) - 1)` for a fractional byte `b`, as
+    /// bilinear sampling produces, with `span` taken once.
     pub fn radiance_at(&self, b: f64) -> f64 {
         self.scale.r0_nw * ((b / 255.0 * self.span).exp() - 1.0)
     }

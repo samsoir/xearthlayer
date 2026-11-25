@@ -68,7 +68,7 @@ impl LitPattern {
 
     /// Bilinear sample at pattern coordinates `(u, v)` in repeats; the
     /// pattern wraps, so any real `u`, `v` is valid. A tap wraps as the
-    /// pattern's [`Wrap`] says, decided once when it was made.
+    /// pattern's wrap says, decided once when it was made.
     pub fn sample(&self, u: f64, v: f64) -> [f32; 3] {
         let n = self.size as f64;
         let (x, y) = (u * n - 0.5, v * n - 0.5);

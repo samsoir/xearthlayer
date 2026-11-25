@@ -45,8 +45,10 @@ fn cell_of(x: f64, y: f64) -> ((i64, i64), f64, f64) {
 }
 
 /// Smooth value noise in `[-1, 1]`: random values at integer lattice points,
-/// blended with a smoothstep, so it is continuous everywhere.
-pub fn value_noise(x: f64, y: f64, seed: u64) -> f64 {
+/// blended with a smoothstep, so it is continuous everywhere. The reference
+/// [`NoisePair`] is tested against.
+#[cfg(test)]
+fn value_noise(x: f64, y: f64, seed: u64) -> f64 {
     let ((ix, iy), sx, sy) = cell_of(x, y);
     blend(&corners(ix, iy, seed), sx, sy)
 }

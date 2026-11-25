@@ -252,8 +252,10 @@ pub struct Patch {
 }
 
 /// The patch at Web Mercator `(x, y)`: the nearest of the 3 x 3 jittered
-/// cell centres around it. A function of position only.
-pub fn patch_at(x: f64, y: f64) -> Patch {
+/// cell centres around it. A function of position only. The reference
+/// [`patch_at_cached`] is tested against.
+#[cfg(test)]
+pub(crate) fn patch_at(x: f64, y: f64) -> Patch {
     patch_at_cached(x, y, &mut PatchCache::default())
 }
 

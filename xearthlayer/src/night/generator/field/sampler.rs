@@ -154,8 +154,8 @@ struct BrightnessLayer {
 
 /// A [`RecipeField`] sampled at the texel centres of one texture: columns
 /// at `lons` and rows at `lats`. Gives the bits of the field's per-point
-/// [`RecipeField::class_weights`] and [`RecipeField::radiance`] at texel
-/// `(row, col)`, which are this sampler over one point.
+/// `RecipeField::class_weights` and `RecipeField::radiance` (test only) at
+/// texel `(row, col)`, which are this sampler over one point.
 ///
 /// The warp noise keeps the corner values of the last lattice cell it
 /// read, so texels sampled in raster order hash once per cell (about 20 to
@@ -221,7 +221,8 @@ impl<'f> FieldSampler<'f> {
 
     /// The class weights at texel `(row, col)`, into `out`: the bilinear
     /// weights of the four class cell centres around the warped position,
-    /// merged per class (see [`RecipeField::class_weights`]).
+    /// merged per class. Class 0 and cells without a recipe carry no entry,
+    /// so the weights sum to less than 1 near the edge of classified ground.
     pub fn class_weights(&mut self, row: usize, col: usize, out: &mut Vec<ClassWeight>) {
         out.clear();
         let Some(class) = &self.class else {

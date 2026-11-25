@@ -197,9 +197,11 @@ impl RecipeField {
     }
 
     /// Radiance (nW/cm2/sr) at a point: the brightness byte, bilinear
-    /// between cell centres; 0 where no recipe contributes. For one point; a
-    /// texture samples through a [`FieldSampler`], which gives the same bits.
-    pub fn radiance(&self, lat: f64, lon: f64) -> f64 {
+    /// between cell centres; 0 where no recipe contributes. For one point,
+    /// in tests; a texture samples through a [`FieldSampler`], which gives
+    /// the same bits.
+    #[cfg(test)]
+    pub(crate) fn radiance(&self, lat: f64, lon: f64) -> f64 {
         FieldSampler::new(self, &[lon], &[lat]).radiance(0, 0)
     }
 }
@@ -251,9 +253,10 @@ impl RecipeField {
     /// Class 0 and cells without a recipe carry no entry, so the weights sum
     /// to less than 1 near the edge of classified ground.
     ///
-    /// For one point; a texture samples through a [`FieldSampler`], which
-    /// gives the same bits.
-    pub fn class_weights(&self, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
+    /// For one point, in tests; a texture samples through a
+    /// [`FieldSampler`], which gives the same bits.
+    #[cfg(test)]
+    pub(crate) fn class_weights(&self, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
         FieldSampler::new(self, &[lon], &[lat]).class_weights(0, 0, out);
     }
 
