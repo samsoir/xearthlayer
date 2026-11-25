@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### GPU
 
-- **The GPU encoder reports where its time goes** ([#419](https://github.com/samsoir/xearthlayer/issues/419)): With `texture.compressor = gpu`, the flight log gets a `GPU encode sample` line every minute in which tiles were encoded. It gives the time each tile spent waiting for the GPU worker, building its smaller levels, uploading to the GPU, compressing and reading back, how many tiles were waiting at most, and how many failed; `run --debug` adds a line per tile, and `run --profile` shows each stage in the trace. Measured with it on one laptop, the GPU path encodes up to about 55 tiles a second, a third of what ISPC does across all CPU cores, and a discrete NVIDIA GPU slows to about 14 tiles a second when its driver lowers its clocks between bursts of tiles. See [GPU encoding](docs/dev/gpu-encoding-design.md#performance).
+- **The GPU encoder reports where its time goes** ([#419](https://github.com/samsoir/xearthlayer/issues/419)): With `texture.compressor = gpu`, the flight log gets a `GPU encode sample` line every minute in which tiles were encoded. It gives the time each tile spent waiting for the GPU worker, building its smaller levels, uploading to the GPU, compressing and reading back, how many tiles were waiting at most, and how many failed; `run --debug` adds a line per tile, and `run --profile` shows each stage in the trace. Reference figures from one laptop (its integrated Radeon and its laptop RTX 5070, not representative of most systems) are in the design document. See [GPU encoding](docs/dev/gpu-encoding-design.md#performance).
 
 ### Changed
 

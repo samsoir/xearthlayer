@@ -209,7 +209,7 @@ The `MipmapCompressor` trait accepts an owned `RgbaImage`, which is moved (not c
 
 ## Performance
 
-Measured on 2026-11-24 with `tests/gpu_pipeline_stress.rs` (#419), on a quiet Framework 16 (Ryzen AI 9 HX 370, 24 threads, on AC power). The tile is a textured 4096×4096 image with its full 13-level chain, encoded to BC1 in a release build. "Lone" is 10 tiles, one at a time, after a warm-up. "Burst" is 15 tiles submitted at once, then 1 s idle, for 40 s. Times are p50 per tile in ms.
+Measured on 2026-11-24 with `tests/gpu_pipeline_stress.rs` (#419), on a quiet Framework 16 laptop (Ryzen AI 9 HX 370, 24 threads, on AC power) with an integrated Radeon 890M and the laptop RTX 5070. **These are reference figures from one laptop, not representative of most systems**: a desktop GPU, CPU or driver can rank the stages and the two paths differently. Use them to compare stages and changes on the same machine, and rerun the stress test on the hardware in question. The tile is a textured 4096×4096 image with its full 13-level chain, encoded to BC1 in a release build. "Lone" is 10 tiles, one at a time, after a warm-up. "Burst" is 15 tiles submitted at once, then 1 s idle, for 40 s. Times are p50 per tile in ms.
 
 | Stage | Radeon 890M (integrated, RADV) lone | burst | RTX 5070 Laptop (discrete) lone | burst, first bursts |
 |---|---|---|---|---|
@@ -229,7 +229,7 @@ What the numbers show:
 - **The single worker sets the GPU path's throughput.** Throughput is about 1 / worker total, about 55 tiles/s at best, a third of ISPC across all cores. Under a burst, a tile's latency is almost all queue wait, growing with its place in the queue.
 - **A lone tile is only a little faster than ISPC on one thread:** about 25 ms against 32 ms. Of that, 5 to 6 ms is the idle worker's 10 ms poll (`try_recv` and sleep).
 - **The CPU downsample, which runs on the worker thread, is its largest stage on the integrated GPU.** Upload is not free there either (4.3 ms, shared memory); on the discrete GPU it is the largest stage (8.2 ms over PCIe).
-- **The NVIDIA driver's power management cuts the discrete GPU's rate by two thirds under bursty work.** After about 7 bursts with 1 s idle gaps, the driver moved the GPU from P0 (12,001 MHz memory, PCIe gen 4) to P5 and P8 (810 and 405 MHz memory, PCIe gen 1 to 2) at 38 °C. Upload rose to 31 ms and submit-to-poll to 21 ms, and throughput fell to 14 tiles/s, in two runs out of two. Bursts back to back stayed at about 45 tiles/s. A discrete GPU that renders nothing else between tiles sees this load pattern in flight.
+- **On this laptop, the NVIDIA driver's power management cut the discrete GPU's rate by two thirds under bursty work.** After about 7 bursts with 1 s idle gaps, the driver moved the GPU from P0 (12,001 MHz memory, PCIe gen 4) to P5 and P8 (810 and 405 MHz memory, PCIe gen 1 to 2) at 38 °C. Upload rose to 31 ms and submit-to-poll to 21 ms, and throughput fell to 14 tiles/s, in two runs out of two. Bursts back to back stayed at about 45 tiles/s. Whether a desktop GPU or another driver does the same is not known; a GPU that renders nothing else between tiles would see this load pattern in flight.
 - **Memory:** process RSS grew about 200 MB on the NVIDIA driver over a run, and between 3 and 110 MB on RADV.
 
 The GPU figure is wall time from submit to poll, driver included: timestamp queries are not used. Header assembly in `DdsEncoder` is not in the table.
