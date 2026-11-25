@@ -49,9 +49,8 @@ impl StatsSnapshot {
     }
 }
 
-/// What one tile build did, recorded once when the build ends, which may be
-/// before its permit is released: a built tile hands the permit to the
-/// write of its cache entries.
+/// What one tile build did, recorded once when the build ends, after its
+/// permit is released and before its cache entries are written.
 #[derive(Debug, Clone, Default)]
 pub struct BuildRecord {
     pub ready: bool,

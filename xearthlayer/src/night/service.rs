@@ -94,9 +94,11 @@ impl LitTextureSource for BlackLitSource {
 const LIT_PROBE_PERMITS: usize = 2;
 
 /// Concurrent lit disk tier work: fingerprinting (art walk and recipe stats)
-/// with the read of an entry, or the write-back of a generated one. The
-/// permits sit inside the blocking pool's `BLOCKING_POOL_HEADROOM`.
-const LIT_DISK_PERMITS: usize = 2;
+/// with the read of an entry, or the write-back of a generated one, or of a
+/// road tile's extractions (the road service's permits are these when
+/// attached, #429). The permits sit inside the blocking pool's
+/// `BLOCKING_POOL_HEADROOM`.
+pub(crate) const LIT_DISK_PERMITS: usize = 2;
 
 /// Zoom levels a lit footprint is computed for. `parse_dds_filename` accepts
 /// any two-digit zoom and `Footprint::from_name` shifts by it, so anything
@@ -108,10 +110,11 @@ const SUPPORTED_LIT_ZOOMS: std::ops::RangeInclusive<u8> = 12..=22;
 const MIN_LIT_GENERATION_PERMITS: usize = 2;
 const MAX_LIT_GENERATION_PERMITS: usize = 4;
 
-// Lit work (probes, generations, disk tier, road extraction) runs on the
-// blocking pool inside its headroom (R17); night may use a third of it so it
-// cannot starve other blocking work. The night share is fully used (10 of
-// 10): a new night permit needs a smaller one elsewhere or a larger headroom.
+// Lit work (probes, generations, disk tier with the road entries' writes,
+// road extraction) runs on the blocking pool inside its headroom (R17);
+// night may use a third of it so it cannot starve other blocking work. The
+// night share is fully used (10 of 10): a new night permit needs a smaller
+// one elsewhere or a larger headroom.
 const _: () = assert!(
     LIT_PROBE_PERMITS
         + MAX_LIT_GENERATION_PERMITS
@@ -287,7 +290,8 @@ pub struct NightLitSource {
     generator: Arc<dyn LitGenerator>,
     /// Lit payloads on disk, from the cache layer; None when caching is off.
     disk: Option<Arc<dyn Cache>>,
-    /// Shared with the detached write-backs, which hold a permit too.
+    /// Shared with the detached write-backs, which hold a permit too, and
+    /// with the road service's writes when roads are attached.
     disk_io: Arc<tokio::sync::Semaphore>,
     /// Fingerprint of the session's inputs (generator, brightness, art,
     /// road model), computed on the first payload, after the builders have
@@ -414,8 +418,11 @@ impl NightLitSource {
     }
 
     /// Light roads from `roads`: in the probe, in generation and in the
-    /// disk tier's fingerprints.
+    /// disk tier's fingerprints. The source's lit disk permits become the
+    /// road service's, which the writes of its road entries take, so the
+    /// lit disk tier's work stays within them.
     pub fn with_roads(mut self, roads: Arc<RoadService>) -> Self {
+        self.disk_io = roads.disk_permits();
         self.roads = Some(roads);
         self
     }
@@ -2182,13 +2189,42 @@ mod tests {
         const LONG: u64 = 10_000;
 
         /// A road service over `xp` that waits `probe_ms` for a probe and
-        /// `generate_ms` for a generation, its builds held by `gate` when
-        /// one is given (each `add_permits(1)` lets one build run).
+        /// `generate_ms` for a generation from the first ask (caps equal to
+        /// the waits), its builds held by `gate` when one is given (each
+        /// `add_permits(1)` lets one build run).
         fn roads(
             xp: std::path::PathBuf,
             probe_ms: u64,
             generate_ms: u64,
             gate: Option<Arc<tokio::sync::Semaphore>>,
+        ) -> Arc<RoadService> {
+            let (probe, generate) = (
+                Duration::from_millis(probe_ms),
+                Duration::from_millis(generate_ms),
+            );
+            RoadService::with_config(
+                xp,
+                vec![],
+                None,
+                RoadServiceConfig {
+                    probe_wait: probe,
+                    probe_cap: probe,
+                    generate_wait: generate,
+                    generate_cap: generate,
+                    gate,
+                    ..RoadServiceConfig::default()
+                },
+            )
+        }
+
+        /// A road service over `xp` with one extract permit, whose builds
+        /// each take a permit of `hold` once they hold it, and whose probes
+        /// wait `probe_ms` from their build's permit, `cap_ms` at most.
+        fn held_roads(
+            xp: std::path::PathBuf,
+            probe_ms: u64,
+            cap_ms: u64,
+            hold: Arc<tokio::sync::Semaphore>,
         ) -> Arc<RoadService> {
             RoadService::with_config(
                 xp,
@@ -2196,11 +2232,27 @@ mod tests {
                 None,
                 RoadServiceConfig {
                     probe_wait: Duration::from_millis(probe_ms),
-                    generate_wait: Duration::from_millis(generate_ms),
-                    gate,
+                    probe_cap: Duration::from_millis(cap_ms),
+                    extract_permits: 1,
+                    hold: Some(hold),
                     ..RoadServiceConfig::default()
                 },
             )
+        }
+
+        /// The tile north of the fixture's, which no fixture footprint asks
+        /// for: its build is started and holds the only extract permit.
+        async fn hold_the_permit(roads: &Arc<RoadService>) {
+            let other = (TILE.0 + 1, TILE.1);
+            assert!(!road_tiles(&dark_name(), 1024, &RoadModel::DEFAULT).contains(&other));
+            roads.ensure(other, Trigger::DsfOpen);
+            for _ in 0..500 {
+                if roads.extract_permits_free() == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            panic!("the other build never got its permit");
         }
 
         /// A shut build gate.
@@ -2435,10 +2487,60 @@ mod tests {
                 gate.add_permits(1);
             });
             assert_eq!(size, source.layout(&name).total_len, "lit by the road");
+            // Whether it waited depends on how long its recipe read took;
+            // that it never answered before the roads does not.
             let s = roads.stats_snapshot();
-            assert_eq!((s.probe_waits, s.probe_timeouts), (1, 0));
-            assert_eq!(s.answered_before_roads, 0);
+            assert_eq!((s.probe_timeouts, s.answered_before_roads), (0, 0));
             assert_eq!(source.stats.snapshot().probes(ProbeAnswer::Road), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_probe_waits_from_its_builds_permit_not_from_its_queue() {
+            // #429: the probe's tile queues for the extract permit longer
+            // than the probe wait; its wait starts when it gets the permit.
+            let temp = TempDir::new().unwrap();
+            let name = dark_name();
+            let hold = shut();
+            let roads = held_roads(
+                xp_install(&temp, Some(road_across(&name))),
+                1_000,
+                LONG,
+                hold.clone(),
+            );
+            let source = source_in(&temp).with_roads(roads.clone());
+            hold_the_permit(&roads).await;
+            let (size, ()) = tokio::join!(source.size(&name), async {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                // The held build, then the probe's.
+                hold.add_permits(2);
+            });
+            assert_eq!(size, source.layout(&name).total_len, "lit by the road");
+            let s = roads.stats_snapshot();
+            assert_eq!((s.probe_timeouts, s.answered_before_roads), (0, 0));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_probe_queued_past_its_cap_answers_dark_and_counts_it() {
+            let temp = TempDir::new().unwrap();
+            let name = dark_name();
+            let hold = shut();
+            let cap = Duration::from_millis(400);
+            let roads = held_roads(
+                xp_install(&temp, Some(road_across(&name))),
+                100,
+                cap.as_millis() as u64,
+                hold.clone(),
+            );
+            let source = source_in(&temp).with_roads(roads.clone());
+            hold_the_permit(&roads).await;
+            let started = Instant::now();
+            assert_eq!(source.size(&name).await, 152, "committed without roads");
+            let waited = started.elapsed();
+            assert!(waited >= cap, "{waited:?}: waited until the cap");
+            assert!(waited < Duration::from_secs(5), "{waited:?}");
+            let s = roads.stats_snapshot();
+            assert_eq!((s.probe_timeouts, s.answered_before_roads), (1, 1));
+            hold.add_permits(2);
         }
 
         #[tokio::test]
