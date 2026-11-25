@@ -80,6 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### FUSE
 
+- **A recoverable error no longer takes the scenery away** ([#418](https://github.com/samsoir/xearthlayer/issues/418)): When anything inside XEarthLayer panicked, its panic handler unmounted the scenery before anyone knew whether the panic would be caught. Almost every panic during a flight is caught, in one tile's download, decode or encode, in night lighting generation or in the GPU encoder, and XEarthLayer carried on with its dashboard up but serving nothing: X-Plane saw an empty scenery folder until XEarthLayer was restarted. The panic handler now only writes its report to the flight log, and the scenery is unmounted only when XEarthLayer is really ending, as `xearthlayer run` exits.
+- **A failure during startup under the dashboard no longer hangs with the scenery mounted** ([#418](https://github.com/samsoir/xearthlayer/issues/418)): A panic while `xearthlayer run` was starting up under the dashboard (mounting, building the scenery index, starting prefetch) left the loading screen up forever, deaf to Ctrl+C. It now ends `run`, which unmounts and exits.
 - **The first tile timeout no longer stalls other requests** ([#386](https://github.com/samsoir/xearthlayer/issues/386)): The magenta texture XEarthLayer serves for a tile it could not produce in time was built the first time it was needed, by encoding a full 4096×4096 image on a thread that also serves X-Plane's file requests, while other failing requests waited for it. It is now built once at startup from a single repeated colour block, in a few milliseconds. It looks and is exactly the same.
 
 #### GPU
