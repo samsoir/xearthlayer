@@ -30,11 +30,13 @@ pub struct DdsTextureEncoder {
     /// Mipmap levels to emit; `None` means the full chain for the texture size.
     mipmap_count: Option<usize>,
     /// Image compressor for per-level encoding (ISPC, Software). Always
-    /// initialized to the default compressor even when `mipmap_compressor`
-    /// is set.
+    /// initialized to the default compressor (ISPC); when
+    /// `mipmap_compressor` is set it is that backend's fallback, encoding
+    /// the images it hands back (#420).
     compressor: Arc<dyn ImageCompressor>,
     /// When set, `encode()` delegates the full mipmap chain to this backend
-    /// instead of iterating levels via `MipmapStream` + `compressor`.
+    /// instead of iterating levels via `MipmapStream` + `compressor`, which
+    /// encodes only what the backend hands back.
     mipmap_compressor: Option<Arc<dyn crate::dds::MipmapCompressor>>,
 }
 
@@ -121,7 +123,8 @@ impl DdsTextureEncoder {
     /// Use a mipmap compressor backend (GPU pipeline).
     ///
     /// When set, the encoder delegates the full mipmap chain to this backend
-    /// instead of using the image compressor per level.
+    /// instead of using the image compressor per level; the image compressor
+    /// encodes the images the backend hands back (a failed GPU, #420).
     pub fn with_mipmap_compressor(
         mut self,
         compressor: Arc<dyn crate::dds::MipmapCompressor>,
@@ -163,7 +166,7 @@ impl TextureEncoder for DdsTextureEncoder {
         }
 
         if let Some(ref mc) = self.mipmap_compressor {
-            encoder = encoder.with_mipmap_compressor(Arc::clone(mc));
+            encoder = encoder.with_mipmap_compressor(Arc::clone(mc), Arc::clone(&self.compressor));
         } else {
             encoder = encoder.with_compressor(Arc::clone(&self.compressor));
         }
@@ -384,6 +387,43 @@ mod tests {
         let image = RgbaImage::new(4, 4);
         assert!(encoder1.encode(image.clone()).is_ok());
         assert!(encoder2.encode(image).is_ok());
+    }
+
+    /// With a mipmap backend, the default compressor (ISPC) is its fallback:
+    /// an image the backend hands back is the ISPC encode, byte for byte
+    /// (#420).
+    #[test]
+    fn an_image_the_mipmap_backend_hands_back_is_encoded_with_ispc() {
+        use crate::dds::{ChainOutcome, DdsError, MipmapCompressor};
+
+        struct HandsBack;
+        impl MipmapCompressor for HandsBack {
+            fn compress_mipmap_chain(
+                &self,
+                image: RgbaImage,
+                _format: DdsFormat,
+                _mipmap_count: usize,
+            ) -> Result<ChainOutcome, DdsError> {
+                Ok(ChainOutcome::Returned {
+                    image,
+                    reason: "GPU device lost".to_string(),
+                })
+            }
+            fn name(&self) -> &str {
+                "hands-back"
+            }
+        }
+
+        let image = RgbaImage::from_fn(256, 256, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, 255])
+        });
+        let gpu =
+            DdsTextureEncoder::new(DdsFormat::BC1).with_mipmap_compressor(Arc::new(HandsBack));
+        let ispc = DdsTextureEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(crate::dds::IspcCompressor));
+        let dds = gpu.encode(image.clone()).unwrap();
+        assert_eq!(dds.len(), gpu.expected_size(256, 256));
+        assert_eq!(dds, ispc.encode(image).unwrap());
     }
 
     #[test]

@@ -6,10 +6,14 @@
 //!   buffer of the file's exact size; the encoder manages mipmap iteration via
 //!   [`MipmapStream`].
 //! - [`MipmapCompressor`] backends (GPU channel) own the full mipmap pipeline;
-//!   the encoder only handles DDS header assembly.
+//!   the encoder only handles DDS header assembly. Such a backend comes with
+//!   a fallback [`ImageCompressor`]: an image the backend hands back
+//!   ([`ChainOutcome::Returned`], a failed GPU, #420) is encoded with it
+//!   through the same in-place loop, so the file is byte for byte the
+//!   fallback's.
 
 use crate::dds::compressor::{
-    compress_level_into, default_compressor, ImageCompressor, MipmapCompressor,
+    compress_level_into, default_compressor, ChainOutcome, ImageCompressor, MipmapCompressor,
 };
 use crate::dds::layout;
 use crate::dds::mipmap::MipmapStream;
@@ -22,8 +26,12 @@ use tracing::debug;
 enum CompressorBackend {
     /// Single-level compressor — encoder manages mipmap iteration.
     Image(Arc<dyn ImageCompressor>),
-    /// Full-pipeline compressor — backend owns mipmap iteration.
-    Mipmap(Arc<dyn MipmapCompressor>),
+    /// Full-pipeline compressor — backend owns mipmap iteration — and the
+    /// single-level compressor that encodes what it hands back.
+    Mipmap {
+        compressor: Arc<dyn MipmapCompressor>,
+        fallback: Arc<dyn ImageCompressor>,
+    },
 }
 
 /// DDS encoder configuration.
@@ -66,13 +74,24 @@ impl DdsEncoder {
         self
     }
 
-    /// Use a mipmap compressor backend that owns the full pipeline.
+    /// Use a mipmap compressor backend that owns the full pipeline, and
+    /// `fallback` for the images it hands back.
     ///
     /// The backend receives the source image and returns compressed data
     /// for all mipmap levels. This avoids per-level channel round-trips
-    /// for GPU-based compression.
-    pub fn with_mipmap_compressor(mut self, compressor: Arc<dyn MipmapCompressor>) -> Self {
-        self.backend = CompressorBackend::Mipmap(compressor);
+    /// for GPU-based compression. An image the backend does not take
+    /// ([`ChainOutcome::Returned`]: the GPU worker failed or is gone, #420)
+    /// is encoded with `fallback` as [`with_compressor`](Self::with_compressor)
+    /// would encode it.
+    pub fn with_mipmap_compressor(
+        mut self,
+        compressor: Arc<dyn MipmapCompressor>,
+        fallback: Arc<dyn ImageCompressor>,
+    ) -> Self {
+        self.backend = CompressorBackend::Mipmap {
+            compressor,
+            fallback,
+        };
         self
     }
 
@@ -124,9 +143,17 @@ impl DdsEncoder {
             1
         };
         match &self.backend {
-            CompressorBackend::Mipmap(compressor) => {
-                self.encode_with_mipmap_compressor(compressor, image, width, height, count)
-            }
+            CompressorBackend::Mipmap {
+                compressor,
+                fallback,
+            } => self.encode_with_mipmap_compressor(
+                compressor,
+                fallback.as_ref(),
+                image,
+                width,
+                height,
+                count,
+            ),
             CompressorBackend::Image(compressor) => {
                 self.encode_mipmap_stream(compressor.as_ref(), image, width, height, count)
             }
@@ -204,10 +231,12 @@ impl DdsEncoder {
     /// Delegate compression to a MipmapCompressor backend.
     ///
     /// The backend owns mipmap generation and compression. This method
-    /// only handles DDS header assembly.
+    /// only handles DDS header assembly, unless the backend hands the image
+    /// back: then `fallback` encodes it ([`encode_mipmap_stream`](Self::encode_mipmap_stream)).
     fn encode_with_mipmap_compressor(
         &self,
         compressor: &Arc<dyn MipmapCompressor>,
+        fallback: &dyn ImageCompressor,
         image: RgbaImage,
         width: u32,
         height: u32,
@@ -222,7 +251,18 @@ impl DdsEncoder {
             "Delegating mipmap chain to MipmapCompressor"
         );
 
-        let compressed = compressor.compress_mipmap_chain(image, self.format, count)?;
+        let compressed = match compressor.compress_mipmap_chain(image, self.format, count)? {
+            ChainOutcome::Compressed(compressed) => compressed,
+            ChainOutcome::Returned { image, reason } => {
+                debug!(
+                    backend = compressor.name(),
+                    fallback = fallback.name(),
+                    reason = %reason,
+                    "MipmapCompressor handed the image back, encoding on the fallback"
+                );
+                return self.encode_mipmap_stream(fallback, image, width, height, count);
+            }
+        };
 
         // Timed for the GPU path's stages (#419): the copy behind the header
         // is the whole payload.
@@ -352,9 +392,9 @@ mod tests {
                 _image: RgbaImage,
                 _format: DdsFormat,
                 _mipmap_count: usize,
-            ) -> Result<Vec<u8>, DdsError> {
+            ) -> Result<ChainOutcome, DdsError> {
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok(Vec::new())
+                Ok(ChainOutcome::Compressed(Vec::new()))
             }
             fn name(&self) -> &str {
                 "recording"
@@ -363,7 +403,10 @@ mod tests {
 
         let backend = Arc::new(Recording(std::sync::atomic::AtomicBool::new(false)));
         let result = DdsEncoder::new(DdsFormat::BC3)
-            .with_mipmap_compressor(Arc::clone(&backend) as Arc<dyn MipmapCompressor>)
+            .with_mipmap_compressor(
+                Arc::clone(&backend) as Arc<dyn MipmapCompressor>,
+                Arc::new(IspcCompressor),
+            )
             .encode(RgbaImage::new(256, 256));
 
         assert!(matches!(result, Err(DdsError::UnsupportedFormat(_))));
@@ -529,11 +572,11 @@ mod tests {
                 image: RgbaImage,
                 format: DdsFormat,
                 mipmap_count: usize,
-            ) -> Result<Vec<u8>, DdsError> {
+            ) -> Result<ChainOutcome, DdsError> {
                 assert_eq!(image.dimensions(), (256, 256));
                 assert_eq!(format, DdsFormat::BC1);
                 assert_eq!(mipmap_count, 5);
-                Ok(self.expected_bc1_data.clone())
+                Ok(ChainOutcome::Compressed(self.expected_bc1_data.clone()))
             }
 
             fn name(&self) -> &str {
@@ -553,7 +596,7 @@ mod tests {
 
         let encoder = DdsEncoder::new(DdsFormat::BC1)
             .with_mipmap_count(5)
-            .with_mipmap_compressor(Arc::new(compressor));
+            .with_mipmap_compressor(Arc::new(compressor), Arc::new(IspcCompressor));
 
         let image = RgbaImage::new(256, 256);
         let result = encoder.encode(image).unwrap();
@@ -581,14 +624,14 @@ mod tests {
                 image: RgbaImage,
                 format: DdsFormat,
                 mipmap_count: usize,
-            ) -> Result<Vec<u8>, DdsError> {
+            ) -> Result<ChainOutcome, DdsError> {
                 let sw = SoftwareCompressor;
                 let mut output = Vec::new();
                 for level in MipmapStream::new(image, mipmap_count) {
                     let compressed = sw.compress(&level, format)?;
                     output.extend_from_slice(&compressed);
                 }
-                Ok(output)
+                Ok(ChainOutcome::Compressed(output))
             }
 
             fn name(&self) -> &str {
@@ -607,11 +650,87 @@ mod tests {
         // MipmapCompressor path (backend-owned pipeline)
         let mipmap_encoder = DdsEncoder::new(DdsFormat::BC1)
             .with_mipmap_count(5)
-            .with_mipmap_compressor(Arc::new(SoftwareMipmapCompressor));
+            .with_mipmap_compressor(Arc::new(SoftwareMipmapCompressor), Arc::new(IspcCompressor));
         let mipmap_result = mipmap_encoder.encode(image).unwrap();
 
         // Byte-for-byte parity
         assert_eq!(image_result, mipmap_result);
+    }
+
+    // =========================================================================
+    // The fallback for images a mipmap backend hands back (#420)
+    // =========================================================================
+
+    /// A backend that hands every image back, counting them.
+    struct HandsBack(std::sync::atomic::AtomicUsize);
+
+    impl MipmapCompressor for HandsBack {
+        fn compress_mipmap_chain(
+            &self,
+            image: RgbaImage,
+            _format: DdsFormat,
+            _mipmap_count: usize,
+        ) -> Result<ChainOutcome, DdsError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChainOutcome::Returned {
+                image,
+                reason: "GPU worker panicked: test".to_string(),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "hands-back"
+        }
+    }
+
+    /// A returned image is encoded by the fallback, byte for byte what
+    /// that compressor alone produces, for every shape and level count:
+    /// the same in-place loop, the same header.
+    #[test]
+    fn a_returned_image_is_the_fallbacks_encode_byte_for_byte() {
+        let backend = Arc::new(HandsBack(Default::default()));
+        let mut asked = 0;
+        for kernel in cpu_kernels() {
+            for (w, h) in SHAPES {
+                for requested in REQUESTS {
+                    let image = varied(w, h);
+                    let expected = encoder_for(&kernel, requested)
+                        .encode(image.clone())
+                        .unwrap();
+                    let encoder = DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
+                        Arc::clone(&backend) as Arc<dyn MipmapCompressor>,
+                        Arc::clone(&kernel),
+                    );
+                    let encoder = match requested {
+                        None => encoder,
+                        Some(count) => encoder.with_mipmap_count(count as usize),
+                    };
+                    let dds = encoder.encode(image).unwrap();
+                    asked += 1;
+                    assert_eq!(dds, expected, "{} {w}x{h} {requested:?}", kernel.name());
+                    assert_eq!(dds.capacity(), dds.len(), "one buffer at the file's size");
+                }
+            }
+        }
+        assert_eq!(
+            backend.0.load(std::sync::atomic::Ordering::SeqCst),
+            asked,
+            "the backend was asked first every time"
+        );
+    }
+
+    /// The production tile through the ISPC fallback.
+    #[test]
+    fn a_returned_4096_tile_is_the_ispc_encode() {
+        let ispc: Arc<dyn ImageCompressor> = Arc::new(IspcCompressor);
+        let image = varied(4096, 4096);
+        let expected = encoder_for(&ispc, None).encode(image.clone()).unwrap();
+        let dds = DdsEncoder::new(DdsFormat::BC1)
+            .with_mipmap_compressor(Arc::new(HandsBack(Default::default())), ispc)
+            .encode(image)
+            .unwrap();
+        assert_eq!(dds.len(), 11_184_952);
+        assert!(dds == expected, "the bytes differ");
     }
 
     // =========================================================================

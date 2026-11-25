@@ -2,8 +2,9 @@
 //! tile, and how many requests are in the channel.
 //!
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel) records
-//! every request it sends: the stages of each encoded tile, and a count of
-//! the requests that came back without one. In the service, a task started
+//! every request it is given: the stages of each encoded tile, a count of
+//! the requests that came back without one, and a count of the images the
+//! GPU did not take, which the encoder's fallback encodes on the CPU (#420). In the service, a task started
 //! by `service::builder::create_encoder` closes the window every
 //! `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
 //! logs one `GPU encode sample` line. Anything else holding a channel must
@@ -19,6 +20,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::gpu_channel::GpuTileTiming;
+use super::gpu_health::SharedGpuHealth;
 use crate::metrics::{LatencySummary, LatencyWindow, MEMORY_SAMPLE_INTERVAL};
 
 /// Tiles one window summarises at most. Past it a tile is only counted
@@ -59,9 +61,13 @@ pub struct GpuSample {
     /// Encoded tiles past [`WINDOW_CAP`], in no summary.
     pub unsampled: u64,
     /// Requests that came back without a tile: an error from the worker,
-    /// a worker not running or gone before replying, or a handle already
-    /// shut down.
+    /// a worker gone before replying, or a handle already shut down.
     pub failed: u64,
+    /// Images the GPU did not take, handed back for the encoder's fallback
+    /// to encode on the CPU (#420): the GPU had failed, its worker was not
+    /// running, or the worker handed its queue back. Neither tiles nor
+    /// failures.
+    pub fallback: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).
     pub depth_now: usize,
@@ -77,7 +83,11 @@ impl GpuSample {
 
     /// Nothing was encoded, failed or waiting during the sample.
     fn is_idle(&self) -> bool {
-        self.tiles() == 0 && self.failed == 0 && self.depth_max == 0 && self.depth_now == 0
+        self.tiles() == 0
+            && self.failed == 0
+            && self.fallback == 0
+            && self.depth_max == 0
+            && self.depth_now == 0
     }
 }
 
@@ -87,6 +97,7 @@ impl GpuSample {
 pub struct GpuEncodeStats {
     window: Mutex<StageWindows>,
     failed: AtomicU64,
+    fallback: AtomicU64,
     depth: AtomicUsize,
     depth_peak: AtomicUsize,
 }
@@ -120,6 +131,11 @@ impl GpuEncodeStats {
         self.failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one image the GPU did not take, handed back to the caller.
+    pub fn record_fallback(&self) {
+        self.fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Requests in the channel now: buffered, blocked in `blocking_send` on
     /// a full channel, and in progress. The channel's own
     /// `max_capacity() - capacity()` sees only the buffered ones.
@@ -142,6 +158,7 @@ impl GpuEncodeStats {
         // The next sample's peak starts from what is in the channel now.
         let depth_max = self.depth_peak.swap(depth_now, Ordering::Relaxed);
         let failed = self.failed.swap(0, Ordering::Relaxed);
+        let fallback = self.fallback.swap(0, Ordering::Relaxed);
         let mut w = self.window.lock().ok()?;
         w.recorded = 0;
         let sample = GpuSample {
@@ -154,14 +171,16 @@ impl GpuEncodeStats {
             total: w.total.take(),
             unsampled: std::mem::take(&mut w.unsampled),
             failed,
+            fallback,
             depth_now,
             depth_max: depth_max.max(depth_now),
         };
         (!sample.is_idle()).then_some(sample)
     }
 
-    /// Logs the sample as `GPU encode sample`, unless it was idle.
-    pub fn log_sample(&self) {
+    /// Logs the sample as `GPU encode sample`, with the GPU's `health`,
+    /// unless it was idle.
+    pub fn log_sample(&self, health: &SharedGpuHealth) {
         let Some(s) = self.take_sample() else {
             return;
         };
@@ -183,6 +202,12 @@ impl GpuEncodeStats {
             tiles = s.tiles(),
             unsampled = s.unsampled,
             failed = s.failed,
+            fallback = s.fallback,
+            health = if health.is_failed() {
+                "failed"
+            } else {
+                "healthy"
+            },
             depth_now = s.depth_now,
             depth_max = s.depth_max,
             total_p50_ms,
@@ -220,19 +245,21 @@ impl Drop for DepthGuard<'_> {
     }
 }
 
-/// Logs a sample of `stats` every [`MEMORY_SAMPLE_INTERVAL`] until
-/// `shutdown` is cancelled or the stats are dropped with their channel.
-/// Must be called inside a Tokio runtime.
+/// Logs a sample of `stats`, with `health`, every [`MEMORY_SAMPLE_INTERVAL`]
+/// until `shutdown` is cancelled or the stats are dropped with their
+/// channel. Must be called inside a Tokio runtime.
 pub(crate) fn start_sample_log(
     stats: Weak<GpuEncodeStats>,
+    health: SharedGpuHealth,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    sample_log_every(MEMORY_SAMPLE_INTERVAL, stats, shutdown)
+    sample_log_every(MEMORY_SAMPLE_INTERVAL, stats, health, shutdown)
 }
 
 fn sample_log_every(
     period: Duration,
     stats: Weak<GpuEncodeStats>,
+    health: SharedGpuHealth,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -247,7 +274,7 @@ fn sample_log_every(
             let Some(stats) = stats.upgrade() else {
                 break;
             };
-            stats.log_sample();
+            stats.log_sample(&health);
         }
     })
 }
@@ -320,6 +347,16 @@ mod tests {
     }
 
     #[test]
+    fn handed_back_images_are_counted_apart_from_tiles_and_failures() {
+        let stats = GpuEncodeStats::default();
+        stats.record_fallback();
+        stats.record_fallback();
+        let s = stats.take_sample().expect("a fallback is not idle");
+        assert_eq!((s.tiles(), s.failed, s.fallback), (0, 0, 2));
+        assert!(stats.take_sample().is_none(), "taking starts a new sample");
+    }
+
+    #[test]
     fn a_sample_of_failures_only_is_not_idle() {
         let stats = GpuEncodeStats::default();
         stats.record_failed();
@@ -383,7 +420,7 @@ mod tests {
         let stats = GpuEncodeStats::default();
         stats.record_encoded(&timing(1), Duration::from_micros(16_234));
 
-        let events = capture_events(|| stats.log_sample());
+        let events = capture_events(|| stats.log_sample(&SharedGpuHealth::new()));
         let line = events
             .iter()
             .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
@@ -392,6 +429,8 @@ mod tests {
             ("tiles", "1"),
             ("unsampled", "0"),
             ("failed", "0"),
+            ("fallback", "0"),
+            ("health", "\"healthy\""),
             ("depth_now", "0"),
             ("depth_max", "0"),
             ("total_max_ms", "16.23"),
@@ -406,17 +445,40 @@ mod tests {
         }
     }
 
+    /// After the GPU failed, the line shows it and counts the images the
+    /// fallback encoded (#420).
+    #[test]
+    fn the_sample_line_shows_a_failed_gpu_and_its_fallback_encodes() {
+        let stats = GpuEncodeStats::default();
+        stats.record_fallback();
+        let health = SharedGpuHealth::new();
+        health.fail("GPU worker panicked: test");
+
+        let events = capture_events(|| stats.log_sample(&health));
+        let line = events
+            .iter()
+            .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
+            .expect("a sample line");
+        for (field, value) in [("tiles", "0"), ("fallback", "1"), ("health", "\"failed\"")] {
+            assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
+        }
+    }
+
     #[test]
     fn an_idle_sample_logs_nothing() {
         let stats = GpuEncodeStats::default();
-        assert!(capture_events(|| stats.log_sample()).is_empty());
+        assert!(capture_events(|| stats.log_sample(&SharedGpuHealth::new())).is_empty());
     }
 
     #[tokio::test]
     async fn the_sample_log_ends_at_shutdown() {
         let stats = Arc::new(GpuEncodeStats::default());
         let shutdown = CancellationToken::new();
-        let task = start_sample_log(Arc::downgrade(&stats), shutdown.clone());
+        let task = start_sample_log(
+            Arc::downgrade(&stats),
+            SharedGpuHealth::new(),
+            shutdown.clone(),
+        );
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -428,7 +490,12 @@ mod tests {
     async fn the_sample_log_ends_at_the_tick_after_its_stats_are_dropped() {
         let stats = Arc::new(GpuEncodeStats::default());
         let period = Duration::from_millis(10);
-        let task = sample_log_every(period, Arc::downgrade(&stats), CancellationToken::new());
+        let task = sample_log_every(
+            period,
+            Arc::downgrade(&stats),
+            SharedGpuHealth::new(),
+            CancellationToken::new(),
+        );
         tokio::time::sleep(period * 3).await;
         assert!(!task.is_finished(), "the task ticks while its stats live");
         drop(stats);

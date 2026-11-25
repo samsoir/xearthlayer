@@ -14,11 +14,19 @@
 
 use image::RgbaImage;
 use std::sync::Arc;
-use xearthlayer::dds::{DdsFormat, MipmapCompressor, MipmapGenerator};
+use xearthlayer::dds::{ChainOutcome, DdsFormat, MipmapCompressor, MipmapGenerator};
 
 /// The adapter these tests run on; read by the test, never the library.
 fn gpu_device() -> String {
     std::env::var("XEL_TEST_GPU_DEVICE").unwrap_or_else(|_| "integrated".to_string())
+}
+
+/// The GPU's chain; a tile the GPU handed back to the CPU fails the test.
+fn gpu_bytes(outcome: ChainOutcome) -> Vec<u8> {
+    match outcome {
+        ChainOutcome::Compressed(data) => data,
+        ChainOutcome::Returned { reason, .. } => panic!("the GPU handed the tile back: {reason}"),
+    }
 }
 
 /// Expected payload bytes for a BC1 chain, walking levels the way the
@@ -53,12 +61,14 @@ async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
     // spawn_blocking: compress_mipmap_chain blocks on the worker round trip.
     let channel = Arc::new(channel);
     let ch = Arc::clone(&channel);
-    let data = tokio::task::spawn_blocking(move || {
-        ch.compress_mipmap_chain(RgbaImage::new(4096, 4096), DdsFormat::BC1, levels)
-    })
-    .await
-    .expect("join")
-    .expect("GPU compression of the full chain must not fail");
+    let data = gpu_bytes(
+        tokio::task::spawn_blocking(move || {
+            ch.compress_mipmap_chain(RgbaImage::new(4096, 4096), DdsFormat::BC1, levels)
+        })
+        .await
+        .expect("join")
+        .expect("GPU compression of the full chain must not fail"),
+    );
 
     assert_eq!(
         data.len(),
@@ -115,23 +125,27 @@ async fn gpu_worker_survives_sub_block_levels() {
     // 64x64 -> 7 levels, reaching 4x4, 2x2 and 1x1.
     let levels = MipmapGenerator::full_chain_count(64, 64);
     let ch = Arc::clone(&channel);
-    let first = tokio::task::spawn_blocking(move || {
-        ch.compress_mipmap_chain(RgbaImage::new(64, 64), DdsFormat::BC1, levels)
-    })
-    .await
-    .expect("join")
-    .expect("sub-block levels must not kill the GPU worker");
+    let first = gpu_bytes(
+        tokio::task::spawn_blocking(move || {
+            ch.compress_mipmap_chain(RgbaImage::new(64, 64), DdsFormat::BC1, levels)
+        })
+        .await
+        .expect("join")
+        .expect("sub-block levels must not kill the GPU worker"),
+    );
 
     assert_eq!(first.len(), expected_bc1_payload(64, 64, levels));
 
     // Second request proves the worker did not break out of its loop.
     let ch = Arc::clone(&channel);
-    let second = tokio::task::spawn_blocking(move || {
-        ch.compress_mipmap_chain(RgbaImage::new(256, 256), DdsFormat::BC1, 9)
-    })
-    .await
-    .expect("join")
-    .expect("worker must still serve requests after the sub-block tail");
+    let second = gpu_bytes(
+        tokio::task::spawn_blocking(move || {
+            ch.compress_mipmap_chain(RgbaImage::new(256, 256), DdsFormat::BC1, 9)
+        })
+        .await
+        .expect("join")
+        .expect("worker must still serve requests after the sub-block tail"),
+    );
 
     assert_eq!(second.len(), expected_bc1_payload(256, 256, 9));
 }

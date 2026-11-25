@@ -64,6 +64,10 @@ pub struct EncoderComponents {
     pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
     /// The GPU the encoder selected (present when `texture.compressor = gpu`).
     pub gpu_adapter: Option<crate::system::GpuAdapter>,
+    /// The GPU encoder's health (present when `texture.compressor = gpu`):
+    /// Failed once the GPU worker has stopped and tiles are encoded on the
+    /// CPU (#420). The dashboard reads it every tick.
+    pub gpu_health: Option<crate::dds::gpu_health::SharedGpuHealth>,
     /// The encoder policy's warning when `gpu` was honoured on a host whose
     /// only GPU is the one X-Plane renders with (#203). Logged at creation
     /// and shown on the dashboard's Status pane.
@@ -126,6 +130,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
         ),
         gpu_worker_handle: None,
         gpu_adapter: None,
+        gpu_health: None,
         gpu_warning: None,
         gpu_shutdown: None,
     };
@@ -148,8 +153,10 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
             // by the shutdown token or when the channel is dropped (#419).
             crate::dds::gpu_stats::start_sample_log(
                 Arc::downgrade(channel.stats()),
+                channel.health().clone(),
                 shutdown_token.clone(),
             );
+            let gpu_health = channel.health().clone();
 
             tracing::info!("GPU pipeline encoder created with dedicated worker");
 
@@ -163,6 +170,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                 ),
                 gpu_worker_handle: Some(worker_handle),
                 gpu_adapter: Some(selection.adapter),
+                gpu_health: Some(gpu_health),
                 gpu_warning: decision.warning,
                 gpu_shutdown: Some(shutdown_token),
             })
@@ -241,6 +249,10 @@ mod tests {
                     .gpu_adapter
                     .expect("a GPU encoder reports its adapter");
                 assert!(!adapter.name.is_empty());
+                let health = components
+                    .gpu_health
+                    .expect("a GPU encoder reports its health");
+                assert!(!health.is_failed(), "a new GPU is healthy");
                 // The policy's verdict must match the host: a lone GPU is the
                 // one X-Plane renders with and warns, two or more do not (#203).
                 let host = crate::system::HardwareProfile::new(crate::system::enumerate_gpus());
@@ -305,6 +317,7 @@ mod tests {
             "ISPC compressor should not have a GPU worker handle"
         );
         assert!(components.gpu_adapter.is_none());
+        assert!(components.gpu_health.is_none());
         assert!(
             components.gpu_warning.is_none(),
             "a CPU encoder never contends with the sim's GPU"

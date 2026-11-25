@@ -232,8 +232,11 @@ pub trait ImageCompressor: Send + Sync {
 ///
 /// # Returns
 ///
-/// Concatenated compressed data for all mipmap levels (without DDS header).
-/// Level 0 (full resolution) first, then each successively halved level.
+/// [`ChainOutcome::Compressed`]: the compressed data of every mipmap level
+/// (without DDS header), level 0 (full resolution) first, then each
+/// successively halved level. Or [`ChainOutcome::Returned`]: the backend did
+/// not take the image, and hands it back for the caller to encode another way
+/// (#420).
 pub trait MipmapCompressor: Send + Sync {
     /// Compress a full mipmap chain from the source image.
     ///
@@ -249,10 +252,48 @@ pub trait MipmapCompressor: Send + Sync {
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
-    ) -> Result<Vec<u8>, DdsError>;
+    ) -> Result<ChainOutcome, DdsError>;
 
     /// Human-readable name for logging and diagnostics.
     fn name(&self) -> &str;
+}
+
+/// What a [`MipmapCompressor`] did with an image.
+pub enum ChainOutcome {
+    /// Every level, compressed back to back, largest first.
+    Compressed(Vec<u8>),
+    /// The backend did not take the image, so it comes back unchanged for
+    /// the caller to encode another way: [`DdsEncoder`] encodes it with its
+    /// fallback [`ImageCompressor`]. The GPU channel hands an image back when
+    /// its worker has failed, is gone, or gave up on the queue (#420).
+    ///
+    /// [`DdsEncoder`]: super::DdsEncoder
+    Returned {
+        /// The source image, as it was given.
+        image: RgbaImage,
+        /// Why the backend did not take it.
+        reason: String,
+    },
+}
+
+impl std::fmt::Debug for ChainOutcome {
+    /// The image by its size: its pixels would fill the screen.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compressed(data) => f
+                .debug_tuple("Compressed")
+                .field(&format_args!("{} bytes", data.len()))
+                .finish(),
+            Self::Returned { image, reason } => f
+                .debug_struct("Returned")
+                .field(
+                    "image",
+                    &format_args!("{}x{}", image.width(), image.height()),
+                )
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 // =============================================================================
@@ -408,6 +449,9 @@ mod gpu {
     /// # Arguments
     ///
     /// * `gpu_device` - Device selector: "integrated", "discrete", or adapter name substring
+    /// * `health` - The encoder's health, which the device's lost callback
+    ///   fails when the device is lost
+    ///   ([`device_lost`](crate::dds::gpu_health::device_lost))
     ///
     /// # Returns
     ///
@@ -416,6 +460,7 @@ mod gpu {
     /// the host offered, for the encoder policy (#203).
     pub fn create_gpu_resources(
         gpu_device: &str,
+        health: &crate::dds::gpu_health::SharedGpuHealth,
     ) -> Result<
         (
             wgpu::Device,
@@ -447,9 +492,17 @@ mod gpu {
         }))
         .map_err(|e| DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}")))?;
 
+        // Validation and out-of-memory errors no error scope captured. wgpu
+        // never reports device loss here: it goes to the lost callback.
         device.on_uncaptured_error(std::sync::Arc::new(|error| {
-            tracing::error!(error = %error, "wgpu uncaptured error (possible device loss)");
+            tracing::error!(error = %error, "wgpu uncaptured error");
         }));
+        // Device loss: a driver reset or fault fails the GPU, so every tile
+        // after it is encoded on the CPU (#420).
+        let lost = health.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            crate::dds::gpu_health::device_lost(&lost, reason, &message);
+        });
 
         let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
@@ -902,6 +955,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+    use crate::dds::gpu_health::SharedGpuHealth;
 
     #[test]
     fn concurrent_gpu_setup_does_not_crash() {
@@ -939,14 +993,14 @@ mod gpu_tests {
 
     #[test]
     fn test_create_gpu_resources_invalid_device() {
-        let result = create_gpu_resources("nonexistent_device_12345");
+        let result = create_gpu_resources("nonexistent_device_12345", &SharedGpuHealth::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_create_gpu_resources_returns_adapter_name() {
         // Skip if no GPU available
-        let result = create_gpu_resources("integrated");
+        let result = create_gpu_resources("integrated", &SharedGpuHealth::new());
         if let Ok((_, _, _, selection)) = result {
             assert!(!selection.adapter.name.is_empty());
             assert!(
@@ -956,17 +1010,27 @@ mod gpu_tests {
         }
     }
 
+    /// The device-lost callback is registered: destroying the device calls
+    /// it with `Destroyed`, which is logged and leaves the GPU healthy (#420).
     #[test]
-    fn test_create_gpu_resources_registers_error_handler() {
-        // This test verifies create_gpu_resources still works after
-        // adding the on_uncaptured_error handler. Skip if no GPU.
-        let result = create_gpu_resources("integrated");
-        // Either succeeds (GPU available) or fails with adapter error (no GPU)
-        // — neither should panic from the error handler registration.
-        match result {
-            Ok((_, _, _, selection)) => assert!(!selection.adapter.name.is_empty()),
-            Err(_) => {} // No GPU available, that's fine
-        }
+    #[ignore] // Requires GPU hardware
+    fn create_gpu_resources_registers_the_device_lost_callback() {
+        let health = SharedGpuHealth::new();
+        let Ok((device, _queue, _compressor, _)) = create_gpu_resources("integrated", &health)
+        else {
+            return; // No GPU available
+        };
+        let (_, events) = crate::dds::gpu_health::tests::capture(|| {
+            device.destroy();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message() == Some("GPU device destroyed")),
+            "the callback ran: {events:?}"
+        );
+        assert_eq!(health.health(), crate::dds::gpu_health::GpuHealth::Healthy);
     }
 
     // =========================================================================
@@ -981,8 +1045,8 @@ mod gpu_tests {
             _image: RgbaImage,
             _format: DdsFormat,
             _mipmap_count: usize,
-        ) -> Result<Vec<u8>, DdsError> {
-            Ok(vec![0xAA, 0xBB])
+        ) -> Result<ChainOutcome, DdsError> {
+            Ok(ChainOutcome::Compressed(vec![0xAA, 0xBB]))
         }
 
         fn name(&self) -> &str {
@@ -1001,7 +1065,7 @@ mod gpu_tests {
         let compressor = MockMipmapCompressor;
         let image = RgbaImage::new(256, 256);
         let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5);
-        assert_eq!(result.unwrap(), vec![0xAA, 0xBB]);
+        assert!(matches!(result, Ok(ChainOutcome::Compressed(data)) if data == [0xAA, 0xBB]));
     }
 
     #[test]

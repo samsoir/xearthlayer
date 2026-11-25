@@ -70,6 +70,13 @@
 //! [`MipmapCompressor`] — full-pipeline compression:
 //! - [`GpuEncoderChannel`] — Worker-side mipmap streaming via GPU compute
 //!
+//! A [`MipmapCompressor`] may hand an image back ([`ChainOutcome::Returned`])
+//! instead of compressing it: the GPU channel does when its worker has
+//! failed (#420, health in [`gpu_health`]). [`DdsEncoder`] then encodes it
+//! with its fallback [`ImageCompressor`] through the same in-place loop as
+//! an [`ImageCompressor`] backend, so the file is byte for byte that
+//! compressor's.
+//!
 //! # Compatibility
 //!
 //! Generated DDS files are compatible with:
@@ -92,8 +99,8 @@ mod types;
 
 // Public API
 pub use compressor::{
-    compress_level, compress_level_into, create_gpu_resources, default_compressor, ImageCompressor,
-    IspcCompressor, MipmapCompressor, SoftwareCompressor,
+    compress_level, compress_level_into, create_gpu_resources, default_compressor, ChainOutcome,
+    ImageCompressor, IspcCompressor, MipmapCompressor, SoftwareCompressor,
 };
 pub use encoder::DdsEncoder;
 pub use gpu_channel::create_gpu_encoder_channel;

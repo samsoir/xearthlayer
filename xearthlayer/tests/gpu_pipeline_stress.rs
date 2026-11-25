@@ -29,7 +29,7 @@ mod gpu_stress {
     use xearthlayer::dds::gpu_channel::*;
     use xearthlayer::dds::gpu_stats::GpuSample;
     use xearthlayer::dds::{
-        DdsEncoder, DdsFormat, IspcCompressor, MipmapCompressor, MipmapGenerator,
+        ChainOutcome, DdsEncoder, DdsFormat, IspcCompressor, MipmapCompressor, MipmapGenerator,
     };
     use xearthlayer::metrics::LatencySummary;
 
@@ -86,6 +86,16 @@ mod gpu_stress {
         })
     }
 
+    /// The GPU's chain; a tile handed back to the CPU fails the test.
+    fn gpu_bytes(outcome: ChainOutcome) -> Vec<u8> {
+        match outcome {
+            ChainOutcome::Compressed(data) => data,
+            ChainOutcome::Returned { reason, .. } => {
+                panic!("the GPU handed the tile back: {reason}")
+            }
+        }
+    }
+
     fn ms(us: u64) -> f64 {
         us as f64 / 1000.0
     }
@@ -105,10 +115,11 @@ mod gpu_stress {
 
     fn print_sample(title: &str, s: &GpuSample) {
         eprintln!(
-            "{title}: tiles={} (unsampled {}) failed={} depth_now={} depth_max={}",
+            "{title}: tiles={} (unsampled {}) failed={} fallback={} depth_now={} depth_max={}",
             s.tiles(),
             s.unsampled,
             s.failed,
+            s.fallback,
             s.depth_now,
             s.depth_max
         );
@@ -175,6 +186,7 @@ mod gpu_stress {
             })
             .await
             .unwrap()
+            .map(gpu_bytes)
             .expect("warm-up tile");
             let _ = stats.take_sample();
         }
@@ -188,6 +200,7 @@ mod gpu_stress {
             })
             .await
             .unwrap()
+            .map(gpu_bytes)
             .expect("lone tile");
         }
         if let Some(s) = stats.take_sample() {
@@ -235,9 +248,13 @@ mod gpu_stress {
             for handle in handles {
                 total_requests += 1;
                 match tokio::time::timeout(Duration::from_secs(60), handle).await {
-                    Ok(Ok((Ok(_data), elapsed))) => {
+                    Ok(Ok((Ok(ChainOutcome::Compressed(_data)), elapsed))) => {
                         total_successes += 1;
                         burst_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                    }
+                    Ok(Ok((Ok(ChainOutcome::Returned { reason, .. }), _))) => {
+                        total_failures += 1;
+                        eprintln!("  Handed back to the CPU: {reason}");
                     }
                     Ok(Ok((Err(e), _))) => {
                         total_failures += 1;
