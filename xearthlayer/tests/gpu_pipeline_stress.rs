@@ -29,7 +29,7 @@ mod gpu_stress {
     use xearthlayer::dds::gpu_channel::*;
     use xearthlayer::dds::gpu_stats::GpuSample;
     use xearthlayer::dds::{
-        DdsEncoder, DdsFormat, IspcCompressor, MipmapCompressor, MipmapGenerator,
+        ChainOutcome, DdsEncoder, DdsFormat, IspcCompressor, MipmapCompressor, MipmapGenerator,
     };
     use xearthlayer::metrics::LatencySummary;
 
@@ -86,6 +86,16 @@ mod gpu_stress {
         })
     }
 
+    /// The GPU's chain; a tile handed back to the CPU fails the test.
+    fn gpu_bytes(outcome: ChainOutcome) -> Vec<u8> {
+        match outcome {
+            ChainOutcome::Compressed(data) => data,
+            ChainOutcome::Returned { reason, .. } => {
+                panic!("the GPU handed the tile back: {reason}")
+            }
+        }
+    }
+
     fn ms(us: u64) -> f64 {
         us as f64 / 1000.0
     }
@@ -105,10 +115,11 @@ mod gpu_stress {
 
     fn print_sample(title: &str, s: &GpuSample) {
         eprintln!(
-            "{title}: tiles={} (unsampled {}) failed={} depth_now={} depth_max={}",
+            "{title}: tiles={} (unsampled {}) failed={} fallback={} depth_now={} depth_max={}",
             s.tiles(),
             s.unsampled,
             s.failed,
+            s.fallback,
             s.depth_now,
             s.depth_max
         );
@@ -175,6 +186,7 @@ mod gpu_stress {
             })
             .await
             .unwrap()
+            .map(gpu_bytes)
             .expect("warm-up tile");
             let _ = stats.take_sample();
         }
@@ -188,6 +200,7 @@ mod gpu_stress {
             })
             .await
             .unwrap()
+            .map(gpu_bytes)
             .expect("lone tile");
         }
         if let Some(s) = stats.take_sample() {
@@ -198,6 +211,11 @@ mod gpu_stress {
         let mut total_requests = 0u64;
         let mut total_successes = 0u64;
         let mut total_failures = 0u64;
+        // Tiles the worker handed back to the CPU: on a GPU slower than the
+        // deadline over a burst's queue, the queue-age valve hands the last
+        // ones back, as it should. Reported, never a failure: how many
+        // depends on the GPU's speed.
+        let mut total_handed_back = 0u64;
         let mut burst_count = 0u64;
         let mut all_latencies_ms: Vec<f64> = Vec::new();
         let mut burst_tiles = 0usize;
@@ -230,14 +248,21 @@ mod gpu_stress {
                 }));
             }
 
-            // Collect results with timeout
+            // Collect results; the 60 s timeout only guards a deadlock.
             let mut burst_latencies = Vec::new();
+            let mut answered = 0usize;
             for handle in handles {
                 total_requests += 1;
                 match tokio::time::timeout(Duration::from_secs(60), handle).await {
-                    Ok(Ok((Ok(_data), elapsed))) => {
+                    Ok(Ok((Ok(ChainOutcome::Compressed(_data)), elapsed))) => {
                         total_successes += 1;
+                        answered += 1;
                         burst_latencies.push(elapsed.as_secs_f64() * 1000.0);
+                    }
+                    Ok(Ok((Ok(ChainOutcome::Returned { reason, .. }), _))) => {
+                        total_handed_back += 1;
+                        answered += 1;
+                        eprintln!("  Handed back to the CPU: {reason}");
                     }
                     Ok(Ok((Err(e), _))) => {
                         total_failures += 1;
@@ -276,7 +301,7 @@ mod gpu_stress {
             // A burst whose callers all returned leaves the channel empty.
             // Checked at the end, after the failure summary: a caller that
             // timed out is still counted in the depth.
-            if burst_latencies.len() == burst_size && stats.depth() != 0 {
+            if answered == burst_size && stats.depth() != 0 {
                 eprintln!("  Depth {} after a complete burst", stats.depth());
                 depth_left_after_bursts += 1;
             }
@@ -302,6 +327,7 @@ mod gpu_stress {
         eprintln!("Requests:     {total_requests}");
         eprintln!("Successes:    {total_successes}");
         eprintln!("Failures:     {total_failures}");
+        eprintln!("Handed back:  {total_handed_back} (queue-age valve; GPU speed dependent)");
         eprintln!("Worker alive: {}", channel.is_connected());
         eprintln!(
             "RSS:          {initial_rss:.1}MB → {final_rss:.1}MB (delta: {:.1}MB)",
@@ -332,7 +358,10 @@ mod gpu_stress {
         );
         assert!(
             channel.is_connected(),
-            "GPU worker should still be alive after stress test"
+            "GPU worker should still be alive after stress test (health: {:?}; it fails \
+             only on a panic, a lost device, or {MISSES_BEFORE_FAILED} tiles in a row past \
+             the {TILE_DEADLINE:?} deadline)",
+            channel.health().health()
         );
         assert_eq!(
             depth_left_after_bursts, 0,
@@ -394,5 +423,198 @@ mod gpu_stress {
             burst_size as f64 / wall.as_secs_f64(),
             std::thread::available_parallelism().map_or(0, |n| n.get())
         );
+    }
+
+    /// Device loss in the middle of a burst (#420): the device is destroyed
+    /// with `Device::destroy` once two tiles have come back. Reports how
+    /// every tile of the burst ended (GPU, fallback, failed), the health,
+    /// and how the tiles after the burst are encoded, and asserts the run
+    /// ends in fallback encodes byte for byte the ISPC encode rather than
+    /// failed tiles.
+    ///
+    /// `Destroyed` is the one device-lost reason that does not fail the
+    /// health (it follows only an explicit `destroy`, which XEarthLayer never
+    /// calls), so what turns the encoder over here is what the destroyed
+    /// device does to the worker. Measured on Vulkan (wgpu 30): every
+    /// submission is refused and `poll` fails at once with
+    /// `WrongSubmissionIndex`, no panic and no hang, so the tiles after the
+    /// destroy fail in time and `MISSES_BEFORE_FAILED` of them fail the GPU.
+    /// Those tiles are lost; every tile after them is a fallback encode.
+    #[tokio::test]
+    #[ignore]
+    async fn device_destroyed_mid_burst_ends_in_fallback_encodes() {
+        use xearthlayer::dds::gpu_health::SharedGpuHealth;
+
+        // The device is destroyed once two tiles are back; the tile in
+        // progress then may still succeed, and MISSES_BEFORE_FAILED more
+        // must fail on the destroyed device to fail the GPU.
+        let min_burst = 3 + MISSES_BEFORE_FAILED as usize;
+        let requested: usize = env_or("GPU_STRESS_BURST_SIZE", 15);
+        let burst_size = if requested < min_burst {
+            eprintln!(
+                "GPU_STRESS_BURST_SIZE={requested} is below the {min_burst} tiles this test \
+                 needs (2 before the destroy, 1 in progress, {MISSES_BEFORE_FAILED} to fail \
+                 the GPU); using {min_burst}"
+            );
+            min_burst
+        } else {
+            requested
+        };
+        let image_size = image_size();
+        let levels = levels(image_size);
+        let health = SharedGpuHealth::new();
+        let (device, queue, compressor, selection) =
+            match xearthlayer::dds::create_gpu_resources(&gpu_device(), &health) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Skipping: no usable GPU ({e})");
+                    return;
+                }
+            };
+        let killer = device.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+            health.clone(),
+        );
+        let channel = Arc::new(GpuEncoderChannel::new(
+            tx,
+            health.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        let encoder = Arc::new(
+            DdsEncoder::new(DdsFormat::BC1)
+                .with_mipmap_compressor(
+                    Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
+                    Arc::new(IspcCompressor),
+                )
+                .with_mipmap_count(levels),
+        );
+        let source = Arc::new(test_image(image_size));
+        let expected = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(IspcCompressor))
+            .with_mipmap_count(levels)
+            .encode((*source).clone())
+            .unwrap();
+        eprintln!(
+            "Device loss: adapter={}, burst={burst_size}, {image_size}x{image_size}, {levels} levels",
+            selection.adapter
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let start = Instant::now();
+        let handles: Vec<_> = (0..burst_size)
+            .map(|_| {
+                let enc = Arc::clone(&encoder);
+                let img = (*source).clone();
+                let done = done_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let r = enc.encode(img);
+                    let _ = done.send(());
+                    r
+                })
+            })
+            .collect();
+        let destroyed_at = tokio::task::spawn_blocking(move || {
+            for _ in 0..2 {
+                let _ = done_rx.recv();
+            }
+            killer.destroy();
+            Instant::now()
+        })
+        .await
+        .unwrap();
+        eprintln!(
+            "  destroyed the device at {:.1} ms",
+            (destroyed_at - start).as_secs_f64() * 1000.0
+        );
+
+        let (mut ok, mut same, mut failed) = (0, 0, 0);
+        for h in handles {
+            match tokio::time::timeout(Duration::from_secs(60), h).await {
+                Ok(Ok(Ok(dds))) => {
+                    ok += 1;
+                    same += usize::from(dds == expected);
+                }
+                Ok(Ok(Err(e))) => {
+                    failed += 1;
+                    eprintln!("  failed: {e}");
+                }
+                other => panic!("a caller hung or panicked: {other:?}"),
+            }
+        }
+        let burst = channel.stats().take_sample().unwrap_or_default();
+        eprintln!(
+            "  burst: ok={ok} (ISPC-identical {same}) failed={failed}; GPU tiles={} \
+             fallback={} failed={}; health={:?}; worker ended={}",
+            burst.tiles(),
+            burst.fallback,
+            burst.failed,
+            health.health(),
+            worker.is_finished()
+        );
+
+        // How many of the burst's tiles reached the destroyed device
+        // depends on the GPU's speed: on a slow one the queue-age valve
+        // hands the last ones back before the destroy. Tiles one at a time
+        // reach it until it fails the GPU; they are lost, as the burst's
+        // would have been.
+        let mut extra_failed = 0;
+        while !health.is_failed() && extra_failed < MISSES_BEFORE_FAILED {
+            let enc = Arc::clone(&encoder);
+            let img = (*source).clone();
+            match tokio::task::spawn_blocking(move || enc.encode(img))
+                .await
+                .unwrap()
+            {
+                Ok(dds) => panic!(
+                    "a tile after the destroy was encoded (ISPC-identical: {}) while the \
+                     GPU is not failed",
+                    dds == expected
+                ),
+                Err(e) => {
+                    extra_failed += 1;
+                    eprintln!("  one at a time, failed on the destroyed device: {e}");
+                }
+            }
+        }
+        assert!(
+            health.is_failed(),
+            "the destroyed device did not fail the GPU (burst ok={ok}, failed={failed}; \
+             {extra_failed} more failed one at a time)"
+        );
+        let _ = channel.stats().take_sample();
+
+        // After the burst: every tile must be encoded, on the fallback.
+        let mut after_failed = 0;
+        for i in 0..5 {
+            let enc = Arc::clone(&encoder);
+            let img = (*source).clone();
+            match tokio::task::spawn_blocking(move || enc.encode(img))
+                .await
+                .unwrap()
+            {
+                Ok(dds) => assert!(dds == expected, "tile {i} after the burst: bytes"),
+                Err(e) => {
+                    after_failed += 1;
+                    eprintln!("  after the burst, tile {i} failed: {e}");
+                }
+            }
+        }
+        let after = channel.stats().take_sample().unwrap_or_default();
+        eprintln!(
+            "  after: GPU tiles={} fallback={} failed={}; health={:?}",
+            after.tiles(),
+            after.fallback,
+            after.failed,
+            health.health()
+        );
+        assert!(health.is_failed(), "the GPU is failed for the session");
+        assert_eq!(after_failed, 0, "the run ends in fallback encodes");
+        assert_eq!(after.fallback, 5, "every later tile is a fallback encode");
     }
 }

@@ -90,6 +90,8 @@ pub struct XEarthLayerService {
     gpu_shutdown: Option<CancellationToken>,
     /// The GPU the encoder selected (when `texture.compressor = gpu`).
     gpu_adapter: Option<crate::system::GpuAdapter>,
+    /// The GPU encoder's health (when `texture.compressor = gpu`, #420).
+    gpu_health: Option<crate::dds::gpu_health::SharedGpuHealth>,
     /// The encoder policy's contention warning, when `gpu` was honoured on
     /// a host whose only GPU is the one X-Plane renders with (#203).
     gpu_warning: Option<String>,
@@ -174,6 +176,7 @@ impl XEarthLayerService {
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
         let gpu_shutdown = encoder_components.gpu_shutdown;
         let gpu_adapter = encoder_components.gpu_adapter;
+        let gpu_health = encoder_components.gpu_health;
         let gpu_warning = encoder_components.gpu_warning;
 
         // 6. Create XEarthLayer runtime with cache bridges
@@ -297,6 +300,7 @@ impl XEarthLayerService {
             gpu_worker_handle,
             gpu_shutdown,
             gpu_adapter,
+            gpu_health,
             gpu_warning,
         })
     }
@@ -430,6 +434,13 @@ impl XEarthLayerService {
     /// The GPU encoding textures, or `None` when a CPU encoder is in use.
     pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
         self.gpu_adapter.as_ref()
+    }
+
+    /// The GPU encoder's health, or `None` when a CPU encoder is in use.
+    /// Failed once the GPU worker has stopped and every tile is encoded on
+    /// the CPU (#420); read it each time, it changes during the session.
+    pub fn gpu_health(&self) -> Option<&crate::dds::gpu_health::SharedGpuHealth> {
+        self.gpu_health.as_ref()
     }
 
     /// Why GPU encoding will contend with X-Plane on this host, or `None`

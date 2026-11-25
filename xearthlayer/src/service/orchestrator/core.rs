@@ -590,6 +590,14 @@ impl ServiceOrchestrator {
         self.service().and_then(|s| s.gpu_adapter())
     }
 
+    /// The GPU encoder's health beside [`gpu_adapter`](Self::gpu_adapter),
+    /// or `None` when a CPU encoder is in use or services are not
+    /// initialized yet. A clone shares the state: the dashboard keeps one
+    /// and reads it every tick (#420).
+    pub fn gpu_health(&self) -> Option<crate::dds::gpu_health::SharedGpuHealth> {
+        self.service().and_then(|s| s.gpu_health()).cloned()
+    }
+
     /// The encoder policy's warning that GPU encoding shares the GPU X-Plane
     /// renders with, or `None` (#203).
     pub fn gpu_warning(&self) -> Option<&str> {
