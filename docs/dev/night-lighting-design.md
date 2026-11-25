@@ -298,6 +298,22 @@ exactly the byte the sRGB encode followed by rounding gives, without a
 `powf` per channel (#439). Every generated texel is opaque, so an alpha of
 exactly 1.0 is stored as 255 without rounding.
 
+**One level at a time** (#440). `lit_chain` takes the first visible level
+by value and visits the chain one level at a time, in place. The first
+level's bytes are dimmed, floored, compressed into their slice of the
+payload (`bc1_level_into`) and repaired. Its linear values (three `f32`
+per texel; alpha is not kept, every lit texel being opaque, and ISPC's
+BC1 kernels and the repair ignore alpha, which tests pin) are then
+halved in place for each next level, whose bytes are stored into one
+reused buffer and encoded the same way before the level after is made.
+The encode used to hold the whole chain at once, in linear and in
+stored form: 24 MiB for a 1024 px texture. It now holds the first
+averaged level's linear values (512 x 512 x 12 bytes, 3 MiB) and the
+payload (699,064 bytes): 3,844,856 bytes measured, the 64 over being a
+padded copy of the smallest level for its kernel. The road field is
+dropped before the encode, so a generation no longer holds it while it
+encodes. The bytes are unchanged.
+
 **What lit bytes depend on.** A lit payload is a function of its inputs
 (recipes, Laminar art, road networks, `night.brightness`, the texture
 setting), of the CPU's ISPC kernel class and of the platform's libm. ISPC
@@ -1672,6 +1688,12 @@ lights).
   pseudo-random colours per model at gains from the floor to 1, and
   byte luminance on every byte of each channel; the pinned LED and
   sodium digests hold unchanged.
+  The encode's memory is measured by a counting allocator in its own
+  test binary (`tests/lit_encode_memory.rs`, #440): a 1024 px level is
+  held to the chain level and payload it must hold plus 16 KiB, and a
+  copy of the former whole-chain encoder (`tests/support/`) gives the
+  same bytes at more than five times the memory. The ignored timing
+  harness is `tests/lit_encode_timing.rs`.
   The service keeps no payload whose encode failed, lights only the
   payload of a read spanning the uploaded top and the payload, and
   writes only the payload to disk.
