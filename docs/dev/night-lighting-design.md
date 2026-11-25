@@ -849,6 +849,26 @@ toned bytes are never dimmer than Laminar's bytes at the same gain, and LED
 bytes are never dimmer than the toned ones. `SodiumTone::NONE` (in
 `LedModel::OFF`) returns Laminar's bytes exactly.
 
+**The tone path** (#436). `led::Toner` prepares what the tone derives from
+the request alone once (`PreparedTone`: the clamped mix, the white of its
+temperature and the gain), and the generator decodes each texel's pattern
+sum to linear light once (`Decoded`), for both the sodium tone and the LED
+recolour. The byte rule's luminance of bytes reads the decode of every
+byte from `led::linear_table()` (shared with road light and the lit chain),
+and each of its steps hands the luminance it settles on to the next as its
+floor. The same `f32` values come from the same operations, so no byte
+changed and `LIT_GENERATOR_VERSION` stayed. `powf` per toned texel went
+from 12 to 30 down to 6 to 9: what is left is the decode of a non-integer
+colour and the encode before a per-texel gain, which no 256-entry table
+replaces exactly. On 99 real ZL16 textures at 1024 px (the 5 x 5 grids
+around Mexico City, Geneva, Paris and Montreal, `LedModel::DEFAULT`, no
+roads, warm, release, one thread) the tone path took 71.5 ms per texture
+before and 43.7 ms after, and generation 284 ms and 256 ms (10% less);
+these are one laptop's figures (AMD Ryzen AI 9 HX 370), for reference
+only. The ignored test `time_the_tone_path_on_real_zl16_textures` repeats
+the measurement, with the installation's paths from `XEL_NIGHT_PACKAGES`
+and `XEL_LAMINAR_ART` (read by tests only).
+
 **Regions.** The region is the first segment of the code of the package a
 recipe was read from (`NA-USA-MX-CENTRAL` is NA; legacy `na` and `eu`
 work), recorded when the recipe is loaded, as the identity is. Patches
@@ -1646,6 +1666,12 @@ lights).
   byte value at each fade gain, and `encode_visible` on six images.
   `led::ByteEncoder` itself is checked on every float from 0 to 1 by an
   ignored test, `the_byte_encoder_exhaustive`, run in release.
+  The tone path is checked against its former `powf` forms
+  (`led::powf_reference`, test only, #436): the generator run with both
+  through `CpuLitGenerator::generate_with`, the tone steps on 25,000
+  pseudo-random colours per model at gains from the floor to 1, and
+  byte luminance on every byte of each channel; the pinned LED and
+  sodium digests hold unchanged.
   The service keeps no payload whose encode failed, lights only the
   payload of a read spanning the uploaded top and the payload, and
   writes only the payload to disk.
