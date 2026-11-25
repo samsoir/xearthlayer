@@ -433,7 +433,21 @@ mod gpu_stress {
     async fn device_destroyed_mid_burst_ends_in_fallback_encodes() {
         use xearthlayer::dds::gpu_health::SharedGpuHealth;
 
-        let burst_size: usize = env_or("GPU_STRESS_BURST_SIZE", 15);
+        // The device is destroyed once two tiles are back; the tile in
+        // progress then may still succeed, and MISSES_BEFORE_FAILED more
+        // must fail on the destroyed device to fail the GPU.
+        let min_burst = 3 + MISSES_BEFORE_FAILED as usize;
+        let requested: usize = env_or("GPU_STRESS_BURST_SIZE", 15);
+        let burst_size = if requested < min_burst {
+            eprintln!(
+                "GPU_STRESS_BURST_SIZE={requested} is below the {min_burst} tiles this test \
+                 needs (2 before the destroy, 1 in progress, {MISSES_BEFORE_FAILED} to fail \
+                 the GPU); using {min_burst}"
+            );
+            min_burst
+        } else {
+            requested
+        };
         let image_size = image_size();
         let levels = levels(image_size);
         let health = SharedGpuHealth::new();
@@ -530,6 +544,12 @@ mod gpu_stress {
             burst.failed,
             health.health(),
             worker.is_finished()
+        );
+
+        assert!(
+            health.is_failed(),
+            "the burst did not fail the GPU (ok={ok}, failed={failed}): fewer than \
+             {MISSES_BEFORE_FAILED} of its tiles failed on the destroyed device"
         );
 
         // After the burst: every tile must be encoded, on the fallback.
