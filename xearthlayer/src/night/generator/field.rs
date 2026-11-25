@@ -210,10 +210,16 @@ impl RecipeField {
     /// larger of the latitude and longitude distances to the tile, ties to
     /// the smaller tile key); `None` when no tile of the field has it.
     ///
-    /// A field reads the tiles within `FIELD_MARGIN_DEG` of every point of
-    /// its footprint, so for grids fine enough that a sample reaches less
-    /// than that (version 1's), any field holding a point chooses the same
-    /// grid wherever the choice changes a value.
+    /// The choice is independent of the footprint asking only for grids
+    /// whose sample reach (the class warp and bilinear neighbours, or the
+    /// brightness bilinear neighbours) is under [`FIELD_MARGIN_DEG`]: a
+    /// field reads the tiles within that margin of every point of its
+    /// footprint, so for those grids any field holding a point sees the
+    /// tiles that decide it and chooses the same grid wherever the choice
+    /// changes a value. A coarser grid could reach a tile one field reads
+    /// and another does not. Every version 1 grid qualifies: 1200 class
+    /// cells per degree reach under 2 cells (about 0.0017 degrees), 240
+    /// brightness cells per degree one cell (about 0.0042 degrees).
     pub(crate) fn grid_at(&self, layer: Layer, lat: f64, lon: f64) -> Option<LayerGrid> {
         let grids = self.layer(layer);
         match grids.distinct.as_slice() {

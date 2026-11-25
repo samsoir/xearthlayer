@@ -84,6 +84,17 @@ struct CellTable<T> {
 }
 
 impl<T: Copy> CellTable<T> {
+    /// The table with no cell: every read misses it.
+    fn empty() -> Self {
+        Self {
+            row0: 0,
+            col0: 0,
+            rows: 0,
+            cols: 0,
+            cells: Vec::new(),
+        }
+    }
+
     /// The cells of the inclusive `rows` and `cols` ranges, each from `cell`;
     /// empty without a range or past `budget` cells.
     fn build(
@@ -92,18 +103,11 @@ impl<T: Copy> CellTable<T> {
         budget: usize,
         cell: impl Fn(i64, i64) -> T,
     ) -> Self {
-        let empty = Self {
-            row0: 0,
-            col0: 0,
-            rows: 0,
-            cols: 0,
-            cells: Vec::new(),
-        };
         let (Some((r0, r1)), Some((c0, c1))) = (rows, cols) else {
-            return empty;
+            return Self::empty();
         };
         if r1 < r0 || c1 < c0 {
-            return empty;
+            return Self::empty();
         }
         let (nr, nc) = (
             r1.abs_diff(r0).saturating_add(1),
@@ -111,7 +115,7 @@ impl<T: Copy> CellTable<T> {
         );
         let n = match nr.checked_mul(nc) {
             Some(n) if n <= budget as u64 => n as usize,
-            _ => return empty,
+            _ => return Self::empty(),
         };
         let mut cells = Vec::with_capacity(n);
         for r in r0..=r1 {
@@ -252,9 +256,9 @@ pub struct FieldSampler<'f> {
     class: Vec<ClassLayer>,
     /// One per brightness grid of the field, in its order; usually one.
     brightness: Vec<BrightnessLayer>,
-    /// The texel positions, to choose a grid where a layer has several.
-    lats: Vec<f64>,
-    lons: Vec<f64>,
+    /// The texel positions, borrowed, to choose a grid where a layer has
+    /// several.
+    axes: TexelAxes<'f>,
     warp: NoisePair,
     /// Reads that fell outside a built table and went to the field.
     #[cfg(test)]
@@ -263,19 +267,19 @@ pub struct FieldSampler<'f> {
 
 impl<'f> FieldSampler<'f> {
     /// The sampler, with the class mask.
-    pub fn new(field: &'f RecipeField, axes: TexelAxes<'_>) -> Self {
+    pub fn new(field: &'f RecipeField, axes: TexelAxes<'f>) -> Self {
         Self::with_class_mask(field, axes, true)
     }
 
     /// The sampler, with the class mask or without it: the same weights
     /// either way (tests and timings compare the two).
-    pub fn with_class_mask(field: &'f RecipeField, axes: TexelAxes<'_>, mask: bool) -> Self {
+    pub fn with_class_mask(field: &'f RecipeField, axes: TexelAxes<'f>, mask: bool) -> Self {
         Self::build(field, axes, TABLE_SLACK_CELLS, mask)
     }
 
     /// The sampler with `slack` cells around the cells its tables must
     /// hold; tests pass a negative slack to make reads miss the tables.
-    fn build(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64, mask: bool) -> Self {
+    fn build(field: &'f RecipeField, axes: TexelAxes<'f>, slack: i64, mask: bool) -> Self {
         let TexelAxes { lats, lons } = axes;
         let budget = lons.len() * lats.len() * MAX_TABLE_CELLS_PER_TEXEL;
         let class_layer = |grid: &LayerGrid| {
@@ -304,7 +308,7 @@ impl<'f> FieldSampler<'f> {
             let near = if mask {
                 cells.near_class()
             } else {
-                CellTable::build(None, None, 0, |_, _| true)
+                CellTable::empty()
             };
             ClassLayer {
                 grid: *grid,
@@ -346,8 +350,7 @@ impl<'f> FieldSampler<'f> {
                 .iter()
                 .map(brightness_layer)
                 .collect(),
-            lats: lats.to_vec(),
-            lons: lons.to_vec(),
+            axes,
             warp: NoisePair::new(WARP_SEED_X, WARP_SEED_Y),
             #[cfg(test)]
             misses: std::cell::Cell::new(0),
@@ -370,7 +373,9 @@ impl<'f> FieldSampler<'f> {
             0 => None,
             1 => Some(0),
             _ => {
-                let at = self.field.grid_at(layer, self.lats[row], self.lons[col])?;
+                let at = self
+                    .field
+                    .grid_at(layer, self.axes.lats[row], self.axes.lons[col])?;
                 layers.iter().position(|l| *grid(l) == at)
             }
         }
@@ -459,7 +464,7 @@ impl<'f> FieldSampler<'f> {
     /// A sampler whose tables hold `slack` cells around the cells it must
     /// read (negative: fewer), for tests of reads outside a table.
     #[cfg(test)]
-    pub(crate) fn with_slack(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64) -> Self {
+    pub(crate) fn with_slack(field: &'f RecipeField, axes: TexelAxes<'f>, slack: i64) -> Self {
         Self::build(field, axes, slack, true)
     }
 
@@ -531,6 +536,22 @@ mod tests {
         assert_eq!(none.get(0, 5), None);
         let inverted = CellTable::build(Some((2, 1)), Some((5, 8)), 100, |r, c| r * 100 + c);
         assert!(inverted.cells.is_empty(), "an empty range: no table");
+    }
+
+    #[test]
+    fn an_empty_table_has_no_cell_and_answers_nothing() {
+        let t = CellTable::<bool>::empty();
+        assert!(t.cells.is_empty());
+        for (r, c) in [(0, 0), (-1, 1), (i64::MIN, i64::MAX)] {
+            assert_eq!(t.get(r, c), None, "{r}, {c}");
+        }
+        // The table a build without a range gives.
+        let built = CellTable::build(None, None, 0, |_, _| true);
+        assert_eq!(
+            (built.row0, built.col0, built.rows, built.cols),
+            (t.row0, t.col0, t.rows, t.cols)
+        );
+        assert!(built.cells.is_empty());
     }
 
     #[test]

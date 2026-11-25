@@ -72,7 +72,7 @@ impl Footprint {
 }
 
 /// A 1 degree tile's longitude wrapped into [-180, 180).
-pub fn wrap_tile_lon(lon: i32) -> i32 {
+pub(crate) fn wrap_tile_lon(lon: i32) -> i32 {
     (lon + 180).rem_euclid(360) - 180
 }
 
