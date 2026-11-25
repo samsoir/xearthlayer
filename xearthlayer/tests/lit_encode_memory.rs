@@ -1,10 +1,10 @@
 //! How much memory the lit encode holds beyond its input (#440).
 //!
 //! A binary of its own, because measuring needs a counting global allocator
-//! (`counting_alloc`, shared with the library's lit encode timing test),
-//! which this binary installs and no other test binary needs.
+//! (`support/counting_alloc.rs`, shared with `lit_encode_timing`), which
+//! this binary installs and no other test binary needs.
 
-#[path = "../src/night/generator/counting_alloc.rs"]
+#[path = "support/counting_alloc.rs"]
 mod counting_alloc;
 
 use counting_alloc::{held_at_peak, CountingAllocator};

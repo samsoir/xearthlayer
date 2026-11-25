@@ -1,16 +1,17 @@
 //! A global allocator for tests that measures how many heap bytes a closure
 //! holds at its peak, on the calling thread, beyond what that thread held
-//! when it started (#440). Test-only: the library's unit tests install it
-//! for the lit encode's timing test (`encode_timing`), and the integration
-//! test binary `lit_encode_memory` includes this file by path and installs
-//! it there. Each user declares the `#[global_allocator]` itself.
+//! when it started (#440). The integration test binaries that measure the
+//! lit encode (`lit_encode_memory`, `lit_encode_timing`) include this file
+//! by path, and each declares the `#[global_allocator]` itself, so no other
+//! test binary, the library's unit tests included, pays for the counting.
 //!
 //! Counts are per thread, so other tests running at the same time do not
 //! disturb a measurement: a thread's count is what it allocated less what
 //! it freed. Memory another thread frees is counted on that thread; the
 //! measured closures allocate and free on their own thread. Allocations by
 //! C code (`malloc`) are not seen; the lit encode's kernels make none.
-//! Every other thread pays two thread-local updates per allocation.
+//! Every other thread of a binary that installs it pays two thread-local
+//! updates per allocation.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -73,7 +74,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
 /// What `f` returns, and the most heap bytes the calling thread held while
 /// it ran beyond what it held when `f` started (what `f` returns included,
 /// if it is on the heap). Requires [`CountingAllocator`] to be the global
-/// allocator; measurements on one thread must not nest.
+/// allocator.
+///
+/// Measurements cannot nest: there is one peak per thread, so a
+/// measurement inside `f` resets it, and the outer one then reads only
+/// what came after the inner one began. A `realloc` that moves its block
+/// counts only the change in size, not the moment both blocks are held.
 pub fn held_at_peak<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let start = HELD.with(Cell::get);
     PEAK.with(|peak| peak.set(start));
