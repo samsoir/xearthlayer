@@ -737,8 +737,9 @@ the metrics system and the dashboard shows nothing of it. The line has:
   have saved a memory hit, never a join.
 - **Probes** by the source of the committed answer (`recipe` first, then
   `road`, then `dark`), with probe permit wait and, with road lights on,
-  road wait. A probe that finds another probe's answer after its permit
-  wait records its waits but no answer.
+  road wait, which only a probe its recipe left dark has (#428). A probe
+  that finds another probe's answer after its permit wait records its
+  permit wait but no answer.
 - **Generations**: count and black generations; permit wait and generation
   time, timed apart; `generations_waiting_peak`; road state (complete,
   timed out, failed); `roads_ready_at_permit`, generations whose roads had
@@ -1334,10 +1335,16 @@ maximum. `lamps: None` draws the continuous glow, byte for byte as before
   reused, and the merged tile is laid out in exactly sized arrays (see
   Merge).
 - **Permits.** `ROAD_EXTRACT_PERMITS` (2) bound concurrent builds. A build
-  holds one permit for its whole tile and no other lit permit. A successful
-  build hands its permit to one detached task that writes the tile's disk
-  entries and releases it when done: readiness never waits for a write,
-  and at most two tiles' entries are ever waiting in memory.
+  holds one extract permit while it reads its tile and no other lit permit,
+  and releases it before its disk entries are written (#429), so a slow
+  write never holds the next build. A successful build hands its entries
+  to one detached write task: readiness never waits for a write. At most
+  `ROAD_WRITE_BACKLOG` (2) tiles' writes wait in memory; past that a tile's
+  entries are dropped (counted as `road_writes_dropped`, logged at debug)
+  and re-extracted next session. Each entry's write takes one of the lit
+  disk permits and releases it before the next entry, so a lit disk lookup
+  on X-Plane's read path waits for at most one entry's write, never a whole
+  tile's.
 - **Coalescing.** A build runs in its own task, kept in a map of shared
   futures by tile, so concurrent callers share it and a caller that stops
   waiting never cancels it. A tile with an unreadable source is marked
@@ -1383,11 +1390,30 @@ maximum. `lamps: None` draws the continuous glow, byte for byte as before
   other `stat` failure fails the pass, which answers `None` for that call
   and is not kept, so the lit source keeps that payload in memory only
   rather than fingerprint it as a tile without the DSF.
+- **What a build read (#430).** Each build records the identity of every
+  DSF it read (`ReadFrom`), taken with an `fstat` on the handle it reads
+  through (`read_dsf_open`), so the identity is that of the bytes read even
+  if the file is replaced meanwhile. It is kept with the merged roads in the
+  tile cache (`ReadyTile`) and dropped with them. A payload is written to
+  disk only when the identity pass agrees with what each of its tiles' builds
+  read, or with a prefix of it when a covering exclusion zone stopped the
+  build early (sources below it cannot change the roads). Otherwise the DSF
+  changed since its roads were read, the payload is kept in memory only
+  (`WriteBackSkip::RoadSourcesChanged`), and the next session regenerates it
+  under the new identity.
 - **Waits.** A caller asks for a footprint's tiles with a purpose: `Probe`
   waits up to `ROAD_PROBE_WAIT` (2 s), `Generate` up to
   `ROAD_GENERATE_WAIT` (10 s). The wait is a budget per build, not per
   call: the first call that waits on a tile's build for a purpose sets
-  that build's deadline, and later calls wait only until it. X-Plane
+  that build's deadline, and later calls wait only until it. The budget
+  runs from when the build gets its extract permit, not from the ask, so
+  a tile queued behind other builds is not given up on before it starts
+  (#429); a cap bounds the whole wait from the first ask, queue included:
+  `ROAD_PROBE_CAP` (5 s) for probes, the generation cap equal to its wait.
+  The deadline is `min(ask + cap, max(ask, permit) + wait)`
+  (`RoadServiceConfig::deadline`), never earlier than before #429. A probe's
+  `stat` can therefore wait up to 5 s, against 2 s before, when its tile was
+  queued for a permit. X-Plane
   stats thousands of lit names while a scene loads, so a wait per call
   would stall loading for as long as the slowest tile multiplied by the
   names it covers. A new build (a tile rebuilt after the LRU evicted it)
@@ -1403,7 +1429,10 @@ maximum. `lamps: None` draws the continuous glow, byte for byte as before
 **Permit budget.** Night work runs on the blocking pool inside
 `BLOCKING_POOL_HEADROOM` (32) and may use a third of it: probe permits (2)
 plus the most generation permits (4) plus lit disk permits (2) plus road
-extract permits (2) is 10, held there by a compile-time assertion. The
+extract permits (2) is 10, held there by a compile-time assertion. The lit
+disk permits are one set (`LitDiskPermits`), made by the mount manager and
+given to both the lit source and the road service: lit disk reads and
+writes and road cache writes share them, so they count once. The
 share is fully used, so a new night permit needs a smaller one elsewhere
 or a larger headroom. The pack index build takes no permit (it is a
 one-off listing), so a caller that holds a lit disk permit while it asks
@@ -1415,11 +1444,19 @@ for identities never holds two.
 and payload is exactly as without road lights.
 
 **Probe.** `has_light` answers in this order: a committed answer for the
-footprint, if any; otherwise it waits for the footprint's road tiles
-(purpose `Probe`) holding no permit, takes a probe permit, and answers lit
-when the recipe field lights the footprint or, failing that, when any ready
-road tile `crosses` the footprint grown by `reach_deg` at the size of its
-first visible level. The road tiles a footprint asks for (in the probe,
+footprint, if any; otherwise it starts the footprint's road builds, takes
+a probe permit and reads the recipe field (`recipe_lights`), and answers
+lit at once when the recipe lights the footprint (#428: such a probe never
+waits for roads). Only when the recipe leaves it dark does it release the
+permit, wait for the road tiles (purpose `Probe`) holding none, and answer
+lit when any ready road tile comes within `reach_deg`, at the size of its
+first visible level, of the footprint. The decision is one pure function,
+`probe_answer(recipe_lit, footprint, road_tiles, reach)`, tested by value:
+the recipe's answer first, the road tiles consulted only when it is dark.
+Its road test is `crosses_footprint`, `crosses` over the same `RoadWindow`
+the raster culls with, a tile across the antimeridian shifted by 360
+degrees to the footprint's side (#434), so the probe and the raster cannot
+disagree at the line. The road tiles a footprint asks for (in the probe,
 the generation and the fingerprint alike) are those of the footprint grown
 by `max(FIELD_MARGIN_DEG, reach_deg)`, so a coarse zoom, a low texture
 setting, a high latitude or a wider model cannot leave a lit road's tile
@@ -1437,9 +1474,15 @@ the generation then finds that tile missing, the texture is generated
 without it, possibly full-size black; its size is unchanged.
 
 **Generation.** `generate` waits for the footprint's road tiles (purpose
-`Generate`) holding no permit, then takes a generation permit; the raster
-runs inside the generation task, and the tiles' handles are dropped once
-rastered, so the tile cache alone keeps merged roads.
+`Generate`) holding no permit, then takes a generation permit. If its wait
+had timed out, it looks at the tiles again once it holds the permit
+(`RoadService::tiles_now`, which never waits and starts nothing) and adds
+the tiles that became ready while it queued (#427), so a generation that
+waited out its budget for a permit is not served without roads that are
+there; the write-back and the generation line use the state after this
+look (`roads_ready_at_permit`). The raster runs inside the generation task,
+and the tiles' handles are dropped once rastered, so the tile cache alone
+keeps merged roads.
 
 **Memory and disk.** A payload is written to the lit tier only when every
 road tile it asked for was ready (and, as before, every recipe was read
@@ -1449,7 +1492,9 @@ disk: a timeout is transient, so the next read generates again, with the
 roads once they are ready (while the tile is still building past the
 generation budget, each read generates). A payload missing a failed tile
 is kept in memory (the tile has no roads this session) but not on disk,
-because a later session may read the tile.
+because a later session may read the tile. A payload whose tiles' DSFs
+changed since their roads were read is kept in memory only (#430, see What
+a build read), logged once per tile.
 
 **Fingerprints.** The session fingerprint includes the road digest
 (`roads::roads_digest`: `ROADS_VERSION` and `RoadModel::digest()`; zeros
@@ -1508,6 +1553,8 @@ flights show negative lead times.
 | More than `ROAD_HINT_BACKLOG` builds pending at a DSF hint | The hint is ignored; a probe or generation still starts the build | `Night roads: hint ignored`, debug |
 | A road disk entry that does not match or does not decode | Re-extracted from the file | No |
 | A road disk entry write fails | Nothing (re-extracted next session) | Debug |
+| More than `ROAD_WRITE_BACKLOG` tiles' writes waiting | The tile's entries are dropped (re-extracted next session) | `Night roads: road cache writes dropped; too many waiting`, debug; counted as `road_writes_dropped` |
+| A road DSF replaced after its roads were read | Payloads over that tile are served but kept in memory only; the next session regenerates | `Night lighting: lit textures over a road tile kept off disk; its DSFs changed since its roads were read`, once per tile, debug; counted as `write_back_skipped_road_sources_changed` |
 | An unknown road subtype | Drawn unlit | Once per subtype, debug |
 | `scenery_packs.ini` missing | Only Global Scenery is listed; its meshes are read to their HEAD, so no road light | No |
 
@@ -1527,7 +1574,8 @@ warning for an unreadable DSF. Read them with `run --debug`.
 | `Night roads: footprint waited` | `purpose`, `tiles`, `waited_ms`, `timed_out`, `complete` (only when the call waited or timed out) |
 | `Night roads: lead time` | `lat`, `lon`, `ms` |
 | `Night roads: LRU` | `lat`, `lon`, `bytes_held` |
-| `Night roads: summary` (every 60 s, only when something happened) | `tile_cache_bytes`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `tiles_ready`, `tiles_failed`, `probe_waits`, `probe_timeouts`, `generate_waits`, `generate_timeouts`, `answered_before_roads`, `extracted`, `extract_median_ms`, `extract_p95_ms`, `extract_max_ms`, `ready_median_ms`, `ready_p95_ms`, `ready_max_ms`, `permit_wait_p95_ms`, `road_cpu_ms` |
+| `Night roads: summary` (every 60 s, only when something happened) | `tile_cache_bytes`, `cache_hits`, `cache_misses`, `cache_hit_rate`, `tiles_ready`, `tiles_failed`, `probe_waits`, `probe_timeouts`, `generate_waits`, `generate_timeouts`, `answered_before_roads`, `extracted`, `extract_median_ms`, `extract_p95_ms`, `extract_max_ms`, `ready_median_ms`, `ready_p95_ms`, `ready_max_ms`, `permit_wait_p95_ms`, `road_cpu_ms`, `road_writes_dropped` |
+| `Night roads: road cache writes dropped; too many waiting` | the tile and its entry count |
 | `Night roads: unknown road subtype, drawn unlit` | `subtype` |
 | `Night roads: DSF unreadable; tile has no road lights this session` (warning) | `lat`, `lon`, `path`, `error` |
 | `Night roads: tile build ended without an answer; no road lights this session` | `lat`, `lon` |
@@ -1538,7 +1586,7 @@ warning for an unreadable DSF. Read them with `run --debug`.
 The existing `Night lighting: lit texture generated` line gains
 `road_segments` (point-to-point segments handed to the raster, see
 Merge), `road_raster_us`, `road_texels`, `roads_complete` and
-`roads_timed_out`, and `size`. `Night lighting: lit probe`
+`roads_timed_out`, `roads_ready_at_permit` (#427), and `size`. `Night lighting: lit probe`
 gains `roads_complete` and `roads_timed_out`. `Night lighting: lit read`
 says in `part` whether a read reached the payload: `blank` (header or the
 black levels above the payload), `lit`, or `black` when the payload it
@@ -1735,7 +1783,8 @@ lights).
   beside the sodium and LED pins; the class mask and the black stop are
   compared with the full path (`Shortcuts::NONE`); adjacent footprints
   agree along their edge with a mixed-grid recipe; the probe and the raster
-  agree across the antimeridian (`probe_answer`, `crosses_footprint`).
+  agree across the antimeridian (`probe_answer`, `crosses_footprint`),
+  and a footprint its recipe lights is answered whatever its road tiles.
   The tone path is checked against its former `powf` forms
   (`led::powf_reference`, test only, #436): the generator run with both
   through `CpuLitGenerator::generate_with`, the tone steps on 25,000
