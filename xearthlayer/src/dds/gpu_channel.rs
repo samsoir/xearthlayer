@@ -1637,11 +1637,15 @@ mod tests {
     }
 
     /// A rule short enough for tests, and a processor that overruns it.
+    // Wide enough that a busy CI runner's delay in picking a request up
+    // never reaches the deadline: the queue-age valve uses the same deadline,
+    // and a request it hands back is not a miss (a 40 ms deadline failed on
+    // macOS CI). Late tiles stay clearly late.
     const SHORT: HangRule = HangRule {
-        deadline: Duration::from_millis(40),
+        deadline: Duration::from_millis(200),
         misses: 3,
     };
-    const OVERRUN: Duration = Duration::from_millis(60);
+    const OVERRUN: Duration = Duration::from_millis(300);
 
     fn overrunning() -> impl TileProcessor {
         FnProcessor(|_: RgbaImage, _: &mut GpuTileTiming| {
@@ -1875,10 +1879,13 @@ mod tests {
         processed(reply_of(replies.next().unwrap()).await)
             .0
             .unwrap();
-        let reason = "3 tiles in a row missed the GPU's 40 ms deadline";
+        let reason = format!(
+            "3 tiles in a row missed the GPU's {} ms deadline",
+            SHORT.deadline.as_millis()
+        );
         for (reply, width) in replies.zip([16, 20]) {
             let (image, why) = returned(reply_of(reply).await);
-            assert_eq!((image.width(), why.as_str()), (width, reason));
+            assert_eq!((image.width(), why.as_str()), (width, reason.as_str()));
         }
         assert!(
             started.elapsed() < SHORT.deadline + OVERRUN + Duration::from_millis(500),
@@ -1895,7 +1902,7 @@ mod tests {
 
         let channel = Arc::new(GpuEncoderChannel::new(tx, health, CancellationToken::new()));
         let (image, why) = returned_by(&channel, 24).await;
-        assert_eq!((image.width(), why.as_str()), (24, reason));
+        assert_eq!((image.width(), why.as_str()), (24, reason.as_str()));
         assert_eq!(calls.load(Ordering::SeqCst), 3, "never sent");
     }
 
@@ -1987,8 +1994,12 @@ mod tests {
         assert_eq!(
             health.failure(),
             Some(
-                "3 tiles in a row failed on the GPU or missed its 40 ms deadline, \
-                 the last failure: Compression failed: mapping refused"
+                format!(
+                    "3 tiles in a row failed on the GPU or missed its {} ms deadline, \
+                     the last failure: Compression failed: mapping refused",
+                    SHORT.deadline.as_millis()
+                )
+                .as_str()
             )
         );
     }
