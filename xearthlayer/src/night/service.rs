@@ -1459,7 +1459,7 @@ mod tests {
             let key = crate::night::lit_cache_key(&name);
             let entry = d.get(&key).await.unwrap().expect("the payload is written");
             let fp = source.fingerprint(&name).await.unwrap();
-            assert!(crate::night::decode_entry(entry, &fp, layout.payload_len()).is_some());
+            assert!(crate::night::check_entry(entry, &fp, layout.payload_len()).is_ok());
             // The memory provider's count is eventually consistent (moka
             // applies a write on its next housekeeping pass, at most 300 ms
             // after an operation): keep operating until it has caught up.
@@ -1592,8 +1592,8 @@ mod tests {
             let key = crate::night::lit_cache_key(&name);
             for _ in 0..50 {
                 let entry = disk.get(&key).await.unwrap().unwrap();
-                if crate::night::decode_entry(entry, &b_fp, LitLayout::new(16, 4).payload_len())
-                    .is_some()
+                if crate::night::check_entry(entry, &b_fp, LitLayout::new(16, 4).payload_len())
+                    .is_ok()
                 {
                     break;
                 }
@@ -1637,7 +1637,7 @@ mod tests {
             let mut overwritten = false;
             for _ in 0..50 {
                 let entry = disk.get(&key).await.unwrap().unwrap();
-                if crate::night::decode_entry(entry, &b_fp, layout.payload_len()).is_some() {
+                if crate::night::check_entry(entry, &b_fp, layout.payload_len()).is_ok() {
                     overwritten = true;
                     break;
                 }
@@ -1645,7 +1645,7 @@ mod tests {
             }
             assert!(overwritten, "the entry carries the new fingerprint");
             let entry = disk.get(&key).await.unwrap().unwrap();
-            assert!(crate::night::decode_entry(entry, &a_fp, layout.payload_len()).is_none());
+            assert!(crate::night::check_entry(entry, &a_fp, layout.payload_len()).is_err());
         }
 
         #[tokio::test]

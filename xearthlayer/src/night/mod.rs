@@ -20,8 +20,8 @@ pub mod stats;
 pub mod store;
 
 pub use disk::{
-    check_entry, decode_entry, decode_entry_unsized, encode_entry, footprint_fingerprint,
-    lit_cache_key, session_fingerprint, EntryReject, LitFingerprint,
+    check_entry, decode_entry_unsized, encode_entry, footprint_fingerprint, lit_cache_key,
+    session_fingerprint, EntryReject, LitFingerprint,
 };
 pub use footprint::Footprint;
 pub use generator::{

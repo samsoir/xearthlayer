@@ -134,8 +134,9 @@ pub fn check_entry(
     if entry[4..36] != fp.0 {
         return Err(EntryReject::Fingerprint);
     }
-    let stored = stamped_len(&entry, fp).ok_or(EntryReject::Corrupt)?;
-    if stored != expected_len {
+    let mut stored = [0; 8];
+    stored.copy_from_slice(&entry[36..ENTRY_HEADER_LEN]);
+    if u64::from_le_bytes(stored) != expected_len {
         return Err(EntryReject::Length);
     }
     if (entry.len() - ENTRY_HEADER_LEN) as u64 != expected_len {
@@ -144,14 +145,7 @@ pub fn check_entry(
     Ok(entry.slice(ENTRY_HEADER_LEN..))
 }
 
-/// The payload of `entry` when it carries `fp` and is exactly
-/// `expected_len` bytes long; `None` otherwise ([`check_entry`] says why).
-/// Slices, no copy.
-pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Option<Bytes> {
-    check_entry(entry, fp, expected_len).ok()
-}
-
-/// Like [`decode_entry`] for entries whose length is not known in advance
+/// Like [`check_entry`] for entries whose length is not known in advance
 /// (road cache entries): the stored length must match the bytes present.
 pub fn decode_entry_unsized(entry: Bytes, fp: &LitFingerprint) -> Option<Bytes> {
     let stored = stamped_len(&entry, fp)?;
@@ -173,33 +167,9 @@ mod tests {
         let entry = encode_entry(&fp(1), b"payload");
         assert_eq!(&entry[..4], b"XELL");
         assert_eq!(
-            decode_entry(entry, &fp(1), 7).as_deref(),
-            Some(&b"payload"[..])
+            check_entry(entry, &fp(1), 7).as_deref(),
+            Ok(&b"payload"[..])
         );
-    }
-
-    #[test]
-    fn a_different_fingerprint_is_a_miss() {
-        assert_eq!(
-            decode_entry(encode_entry(&fp(1), b"payload"), &fp(2), 7),
-            None
-        );
-    }
-
-    #[test]
-    fn a_wrong_or_truncated_length_is_a_miss() {
-        let entry = encode_entry(&fp(1), b"payload");
-        assert_eq!(
-            decode_entry(entry.clone(), &fp(1), 8),
-            None,
-            "layout expects another size"
-        );
-        assert_eq!(
-            decode_entry(entry.slice(..entry.len() - 1), &fp(1), 7),
-            None,
-            "torn write"
-        );
-        assert_eq!(decode_entry(Bytes::from_static(b"XEL"), &fp(1), 0), None);
     }
 
     #[test]
