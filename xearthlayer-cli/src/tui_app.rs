@@ -153,53 +153,34 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     // Channel for progress updates from initialization
     let (progress_tx, progress_rx) = std::sync::mpsc::channel();
 
-    // Run initialization in a scoped thread so we can update dashboard
-    // Use a Mutex to store the result for thread-safe access
-    let init_result: std::sync::Mutex<Option<Result<_, xearthlayer::service::ServiceError>>> =
-        std::sync::Mutex::new(None);
-
-    std::thread::scope(|s| {
+    // Run initialization in a scoped thread so the loading screen keeps
+    // drawing. A panic there is carried to this thread (#418): it unwinds
+    // through `run`, whose orchestrator unmounts as it drops.
+    let result = std::thread::scope(|s| {
         // Spawn initialization thread - borrows from outer scope (scoped threads allow this)
         let progress_tx_clone = progress_tx.clone();
-        let init_result_ref = &init_result;
-        s.spawn(|| {
+        let init = s.spawn(|| {
             // Progress callback needs move to own progress_tx_clone
             let progress_callback = move |progress: StartupProgress| {
                 let _ = progress_tx_clone.send(progress);
             };
 
-            let result =
-                orchestrator.initialize_services(store, &ortho_packages, Some(progress_callback));
-            *init_result_ref.lock().unwrap() = Some(result);
+            orchestrator.initialize_services(store, &ortho_packages, Some(progress_callback))
         });
 
         // Update dashboard while initialization is in progress
-        let tick_rate = Duration::from_millis(50);
-        loop {
-            // Process progress updates
+        wait_for_init(init, Duration::from_millis(50), || {
             while let Ok(progress) = progress_rx.try_recv() {
                 update_loading_progress(&mut dashboard, &progress);
             }
-
-            // Check if initialization is complete
-            if init_result.lock().unwrap().is_some() {
-                break;
-            }
-
-            // Not ready yet - draw dashboard and wait
             if let Err(e) = dashboard.draw_loading() {
                 tracing::warn!(error = %e, "Dashboard draw error during init");
             }
-            std::thread::sleep(tick_rate);
-        }
+        })
     });
 
     // Check initialization result
     tracing::info!("Checking initialization result");
-    let result = init_result
-        .into_inner()
-        .unwrap()
-        .ok_or_else(|| CliError::Config("Initialization failed".to_string()))?;
     let _startup_result = result.map_err(CliError::Serve)?;
     tracing::info!("Initialization completed successfully");
 
@@ -414,6 +395,30 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     Ok(orchestrator.cancellation())
 }
 
+/// Wait for the startup thread, calling `on_tick` every `tick` until it
+/// finishes, and return what it returned.
+///
+/// A panic on the startup thread is resumed on this one. Waiting for a result
+/// the thread would never deliver left the loading screen up forever with the
+/// scenery mounted, deaf to every signal (the shutdown flag is read only once
+/// the dashboard runs), and killable only with `SIGKILL`. Carried here, the
+/// panic unwinds through `run`, whose orchestrator unmounts as it drops
+/// (#418).
+fn wait_for_init<T>(
+    init: std::thread::ScopedJoinHandle<'_, T>,
+    tick: Duration,
+    mut on_tick: impl FnMut(),
+) -> T {
+    while !init.is_finished() {
+        on_tick();
+        std::thread::sleep(tick);
+    }
+    match init.join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 /// Update dashboard loading progress based on StartupProgress.
 fn update_loading_progress(dashboard: &mut Dashboard, progress: &StartupProgress) {
     match progress {
@@ -540,4 +545,59 @@ pub fn run_headless(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Run `body` on a thread of its own and give up after `limit`, so a test
+    /// of a wait that hangs fails rather than hanging the suite.
+    fn within<T: Send + 'static>(limit: Duration, body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, outcome) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(body());
+        });
+        outcome
+            .recv_timeout(limit)
+            .expect("the wait did not end: a panicking startup thread was waited on forever")
+    }
+
+    #[test]
+    fn the_startup_result_is_returned_once_the_thread_finishes() {
+        let ticks = within(Duration::from_secs(10), || {
+            let mut ticks = 0;
+            let value = std::thread::scope(|s| {
+                let init = s.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(30));
+                    7
+                });
+                wait_for_init(init, Duration::from_millis(1), || ticks += 1)
+            });
+            assert_eq!(value, 7);
+            ticks
+        });
+
+        assert!(ticks > 0, "the loading screen is drawn while startup runs");
+    }
+
+    #[test]
+    fn a_panic_on_the_startup_thread_is_carried_to_the_waiting_thread() {
+        // #418: the loop waited for a result a panicked thread never sends.
+        let caught = within(Duration::from_secs(10), || {
+            std::panic::catch_unwind(|| {
+                std::thread::scope(|s| {
+                    let init = s.spawn(|| -> u32 { panic!("mount failed during startup") });
+                    wait_for_init(init, Duration::from_millis(1), || {})
+                })
+            })
+        });
+
+        let payload = caught.expect_err("the panic reaches the waiting thread");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"mount failed during startup")
+        );
+    }
 }
