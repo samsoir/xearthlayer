@@ -12,9 +12,6 @@ pub mod led;
 pub mod noise;
 pub mod tiling;
 
-#[cfg(test)]
-mod encode_timing;
-
 use std::sync::Arc;
 
 use image::RgbaImage;
@@ -126,6 +123,12 @@ pub const BC1_FLOOR: u8 = 8;
 /// and every level is floored at [`BC1_FLOOR`] after its dimming, then
 /// repaired where BC1 tints it ([`bc1_repair`]).
 ///
+/// The levels are made, dimmed, compressed and repaired one at a time, each
+/// into its own slice of a payload allocated once at its exact length
+/// (`capacity() == len()`); [`lit_chain`] says what is held meanwhile:
+/// beyond the image, about 3.7 MiB for a 1024 px one, payload included
+/// (#440).
+///
 /// An opaque black image (the probe answered lit, the generator lit
 /// nothing) is not encoded: its payload is all zeros, which the full path
 /// gives too (pinned at the first visible sizes from 4 to 2048 px), so it is
@@ -140,16 +143,26 @@ pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsE
     if let Some(len) = black_payload_len(&image) {
         return Ok(bytes::Bytes::from(vec![0; len]));
     }
-    encode_chain(&image).map(bytes::Bytes::from)
+    encode_chain(image).map(bytes::Bytes::from)
 }
 
-/// The full path of [`encode_visible`]: the chain, its dimming and BC1.
-fn encode_chain(image: &RgbaImage) -> Result<Vec<u8>, crate::dds::DdsError> {
-    let mut chain = lit_chain(image);
-    for (n, level) in chain.iter_mut().enumerate() {
+/// The full path of [`encode_visible`]: each level of [`lit_chain`] dimmed
+/// by its place in [`FADE_RAMP`], then compressed and repaired into its
+/// slice of the payload ([`bc1_level_into`]) before the next level is made.
+fn encode_chain(image: RgbaImage) -> Result<Vec<u8>, crate::dds::DdsError> {
+    let (w, h) = image.dimensions();
+    let levels = layout::full_chain_levels(w, h);
+    let mut payload = vec![0; layout::chain_len(w, h, levels, DdsFormat::BC1)];
+    let mut at = 0;
+    lit_chain(image, |n, level| {
         dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
-    }
-    bc1_levels(&chain)
+        let len = layout::level_len(level.width(), level.height(), DdsFormat::BC1);
+        bc1_level_into(level, &mut payload[at..at + len])?;
+        at += len;
+        Ok(())
+    })?;
+    debug_assert_eq!(at, payload.len(), "the chain has the layout's levels");
+    Ok(payload)
 }
 
 /// The payload length of `image`'s chain when every texel of it is opaque
@@ -164,27 +177,18 @@ fn black_payload_len(image: &RgbaImage) -> Option<usize> {
     black.then(|| layout::chain_len(w, h, layout::full_chain_levels(w, h), DdsFormat::BC1))
 }
 
-/// The BC1 blocks of `levels`, in order, without a DDS header, each level
-/// repaired where its endpoints tint dim texels ([`bc1_repair`]), in a
-/// buffer allocated once at its exact size, each level compressed and
-/// repaired in its own slice of it.
+/// Compresses one level into `blocks`, which must be its
+/// [`layout::level_len`] bytes, and repairs the blocks whose endpoints tint
+/// dim texels ([`bc1_repair`]).
 ///
 /// The kernel is [`IspcCompressor`], named here and never taken from a
 /// default: lit bytes are versioned by [`LIT_GENERATOR_VERSION`] and
 /// fingerprinted on disk on the understanding that they come from ISPC,
 /// whatever `texture.compressor` says.
-fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
-    let level_len =
-        |level: &RgbaImage| layout::level_len(level.width(), level.height(), DdsFormat::BC1);
-    let mut payload = vec![0; levels.iter().map(level_len).sum()];
-    let mut at = 0;
-    for level in levels {
-        let blocks = &mut payload[at..at + level_len(level)];
-        compress_level_into(&IspcCompressor, level, DdsFormat::BC1, blocks)?;
-        bc1_repair::repair_level(blocks, level);
-        at += blocks.len();
-    }
-    Ok(payload)
+fn bc1_level_into(level: &RgbaImage, blocks: &mut [u8]) -> Result<(), crate::dds::DdsError> {
+    compress_level_into(&IspcCompressor, level, DdsFormat::BC1, blocks)?;
+    bc1_repair::repair_level(blocks, level);
+    Ok(())
 }
 
 /// Scales a level's stored R, G and B by `gain`, each rounded to nearest,
@@ -223,64 +227,124 @@ fn map_and_floor(level: &mut RgbaImage, scale: impl Fn(u8) -> u8) {
     }
 }
 
-/// The mip chain of a lit level down to 1 x 1, averaged in linear light.
-/// Lit art is bright points on black, and averaging stored (sRGB) values
-/// counts a lit texel beside dark ones at a fraction of its light: by the
-/// sixth level a town kept a quarter of its light, and blue, the sparsest
-/// channel of warm light, lost the most, so distance made every town dimmer
-/// and more orange (#363). Each level is averaged from the linear values of
-/// the level above, never from its rounded bytes. Alpha is linear already.
+/// The mip chain of a lit level down to 1 x 1 (down to where either side
+/// is 1), averaged in linear light, handed to `visit` one level at a time,
+/// largest first, with its index. Lit art is bright points on black, and
+/// averaging stored (sRGB) values counts a lit texel beside dark ones at a
+/// fraction of its light: by the sixth level a town kept a quarter of its
+/// light, and blue, the sparsest channel of warm light, lost the most, so
+/// distance made every town dimmer and more orange (#363). Each level is
+/// averaged from the linear values of the level above, never from its
+/// rounded bytes, so `visit` may change the level it is given (the encoder
+/// dims it in place) without changing the levels below.
 ///
 /// Stored values decode through the process-wide table of
 /// `led::linear_table` and linear values encode through
 /// [`led::ByteEncoder`], which gives exactly the byte `led::encode` rounded
-/// to nearest gives, with no `powf` or `round` per channel. An alpha of
-/// exactly 1.0 (every opaque texel) is 255 without rounding.
-fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
-    let decode = led::linear_table();
+/// to nearest gives, with no `powf` or `round` per channel.
+///
+/// Level 0 is `image` itself. Below it only R, G and B are carried, and
+/// alpha is written 255: the generator's images are opaque, and neither
+/// ISPC's BC1 kernel nor the repair reads alpha (pinned by test).
+///
+/// What is held beyond `image` (#440): one buffer of level 1's linear
+/// values, three `f32`s per texel, 3 MiB for a 1024 px image, for the whole
+/// chain. Level 1's values are averaged straight from level 0's stored
+/// values through the decode table, summing the same four values in the
+/// same order as from a linear copy of level 0, which is never made, so
+/// each is the same `f32`; every later level is averaged over the one above
+/// in place ([`halve_in_place`]); and each level's bytes are written into
+/// `image`'s own buffer, which every level below it fits in.
+fn lit_chain<E>(
+    image: RgbaImage,
+    mut visit: impl FnMut(usize, &mut RgbaImage) -> Result<(), E>,
+) -> Result<(), E> {
     let encoder = led::ByteEncoder::get();
-    let encode = |c: f32| encoder.byte(c);
-    // Every texel the generator makes is opaque, so nearly every alpha is
-    // exactly 1.0 and skips the rounding.
-    let alpha = |a: f32| {
-        if a == 1.0 {
-            255
-        } else {
-            (a * 255.0).round() as u8
-        }
-    };
     let (mut w, mut h) = image.dimensions();
-    let mut linear: Vec<[f32; 4]> = image
-        .pixels()
-        .map(|p| {
-            let [r, g, b, a] = p.0;
-            [
-                decode[usize::from(r)],
-                decode[usize::from(g)],
-                decode[usize::from(b)],
-                f32::from(a) / 255.0,
-            ]
-        })
-        .collect();
-    let mut chain = vec![image.clone()];
-    while w > 1 && h > 1 {
-        let (nw, nh) = (w / 2, h / 2);
-        let above = &linear;
-        let at = |x: u32, y: u32| above[(y * w + x) as usize];
-        let next: Vec<[f32; 4]> = (0..nh)
-            .flat_map(|y| (0..nw).map(move |x| (x * 2, y * 2)))
-            .map(|(x, y)| {
-                let q = [at(x, y), at(x + 1, y), at(x, y + 1), at(x + 1, y + 1)];
-                std::array::from_fn(|c| (q[0][c] + q[1][c] + q[2][c] + q[3][c]) / 4.0)
-            })
-            .collect();
-        (linear, w, h) = (next, nw, nh);
-        chain.push(RgbaImage::from_fn(w, h, |x, y| {
-            let [r, g, b, a] = linear[(y * w + x) as usize];
-            image::Rgba([encode(r), encode(g), encode(b), alpha(a)])
-        }));
+    let mut linear = (w > 1 && h > 1).then(|| halve_stored(&image, led::linear_table()));
+    let mut level = image;
+    visit(0, &mut level)?;
+    let mut n = 1;
+    while let Some(mut values) = linear.take() {
+        (w, h) = (w / 2, h / 2);
+        level = stored_level(level.into_raw(), w, h, &values, encoder);
+        if w > 1 && h > 1 {
+            halve_in_place(&mut values, w, h);
+            linear = Some(values);
+        }
+        visit(n, &mut level)?;
+        n += 1;
     }
-    chain
+    Ok(())
+}
+
+/// The mean of four texels' linear values, channel by channel, summed in
+/// the order given: `(x, y)`, `(x + 1, y)`, `(x, y + 1)`, `(x + 1, y + 1)`.
+fn mean4(q: [[f32; 3]; 4]) -> [f32; 3] {
+    std::array::from_fn(|c| (q[0][c] + q[1][c] + q[2][c] + q[3][c]) / 4.0)
+}
+
+/// Level 1 of `image`'s chain in linear light, from its stored R, G and B
+/// through `decode`: each texel the [`mean4`] of the 2 x 2 texels above it.
+/// An odd last row or column is left out, as the chain always has.
+fn halve_stored(image: &RgbaImage, decode: &[f32; 256]) -> Vec<[f32; 3]> {
+    let (w, h) = image.dimensions();
+    let (nw, nh) = ((w / 2) as usize, (h / 2) as usize);
+    let stride = w as usize * 4;
+    let raw = image.as_raw();
+    let linear = |row: &[u8], at: usize| -> [f32; 3] {
+        std::array::from_fn(|c| decode[usize::from(row[at + c])])
+    };
+    let mut out = Vec::with_capacity(nw * nh);
+    for y in 0..nh {
+        let top = &raw[2 * y * stride..][..stride];
+        let bottom = &raw[(2 * y + 1) * stride..][..stride];
+        for x in (0..nw).map(|x| 8 * x) {
+            out.push(mean4([
+                linear(top, x),
+                linear(top, x + 4),
+                linear(bottom, x),
+                linear(bottom, x + 4),
+            ]));
+        }
+    }
+    out
+}
+
+/// Replaces `values`, the linear values of a `w` x `h` level, with those of
+/// the level below it: each texel the [`mean4`] of the 2 x 2 above it, as
+/// [`halve_stored`] averages. In place: the texel written at index `i`
+/// reads indices from `2 * y * w + 2 * x`, which is at least `i`, onwards,
+/// and every texel written after it reads only indices above `i`, so no
+/// value is overwritten before it is read.
+fn halve_in_place(values: &mut Vec<[f32; 3]>, w: u32, h: u32) {
+    let (w, nw, nh) = (w as usize, (w / 2) as usize, (h / 2) as usize);
+    debug_assert_eq!(values.len(), w * h as usize);
+    for y in 0..nh {
+        for x in 0..nw {
+            let (a, b) = (2 * y * w + 2 * x, (2 * y + 1) * w + 2 * x);
+            values[y * nw + x] = mean4([values[a], values[a + 1], values[b], values[b + 1]]);
+        }
+    }
+    values.truncate(nw * nh);
+}
+
+/// The `w` x `h` level whose linear values are `values`, encoded through
+/// `encoder`, alpha 255, written into `buffer`: the bytes of the level
+/// above, no longer needed, which it fits in, so nothing is allocated.
+fn stored_level(
+    mut buffer: Vec<u8>,
+    w: u32,
+    h: u32,
+    values: &[[f32; 3]],
+    encoder: &led::ByteEncoder,
+) -> RgbaImage {
+    debug_assert_eq!(values.len(), w as usize * h as usize);
+    buffer.truncate(values.len() * 4);
+    for (texel, &[r, g, b]) in buffer.chunks_exact_mut(4).zip(values) {
+        texel.copy_from_slice(&[encoder.byte(r), encoder.byte(g), encoder.byte(b), 255]);
+    }
+    RgbaImage::from_raw(w, h, buffer).expect("a level fits in the bytes of the level above")
 }
 
 #[cfg(test)]
@@ -299,7 +363,7 @@ mod tests {
         assert_eq!(LIT_GENERATOR_VERSION, 10);
     }
 
-    pub(super) fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    fn name_at(lat: f64, lon: f64) -> DdsFilename {
         let n = f64::from(1u32 << 16);
         let x = ((lon + 180.0) / 360.0 * n) as u32;
         let lat_r = lat.to_radians();
@@ -390,7 +454,7 @@ mod tests {
         rgbs
     }
 
-    pub(super) fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
+    fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
         RgbaImage::from_pixel(size, size, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
     }
 
@@ -450,7 +514,7 @@ mod tests {
         // the light in each channel, so it is neither dimmer nor warmer.
         let lit = [200, 120, 50];
         let source = checker(64, lit);
-        let chain = lit_chain(&source);
+        let chain = lit_chain_levels(source.clone());
         assert_eq!(chain.len(), 7, "64 px down to 1 px");
         assert_eq!(chain[0], source, "the first level is the image");
         for (level, img) in chain.iter().enumerate().skip(1) {
@@ -494,6 +558,33 @@ mod tests {
         })
     }
 
+    /// Every level of `image`'s chain, collected: what [`lit_chain`] hands
+    /// its visitor, kept.
+    fn lit_chain_levels(image: RgbaImage) -> Vec<RgbaImage> {
+        let mut levels = Vec::new();
+        lit_chain(image, |_, level| {
+            levels.push(level.clone());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        levels
+    }
+
+    /// The payload of `levels`, each compressed and repaired by
+    /// [`bc1_level_into`] into its slice of one buffer, in order.
+    fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
+        let level_len =
+            |level: &RgbaImage| layout::level_len(level.width(), level.height(), DdsFormat::BC1);
+        let mut payload = vec![0; levels.iter().map(level_len).sum()];
+        let mut at = 0;
+        for level in levels {
+            let len = level_len(level);
+            bc1_level_into(level, &mut payload[at..at + len])?;
+            at += len;
+        }
+        Ok(payload)
+    }
+
     /// One level BC1-encoded by ISPC alone, without the repair.
     fn unrepaired(level: &RgbaImage) -> Vec<u8> {
         compress_level(&IspcCompressor, level, DdsFormat::BC1).unwrap()
@@ -504,7 +595,7 @@ mod tests {
         // The nearest level's dimming turns these into the probe's lamp,
         // (9, 7, 5), (8, 6, 5) and (8, 7, 5).
         let img = lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]);
-        let mut chain = lit_chain(&img);
+        let mut chain = lit_chain_levels(img.clone());
         for (n, level) in chain.iter_mut().enumerate() {
             dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
         }
@@ -623,7 +714,7 @@ mod tests {
         // disk under a fingerprint of it: an unintended change to them, here
         // or in the encoder below, must fail this test, not reach the cache.
         let img = golden_level();
-        let mut chain = lit_chain(&img);
+        let mut chain = lit_chain_levels(img.clone());
         for (n, level) in chain.iter_mut().enumerate() {
             dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
         }
@@ -681,8 +772,7 @@ mod tests {
     fn the_payload_is_allocated_at_its_exact_size() {
         // A ZL16 payload grown by doubling held 1,048,832 bytes for 699,064
         // (#392), and the payload cache weighs only the length.
-        let chain = lit_chain(&golden_level());
-        let payload = bc1_levels(&chain).unwrap();
+        let payload = encode_chain(golden_level()).unwrap();
         assert_eq!(
             payload.len(),
             layout::chain_len(GOLDEN_SIZE, GOLDEN_SIZE, 8, DdsFormat::BC1)
@@ -717,7 +807,7 @@ mod tests {
     }
 
     /// `lit_chain` before #439.
-    pub(super) fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
+    fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
         let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
         let (mut w, mut h) = image.dimensions();
         let mut linear: Vec<[f32; 4]> = image
@@ -755,7 +845,7 @@ mod tests {
     }
 
     /// `dim` before #439.
-    pub(super) fn dim_reference(level: &mut RgbaImage, gain: f32) {
+    fn dim_reference(level: &mut RgbaImage, gain: f32) {
         for px in level.pixels_mut() {
             let rgb = &mut px.0[..3];
             for c in rgb.iter_mut() {
@@ -767,7 +857,11 @@ mod tests {
         }
     }
 
-    /// `encode_visible` before #439: the full path, with no shortcut.
+    /// `encode_visible` before #439: the full path, with no shortcut. Its
+    /// memory is also that of #439's: the whole chain, with a copy of the
+    /// first level and a linear copy of it, four channels (#440). The
+    /// integration tests, which cannot reach this module, measure that
+    /// memory with a copy of it (`tests/support/lit_encode_before.rs`).
     fn encode_visible_reference(image: &RgbaImage) -> Vec<u8> {
         let mut chain = lit_chain_reference(image);
         for (n, level) in chain.iter_mut().enumerate() {
@@ -786,7 +880,7 @@ mod tests {
     /// [0, 1.25]. A superset of the inputs `led`'s
     /// `the_byte_encoder_is_encode_rounded_for_every_kind_of_input` builds
     /// inline, for its tests to share.
-    pub(super) fn encode_probe_inputs() -> Vec<f32> {
+    fn encode_probe_inputs() -> Vec<f32> {
         let mut inputs = vec![
             0.0,
             -0.0,
@@ -877,7 +971,40 @@ mod tests {
             RgbaImage::from_pixel(1, 1, image::Rgba([90, 60, 30, 255])),
         ];
         for (i, img) in images.iter().enumerate() {
-            assert!(lit_chain(img) == lit_chain_reference(img), "image {i}");
+            assert_chain_is_the_reference(img, &format!("image {i}"));
+        }
+    }
+
+    /// Asserts that `img`'s chain is the reference's: the image itself
+    /// first, then the reference's R, G and B at every level, with alpha 255
+    /// where the reference averaged it (#440); for an opaque image, the
+    /// reference's levels exactly.
+    fn assert_chain_is_the_reference(img: &RgbaImage, label: &str) {
+        let (got, want) = (lit_chain_levels(img.clone()), lit_chain_reference(img));
+        assert_eq!(got.len(), want.len(), "{label}");
+        assert!(got[0] == *img, "{label}: level 0 is the image");
+        for (n, (got, want)) in got.iter().zip(&want).enumerate().skip(1) {
+            assert_eq!(got.dimensions(), want.dimensions(), "{label} level {n}");
+            let same = got
+                .pixels()
+                .zip(want.pixels())
+                .all(|(g, w)| g.0[..3] == w.0[..3] && g.0[3] == 255);
+            assert!(same, "{label} level {n}");
+        }
+        if img.pixels().all(|p| p.0[3] == 255) {
+            assert!(got == want, "{label}: opaque, so the same levels");
+        }
+    }
+
+    #[test]
+    fn lit_chain_equals_the_reference_on_generated_levels() {
+        for (lat, lon, size) in [(37.20, -122.725, 256), (37.25, -122.75, 128)] {
+            let img = generate(&name_at(lat, lon), size);
+            assert!(
+                img.pixels().any(|p| p.0[..3] != [0; 3]),
+                "{lat} {lon} is lit"
+            );
+            assert_chain_is_the_reference(&img, &format!("{lat} {lon}"));
         }
     }
 
@@ -910,6 +1037,18 @@ mod tests {
             every_byte(|_, _| 255),
             around_the_floor(),
             solid(64, [14; 3]),
+            // Generated, non-square and with random alpha (#440).
+            generate(&name_at(37.20, -122.725), 256),
+            generate(&name_at(37.25, -122.75), 128),
+            RgbaImage::from_fn(64, 16, |x, y| {
+                image::Rgba([x as u8 * 4, y as u8 * 16, 9, 255])
+            }),
+            RgbaImage::from_fn(13, 7, |x, y| {
+                image::Rgba([x as u8 * 19, y as u8 * 37, 200, 255])
+            }),
+            with_random_alpha(&golden_level()),
+            with_random_alpha(&generate(&name_at(37.20, -122.725), 256)),
+            every_byte(|x, y| (x * 7 + y * 3) as u8),
         ] {
             let want = encode_visible_reference(&img);
             assert_eq!(&encode_visible(img).unwrap()[..], &want[..]);
@@ -929,7 +1068,7 @@ mod tests {
         let square = FIRST_VISIBLE_SIZES.map(|s| (s, s));
         for (w, h) in square.into_iter().chain([(64, 16), (13, 7), (1024, 512)]) {
             let black = RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-            let full = encode_chain(&black).unwrap();
+            let full = encode_chain(black.clone()).unwrap();
             let levels = layout::full_chain_levels(w, h);
             assert_eq!(
                 full.len(),
@@ -939,6 +1078,74 @@ mod tests {
             assert!(full.iter().all(|&b| b == 0), "{w}x{h} full path");
             assert_eq!(black_payload_len(&black), Some(full.len()), "{w}x{h}");
             assert_eq!(&encode_visible(black).unwrap()[..], &full[..], "{w}x{h}");
+        }
+    }
+
+    /// `img` with every alpha replaced by a hash of the texel's position,
+    /// never 255.
+    fn with_random_alpha(img: &RgbaImage) -> RgbaImage {
+        let mut out = img.clone();
+        for (x, y, px) in out.enumerate_pixels_mut() {
+            let h = (u64::from(y) << 32 | u64::from(x)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            px.0[3] = (h >> 56) as u8 % 255;
+        }
+        out
+    }
+
+    #[test]
+    fn ispc_bc1_blocks_ignore_alpha() {
+        // Why the chain may write alpha 255 below the first level (#440):
+        // the blocks are the same whatever the alpha, at a whole-block size
+        // and at the padded 1, 2 and 3 px levels.
+        for (i, source) in [every_byte(|_, _| 255), golden_level()].iter().enumerate() {
+            for size in [256, 64, 3, 2, 1]
+                .into_iter()
+                .filter(|&s| s <= source.width())
+            {
+                // From the centre, which is lit in both sources.
+                let at = (source.width() - size).min(source.width() / 2);
+                let opaque = image::imageops::crop_imm(source, at, at, size, size).to_image();
+                assert!(
+                    opaque.pixels().any(|p| p.0[..3] != [0; 3]),
+                    "{i}: {size} px"
+                );
+                let random = with_random_alpha(&opaque);
+                assert!(random.pixels().any(|p| p.0[3] != 255), "{i}: {size} px");
+                assert_eq!(
+                    compress_level(&IspcCompressor, &random, DdsFormat::BC1).unwrap(),
+                    compress_level(&IspcCompressor, &opaque, DdsFormat::BC1).unwrap(),
+                    "{i}: {size} px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bc1_repair_ignores_alpha() {
+        // The nearest level of these lamps is one ISPC tints, so the repair
+        // changes blocks.
+        let mut opaque = lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]);
+        dim(&mut opaque, FADE_RAMP[0]);
+        let random = with_random_alpha(&opaque);
+        let ispc = unrepaired(&opaque);
+        let (mut from_opaque, mut from_random) = (ispc.clone(), ispc.clone());
+        bc1_repair::repair_level(&mut from_opaque, &opaque);
+        bc1_repair::repair_level(&mut from_random, &random);
+        assert_ne!(from_opaque, ispc, "the repair has work to do");
+        assert_eq!(from_random, from_opaque);
+    }
+
+    #[test]
+    fn the_payload_ignores_alpha() {
+        for img in [
+            golden_level(),
+            lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]),
+            every_byte(|_, _| 255),
+        ] {
+            let want = encode_visible_reference(&img);
+            let random = with_random_alpha(&img);
+            assert_eq!(&encode_visible_reference(&random)[..], &want[..]);
+            assert_eq!(&encode_visible(random).unwrap()[..], &want[..]);
         }
     }
 
