@@ -644,7 +644,11 @@ impl NightLitSource {
                 roads: &roads,
                 road_model: &road_model,
             });
-            Some((super::generator::encode_visible(image), roads.stats))
+            // Only its stats are wanted now: the field (4 MiB at 1024 px
+            // when a road is lit) is not held through the encode (#440).
+            let road_stats = roads.stats;
+            drop(roads);
+            Some((super::generator::encode_visible(image), road_stats))
         })
         .await;
         let result = match generated {
