@@ -909,19 +909,25 @@ mod gpu_tests {
         // parallel: several threads enumerating adapters while others create
         // a device and its compute pipelines. Each enumeration used to create
         // and drop its own wgpu instance, and the Vulkan loader or the NVIDIA
-        // driver jumped to address 0 (SIGSEGV of the whole test binary). On a
-        // host without a GPU this passes trivially.
+        // driver jumped to address 0 (SIGSEGV of the whole test binary). The
+        // device is made on an adapter the host has, so the devices are really
+        // created; a host without a GPU has nothing to test.
         const THREADS: usize = 8;
         const ROUNDS: usize = 4;
+        let adapters = crate::system::enumerate_gpus();
+        let Some(first) = adapters.first() else {
+            return;
+        };
+        let device = first.config_value(&adapters);
         let start = std::sync::Barrier::new(THREADS);
         std::thread::scope(|scope| {
             for thread in 0..THREADS {
-                let start = &start;
+                let (start, device) = (&start, &device);
                 scope.spawn(move || {
                     start.wait();
                     for _ in 0..ROUNDS {
                         if thread % 2 == 0 {
-                            let _ = create_gpu_resources("integrated");
+                            let _ = create_gpu_resources(device);
                         } else {
                             let _ = crate::system::enumerate_gpus();
                         }
