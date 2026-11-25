@@ -211,6 +211,11 @@ mod gpu_stress {
         let mut total_requests = 0u64;
         let mut total_successes = 0u64;
         let mut total_failures = 0u64;
+        // Tiles the worker handed back to the CPU: on a GPU slower than the
+        // deadline over a burst's queue, the queue-age valve hands the last
+        // ones back, as it should. Reported, never a failure: how many
+        // depends on the GPU's speed.
+        let mut total_handed_back = 0u64;
         let mut burst_count = 0u64;
         let mut all_latencies_ms: Vec<f64> = Vec::new();
         let mut burst_tiles = 0usize;
@@ -243,17 +248,20 @@ mod gpu_stress {
                 }));
             }
 
-            // Collect results with timeout
+            // Collect results; the 60 s timeout only guards a deadlock.
             let mut burst_latencies = Vec::new();
+            let mut answered = 0usize;
             for handle in handles {
                 total_requests += 1;
                 match tokio::time::timeout(Duration::from_secs(60), handle).await {
                     Ok(Ok((Ok(ChainOutcome::Compressed(_data)), elapsed))) => {
                         total_successes += 1;
+                        answered += 1;
                         burst_latencies.push(elapsed.as_secs_f64() * 1000.0);
                     }
                     Ok(Ok((Ok(ChainOutcome::Returned { reason, .. }), _))) => {
-                        total_failures += 1;
+                        total_handed_back += 1;
+                        answered += 1;
                         eprintln!("  Handed back to the CPU: {reason}");
                     }
                     Ok(Ok((Err(e), _))) => {
@@ -293,7 +301,7 @@ mod gpu_stress {
             // A burst whose callers all returned leaves the channel empty.
             // Checked at the end, after the failure summary: a caller that
             // timed out is still counted in the depth.
-            if burst_latencies.len() == burst_size && stats.depth() != 0 {
+            if answered == burst_size && stats.depth() != 0 {
                 eprintln!("  Depth {} after a complete burst", stats.depth());
                 depth_left_after_bursts += 1;
             }
@@ -319,6 +327,7 @@ mod gpu_stress {
         eprintln!("Requests:     {total_requests}");
         eprintln!("Successes:    {total_successes}");
         eprintln!("Failures:     {total_failures}");
+        eprintln!("Handed back:  {total_handed_back} (queue-age valve; GPU speed dependent)");
         eprintln!("Worker alive: {}", channel.is_connected());
         eprintln!(
             "RSS:          {initial_rss:.1}MB → {final_rss:.1}MB (delta: {:.1}MB)",
@@ -349,7 +358,10 @@ mod gpu_stress {
         );
         assert!(
             channel.is_connected(),
-            "GPU worker should still be alive after stress test"
+            "GPU worker should still be alive after stress test (health: {:?}; it fails \
+             only on a panic, a lost device, or {MISSES_BEFORE_FAILED} tiles in a row past \
+             the {TILE_DEADLINE:?} deadline)",
+            channel.health().health()
         );
         assert_eq!(
             depth_left_after_bursts, 0,
@@ -546,11 +558,36 @@ mod gpu_stress {
             worker.is_finished()
         );
 
+        // How many of the burst's tiles reached the destroyed device
+        // depends on the GPU's speed: on a slow one the queue-age valve
+        // hands the last ones back before the destroy. Tiles one at a time
+        // reach it until it fails the GPU; they are lost, as the burst's
+        // would have been.
+        let mut extra_failed = 0;
+        while !health.is_failed() && extra_failed < MISSES_BEFORE_FAILED {
+            let enc = Arc::clone(&encoder);
+            let img = (*source).clone();
+            match tokio::task::spawn_blocking(move || enc.encode(img))
+                .await
+                .unwrap()
+            {
+                Ok(dds) => panic!(
+                    "a tile after the destroy was encoded (ISPC-identical: {}) while the \
+                     GPU is not failed",
+                    dds == expected
+                ),
+                Err(e) => {
+                    extra_failed += 1;
+                    eprintln!("  one at a time, failed on the destroyed device: {e}");
+                }
+            }
+        }
         assert!(
             health.is_failed(),
-            "the burst did not fail the GPU (ok={ok}, failed={failed}): fewer than \
-             {MISSES_BEFORE_FAILED} of its tiles failed on the destroyed device"
+            "the destroyed device did not fail the GPU (burst ok={ok}, failed={failed}; \
+             {extra_failed} more failed one at a time)"
         );
+        let _ = channel.stats().take_sample();
 
         // After the burst: every tile must be encoded, on the fallback.
         let mut after_failed = 0;
