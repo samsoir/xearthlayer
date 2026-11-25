@@ -8,8 +8,9 @@
 //! a function of world position, so textures never disagree on shared
 //! ground and the pattern never visibly repeats.
 
-use super::noise::{floor_i64, hash2, mix, unit};
+use super::noise::{hash2, mix, unit};
 use crate::night::laminar::LitPattern;
+use crate::night::math::floor_i64;
 
 pub(crate) const EARTH_RADIUS_M: f64 = 6_378_137.0;
 

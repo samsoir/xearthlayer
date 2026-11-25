@@ -12,7 +12,8 @@ use super::{
     ClassWeight, Layer, RecipeField, WARP_AMPLITUDE_CELLS, WARP_SEED_X, WARP_SEED_Y,
     WARP_WAVELENGTH_CELLS,
 };
-use crate::night::generator::noise::{floor_i64, NoisePair};
+use crate::night::generator::noise::NoisePair;
+use crate::night::math::floor_i64;
 
 /// Cells of slack around those a table must hold. Reads outside a table
 /// are still answered (from the field), so this only keeps them rare.

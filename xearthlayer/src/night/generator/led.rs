@@ -9,8 +9,9 @@
 
 use std::sync::OnceLock;
 
-use super::noise::{floor_i64, hash2, unit};
+use super::noise::{hash2, unit};
 use super::SRGB_GAMMA;
+use crate::night::math::floor_i64;
 
 /// Where LED adoption and colour temperature come from: the continent prefix
 /// of the package region code the recipe was read from.

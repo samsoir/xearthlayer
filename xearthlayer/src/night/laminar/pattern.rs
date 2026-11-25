@@ -2,7 +2,7 @@
 
 use crate::dds::layout::level_len;
 use crate::dds::DdsFormat;
-use crate::night::generator::noise::floor_i64;
+use crate::night::math::floor_i64;
 
 /// One lit pattern: the top level of a Laminar `*_LIT.dds`, as RGB.
 #[derive(Debug, Clone, PartialEq)]

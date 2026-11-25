@@ -20,11 +20,11 @@ use tracing::debug;
 
 use super::field::{FieldSampler, RecipeField};
 use super::led::{self, LedRegion, TonePath};
-use super::noise::floor_i64;
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TexelCentres};
 use crate::night::laminar::LitPattern;
+use crate::night::math::floor_i64;
 use crate::night::roads::field::RoadField;
 
 /// Palette indexes per tile: a class cell is one byte.
