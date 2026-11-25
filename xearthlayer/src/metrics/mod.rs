@@ -18,6 +18,7 @@ mod state;
 mod system;
 
 pub use client::MetricsClient;
+pub(crate) use daemon::MEMORY_SAMPLE_INTERVAL;
 pub use daemon::{MetricsDaemon, MetricsStateSnapshot, SharedMetricsState};
 pub use event::MetricEvent;
 pub use latency::{LatencyHistogram, LatencySummary, LatencyWindow};

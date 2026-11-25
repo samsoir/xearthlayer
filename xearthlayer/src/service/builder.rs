@@ -144,6 +144,13 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                 tracing::warn!(adapter = %selection.adapter, "{warning}");
             }
 
+            // The per-minute `GPU encode sample` line, ended with the worker
+            // by the shutdown token or when the channel is dropped (#419).
+            crate::dds::gpu_stats::start_sample_log(
+                Arc::downgrade(channel.stats()),
+                shutdown_token.clone(),
+            );
+
             tracing::info!("GPU pipeline encoder created with dedicated worker");
 
             Ok(EncoderComponents {

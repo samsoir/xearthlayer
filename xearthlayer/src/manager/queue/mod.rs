@@ -275,7 +275,7 @@ impl<S: Stages> Drop for InstallQueue<S> {
             if let Err(payload) = thread.join() {
                 tracing::error!(
                     "{name} thread panicked: {}",
-                    state::panic_message(payload.as_ref())
+                    crate::panic::panic_message(payload.as_ref())
                 );
             }
         }

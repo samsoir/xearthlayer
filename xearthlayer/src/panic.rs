@@ -131,6 +131,19 @@ const MOUNT_NOTE: &str = "This handler never unmounts. The mount is removed only
 process ends, when `run` unwinds (a panic on the startup thread is carried to the main \
 thread first).";
 
+/// The text of a caught panic's payload (from `catch_unwind` or a thread's
+/// `join`): the message of `panic!("...")` or `panic!("{}", ..)`, else
+/// "unknown panic".
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +159,14 @@ mod tests {
         let mut out = Vec::new();
         write_report(&mut out, location, payload).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn panic_message_reads_str_string_and_other_payloads() {
+        let caught = |f: fn()| panic_message(panic::catch_unwind(f).unwrap_err().as_ref());
+        assert_eq!(caught(|| panic!("plain")), "plain");
+        assert_eq!(caught(|| panic!("formatted {}", 7)), "formatted 7");
+        assert_eq!(caught(|| panic::panic_any(42_u32)), "unknown panic");
     }
 
     #[test]
