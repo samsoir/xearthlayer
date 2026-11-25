@@ -202,8 +202,11 @@ footprint gives:
 
 - its latitude and longitude bounds, and the mapping from a texel to a
   latitude and longitude, north up, row 0 at the north edge;
-- the 1° tiles it touches. A footprint can straddle tile boundaries, and
-  each texel is computed from the recipe of the tile containing it;
+- the 1° tiles it touches, longitudes wrapped into [-180, 180) at the
+  antimeridian (`Footprint::tile_ranges` keeps them unwrapped, so a field
+  across the line stays contiguous, #434). A footprint can straddle tile
+  boundaries, and each texel is computed from the recipe of the tile
+  containing it;
 - `has_light` (`RecipeField::has_light`, beside the generator's sampling
   so the two share one model): whether the generator may light any texel
   of the footprint. It reads recipes only, never generates pixels, and
@@ -415,7 +418,10 @@ reaches the payload, which is generated only then. `LitLayout::read_lit`
 composes the bytes from the payload it is given; a payload that is
 absent or of the wrong length
 reads as zeros, and any split of a read gives the same bytes as one whole
-read. The payload (the visible levels, about 0.7 MB for an urban ZL16
+read. A read wholly inside the zero region, up to 1 MiB, is a slice of one
+static zero buffer (`Bytes::from_static`), so the most common lit read
+allocates nothing; a read with header or payload bytes is composed once
+into its own buffer (#434). The payload (the visible levels, about 0.7 MB for an urban ZL16
 texture) is cached in memory and on disk, the top (2 MiB at ZL16) in
 memory only.
 
@@ -488,8 +494,21 @@ For each texel of the first visible level, the CPU implementation:
    (R12). Cells are indexed globally (row 0 at the north pole, column 0 at
    180 W), so a sample near a 1 degree edge reads the neighbouring tile's
    cells, and `RecipeField` fetches every recipe a footprint plus a small
-   margin touches once. A tile whose grid size differs from the field's
-   reads as missing.
+   margin touches once. Each tile's layers are read on that tile's own
+   grid and brightness scale (#434): a point samples on its own tile's
+   grid, or, where its tile lacks the layer, on the nearest tile's that
+   has it (ties to the smaller tile key), reading cells only from tiles on
+   that grid, so the value depends on the ground and never on which
+   footprint asks; before, a tile whose grid differed from the first
+   recipe's read as missing and every tile used the first recipe's scale,
+   so two adjacent textures could disagree along their shared edge. Every
+   installed recipe today has the same grids (1,200 class and 240
+   brightness cells per degree) and scale, so the change alters no real
+   texture and `LIT_GENERATOR_VERSION` stays 10; a recipe on another grid
+   is a new recipe identity, so a new fingerprint. Tile longitudes wrap
+   across the antimeridian, so a footprint at the line reads the recipe
+   and the roads of the tile across it (the pattern tiling and warp noise
+   are not periodic, so a pattern seam at the line remains).
 3. **Samples each weighted class's pattern** by hex-grid stochastic
    tiling (`tiling.rs`), anchored to world position at the pattern's own
    ground scale (R11):
@@ -556,6 +575,33 @@ developer machine). Three things keep it there: recipes sit in a small
 table of tile slots rather than a hash map, patterns resolve once per
 tile and palette index, and the tiling caches the lattice corners
 neighbouring texels share (with the same bits as without the cache).
+
+Per-texel work is hoisted out of the loop (#437, #438), each change
+computing the same `f32` values by the same operations, so the pinned
+digests hold and no version changed:
+- `FieldSampler` (`field/sampler.rs`) builds, once per texture, dense
+  class and brightness cell tables over the cells the texture's samples
+  can reach, and per column and per row the grid, warp and brightness
+  coordinates, so a cell read no longer divides or hashes. A read outside
+  a table falls back to the field; tests assert real generations never
+  miss.
+- Both warp noises come from one lattice lookup with a one-entry corner
+  cache (`NoisePair`); `floor` calls are replaced by `night::math::floor_i64`;
+  a pattern whose size is a power of two wraps its taps with a mask decided
+  when it is decoded; the LED patch keeps one cache for the pattern pass;
+  `BrightnessScale` takes the radiance logarithm once.
+- A class mask (`CellTable::near_class`, cells within 2 of a class cell,
+  which covers the warp's reach) lets a texel far from any class skip the
+  class lookup, and a texel whose pattern sum is exactly black skips the
+  patch draw and the tone path; road light still reaches it.
+
+On 99 real ZL16 textures at 1024 px (the #436 sample: release, one thread),
+the hoisted parts took 98.1 to 29.8 ms (class weights), 35.5 to 10.3 ms
+(radiance), 134.7 to 97.7 ms (pattern sampling) and 29.5 to 7.9 ms (LED
+patch) per texture, and a whole generation about 335 to 180 ms. These are
+one laptop's figures (AMD Ryzen AI 9 HX 370), measured while other builds
+ran, for reference only; the ignored tests `time_the_hoisted_texel_parts`
+and `time_the_class_mask` repeat them.
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -1682,6 +1728,14 @@ lights).
   byte value at each fade gain, and `encode_visible` on six images.
   `led::ByteEncoder` itself is checked on every float from 0 to 1 by an
   ignored test, `the_byte_encoder_exhaustive`, run in release.
+  The hoisted sampling is checked against copies of the code before #437
+  (`field/lookup_reference.rs`, `tiling/sample_reference.rs`) bit for bit
+  over dense sweeps, missing recipes, mixed grids and degree lines, and a
+  road-lit LED generation is pinned (`the_road_lit_output_is_pinned`)
+  beside the sodium and LED pins; the class mask and the black stop are
+  compared with the full path (`Shortcuts::NONE`); adjacent footprints
+  agree along their edge with a mixed-grid recipe; the probe and the raster
+  agree across the antimeridian (`probe_answer`, `crosses_footprint`).
   The tone path is checked against its former `powf` forms
   (`led::powf_reference`, test only, #436): the generator run with both
   through `CpuLitGenerator::generate_with`, the tone steps on 25,000
