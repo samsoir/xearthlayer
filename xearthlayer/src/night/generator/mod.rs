@@ -232,12 +232,12 @@ fn map_and_floor(level: &mut RgbaImage, scale: impl Fn(u8) -> u8) {
 /// the level above, never from its rounded bytes. Alpha is linear already.
 ///
 /// Stored values decode through the process-wide table of
-/// `cpu::linear_table` and linear values encode through
+/// `led::linear_table` and linear values encode through
 /// [`led::ByteEncoder`], which gives exactly the byte `led::encode` rounded
 /// to nearest gives, with no `powf` or `round` per channel. An alpha of
 /// exactly 1.0 (every opaque texel) is 255 without rounding.
 fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
-    let decode = cpu::linear_table();
+    let decode = led::linear_table();
     let encoder = led::ByteEncoder::get();
     let encode = |c: f32| encoder.byte(c);
     // Every texel the generator makes is opaque, so nearly every alpha is
@@ -818,7 +818,7 @@ mod tests {
 
     #[test]
     fn the_shared_decode_table_is_the_one_lit_chain_built() {
-        let table = cpu::linear_table();
+        let table = led::linear_table();
         for v in 0..=255u8 {
             assert_eq!(
                 table[usize::from(v)].to_bits(),

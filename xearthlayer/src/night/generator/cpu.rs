@@ -13,13 +13,13 @@
 //! Road glow (`LitRequest::roads`) is added last, in linear light, only on
 //! the texels it reaches: an empty road field leaves every byte as it was.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use image::{Rgba, RgbaImage};
 use tracing::debug;
 
 use super::field::RecipeField;
-use super::led::{self, LedRegion};
+use super::led::{self, LedRegion, TonePath};
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TexelCentres};
@@ -35,6 +35,15 @@ pub struct CpuLitGenerator;
 
 impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
+        self.generate_with(request, &led::Toner::new(request.led))
+    }
+}
+
+impl CpuLitGenerator {
+    /// The generator with the tone path `toner`: the request's
+    /// [`led::Toner`] in production; tests pass the reference path, or one
+    /// that records what reaches it, to compare with it.
+    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, toner: &T) -> RgbaImage {
         let name = request.name;
         let size = request.size;
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
@@ -125,19 +134,15 @@ impl LitGenerator for CpuLitGenerator {
                     share += w.weight * tone.share;
                     kelvin += w.weight * tone.kelvin;
                 }
-                let sodium = rgb;
-                let toned = (request.led.sodium.mix > 0.0)
-                    .then(|| led::desaturate(sodium, &request.led.sodium));
-                let (mut led_rgb, mut patch_here) = (None, None);
+                let (mut led_kelvin, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
                     patch_here = Some(patch);
                     if patch.u < share / wsum {
-                        let k = led::patch_kelvin(kelvin / wsum, &patch);
-                        led_rgb = Some(led::recolour(sodium, k, request.led.energy));
+                        led_kelvin = Some(led::patch_kelvin(kelvin / wsum, &patch));
                     }
                 }
-                let mut bytes = led::texel_bytes(sodium, toned, led_rgb, g as f32);
+                let mut bytes = toner.bytes(rgb, led_kelvin, g as f32);
                 if road > 0.0 {
                     let texel = RoadTexel {
                         at: (lat, lon),
@@ -157,13 +162,6 @@ impl LitGenerator for CpuLitGenerator {
 
 fn opaque([r, g, b]: [u8; 3]) -> Rgba<u8> {
     Rgba([r, g, b, 255])
-}
-
-/// Stored values (0..255) to linear light, exactly as `led::decode` gives
-/// them, built once: a road texel decodes its pattern bytes by lookup.
-pub(super) fn linear_table() -> &'static [f32; 256] {
-    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| std::array::from_fn(|v| led::decode([v as f32; 3])[0]))
 }
 
 /// Road glow added over a texel's pattern bytes, in linear light. The level
@@ -209,7 +207,7 @@ impl<'r> RoadLight<'r> {
         ));
         Self {
             request,
-            linear: linear_table(),
+            linear: led::linear_table(),
             encoder: led::ByteEncoder::get(),
             sodium: unit_luminance(sodium),
             region: None,
@@ -359,6 +357,46 @@ mod tests {
             );
             assert!(img.pixels().any(is_led), "the pin covers LED texels");
             assert_eq!(digest(&img), want, "digest {:#018x}", digest(&img));
+        }
+    }
+
+    /// The generator's tone path is byte for byte the `powf` path it
+    /// replaced (#436), at several models, brightnesses and regions.
+    #[test]
+    fn the_generator_gives_the_powf_tone_path_bytes() {
+        let strong_tone = LedModel {
+            sodium: led::SodiumTone {
+                mix: 1.0,
+                kelvin: 5000.0,
+                energy: 1.3,
+            },
+            ..full_share_model()
+        };
+        let n = name_at(37.20, -122.725);
+        for model in [
+            LedModel::DEFAULT,
+            LedModel::OFF,
+            full_share_model(),
+            strong_tone,
+        ] {
+            for (brightness, region) in [(1.0, LedRegion::Na), (0.5, LedRegion::Af)] {
+                let request = LitRequest {
+                    name: &n,
+                    size: 128,
+                    brightness,
+                    recipes: &golden,
+                    patterns: &speckled,
+                    regions: &move |_, _| region,
+                    led: &model,
+                    roads: &RoadField::empty(128),
+                    road_model: &RoadModel::DEFAULT,
+                };
+                let img = CpuLitGenerator.generate(&request);
+                let reference = CpuLitGenerator
+                    .generate_with(&request, &led::powf_reference::PowfToner(&model));
+                assert!(lit_texels(&img) > 0);
+                assert!(img == reference, "{model:?} at {brightness} in {region:?}");
+            }
         }
     }
 
@@ -537,18 +575,6 @@ mod tests {
             }
         }
         assert!(compared > 0, "the road is lit");
-    }
-
-    #[test]
-    fn the_linear_table_is_the_led_decode() {
-        let table = linear_table();
-        for v in 0..=255u8 {
-            assert_eq!(
-                table[usize::from(v)].to_bits(),
-                led::decode([f32::from(v); 3])[0].to_bits(),
-                "stored {v}"
-            );
-        }
     }
 
     /// The composition rule written out plainly, with no table or memo.
@@ -1158,18 +1184,65 @@ mod tests {
         );
     }
 
-    /// Release-build timing on the developer's installation; skipped elsewhere.
+    /// The directory holding the installed packages, for the release-build
+    /// timings over real textures. Read by these tests only.
+    const PACKAGES_VAR: &str = "XEL_NIGHT_PACKAGES";
+    /// X-Plane's `Resources/default scenery/1000 world terrain`, for the
+    /// same timings. Read by these tests only.
+    const ART_VAR: &str = "XEL_LAMINAR_ART";
+
+    /// The installation the release-build timings read, from
+    /// [`PACKAGES_VAR`] and [`ART_VAR`]: the packages directory and the
+    /// Laminar art. Says on stderr what is missing, so a skipped timing
+    /// never passes silently.
+    fn real_install() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let dir = |var: &str, what: &str| match std::env::var_os(var) {
+            Some(v) if std::path::Path::new(&v).is_dir() => Some(std::path::PathBuf::from(v)),
+            Some(v) => {
+                eprintln!("{var}={v:?} is not a directory; skipped");
+                None
+            }
+            None => {
+                eprintln!("set {var} to {what}; skipped");
+                None
+            }
+        };
+        let packages = dir(PACKAGES_VAR, "the directory holding the installed packages");
+        let art = dir(
+            ART_VAR,
+            "X-Plane's \"Resources/default scenery/1000 world terrain\"",
+        );
+        Some((packages?, art?))
+    }
+
+    /// The package `pkg` of the installation, or `None` (said on stderr)
+    /// when it is not installed.
+    fn real_package(packages: &std::path::Path, pkg: &str) -> Option<std::path::PathBuf> {
+        let path = packages.join(pkg);
+        if path.is_dir() {
+            Some(path)
+        } else {
+            eprintln!("no {pkg} in {}; skipped", packages.display());
+            None
+        }
+    }
+
+    /// Release-build timing of one Mexico City ZL16 texture at 1024 px on
+    /// the installation [`real_install`] names; skipped elsewhere. Run with
+    /// `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo test --release -p
+    /// xearthlayer --lib time_a_real_zl16_texture -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn time_a_real_zl16_texture() {
-        let pkg = "/media/FlightSim/XEarthLayer Packages/zzXEL_na-usa-california-night_ortho";
-        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
-        if !std::path::Path::new(pkg).is_dir() || !std::path::Path::new(art).is_dir() {
+        let Some((packages, art)) = real_install() else {
             return;
-        }
-        let store = crate::night::RecipeStore::new(vec![pkg.into()]);
-        let art = crate::night::LaminarArt::new(art.into());
-        let n = name(25360, 10464, 16);
+        };
+        let Some(pkg) = real_package(&packages, "zzXEL_na-mexico-central_ortho") else {
+            return;
+        };
+        let store = crate::night::RecipeStore::new(vec![pkg]);
+        let art = crate::night::LaminarArt::new(art);
+        let n = name_at(19.4326, -99.1332);
         // Cold: the first call inflates the recipes and decodes the patterns.
         // Warm: the second call finds them cached, as a flight usually does
         // after the probe.
@@ -1205,21 +1278,23 @@ mod tests {
         }
     }
 
-    /// Release-build timing of road light on the developer's installation
-    /// (Geneva, ZL16 at 1024 px, eu-west night recipes); skipped elsewhere.
-    /// Run with `cargo test --release -p xearthlayer --lib
+    /// Release-build timing of road light on the installation
+    /// [`real_install`] names (Geneva, ZL16 at 1024 px, eu-west night
+    /// recipes); skipped elsewhere. Run with `XEL_NIGHT_PACKAGES=...
+    /// XEL_LAMINAR_ART=... cargo test --release -p xearthlayer --lib
     /// time_road_light_on_a_real_zl16_texture -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn time_road_light_on_a_real_zl16_texture() {
         use crate::night::roads::field::tests::{crossing, street_grid_over};
-        let pkg = "/media/FlightSim/XEarthLayer Packages/zzXEL_eu-west_ortho";
-        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
-        if !std::path::Path::new(pkg).is_dir() || !std::path::Path::new(art).is_dir() {
+        let Some((packages, art)) = real_install() else {
             return;
-        }
-        let store = crate::night::RecipeStore::new(vec![pkg.into()]);
-        let art = crate::night::LaminarArt::new(art.into());
+        };
+        let Some(pkg) = real_package(&packages, "zzXEL_eu-west_ortho") else {
+            return;
+        };
+        let store = crate::night::RecipeStore::new(vec![pkg]);
+        let art = crate::night::LaminarArt::new(art);
         let n = name_at(46.20, 6.14);
         let size = 1024;
         let model = RoadModel::DEFAULT;
@@ -1279,30 +1354,35 @@ mod tests {
     /// 1024 px: the Geneva texture above, and the Tokyo ZL16 texture with
     /// the most road points in its tile, each generated without roads and
     /// with the roads the installation's DSFs give (read and merged by the
-    /// road service). Skipped without the installation, the packages or the
-    /// art. Run with `cargo test --release -p xearthlayer --lib
-    /// time_real_roads_on_real_zl16_textures -- --ignored --nocapture`.
+    /// road service). The packages and the art are those [`real_install`]
+    /// names; the X-Plane installation the road service reads is
+    /// `roads::service::real`'s. Skipped without any of them. Run with
+    /// `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo test --release -p
+    /// xearthlayer --lib time_real_roads_on_real_zl16_textures -- --ignored
+    /// --nocapture`.
     #[test]
     #[ignore]
     fn time_real_roads_on_real_zl16_textures() {
         use crate::night::roads::service::real;
-        let packages = "/media/FlightSim/XEarthLayer Packages";
-        let art = "/media/FlightSim/X-Plane 12-beta/Resources/default scenery/1000 world terrain";
-        if !std::path::Path::new(art).is_dir() {
-            println!("no Laminar art at {art}; skipped");
+        let Some((packages, art)) = real_install() else {
             return;
-        }
-        let art = crate::night::LaminarArt::new(art.into());
+        };
+        let art = crate::night::LaminarArt::new(art);
         let model = RoadModel::DEFAULT;
         let size = 1024;
         for (label, pkg, tile) in [
             ("Geneva", "zzXEL_eu-west_ortho", (46, 6)),
             ("Tokyo", "zzXEL_as-asia-pacific_ortho", (35, 139)),
         ] {
-            let pkg = format!("{packages}/{pkg}");
-            let store = crate::night::RecipeStore::new(vec![pkg.clone().into()]);
+            let Some(pkg) = real_package(&packages, pkg) else {
+                continue;
+            };
+            let store = crate::night::RecipeStore::new(vec![pkg.clone()]);
             if store.get(tile.0, tile.1).is_none() {
-                println!("{label}: no night recipe for {tile:?} in {pkg}; skipped");
+                eprintln!(
+                    "{label}: no night recipe for {tile:?} in {}; skipped",
+                    pkg.display()
+                );
                 continue;
             }
             let n = if label == "Geneva" {
@@ -1391,6 +1471,180 @@ mod tests {
                 (all_med / none_med - 1.0) * 100.0
             );
         }
+    }
+
+    /// What reached the tone path: pattern sum, LED temperature, gain.
+    type ToneInput = ([f32; 3], Option<f64>, f32);
+
+    /// A tone path that records every texel that reaches it, and gives the
+    /// production bytes.
+    struct Recording {
+        toner: led::Toner,
+        inputs: std::cell::RefCell<Vec<ToneInput>>,
+    }
+
+    impl TonePath for Recording {
+        fn bytes(&self, sodium: [f32; 3], led_kelvin: Option<f64>, s: f32) -> [u8; 3] {
+            self.inputs.borrow_mut().push((sodium, led_kelvin, s));
+            self.toner.bytes(sodium, led_kelvin, s)
+        }
+    }
+
+    /// Release-build timing of the tone path before and after #436 over
+    /// real textures: the 5 x 5 ZL16 grids at 1024 px around Mexico City,
+    /// Geneva, Paris and Montreal (those the probe lights), with the night
+    /// recipes of every `*_ortho` package in [`PACKAGES_VAR`], the Laminar
+    /// art in [`ART_VAR`], `LedModel::DEFAULT`, no roads, warm, one thread.
+    /// Per texture it checks the generator gives the same image with the
+    /// `powf` path, times both generations, then records the texels that
+    /// reach the tone path and times both paths over them alone. Skipped,
+    /// saying so on stderr, without the installation. Run with
+    /// `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo test --release -p
+    /// xearthlayer --lib time_the_tone_path_on_real_zl16_textures --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_the_tone_path_on_real_zl16_textures() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let Some((packages, art)) = real_install() else {
+            return;
+        };
+        let mut roots: Vec<_> = std::fs::read_dir(&packages)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.to_string_lossy().ends_with("_ortho"))
+            .collect();
+        roots.sort();
+        let store = crate::night::RecipeStore::new(roots);
+        let art = crate::night::LaminarArt::new(art);
+        let model = LedModel::DEFAULT;
+        let reference = led::powf_reference::PowfToner(&model);
+        let toner = led::Toner::new(&model);
+        let size = 1024;
+        let recipes = |a: i32, b: i32| store.get(a, b);
+        let regions = |a: i32, b: i32| {
+            store
+                .get_with_region(a, b)
+                .map_or(LedRegion::Unknown, |(_, r)| r)
+        };
+        let ms = |started: Instant| started.elapsed().as_secs_f64() * 1e3;
+        // Totals: textures, toned texels, generation and tone path ms,
+        // before (`powf`) and after.
+        let (mut textures, mut toned) = (0usize, 0usize);
+        let (mut gen_before, mut gen_after, mut tone_before, mut tone_after) = (0.0, 0.0, 0.0, 0.0);
+        for (city, lat, lon) in [
+            ("Mexico City", 19.4326, -99.1332),
+            ("Geneva", 46.2044, 6.1432),
+            ("Paris", 48.8566, 2.3522),
+            ("Montreal", 45.5019, -73.5674),
+        ] {
+            let centre = name_at(lat, lon);
+            let (mut city_textures, mut city_tone) = (0usize, [0.0f64; 2]);
+            for dr in -2i32..=2 {
+                for dc in -2i32..=2 {
+                    let n = name(
+                        centre.row.saturating_add_signed(dr * 16),
+                        centre.col.saturating_add_signed(dc * 16),
+                        16,
+                    );
+                    if !RecipeField::new(&Footprint::from_name(&n), &recipes)
+                        .has_light(|c| art.lit_terrain(c).is_some())
+                    {
+                        continue;
+                    }
+                    let request = LitRequest {
+                        name: &n,
+                        size,
+                        brightness: 1.0,
+                        recipes: &recipes,
+                        patterns: &|c| art.pattern(c),
+                        regions: &regions,
+                        led: &model,
+                        roads: &RoadField::empty(size),
+                        road_model: &RoadModel::DEFAULT,
+                    };
+                    // Warm: inflates the recipes and decodes the patterns.
+                    let after = CpuLitGenerator.generate(&request);
+                    let before = CpuLitGenerator.generate_with(&request, &reference);
+                    assert!(after == before, "{city}: {n:?} differs from the powf path");
+                    // Two rounds each, alternated; the faster of each.
+                    let (mut b, mut a) = (f64::MAX, f64::MAX);
+                    for _ in 0..2 {
+                        let started = Instant::now();
+                        black_box(CpuLitGenerator.generate_with(&request, &reference));
+                        b = b.min(ms(started));
+                        let started = Instant::now();
+                        black_box(CpuLitGenerator.generate(&request));
+                        a = a.min(ms(started));
+                    }
+                    gen_before += b;
+                    gen_after += a;
+                    let recording = Recording {
+                        toner,
+                        inputs: Default::default(),
+                    };
+                    CpuLitGenerator.generate_with(&request, &recording);
+                    let inputs = recording.inputs.into_inner();
+                    let (mut b, mut a) = (f64::MAX, f64::MAX);
+                    for _ in 0..3 {
+                        let started = Instant::now();
+                        for &(sodium, k, s) in &inputs {
+                            black_box(reference.bytes(black_box(sodium), k, s));
+                        }
+                        b = b.min(ms(started));
+                        let started = Instant::now();
+                        for &(sodium, k, s) in &inputs {
+                            black_box(toner.bytes(black_box(sodium), k, s));
+                        }
+                        a = a.min(ms(started));
+                    }
+                    for &(sodium, k, s) in &inputs {
+                        assert_eq!(
+                            toner.bytes(sodium, k, s),
+                            reference.bytes(sodium, k, s),
+                            "{sodium:?} at {k:?} K, gain {s:e}"
+                        );
+                    }
+                    city_textures += 1;
+                    city_tone[0] += b;
+                    city_tone[1] += a;
+                    toned += inputs.len();
+                }
+            }
+            if city_textures > 0 {
+                let per = city_textures as f64;
+                println!(
+                    "{city}: {city_textures} textures, tone path {:.1} ms -> {:.1} ms per texture",
+                    city_tone[0] / per,
+                    city_tone[1] / per
+                );
+            } else {
+                eprintln!("{city}: no lit texture in the installed packages; skipped");
+            }
+            textures += city_textures;
+            tone_before += city_tone[0];
+            tone_after += city_tone[1];
+        }
+        if textures == 0 {
+            eprintln!("no lit texture in {}; skipped", packages.display());
+            return;
+        }
+        let per = textures as f64;
+        println!(
+            "{textures} textures, {:.0} toned texels per texture: tone path {:.1} ms -> {:.1} ms \
+             per texture ({:.1} ms saved); generation {:.1} ms -> {:.1} ms per texture \
+             ({:+.1}%); every byte identical",
+            toned as f64 / per,
+            tone_before / per,
+            tone_after / per,
+            (tone_before - tone_after) / per,
+            gen_before / per,
+            gen_after / per,
+            (gen_after / gen_before - 1.0) * 100.0
+        );
     }
 
     /// The ZL16 texture of `roads`' tile that holds the most road points.

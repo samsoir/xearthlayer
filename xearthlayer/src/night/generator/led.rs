@@ -382,9 +382,17 @@ pub(crate) fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
-/// The luminance of written bytes: sRGB decoded, Rec.709 weights.
-fn byte_luminance(c: [u8; 3]) -> f32 {
-    luminance(c.map(|v| (f32::from(v) / 255.0).powf(SRGB_GAMMA)))
+/// Stored byte values (0..255) to linear light, exactly as [`decode`] gives
+/// them (the same `powf` of the same 256 inputs), built once per process.
+pub(crate) fn linear_table() -> &'static [f32; 256] {
+    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|v| decode([v as f32; 3])[0]))
+}
+
+/// The luminance of written bytes: sRGB decoded by `linear` (the
+/// [`linear_table`], fetched once by the caller), Rec.709 weights.
+fn byte_luminance(linear: &[f32; 256], c: [u8; 3]) -> f32 {
+    luminance(c.map(|v| linear[usize::from(v)]))
 }
 
 /// The bytes of a texel after the gain `s`. Laminar's sodium is `sodium * s`
@@ -399,59 +407,161 @@ pub fn texel_bytes(
     s: f32,
 ) -> [u8; 3] {
     let quantise = |c: [f32; 3], f: fn(f32) -> f32| c.map(|v| f(v * s).clamp(0.0, 255.0) as u8);
-    let no_dimmer = |below: [u8; 3], over: [f32; 3]| {
-        let floor = byte_luminance(below);
+    let bytes = quantise(sodium, f32::round);
+    if desaturated.is_none() && led.is_none() {
+        return bytes;
+    }
+    let linear = linear_table();
+    // Each step settles on bytes and returns their luminance with them:
+    // the next step's floor, so no byte luminance is computed twice.
+    let no_dimmer = |(below, floor): ([u8; 3], f32), over: [f32; 3]| {
         let nearest = quantise(over, f32::round);
-        if byte_luminance(nearest) >= floor {
-            return nearest;
+        let y = byte_luminance(linear, nearest);
+        if y >= floor {
+            return (nearest, y);
         }
         let up = quantise(over, f32::ceil);
-        if byte_luminance(up) >= floor {
-            up
+        let y = byte_luminance(linear, up);
+        if y >= floor {
+            (up, y)
         } else {
-            below
+            (below, floor)
         }
     };
-    let mut bytes = quantise(sodium, f32::round);
+    let mut settled = (bytes, byte_luminance(linear, bytes));
     if let Some(d) = desaturated {
-        bytes = no_dimmer(bytes, d);
+        settled = no_dimmer(settled, d);
     }
     if let Some(l) = led {
-        bytes = no_dimmer(bytes, l);
+        settled = no_dimmer(settled, l);
     }
-    bytes
+    settled.0
+}
+
+/// A texel's stored values (0..255) decoded once: its linear light and that
+/// light's luminance, shared by the sodium tone and the LED recolour. Built
+/// from the stored values only, so the three always agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Decoded {
+    stored: [f32; 3],
+    linear: [f32; 3],
+    y: f32,
+}
+
+impl Decoded {
+    pub(crate) fn new(stored: [f32; 3]) -> Self {
+        let linear = decode(stored);
+        Self {
+            stored,
+            linear,
+            y: luminance(linear),
+        }
+    }
+}
+
+/// What [`desaturate`] derives from a [`SodiumTone`] alone, computed once
+/// (per request in the generator): the clamped mix, the white of the
+/// tone's temperature and the luminance gain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PreparedTone {
+    mix: f32,
+    white: [f32; 3],
+    gain: f32,
+}
+
+impl PreparedTone {
+    pub(crate) fn new(tone: &SodiumTone) -> Self {
+        let mix = tone.mix.clamp(0.0, 1.0);
+        Self {
+            mix,
+            white: white(tone.kelvin),
+            gain: 1.0 + mix * (tone.energy - 1.0),
+        }
+    }
+
+    /// [`desaturate`] of a decoded texel, by the same operations.
+    pub(crate) fn apply(&self, texel: &Decoded) -> [f32; 3] {
+        let (m, y) = (self.mix, texel.y);
+        if m <= 0.0 || y <= 0.0 {
+            return texel.stored;
+        }
+        let (linear, w) = (texel.linear, self.white);
+        let out = [0, 1, 2].map(|c| (linear[c] * (1.0 - m) + w[c] * y * m) * self.gain);
+        encode(keep_light(out, y))
+    }
 }
 
 /// A sodium texel (stored values, 0..255) toned by `tone`: mixed in linear
 /// light towards the white of `tone.kelvin` at its own luminance, then that
 /// luminance raised by `tone.mix` of `tone.energy`. No mix, or black, returns
-/// the input exactly, so `SodiumTone::NONE` keeps Laminar's bytes.
+/// the input exactly, so `SodiumTone::NONE` keeps Laminar's bytes. The
+/// generator holds a [`PreparedTone`] and a [`Decoded`] texel instead.
 pub fn desaturate(stored: [f32; 3], tone: &SodiumTone) -> [f32; 3] {
-    let m = tone.mix.clamp(0.0, 1.0);
-    if m <= 0.0 {
+    let tone = PreparedTone::new(tone);
+    if tone.mix <= 0.0 {
         return stored;
     }
-    let linear = decode(stored);
-    let y = luminance(linear);
-    if y <= 0.0 {
-        return stored;
-    }
-    let w = white(tone.kelvin);
-    let gain = 1.0 + m * (tone.energy - 1.0);
-    let out = [0, 1, 2].map(|c| (linear[c] * (1.0 - m) + w[c] * y * m) * gain);
-    encode(keep_light(out, y))
+    tone.apply(&Decoded::new(stored))
 }
 
 /// A sodium texel (stored values, 0..255) as LED white at `kelvin`: its
 /// luminance times `energy`. A channel past full scales the colour down
 /// with its hue kept; if that leaves it dimmer than the input, it is mixed
-/// towards full white until it is not.
-pub fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
-    let y = luminance(decode(stored));
+/// towards full white until it is not. Tests only: the generator calls
+/// [`recolour_decoded`] with the texel it has already decoded.
+#[cfg(test)]
+pub(crate) fn recolour(stored: [f32; 3], kelvin: f64, energy: f32) -> [f32; 3] {
+    recolour_decoded(&Decoded::new(stored), kelvin, energy)
+}
+
+/// A decoded sodium texel as LED white at `kelvin`: its luminance times
+/// `energy`. A channel past full scales the colour down with its hue kept;
+/// if that leaves it dimmer than the input, it is mixed towards full white
+/// until it is not. Black returns the input exactly.
+pub(crate) fn recolour_decoded(texel: &Decoded, kelvin: f64, energy: f32) -> [f32; 3] {
+    let y = texel.y;
     if y <= 0.0 {
-        return stored;
+        return texel.stored;
     }
     encode(keep_light(white(kelvin).map(|c| c * y * energy), y))
+}
+
+/// How the generator turns a texel's pattern sum `sodium` (stored values,
+/// 0..255) into bytes at gain `s`: toned as sodium, or recoloured to LED
+/// white at `led_kelvin`, then [`texel_bytes`]. A trait so tests can run
+/// the generator with the reference path and compare.
+pub(crate) trait TonePath {
+    fn bytes(&self, sodium: [f32; 3], led_kelvin: Option<f64>, s: f32) -> [u8; 3];
+}
+
+/// The tone path of one request: the model's sodium tone prepared once,
+/// and each texel decoded at most once for both the tone and the LED white.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Toner {
+    /// `None` when the model leaves Laminar's sodium untouched.
+    sodium: Option<PreparedTone>,
+    energy: f32,
+}
+
+impl Toner {
+    pub(crate) fn new(model: &LedModel) -> Self {
+        Self {
+            sodium: (model.sodium.mix > 0.0).then(|| PreparedTone::new(&model.sodium)),
+            energy: model.energy,
+        }
+    }
+}
+
+impl TonePath for Toner {
+    fn bytes(&self, sodium: [f32; 3], led_kelvin: Option<f64>, s: f32) -> [u8; 3] {
+        if self.sodium.is_none() && led_kelvin.is_none() {
+            return texel_bytes(sodium, None, None, s);
+        }
+        let texel = Decoded::new(sodium);
+        let toned = self.sodium.map(|tone| tone.apply(&texel));
+        let led = led_kelvin.map(|k| recolour_decoded(&texel, k, self.energy));
+        texel_bytes(sodium, toned, led, s)
+    }
 }
 
 /// Stored values (0..255) to linear light.
@@ -564,8 +674,192 @@ fn keep_light(mut out: [f32; 3], y: f32) -> [f32; 3] {
 }
 
 #[cfg(test)]
+pub(crate) mod powf_reference;
+
+#[cfg(test)]
 mod tests {
+    use super::super::gain::{gain, GAIN_FLOOR_NW};
     use super::*;
+
+    #[test]
+    fn the_linear_table_is_the_decode() {
+        let table = linear_table();
+        for v in 0..=255u8 {
+            assert_eq!(
+                table[usize::from(v)].to_bits(),
+                decode([f32::from(v); 3])[0].to_bits(),
+                "stored {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_luminance_is_its_powf_form_for_every_byte_of_each_channel() {
+        for v in 0..=255u8 {
+            let w = 255 - v;
+            for c in [[v, 0, 0], [0, v, 0], [0, 0, v], [v, v, v], [v, w, v / 2]] {
+                assert_eq!(
+                    byte_luminance(linear_table(), c).to_bits(),
+                    powf_reference::byte_luminance(c).to_bits(),
+                    "{c:?}"
+                );
+            }
+        }
+    }
+
+    /// splitmix64: a fixed, portable sequence for the equivalence tests.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in [0, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u32 << 24) as f32
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A pattern sum: exact zeros, whole bytes (a single full weight) or
+    /// any value in 0..255, with channels zeroed at random.
+    fn sodium_sample(rng: &mut Rng) -> [f32; 3] {
+        match rng.below(16) {
+            0 => [0.0; 3],
+            1 | 2 => [0; 3].map(|_: u8| (rng.next() % 256) as f32),
+            _ => [0; 3].map(|_: u8| {
+                if rng.below(16) == 0 {
+                    0.0
+                } else {
+                    rng.unit() * 255.0
+                }
+            }),
+        }
+    }
+
+    /// A gain the generator can pass: from just above the radiance floor
+    /// (a tiny positive gain) to 1, spread over four decades.
+    fn gain_sample(rng: &mut Rng) -> f32 {
+        match rng.below(16) {
+            0 => gain(GAIN_FLOOR_NW * (1.0 + 1e-9), 1.0) as f32,
+            1 => gain(GAIN_FLOOR_NW.next_up(), 1.0) as f32,
+            2 => 1.0,
+            3 => rng.unit(),
+            _ => 10f32.powf(-4.0 * rng.unit()),
+        }
+    }
+
+    fn tone_models() -> [LedModel; 4] {
+        let toned = |mix, kelvin, energy| LedModel {
+            sodium: SodiumTone {
+                mix,
+                kelvin,
+                energy,
+            },
+            ..LedModel::DEFAULT
+        };
+        [
+            LedModel::DEFAULT,
+            LedModel::OFF,
+            toned(1.0, 5000.0, 1.3),
+            toned(0.65, 2000.0, 0.9),
+        ]
+    }
+
+    /// LED white or not, at temperatures inside, on and past the table.
+    const LED_KELVINS: [Option<f64>; 8] = [
+        None,
+        Some(1800.0),
+        Some(KELVIN_MIN),
+        Some(3000.0),
+        Some(4000.0),
+        Some(4650.5),
+        Some(KELVIN_MAX),
+        Some(7000.0),
+    ];
+
+    fn bits(c: [f32; 3]) -> [u32; 3] {
+        c.map(f32::to_bits)
+    }
+
+    #[test]
+    fn the_tone_path_matches_its_powf_form_on_two_million_colours() {
+        let models = tone_models();
+        let toners: Vec<_> = models
+            .iter()
+            .map(|m| (Toner::new(m), powf_reference::PowfToner(m)))
+            .collect();
+        let mut rng = Rng(436);
+        let mut led_texels = 0;
+        for i in 0..2_000_000u32 {
+            let sodium = sodium_sample(&mut rng);
+            let s = gain_sample(&mut rng);
+            let k = LED_KELVINS[rng.below(LED_KELVINS.len())];
+            let (toner, reference) = &toners[i as usize % toners.len()];
+            led_texels += usize::from(k.is_some());
+            assert_eq!(
+                toner.bytes(sodium, k, s),
+                reference.bytes(sodium, k, s),
+                "sodium {sodium:?}, gain {s:e}, LED {k:?}, model {}",
+                i as usize % toners.len()
+            );
+        }
+        assert!(led_texels > 1_500_000, "LED texels covered");
+    }
+
+    #[test]
+    fn the_tone_steps_match_their_powf_forms() {
+        let mut rng = Rng(0x436);
+        for model in tone_models() {
+            let tone = PreparedTone::new(&model.sodium);
+            for _ in 0..25_000 {
+                let sodium = sodium_sample(&mut rng);
+                let decoded = Decoded::new(sodium);
+                let want = powf_reference::desaturate(sodium, &model.sodium);
+                assert_eq!(bits(desaturate(sodium, &model.sodium)), bits(want));
+                if model.sodium.mix > 0.0 {
+                    assert_eq!(bits(tone.apply(&decoded)), bits(want), "{sodium:?}");
+                }
+                let k = LED_KELVINS[1 + rng.below(LED_KELVINS.len() - 1)].unwrap();
+                let want = powf_reference::recolour(sodium, k, model.energy);
+                assert_eq!(bits(recolour(sodium, k, model.energy)), bits(want));
+                assert_eq!(
+                    bits(recolour_decoded(&decoded, k, model.energy)),
+                    bits(want),
+                    "{sodium:?} at {k} K"
+                );
+                let s = gain_sample(&mut rng);
+                let (d, l) = (Some(desaturate(sodium, &model.sodium)), Some(want));
+                for (d, l) in [(None, None), (d, None), (None, l), (d, l)] {
+                    assert_eq!(
+                        texel_bytes(sodium, d, l, s),
+                        powf_reference::texel_bytes(sodium, d, l, s),
+                        "{sodium:?} at gain {s:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_tone_path_leaves_exact_zeros_black() {
+        for model in tone_models() {
+            let toner = Toner::new(&model);
+            for k in LED_KELVINS {
+                for s in [f32::MIN_POSITIVE, 1e-3, 1.0] {
+                    assert_eq!(toner.bytes([0.0; 3], k, s), [0; 3]);
+                }
+            }
+        }
+    }
 
     /// What a road texel's channel became before the byte table: encode,
     /// round to nearest, clamp.
@@ -762,7 +1056,7 @@ mod tests {
 
     #[test]
     fn texel_bytes_keep_led_at_least_as_bright_as_sodium() {
-        let lum_b = |c: [u8; 3]| byte_luminance(c);
+        let lum_b = |c: [u8; 3]| byte_luminance(linear_table(), c);
         // Near black: nearest rounding would give (0, 0, 0) for LED.
         let sodium = [200.0, 120.0, 50.0];
         let led = Some(recolour(sodium, 4000.0, 1.25));
@@ -974,7 +1268,7 @@ mod tests {
 
     #[test]
     fn texel_bytes_keep_desaturated_sodium_at_least_as_bright_as_laminar() {
-        let lum_b = |c: [u8; 3]| byte_luminance(c);
+        let lum_b = |c: [u8; 3]| byte_luminance(linear_table(), c);
         let tone = LedModel::DEFAULT.sodium;
         for laminar in [[200.0, 120.0, 50.0], [56.0, 36.0, 18.0], [90.0, 40.0, 10.0]] {
             let sodium = Some(desaturate(laminar, &tone));
