@@ -15,6 +15,8 @@
 //! - radiance, at every weighted texel;
 //! - pattern sampling, for every class weight with a pattern;
 //! - the LED patch, where the generator draws it.
+//!
+//! [`time_the_class_mask`] times #438's shortcuts on the same textures.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use std::time::Instant;
 
 use super::tests::{name, name_at, real_install};
 use super::*;
+use crate::fuse::DdsFilename;
 use crate::night::generator::field::lookup_reference;
 use crate::night::generator::led::LedModel;
 use crate::night::generator::tiling::sample_reference;
@@ -291,5 +294,161 @@ fn time_the_hoisted_texel_parts() {
     println!(
         "  total saved {saved:.1}; generation now {:.1} ms per texture; every result identical",
         total.generation / per
+    );
+}
+
+/// One texture's #438 timing: its name, the share of texels the mask
+/// skips, the class weights without and with the mask and the generation
+/// without and with the shortcuts, in ms.
+type MaskTiming = (DdsFilename, f64, [f64; 2], [f64; 2]);
+
+/// Release-build timing of #438's shortcuts on the same real textures:
+/// the class weights at every texel with and without the class mask, and
+/// the whole generation with and without both shortcuts (the mask and the
+/// stop on black pattern sums), each the least of a few runs, every result
+/// compared bit for bit. Prints the totals per texture, and the mostly dark
+/// texture (the most texels skipped; around Geneva the lake gives one) on
+/// its own line. Run with `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo
+/// test --release -p xearthlayer --lib time_the_class_mask -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore]
+fn time_the_class_mask() {
+    let Some((packages, art)) = real_install() else {
+        return;
+    };
+    let mut roots: Vec<_> = std::fs::read_dir(&packages)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.to_string_lossy().ends_with("_ortho"))
+        .collect();
+    roots.sort();
+    let store = crate::night::RecipeStore::new(roots);
+    let art = crate::night::LaminarArt::new(art);
+    let model = LedModel::DEFAULT;
+    let toner = led::Toner::new(&model);
+    let size = 1024;
+    let recipes = |a: i32, b: i32| store.get(a, b);
+    let patterns = |c: &str| art.pattern(c);
+    let regions = |a: i32, b: i32| {
+        store
+            .get_with_region(a, b)
+            .map_or(LedRegion::Unknown, |(_, r)| r)
+    };
+    let roads = RoadField::empty(size);
+    let mut rows: Vec<MaskTiming> = Vec::new();
+    for (lat, lon) in [
+        (19.4326, -99.1332),
+        (46.2044, 6.1432),
+        (48.8566, 2.3522),
+        (45.5019, -73.5674),
+    ] {
+        let centre = name_at(lat, lon);
+        for dr in -2i32..=2 {
+            for dc in -2i32..=2 {
+                let n = name(
+                    centre.row.saturating_add_signed(dr * 16),
+                    centre.col.saturating_add_signed(dc * 16),
+                    16,
+                );
+                let field = RecipeField::new(&Footprint::from_name(&n), &recipes);
+                if !field.has_light(|c| art.lit_terrain(c).is_some()) {
+                    continue;
+                }
+                let request = LitRequest {
+                    name: &n,
+                    size,
+                    brightness: 1.0,
+                    recipes: &recipes,
+                    patterns: &patterns,
+                    regions: &regions,
+                    led: &model,
+                    roads: &roads,
+                    road_model: &RoadModel::DEFAULT,
+                };
+                // Warm: inflates the recipes and decodes the patterns.
+                let fast = CpuLitGenerator.generate_with(&request, &toner, Shortcuts::ALL);
+                let full = CpuLitGenerator.generate_with(&request, &toner, Shortcuts::NONE);
+                assert!(fast == full, "{n:?}: the shortcuts changed bytes");
+
+                let TexelCentres { lons, lats, .. } = TexelCentres::of(&n, size);
+                let axes = TexelAxes {
+                    lats: &lats,
+                    lons: &lons,
+                };
+                let mut out = Vec::with_capacity(4);
+                let mut weights = [0.0; 2];
+                for (k, mask) in [false, true].into_iter().enumerate() {
+                    weights[k] = least_ms(3, || {
+                        let mut sampler = FieldSampler::with_class_mask(&field, axes, mask);
+                        for i in 0..lats.len() {
+                            for j in 0..lons.len() {
+                                sampler.class_weights(i, j, &mut out);
+                                black_box(&out);
+                            }
+                        }
+                    });
+                }
+                let (mut masked, mut unmasked) = (
+                    FieldSampler::new(&field, axes),
+                    FieldSampler::with_class_mask(&field, axes, false),
+                );
+                let (mut want, mut skipped) = (Vec::with_capacity(4), 0usize);
+                for i in 0..lats.len() {
+                    for j in 0..lons.len() {
+                        skipped += usize::from(masked.skips_class(i, j));
+                        masked.class_weights(i, j, &mut out);
+                        unmasked.class_weights(i, j, &mut want);
+                        assert_eq!(weight_bits(&out), weight_bits(&want));
+                    }
+                }
+                let generation = [Shortcuts::NONE, Shortcuts::ALL].map(|shortcuts| {
+                    least_ms(2, || {
+                        drop(black_box(
+                            CpuLitGenerator.generate_with(&request, &toner, shortcuts),
+                        ))
+                    })
+                });
+                let share = skipped as f64 / (lats.len() * lons.len()) as f64;
+                rows.push((n, share, weights, generation));
+            }
+        }
+    }
+    if rows.is_empty() {
+        eprintln!("no lit texture in {}; skipped", packages.display());
+        return;
+    }
+    let per = rows.len() as f64;
+    let sum = |f: &dyn Fn(&MaskTiming) -> f64| rows.iter().map(f).sum::<f64>() / per;
+    println!(
+        "{} textures at {size} px, ms per texture, without -> with (saved); every result identical:",
+        rows.len()
+    );
+    println!("  texels the mask skips: {:.1}%", sum(&|r| r.1) * 100.0);
+    let (wb, wa) = (sum(&|r| r.2[0]), sum(&|r| r.2[1]));
+    println!(
+        "  class weights, every texel: {wb:.1} -> {wa:.1} ({:.1})",
+        wb - wa
+    );
+    let (gb, ga) = (sum(&|r| r.3[0]), sum(&|r| r.3[1]));
+    println!(
+        "  generation, both shortcuts: {gb:.1} -> {ga:.1} ({:.1})",
+        gb - ga
+    );
+    let darkest = rows
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("rows is not empty");
+    println!(
+        "  mostly dark {}_{}: {:.1}% skipped; class weights {:.1} -> {:.1}; generation {:.1} -> {:.1}",
+        darkest.0.row,
+        darkest.0.col,
+        darkest.1 * 100.0,
+        darkest.2[0],
+        darkest.2[1],
+        darkest.3[0],
+        darkest.3[1]
     );
 }

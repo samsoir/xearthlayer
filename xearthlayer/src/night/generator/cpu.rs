@@ -36,26 +36,56 @@ pub struct CpuLitGenerator;
 
 impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
-        self.generate_with(request, &led::Toner::new(request.led))
+        self.generate_with(request, &led::Toner::new(request.led), Shortcuts::ALL)
     }
 }
 
+/// Work the generator skips where it cannot change a byte (#438).
+/// Production takes every one; tests and timings turn them off to compare
+/// with the full path.
+#[derive(Debug, Clone, Copy)]
+struct Shortcuts {
+    /// The sampler's class mask: no class lookup where no class is near.
+    class_mask: bool,
+    /// No tone path for a texel whose pattern sum is black.
+    black_stop: bool,
+}
+
+impl Shortcuts {
+    const ALL: Self = Self {
+        class_mask: true,
+        black_stop: true,
+    };
+    #[cfg(test)]
+    const NONE: Self = Self {
+        class_mask: false,
+        black_stop: false,
+    };
+}
+
 impl CpuLitGenerator {
-    /// The generator with the tone path `toner`: the request's
-    /// [`led::Toner`] in production; tests pass the reference path, or one
-    /// that records what reaches it, to compare with it.
-    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, toner: &T) -> RgbaImage {
+    /// The generator with the tone path `toner` and `shortcuts`: the
+    /// request's [`led::Toner`] and all of them in production; tests pass
+    /// the reference path, or one that records what reaches it, and turn
+    /// shortcuts off, to compare.
+    fn generate_with<T: TonePath>(
+        &self,
+        request: &LitRequest<'_>,
+        toner: &T,
+        shortcuts: Shortcuts,
+    ) -> RgbaImage {
         let name = request.name;
         let size = request.size;
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
-        let mut sampler = FieldSampler::new(
+        let mut sampler = FieldSampler::with_class_mask(
             &field,
             TexelAxes {
                 lats: &lats,
                 lons: &lons,
             },
+            shortcuts.class_mask,
         );
         // Patterns by (tile slot, palette index), resolved on first use.
         let mut patterns: Vec<Option<Option<Arc<LitPattern>>>> =
@@ -144,6 +174,27 @@ impl CpuLitGenerator {
                     wsum += w.weight;
                     share += w.weight * tone.share;
                     kelvin += w.weight * tone.kelvin;
+                }
+                // Lit art is bright points on black: where every tap is
+                // black (or no weight has a pattern, `wsum == 0`, which
+                // leaves `rgb` zero too), the tone path gives [0, 0, 0]
+                // (luminance 0 is never toned, recoloured or raised), so it
+                // is skipped. Compared exactly: a small non-zero sum can
+                // still round to LED bytes above zero. The road draws the
+                // texel's patch itself, the one `patch_at_cached` gives.
+                if shortcuts.black_stop && rgb == [0.0; 3] {
+                    if road > 0.0 {
+                        let texel = RoadTexel {
+                            at: (lat, lon),
+                            xy: (x, y),
+                            radiance,
+                            bright,
+                            patch: None,
+                        };
+                        let bytes = road_light.over([0; 3], road, &texel);
+                        img.put_pixel(j as u32, i as u32, opaque(bytes));
+                    }
+                    continue;
                 }
                 let (mut led_kelvin, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
@@ -482,6 +533,142 @@ mod tests {
         assert_eq!(sampler.table_misses(), 0, "every read is in the tables");
     }
 
+    /// The class mask (#438) skips only fixture texels the reference gives
+    /// no class weight, and skips some.
+    #[test]
+    fn the_class_mask_skips_only_unweighted_fixture_texels() {
+        use crate::night::generator::field::lookup_reference;
+        let n = name_at(37.20, -122.725);
+        let TexelCentres { lons, lats, .. } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &golden);
+        let sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
+        let (mut skipped, mut want) = (0, Vec::new());
+        for (i, &lat) in lats.iter().enumerate() {
+            for (j, &lon) in lons.iter().enumerate() {
+                if sampler.skips_class(i, j) {
+                    lookup_reference::class_weights(&field, lat, lon, &mut want);
+                    assert!(want.is_empty(), "skipped a weighted texel at {lat}, {lon}");
+                    skipped += 1;
+                }
+            }
+        }
+        assert!(skipped > 128 * 128 / 10, "{skipped} skipped");
+    }
+
+    /// A 32 px pattern black but for a lit square in one corner: sampled,
+    /// many texels sum to exactly black.
+    fn mostly_black(_: &str) -> Option<Arc<LitPattern>> {
+        let rgb = (0..32 * 32)
+            .map(|i| {
+                if i % 32 < 8 && i / 32 < 8 {
+                    [200, 120, 50]
+                } else {
+                    [0, 0, 0]
+                }
+            })
+            .collect();
+        Some(Arc::new(LitPattern::new(32, rgb, 4096.0)))
+    }
+
+    /// The generator's shortcuts (#438), the class mask and the stop on
+    /// black pattern sums, give the bytes of the full path: with and
+    /// without road glow, LED off, on and at full share, over classes whose
+    /// pattern is all black and classes whose pattern is mostly black.
+    #[test]
+    fn the_shortcuts_give_the_bytes_of_the_full_path() {
+        let n = name_at(46.5, 6.5);
+        let roads = crossing_field(&n, 128);
+        let mut banded = (*synthetic(
+            46,
+            6,
+            120,
+            |r, c| ((r / 3 + c / 5) % 3) as u8,
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        ))
+        .clone();
+        banded.palette = vec![String::new(), "lit".into(), "black".into()];
+        let banded = Arc::new(banded);
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| banded.clone());
+        let black = Arc::new(LitPattern::new(4, vec![[0, 0, 0]; 16], 4096.0));
+        let all_black = {
+            let black = black.clone();
+            move |_: &str| Some(black.clone())
+        };
+        let some_black = move |class: &str| match class {
+            "black" => Some(black.clone()),
+            _ => mostly_black(class),
+        };
+        let mut stopped = 0;
+        for patterns in [
+            &some_black as &(dyn Fn(&str) -> Option<Arc<LitPattern>> + Sync),
+            &all_black,
+        ] {
+            for model in [LedModel::OFF, LedModel::DEFAULT, full_share_model()] {
+                for field in [&roads, &RoadField::empty(128)] {
+                    let request = LitRequest {
+                        name: &n,
+                        size: 128,
+                        brightness: 1.0,
+                        recipes: &recipes,
+                        patterns,
+                        regions: &|_, _| LedRegion::Na,
+                        led: &model,
+                        roads: field,
+                        road_model: &RoadModel::DEFAULT,
+                    };
+                    let record = || Recording {
+                        toner: led::Toner::new(&model),
+                        inputs: Default::default(),
+                    };
+                    let (fast, full) = (record(), record());
+                    let got = CpuLitGenerator.generate_with(&request, &fast, Shortcuts::ALL);
+                    let want = CpuLitGenerator.generate_with(&request, &full, Shortcuts::NONE);
+                    assert!(got == want, "{model:?}, roads {}", !field.is_empty());
+                    let black = |r: &Recording| {
+                        r.inputs
+                            .borrow()
+                            .iter()
+                            .filter(|(s, ..)| *s == [0.0; 3])
+                            .count()
+                    };
+                    assert_eq!(black(&fast), 0, "black sums stop before the tone path");
+                    stopped += black(&full);
+                }
+            }
+        }
+        assert!(stopped > 0, "the full path met black sums");
+        // With every pattern black, the road lights texels whose class is
+        // weighted under a gain: the stop's road branch is compared above.
+        let TexelCentres { lons, lats, .. } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &recipes);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
+        let (mut weights, mut under_road) = (Vec::new(), 0);
+        for i in 0..128 {
+            let Some(row) = roads.row(i as u32) else {
+                continue;
+            };
+            for (j, &road) in row.iter().enumerate() {
+                sampler.class_weights(i, j, &mut weights);
+                let lit = gain(sampler.radiance(i, j), 1.0) > 0.0;
+                under_road += usize::from(road > 0.0 && lit && !weights.is_empty());
+            }
+        }
+        assert!(under_road > 0, "no weighted texel under the road");
+    }
+
     /// The pinned generations' sampling never leaves the sampler's tables
     /// (at their size and at larger ones), so the fallback to the field
     /// stays a fallback: a table reach that stopped covering the warp
@@ -558,8 +745,11 @@ mod tests {
                     road_model: &RoadModel::DEFAULT,
                 };
                 let img = CpuLitGenerator.generate(&request);
-                let reference = CpuLitGenerator
-                    .generate_with(&request, &led::powf_reference::PowfToner(&model));
+                let reference = CpuLitGenerator.generate_with(
+                    &request,
+                    &led::powf_reference::PowfToner(&model),
+                    Shortcuts::ALL,
+                );
                 assert!(lit_texels(&img) > 0);
                 assert!(img == reference, "{model:?} at {brightness} in {region:?}");
             }
@@ -1714,13 +1904,18 @@ mod tests {
                     };
                     // Warm: inflates the recipes and decodes the patterns.
                     let after = CpuLitGenerator.generate(&request);
-                    let before = CpuLitGenerator.generate_with(&request, &reference);
+                    let before =
+                        CpuLitGenerator.generate_with(&request, &reference, Shortcuts::ALL);
                     assert!(after == before, "{city}: {n:?} differs from the powf path");
                     // Two rounds each, alternated; the faster of each.
                     let (mut b, mut a) = (f64::MAX, f64::MAX);
                     for _ in 0..2 {
                         let started = Instant::now();
-                        black_box(CpuLitGenerator.generate_with(&request, &reference));
+                        black_box(CpuLitGenerator.generate_with(
+                            &request,
+                            &reference,
+                            Shortcuts::ALL,
+                        ));
                         b = b.min(ms(started));
                         let started = Instant::now();
                         black_box(CpuLitGenerator.generate(&request));
@@ -1732,7 +1927,7 @@ mod tests {
                         toner,
                         inputs: Default::default(),
                     };
-                    CpuLitGenerator.generate_with(&request, &recording);
+                    CpuLitGenerator.generate_with(&request, &recording, Shortcuts::ALL);
                     let inputs = recording.inputs.into_inner();
                     let (mut b, mut a) = (f64::MAX, f64::MAX);
                     for _ in 0..3 {

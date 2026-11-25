@@ -889,6 +889,67 @@ mod tests {
         assert!(assert_matches_reference(&field, &lats, &lons) > 0);
     }
 
+    /// Isolated class cells around the corner of four tiles at (47, 7),
+    /// near both degree lines: (46, 6) and (47, 7) on a 120 cell grid,
+    /// (46, 7) on a 60 cell grid, (47, 6) with no recipe.
+    fn isolated_cells_field() -> RecipeField {
+        let only = |cells: &'static [(usize, usize)]| {
+            move |r: usize, c: usize| u8::from(cells.contains(&(r, c)))
+        };
+        let sw = synthetic(
+            46,
+            6,
+            120,
+            only(&[(0, 119), (3, 114), (1, 117)]),
+            8,
+            |_, _| 200,
+        );
+        let se = synthetic(46, 7, 60, only(&[(0, 0), (2, 1)]), 8, |_, _| 200);
+        let ne = synthetic(47, 7, 120, only(&[(119, 0), (116, 4)]), 8, |_, _| 200);
+        let lookup = move |a: i32, b: i32| match (a, b) {
+            (46, 6) => Some(sw.clone()),
+            (46, 7) => Some(se.clone()),
+            (47, 7) => Some(ne.clone()),
+            _ => None,
+        };
+        RecipeField::new(&footprint(47.04, 46.96, 6.96, 7.04), &lookup)
+    }
+
+    #[test]
+    fn the_class_mask_skips_only_texels_without_class_weight() {
+        let field = isolated_cells_field();
+        let dense = |lo: f64, line: f64| {
+            let mut v: Vec<f64> = (0..480).map(|k| lo + f64::from(k) * 0.000_125).collect();
+            v.extend([line, line.next_up(), line.next_down()]);
+            v
+        };
+        let (lats, lons) = (dense(46.97, 47.0), dense(6.97, 7.0));
+        let axes = TexelAxes {
+            lats: &lats,
+            lons: &lons,
+        };
+        let sampler = FieldSampler::new(&field, axes);
+        assert_eq!(sampler.has_tables(), (true, true));
+        let (mut skipped, mut weighted, mut want) = (0, 0, Vec::new());
+        for (i, &lat) in lats.iter().enumerate() {
+            for (j, &lon) in lons.iter().enumerate() {
+                lookup_reference::class_weights(&field, lat, lon, &mut want);
+                if sampler.skips_class(i, j) {
+                    assert!(want.is_empty(), "skipped a weighted texel at {lat}, {lon}");
+                    skipped += 1;
+                }
+                weighted += usize::from(!want.is_empty());
+            }
+        }
+        assert!(skipped > lats.len() * lons.len() / 10, "{skipped} skipped");
+        assert!(weighted > 0, "the isolated cells are weighted");
+        // With the mask or without, the sampler gives the reference bits.
+        assert!(assert_matches_reference(&field, &lats, &lons) > 0);
+        let mut unmasked = FieldSampler::with_class_mask(&field, axes, false);
+        assert!(!(0..lats.len()).any(|i| (0..lons.len()).any(|j| unmasked.skips_class(i, j))));
+        assert_sampler_matches_reference(&mut unmasked, &field, &lats, &lons);
+    }
+
     #[test]
     fn sampling_matches_the_code_before_437_without_any_recipe() {
         let field = RecipeField::new(&footprint(37.6, 37.4, -122.6, -122.4), &|_, _| None);

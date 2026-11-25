@@ -21,16 +21,23 @@ use crate::night::math::floor_i64;
 /// from the field, with the same bits.
 const TABLE_SLACK_CELLS: i64 = 2;
 
+/// How far, in class cells, from a texel's own class cell the class mask
+/// looks for class (#438). The warped sample `g + amplitude * noise - 0.5`,
+/// noise in [-1, 1], lies in `[g - 1, g]`, so its bilinear corners are
+/// within one cell of `floor(g)`; the second cell is slack for rounding.
+const MASK_REACH_CELLS: usize = 2;
+
 /// The most table cells per texel. A texture coarser than the recipe grid
 /// (a low zoom) reads a small share of the cells it spans, so a table
 /// covering them would cost more than it saves; it reads the field instead.
 const MAX_TABLE_CELLS_PER_TEXEL: usize = 1;
 
 /// One texel column's (or row's) class sample position: the class grid
-/// coordinate and the warp noise coordinate.
+/// coordinate, its cell and the warp noise coordinate.
 #[derive(Debug, Clone, Copy)]
 struct ClassAxis {
     g: f64,
+    cell: i64,
     w: f64,
 }
 
@@ -38,6 +45,7 @@ impl ClassAxis {
     fn of(g: f64) -> Self {
         Self {
             g,
+            cell: floor_i64(g),
             w: g / WARP_WAVELENGTH_CELLS,
         }
     }
@@ -127,6 +135,40 @@ impl<T: Copy> CellTable<T> {
     }
 }
 
+impl CellTable<u32> {
+    /// The class mask (#438): per cell of this class table, whether a cell
+    /// with class (a non-zero word) lies within `MASK_REACH_CELLS` of it
+    /// each way. A cell whose neighbourhood runs past the table is marked
+    /// too: the cells there are read from the field, not known here.
+    fn near_class(&self) -> CellTable<bool> {
+        let (rows, cols) = (self.rows as usize, self.cols as usize);
+        let n = MASK_REACH_CELLS;
+        // Within reach along the row, then along the column of that.
+        let mut across = vec![false; self.cells.len()];
+        for r in 0..rows {
+            let row = &self.cells[r * cols..(r + 1) * cols];
+            for c in 0..cols {
+                across[r * cols + c] =
+                    c < n || c + n >= cols || row[c - n..=c + n].iter().any(|&w| w != 0);
+            }
+        }
+        let mut near = vec![false; self.cells.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                near[r * cols + c] =
+                    r < n || r + n >= rows || (r - n..=r + n).any(|k| across[k * cols + c]);
+            }
+        }
+        CellTable {
+            row0: self.row0,
+            col0: self.col0,
+            rows: self.rows,
+            cols: self.cols,
+            cells: near,
+        }
+    }
+}
+
 /// The lowest and highest of `values`, or `None` for none.
 fn span(values: impl Iterator<Item = i64>) -> Option<(i64, i64)> {
     values.fold(None, |acc, v| match acc {
@@ -163,6 +205,8 @@ struct ClassLayer {
     cols: Vec<ClassAxis>,
     rows: Vec<ClassAxis>,
     cells: CellTable<u32>,
+    /// `cells.near_class()`; empty (so it skips nothing) without the mask.
+    near: CellTable<bool>,
 }
 
 struct BrightnessLayer {
@@ -190,6 +234,10 @@ pub struct TexelAxes<'a> {
 /// The warp noise keeps the corner values of the last lattice cell it
 /// read, so texels sampled in raster order hash once per cell (about 20 to
 /// 25 texels each way at ZL16).
+///
+/// With the class mask (#438), a texel whose own class cell has no class
+/// cell within `MASK_REACH_CELLS` gets its empty weights without the warp
+/// noise or a cell read: about a third of all texels on real textures.
 pub struct FieldSampler<'f> {
     field: &'f RecipeField,
     class: Option<ClassLayer>,
@@ -201,13 +249,20 @@ pub struct FieldSampler<'f> {
 }
 
 impl<'f> FieldSampler<'f> {
+    /// The sampler, with the class mask.
     pub fn new(field: &'f RecipeField, axes: TexelAxes<'_>) -> Self {
-        Self::build(field, axes, TABLE_SLACK_CELLS)
+        Self::with_class_mask(field, axes, true)
+    }
+
+    /// The sampler, with the class mask or without it: the same weights
+    /// either way (tests and timings compare the two).
+    pub fn with_class_mask(field: &'f RecipeField, axes: TexelAxes<'_>, mask: bool) -> Self {
+        Self::build(field, axes, TABLE_SLACK_CELLS, mask)
     }
 
     /// The sampler with `slack` cells around the cells its tables must
     /// hold; tests pass a negative slack to make reads miss the tables.
-    fn build(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64) -> Self {
+    fn build(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64, mask: bool) -> Self {
         let TexelAxes { lats, lons } = axes;
         let budget = lons.len() * lats.len() * MAX_TABLE_CELLS_PER_TEXEL;
         let class = field.dims(Layer::Class).map(|(ny, nx)| {
@@ -232,7 +287,17 @@ impl<'f> FieldSampler<'f> {
             let cells = CellTable::build(reach(&rows), reach(&cols), budget, |r, c| {
                 pack(field.layer_cell(Layer::Class, r, c))
             });
-            ClassLayer { cols, rows, cells }
+            let near = if mask {
+                cells.near_class()
+            } else {
+                CellTable::build(None, None, 0, |_, _| true)
+            };
+            ClassLayer {
+                cols,
+                rows,
+                cells,
+                near,
+            }
         });
         let brightness = field.dims(Layer::Brightness).map(|(ny, nx)| {
             let cols: Vec<BrightnessAxis> = lons
@@ -281,6 +346,9 @@ impl<'f> FieldSampler<'f> {
             return;
         };
         let (x, y) = (class.cols[col], class.rows[row]);
+        if class.near.get(y.cell, x.cell) == Some(false) {
+            return;
+        }
         let (nx, ny) = self.warp.at(x.w, y.w);
         let u = x.g + WARP_AMPLITUDE_CELLS * nx - 0.5;
         let v = y.g + WARP_AMPLITUDE_CELLS * ny - 0.5;
@@ -340,7 +408,16 @@ impl<'f> FieldSampler<'f> {
     /// read (negative: fewer), for tests of reads outside a table.
     #[cfg(test)]
     pub(crate) fn with_slack(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64) -> Self {
-        Self::build(field, axes, slack)
+        Self::build(field, axes, slack, true)
+    }
+
+    /// Whether the class mask gives texel `(row, col)` its empty weights
+    /// without sampling.
+    #[cfg(test)]
+    pub(crate) fn skips_class(&self, row: usize, col: usize) -> bool {
+        self.class
+            .as_ref()
+            .is_some_and(|c| c.near.get(c.rows[row].cell, c.cols[col].cell) == Some(false))
     }
 
     /// Reads so far that fell outside a built table and went to the field.
@@ -402,6 +479,29 @@ mod tests {
         assert_eq!(none.get(0, 5), None);
         let inverted = CellTable::build(Some((2, 1)), Some((5, 8)), 100, |r, c| r * 100 + c);
         assert!(inverted.cells.is_empty(), "an empty range: no table");
+    }
+
+    #[test]
+    fn the_class_mask_marks_cells_within_reach_of_class() {
+        // A 9 x 9 table with class at (14, 24) only (table cell (4, 4)).
+        let t = CellTable::build(Some((10, 18)), Some((20, 28)), 81, |r, c| {
+            u32::from((r, c) == (14, 24)) << 8 | u32::from((r, c) == (14, 24))
+        });
+        let near = t.near_class();
+        for r in 10i64..=18 {
+            for c in 20i64..=28 {
+                let edge = !(12..=16).contains(&r) || !(22..=26).contains(&c);
+                let within = r.abs_diff(14) <= 2 && c.abs_diff(24) <= 2;
+                assert_eq!(near.get(r, c), Some(edge || within), "{r}, {c}");
+            }
+        }
+        assert_eq!(near.get(9, 24), None, "outside the table");
+        // No class: only the cells whose reach runs past the table.
+        let none = CellTable::build(Some((0, 8)), Some((0, 8)), 81, |_, _| 0u32).near_class();
+        assert_eq!(none.cells.iter().filter(|&&m| !m).count(), 5 * 5);
+        // A table narrower than the reach marks every cell.
+        let thin = CellTable::build(Some((0, 3)), Some((0, 30)), 200, |_, _| 0u32).near_class();
+        assert!(thin.cells.iter().all(|&m| m));
     }
 
     #[test]
