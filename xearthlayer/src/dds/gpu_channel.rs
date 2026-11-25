@@ -739,9 +739,10 @@ mod inner {
 
             match result {
                 Ok(result) => {
-                    let _ = response.send(GpuEncodeReply::Processed { result, timing });
+                    let reply = GpuEncodeReply::Processed { result, timing };
                     if timing.process < rule.deadline {
                         misses = 0;
+                        let _ = response.send(reply);
                         continue;
                     }
                     misses += 1;
@@ -750,17 +751,25 @@ mod inner {
                         process_ms = timing.process.as_millis() as u64,
                         "GPU tile missed its deadline"
                     );
-                    if misses >= rule.misses {
+                    // The queue is handed back before the late tile is
+                    // answered, so it is the queue that waited behind that
+                    // tile, never a request its caller sent after the reply.
+                    let failed = misses >= rule.misses;
+                    if failed {
                         health.fail(format!(
                             "{misses} tiles in a row missed the GPU's {} ms deadline",
                             rule.deadline.as_millis()
                         ));
                         hand_back_all(&mut rx, health.failure().unwrap_or_default());
+                    } else {
+                        // The queue behind a slow tile goes to the CPU now
+                        // rather than wait for the next one.
+                        hand_back_queued(&mut rx, "a GPU tile ahead of it missed its deadline");
+                    }
+                    let _ = response.send(reply);
+                    if failed {
                         break;
                     }
-                    // The queue behind a slow tile goes to the CPU now
-                    // rather than wait for the next one.
-                    hand_back_queued(&mut rx, "a GPU tile ahead of it missed its deadline");
                 }
                 Err(panic_info) => {
                     let msg = crate::panic::panic_message(panic_info.as_ref());
