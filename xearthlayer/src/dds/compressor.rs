@@ -981,7 +981,7 @@ mod gpu_tests {
                     start.wait();
                     for _ in 0..ROUNDS {
                         if thread % 2 == 0 {
-                            let _ = create_gpu_resources(device);
+                            let _ = create_gpu_resources(device, &SharedGpuHealth::new());
                         } else {
                             let _ = crate::system::enumerate_gpus();
                         }
