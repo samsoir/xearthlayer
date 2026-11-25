@@ -175,6 +175,9 @@ mod inner {
             )
             .entered();
 
+            // Counted from before the send (which blocks on a full channel)
+            // until the reply or the failure is back.
+            let in_channel = self.stats.enter();
             let sent_at = Instant::now();
             let (resp_tx, resp_rx) = oneshot::channel();
             let request = GpuEncodeRequest {
@@ -193,6 +196,7 @@ mod inner {
                 DdsError::CompressionFailed("GPU worker dropped response channel".to_string())
             })?;
             let total = sent_at.elapsed();
+            drop(in_channel);
 
             let t = &reply.timing;
             let encoded = reply.result.is_ok();
@@ -688,6 +692,7 @@ pub use inner::*;
 mod tests {
     use super::*;
     use crate::dds::compressor::{ImageCompressor, MipmapCompressor};
+    use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::{DdsError, DdsFormat, MipmapStream, SoftwareCompressor};
     use image::RgbaImage;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1239,6 +1244,90 @@ mod tests {
             max(s.total) >= max(s.process) + max(s.queue_wait),
             "the round trip covers the queue and the worker: {s:?}"
         );
+    }
+
+    // =========================================================================
+    // Queue depth (#419 item 3)
+    // =========================================================================
+
+    /// Waits until `stats` shows `depth` requests, or fails after 5 s.
+    async fn depth_reaches(stats: &GpuEncodeStats, depth: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stats.depth() != depth {
+            assert!(
+                Instant::now() < deadline,
+                "depth stayed at {}, expected {depth}",
+                stats.depth()
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// The depth counts every caller from before its send to its reply:
+    /// in progress, buffered, and blocked in `blocking_send` on a full
+    /// channel, which the channel's own capacity does not see. It returns
+    /// to zero after the burst, and the sample keeps the burst's peak.
+    #[tokio::test]
+    async fn queue_depth_rises_under_a_burst_and_returns_to_zero() {
+        // A one-slot channel: of five callers, one is in progress, one is
+        // buffered and three are blocked in their send.
+        let (tx, rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let _worker = spawn_tile_worker(
+            FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+                release_rx.recv().unwrap();
+                Ok(vec![0; 8])
+            }),
+            rx,
+            CancellationToken::new(),
+        );
+        let raw = tx.clone();
+        let channel = Arc::new(GpuEncoderChannel::new(tx));
+        let stats = Arc::clone(channel.stats());
+
+        let callers: Vec<_> = (0..5)
+            .map(|_| {
+                let ch = Arc::clone(&channel);
+                tokio::task::spawn_blocking(move || {
+                    ch.compress_mipmap_chain(RgbaImage::new(4, 4), DdsFormat::BC1, 1)
+                })
+            })
+            .collect();
+
+        depth_reaches(&stats, 5).await;
+        assert_eq!(
+            raw.max_capacity() - raw.capacity(),
+            1,
+            "the channel itself sees only the buffered request"
+        );
+
+        for _ in 0..5 {
+            release_tx.send(()).unwrap();
+        }
+        for caller in callers {
+            caller.await.unwrap().expect("every caller is answered");
+        }
+        assert_eq!(stats.depth(), 0, "the burst has drained");
+
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!((s.depth_now, s.depth_max, s.tiles()), (0, 5, 5));
+    }
+
+    /// A caller whose send fails is not left counted.
+    #[tokio::test]
+    async fn queue_depth_is_lowered_when_the_worker_is_gone() {
+        let (channel, rx) = mock_channel();
+        drop(rx);
+        let channel = Arc::new(channel);
+
+        encode_one(&channel).await.expect_err("no worker");
+
+        assert_eq!(channel.stats().depth(), 0);
+        let s = channel
+            .stats()
+            .take_sample()
+            .expect("the request was counted");
+        assert_eq!((s.depth_now, s.depth_max), (0, 1));
     }
 
     #[tokio::test]
