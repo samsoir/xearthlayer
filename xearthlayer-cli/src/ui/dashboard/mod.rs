@@ -30,6 +30,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use xearthlayer::aircraft_position::web_api::SharedSimState;
 use xearthlayer::aircraft_position::{AircraftPositionProvider, SharedAircraftPosition};
+use xearthlayer::dds::gpu_health::SharedGpuHealth;
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::SharedPrefetchStatus;
 use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
@@ -85,6 +86,9 @@ pub struct Dashboard {
     feature_status: Option<FeatureStatus>,
     /// X-Plane sim state from the Web API, for the live frame rate.
     sim_state: Option<SharedSimState>,
+    /// The GPU encoder's health, read every tick for the encoder line
+    /// (#420); `None` with a CPU encoder.
+    gpu_health: Option<SharedGpuHealth>,
     /// Emoji or plain marks on the Status pane, resolved once at start.
     symbols: SymbolSet,
 }
@@ -129,6 +133,7 @@ impl Dashboard {
             update_info: None,
             feature_status: None,
             sim_state: None,
+            gpu_health: None,
             symbols,
         })
     }
@@ -160,6 +165,13 @@ impl Dashboard {
     /// Set the sim state source for the Status pane's frame rate.
     pub fn with_sim_state(mut self, sim_state: SharedSimState) -> Self {
         self.sim_state = Some(sim_state);
+        self
+    }
+
+    /// Set the GPU encoder's health, read on every tick so the Status pane
+    /// shows a GPU that failed during the session (#420).
+    pub fn with_gpu_health(mut self, health: SharedGpuHealth) -> Self {
+        self.gpu_health = Some(health);
         self
     }
 
@@ -292,6 +304,11 @@ impl Dashboard {
             .and_then(|s| s.read().ok().map(|guard| *guard));
         let frame_rate =
             render::displayed_frame_rate(aircraft_position_status.telemetry_status, sim.as_ref());
+        let gpu_health = self.gpu_health.as_ref().map(SharedGpuHealth::health);
+        let feature_status = self
+            .feature_status
+            .as_ref()
+            .map(|status| status.with_gpu_health(gpu_health.as_ref()));
 
         self.terminal.draw(|frame| {
             render::render_ui(
@@ -313,7 +330,7 @@ impl Dashboard {
                 &tile_progress_entries,
                 update_info,
                 self.config.prefetch_lane,
-                self.feature_status.as_ref(),
+                feature_status.as_deref(),
                 self.symbols,
                 frame_rate,
             );

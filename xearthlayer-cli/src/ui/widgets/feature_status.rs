@@ -14,6 +14,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use std::borrow::Cow;
+use xearthlayer::dds::gpu_health::GpuHealth;
 use xearthlayer::night::NightLighting;
 use xearthlayer::system::{GpuAdapter, GpuKind};
 use xearthlayer::xworld_pro::Detection;
@@ -27,6 +29,13 @@ pub enum EncoderStatus {
     /// `texture.compressor = gpu` honoured on a host whose only GPU is the
     /// one X-Plane renders with, so encoding competes with the sim (#203).
     GpuSharedWithSim(GpuAdapter),
+    /// The GPU encoder failed this session (#420): every tile is encoded on
+    /// the CPU with ISPC from then on.
+    GpuFailed {
+        adapter: GpuAdapter,
+        /// Why, as the encoder's health gives it.
+        reason: String,
+    },
     /// The ISPC SIMD encoder on the CPU.
     Ispc,
     /// The pure-Rust encoder on the CPU.
@@ -88,6 +97,27 @@ impl FeatureStatus {
     /// Lines the pane draws: one more while there are startup warnings.
     pub fn line_count(&self) -> u16 {
         4 + u16::from(self.startup_warnings > 0)
+    }
+
+    /// The status as of the GPU encoder's `health` now, which the dashboard
+    /// reads on every tick (#420): a failed GPU turns a GPU encoder line into
+    /// [`EncoderStatus::GpuFailed`]. Borrowed unchanged otherwise, so a
+    /// healthy tick allocates nothing.
+    pub fn with_gpu_health(&self, health: Option<&GpuHealth>) -> Cow<'_, FeatureStatus> {
+        let (
+            Some(GpuHealth::Failed { reason }),
+            EncoderStatus::Gpu(adapter) | EncoderStatus::GpuSharedWithSim(adapter),
+        ) = (health, &self.encoder)
+        else {
+            return Cow::Borrowed(self);
+        };
+        Cow::Owned(FeatureStatus {
+            encoder: EncoderStatus::GpuFailed {
+                adapter: adapter.clone(),
+                reason: reason.clone(),
+            },
+            ..self.clone()
+        })
     }
 }
 
@@ -158,6 +188,16 @@ impl<'a> FeatureStatusWidget<'a> {
 
     fn encoder_line(&self) -> Line<'static> {
         let mut spans = vec![styled("Tile Processing Engine, ", TEXT)];
+        if let EncoderStatus::GpuFailed { reason, .. } = &self.status.encoder {
+            spans.push(styled(
+                format!(
+                    "GPU encoder failed ({}), encoding on CPU (ISPC)",
+                    shortened(reason)
+                ),
+                WARN,
+            ));
+            return line(Mark::WARNING, spans);
+        }
         let (mark, adapter) = match &self.status.encoder {
             EncoderStatus::Software => {
                 spans.push(styled("Software", Color::Red));
@@ -173,6 +213,7 @@ impl<'a> FeatureStatusWidget<'a> {
             ),
             // The warning outranks the emoji: it is the one thing to see.
             EncoderStatus::GpuSharedWithSim(adapter) => (Mark::WARNING, Some(adapter)),
+            EncoderStatus::GpuFailed { .. } => unreachable!("drawn above"),
         };
         if let Some(adapter) = adapter {
             spans.push(styled(
@@ -232,6 +273,20 @@ impl<'a> FeatureStatusWidget<'a> {
             vec![styled(text, colour)],
         )
     }
+}
+
+/// Characters of a GPU failure's reason the encoder line shows: a panic's
+/// message can run long, and what is being done about it must stay on the
+/// pane. The whole reason is in the log's WARN.
+const REASON_CHARS: usize = 40;
+
+/// `reason`, cut to [`REASON_CHARS`] with an ellipsis when longer.
+fn shortened(reason: &str) -> Cow<'_, str> {
+    if reason.chars().count() <= REASON_CHARS {
+        return Cow::Borrowed(reason);
+    }
+    let kept: String = reason.chars().take(REASON_CHARS - 1).collect();
+    Cow::Owned(format!("{kept}…"))
 }
 
 /// Integrated and other real GPUs green, discrete yellow, and a software
@@ -390,9 +445,10 @@ mod tests {
     }
 
     /// Each row as text, skipping the cell a wide symbol covers so an emoji
-    /// reads as written.
+    /// reads as written. 120 columns, as the Status pane on a typical
+    /// terminal.
     fn render_with(widget: FeatureStatusWidget<'_>) -> (Buffer, Vec<String>) {
-        let area = Rect::new(0, 0, 100, 4);
+        let area = Rect::new(0, 0, 120, 4);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         let rows = (0..area.height)
@@ -659,6 +715,104 @@ mod tests {
             // The row is ASCII from the marker on, so its byte offsets are columns.
             let suffix = rows[1].find("shared").unwrap() as u16;
             assert_eq!(buf[(suffix, 1)].fg, Color::Yellow, "{symbols:?}");
+        }
+    }
+
+    fn failed(reason: &str) -> GpuHealth {
+        GpuHealth::Failed {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// A failed GPU is an amber warning with either symbol set: the
+    /// warning mark and the whole engine text after the label (#420).
+    #[test]
+    fn a_failed_gpu_encoder_reads_as_encoding_on_the_cpu() {
+        let status = FeatureStatus {
+            encoder: EncoderStatus::GpuFailed {
+                adapter: radeon(),
+                reason: "GPU device lost: driver reset".to_string(),
+            },
+            ..all_on()
+        };
+        for symbols in [SymbolSet::Emoji, SymbolSet::Plain] {
+            let (buf, rows) = render(&status, symbols);
+            assert_eq!(
+                rows[1],
+                "  !  Tile Processing Engine, GPU encoder failed (GPU device lost: driver reset), \
+                 encoding on CPU (ISPC)"
+            );
+            assert_eq!(marker(&buf, 1), Color::Yellow, "{symbols:?}");
+            assert_eq!(text(&buf, 1), Color::Gray, "the label stays grey");
+            assert_eq!(engine(&buf), Color::Yellow, "{symbols:?}");
+        }
+    }
+
+    /// A long reason (a panic's message) is cut, so what is being done about
+    /// it stays on the line.
+    #[test]
+    fn a_long_failure_reason_is_cut_before_the_fallback() {
+        let reason = "GPU worker panicked: assertion failed: width % 4 == 0 && height % 4 == 0";
+        let status = FeatureStatus {
+            encoder: EncoderStatus::GpuFailed {
+                adapter: radeon(),
+                reason: reason.to_string(),
+            },
+            ..all_on()
+        };
+        let (_, rows) = render(&status, SymbolSet::Plain);
+        assert_eq!(
+            rows[1],
+            "  !  Tile Processing Engine, GPU encoder failed \
+             (GPU worker panicked: assertion failed: …), encoding on CPU (ISPC)"
+        );
+        assert_eq!(shortened("short"), "short");
+        assert_eq!(shortened(reason).chars().count(), REASON_CHARS);
+    }
+
+    #[test]
+    fn a_failed_gpu_turns_a_gpu_encoder_line_into_the_failure() {
+        let health = failed("GPU worker panicked: boom");
+        for encoder in [
+            EncoderStatus::Gpu(radeon()),
+            EncoderStatus::GpuSharedWithSim(radeon()),
+        ] {
+            let status = FeatureStatus {
+                encoder,
+                ..all_on()
+            };
+            let shown = status.with_gpu_health(Some(&health));
+            assert_eq!(
+                shown.encoder,
+                EncoderStatus::GpuFailed {
+                    adapter: radeon(),
+                    reason: "GPU worker panicked: boom".to_string(),
+                }
+            );
+            assert_eq!(
+                FeatureStatus {
+                    encoder: status.encoder.clone(),
+                    ..shown.into_owned()
+                },
+                status,
+                "only the encoder line changes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_healthy_gpu_or_a_cpu_encoder_is_shown_as_it_is() {
+        let gpu = all_on();
+        for health in [None, Some(&GpuHealth::Healthy)] {
+            assert!(matches!(gpu.with_gpu_health(health), Cow::Borrowed(s) if *s == gpu));
+        }
+        for encoder in [EncoderStatus::Ispc, EncoderStatus::Software] {
+            let cpu = FeatureStatus {
+                encoder,
+                ..all_on()
+            };
+            let shown = cpu.with_gpu_health(Some(&failed("x")));
+            assert!(matches!(shown, Cow::Borrowed(s) if *s == cpu));
         }
     }
 

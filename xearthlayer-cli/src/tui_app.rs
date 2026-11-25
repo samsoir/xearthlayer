@@ -189,6 +189,12 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         dashboard = dashboard.with_runtime_health(runtime_health);
     }
 
+    // The GPU encoder's health, read every tick: a GPU that fails during
+    // the session turns the encoder line amber (#420).
+    if let Some(gpu_health) = orchestrator.gpu_health() {
+        dashboard = dashboard.with_gpu_health(gpu_health);
+    }
+
     // Wire in tile progress tracker for active tile display
     if let Some(tile_progress_tracker) = orchestrator.tile_progress_tracker() {
         dashboard = dashboard.with_tile_progress_tracker(tile_progress_tracker);
