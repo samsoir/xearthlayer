@@ -288,6 +288,9 @@ fn unit_luminance(c: [f32; 3]) -> [f32; 3] {
 }
 
 #[cfg(test)]
+mod texel_timing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fuse::{DdsFilename, TextureKind};
@@ -303,7 +306,7 @@ mod tests {
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
-    fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    pub(super) fn name_at(lat: f64, lon: f64) -> DdsFilename {
         name_at_zoom(lat, lon, 16)
     }
 
@@ -838,7 +841,7 @@ mod tests {
         })
     }
 
-    fn name(row: u32, col: u32, zoom: u8) -> DdsFilename {
+    pub(super) fn name(row: u32, col: u32, zoom: u8) -> DdsFilename {
         DdsFilename {
             row,
             col,
@@ -1301,7 +1304,7 @@ mod tests {
     /// [`PACKAGES_VAR`] and [`ART_VAR`]: the packages directory and the
     /// Laminar art. Says on stderr what is missing, so a skipped timing
     /// never passes silently.
-    fn real_install() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    pub(super) fn real_install() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let dir = |var: &str, what: &str| match std::env::var_os(var) {
             Some(v) if std::path::Path::new(&v).is_dir() => Some(std::path::PathBuf::from(v)),
             Some(v) => {
