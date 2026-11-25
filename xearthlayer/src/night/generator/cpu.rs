@@ -40,10 +40,10 @@ impl LitGenerator for CpuLitGenerator {
 }
 
 impl CpuLitGenerator {
-    /// The generator with the tone path `tone`: the request's
+    /// The generator with the tone path `toner`: the request's
     /// [`led::Toner`] in production; tests pass the reference path, or one
     /// that records what reaches it, to compare with it.
-    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, tone: &T) -> RgbaImage {
+    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, toner: &T) -> RgbaImage {
         let name = request.name;
         let size = request.size;
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
@@ -142,7 +142,7 @@ impl CpuLitGenerator {
                         led_kelvin = Some(led::patch_kelvin(kelvin / wsum, &patch));
                     }
                 }
-                let mut bytes = tone.bytes(rgb, led_kelvin, g as f32);
+                let mut bytes = toner.bytes(rgb, led_kelvin, g as f32);
                 if road > 0.0 {
                     let texel = RoadTexel {
                         at: (lat, lon),
