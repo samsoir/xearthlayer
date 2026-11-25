@@ -97,11 +97,47 @@ impl LitTextureSource for BlackLitSource {
 const LIT_PROBE_PERMITS: usize = 2;
 
 /// Concurrent lit disk tier work: fingerprinting (art walk and recipe stats)
-/// with the read of an entry, or the write-back of a generated one, or of a
-/// road tile's extractions (the road service's permits are these when
-/// attached, #429). The permits sit inside the blocking pool's
-/// `BLOCKING_POOL_HEADROOM`.
+/// with the read of an entry, or the write-back of a generated one, or of one
+/// of a road tile's extractions. The permits sit inside the blocking pool's
+/// `BLOCKING_POOL_HEADROOM`, counted once: there is one [`LitDiskPermits`]
+/// per session.
 pub(crate) const LIT_DISK_PERMITS: usize = 2;
+
+/// The lit disk tier's [`LIT_DISK_PERMITS`] permits. Made once where the lit
+/// source and the road service are built, and handed to both
+/// ([`NightLitSource::new`], [`RoadService::new`]), so the tier's work, the
+/// road entries' writes included, stays within the permits the night budget
+/// counts; neither makes nor replaces them. A clone shares the permits.
+#[derive(Clone, Debug)]
+pub struct LitDiskPermits(Arc<tokio::sync::Semaphore>);
+
+impl LitDiskPermits {
+    pub fn new() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(LIT_DISK_PERMITS)))
+    }
+
+    /// One permit, `None` once the permits are closed (never, today).
+    pub(crate) async fn acquire(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        self.0.acquire().await.ok()
+    }
+
+    /// Whether `other` is these permits, not another set.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The permits themselves, for tests that hold or count them.
+    #[cfg(test)]
+    pub(crate) fn semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.0
+    }
+}
+
+impl Default for LitDiskPermits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Zoom levels a lit footprint is computed for. `parse_dds_filename` accepts
 /// any two-digit zoom and `Footprint::from_name` shifts by it, so anything
@@ -117,7 +153,8 @@ const MAX_LIT_GENERATION_PERMITS: usize = 4;
 // road extraction) runs on the blocking pool inside its headroom (R17);
 // night may use a third of it so it cannot starve other blocking work. The
 // night share is fully used (10 of 10): a new night permit needs a smaller
-// one elsewhere or a larger headroom.
+// one elsewhere or a larger headroom. The disk permits count once because
+// the source and the road service share one `LitDiskPermits`.
 const _: () = assert!(
     LIT_PROBE_PERMITS
         + MAX_LIT_GENERATION_PERMITS
@@ -293,9 +330,10 @@ pub struct NightLitSource {
     generator: Arc<dyn LitGenerator>,
     /// Lit payloads on disk, from the cache layer; None when caching is off.
     disk: Option<Arc<dyn Cache>>,
-    /// Shared with the detached write-backs, which hold a permit too, and
-    /// with the road service's writes when roads are attached.
-    disk_io: Arc<tokio::sync::Semaphore>,
+    /// The lit disk tier's permits, given at construction: shared with the
+    /// detached write-backs, which hold a permit too, and with the road
+    /// service's writes.
+    disk_io: LitDiskPermits,
     /// Fingerprint of the session's inputs (generator, brightness, art,
     /// road model), computed on the first payload, after the builders have
     /// run.
@@ -392,10 +430,14 @@ fn roads_agree(fingerprinted: &[TileDsfs], read_from: &[Arc<ReadFrom>]) -> bool 
 struct Uncached(Option<Bytes>);
 
 impl NightLitSource {
+    /// A source whose lit disk tier work takes `disk_permits`, the
+    /// session's one set, which a road service attached with
+    /// [`Self::with_roads`] must share.
     pub fn new(
         store: Arc<RecipeStore>,
         art: Arc<LaminarArt>,
         setting: Arc<dyn TextureSettingSource>,
+        disk_permits: LitDiskPermits,
     ) -> Self {
         let stats = Arc::new(LitStats::default());
         Self {
@@ -411,7 +453,7 @@ impl NightLitSource {
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
             disk: None,
-            disk_io: Arc::new(tokio::sync::Semaphore::new(LIT_DISK_PERMITS)),
+            disk_io: disk_permits,
             session: tokio::sync::OnceCell::new(),
             roads: None,
             road_model: RoadModel::DEFAULT,
@@ -440,11 +482,14 @@ impl NightLitSource {
     }
 
     /// Light roads from `roads`: in the probe, in generation and in the
-    /// disk tier's fingerprints. The source's lit disk permits become the
-    /// road service's, which the writes of its road entries take, so the
-    /// lit disk tier's work stays within them.
+    /// disk tier's fingerprints. `roads` must have been built with this
+    /// source's [`LitDiskPermits`], which the writes of its road entries
+    /// take, so the lit disk tier's work stays within them.
     pub fn with_roads(mut self, roads: Arc<RoadService>) -> Self {
-        self.disk_io = roads.disk_permits();
+        debug_assert!(
+            roads.disk_permits().same(&self.disk_io),
+            "a road service attached to a lit source shares its lit disk permits"
+        );
         self.roads = Some(roads);
         self
     }
@@ -533,7 +578,7 @@ impl NightLitSource {
         // The disk permit covers the fingerprint and the read, and is released
         // before generating: a lit task never holds two permits at once.
         let asked = Instant::now();
-        let Ok(permit) = self.disk_io.acquire().await else {
+        let Some(permit) = self.disk_io.acquire().await else {
             return Err(Uncached(None));
         };
         let permit_wait = asked.elapsed();
@@ -607,9 +652,9 @@ impl NightLitSource {
         let entry = encode_entry(fp, payload);
         let payload = payload.clone();
         // Pending from here, so a write-back spawned but not yet run counts.
-        let (disk_io, pending) = (Arc::clone(&self.disk_io), self.stats.write_back());
+        let (disk_io, pending) = (self.disk_io.clone(), self.stats.write_back());
         tokio::spawn(async move {
-            let Ok(_permit) = disk_io.acquire().await else {
+            let Some(_permit) = disk_io.acquire().await else {
                 return;
             };
             let written = disk.set(&key, entry).await;
@@ -1270,6 +1315,16 @@ mod tests {
         /// A fresh source over the fixture tree in `temp`, writing the tree
         /// first when it is absent, so two sessions can share one tree.
         fn source_in(temp: &TempDir) -> NightLitSource {
+            source_with_permits(temp, LitDiskPermits::new())
+        }
+
+        /// `source_in` with the lit disk permits of `roads`, as the mount
+        /// builds them, ready for `with_roads(roads)`.
+        fn source_sharing(temp: &TempDir, roads: &RoadService) -> NightLitSource {
+            source_with_permits(temp, roads.disk_permits().clone())
+        }
+
+        fn source_with_permits(temp: &TempDir, disk_permits: LitDiskPermits) -> NightLitSource {
             let pkg = temp.path().join("pkg");
             let art = temp.path().join("art");
             if !art.exists() {
@@ -1279,6 +1334,7 @@ mod tests {
                 Arc::new(RecipeStore::new(vec![pkg])),
                 Arc::new(LaminarArt::new(art)),
                 Arc::new(FixedTextureSetting(4)),
+                disk_permits,
             )
         }
 
@@ -1496,6 +1552,7 @@ mod tests {
                 )])),
                 Arc::new(LaminarArt::new(temp.path().join("art"))),
                 Arc::new(FixedTextureSetting(4)),
+                LitDiskPermits::new(),
             )
             .with_generator(recording.clone());
             let name = name_at(37.20, -122.725);
@@ -1699,6 +1756,7 @@ mod tests {
                 Arc::new(RecipeStore::with_regions(vec![(pkg, region)])),
                 Arc::new(LaminarArt::new(art)),
                 Arc::new(FixedTextureSetting(4)),
+                LitDiskPermits::new(),
             )
         }
 
@@ -1874,6 +1932,7 @@ mod tests {
                 Arc::new(RecipeStore::new(vec![temp.path().join("pkg")])),
                 Arc::new(LaminarArt::with_files(temp.path().join("art"), files)),
                 Arc::new(FixedTextureSetting(4)),
+                LitDiskPermits::new(),
             )
         }
 
@@ -2293,6 +2352,7 @@ mod tests {
                 xp,
                 vec![],
                 None,
+                LitDiskPermits::new(),
                 RoadServiceConfig {
                     probe_wait: probe,
                     probe_cap: probe,
@@ -2317,6 +2377,7 @@ mod tests {
                 xp,
                 vec![],
                 None,
+                LitDiskPermits::new(),
                 RoadServiceConfig {
                     probe_wait: Duration::from_millis(probe_ms),
                     probe_cap: Duration::from_millis(cap_ms),
@@ -2353,7 +2414,21 @@ mod tests {
             dsf: Option<Vec<u8>>,
         ) -> (NightLitSource, Arc<RoadService>) {
             let roads = roads(xp_install(temp, dsf), LONG, LONG, None);
-            (source_in(temp).with_roads(roads.clone()), roads)
+            (
+                source_sharing(temp, &roads).with_roads(roads.clone()),
+                roads,
+            )
+        }
+
+        #[cfg(debug_assertions)]
+        #[test]
+        #[should_panic(expected = "shares its lit disk permits")]
+        fn a_road_service_with_its_own_disk_permits_is_refused() {
+            // Two sets of lit disk permits would exceed the night budget.
+            let temp = TempDir::new().unwrap();
+            let roads =
+                RoadService::new(temp.path().join("xp"), vec![], None, LitDiskPermits::new());
+            let _ = source_in(&temp).with_roads(roads);
         }
 
         async fn until_ready(roads: &Arc<RoadService>, tile: (i32, i32)) {
@@ -2435,7 +2510,7 @@ mod tests {
                 LONG,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             // The gate is shut: the dark probe times out before the build
             // runs. Lit by its recipe, the other never waits (#428).
             let lit = lit_name();
@@ -2500,7 +2575,7 @@ mod tests {
                 Some(gate.clone()),
             );
             let seen = Arc::new(SeesRoads::default());
-            let source = source_in(&temp)
+            let source = source_sharing(&temp, &roads)
                 .with_generator(seen.clone())
                 .with_disk_cache(d.clone())
                 .with_roads(roads.clone());
@@ -2599,7 +2674,7 @@ mod tests {
                 Some(gate.clone()),
             );
             let white = Arc::new(White::default());
-            let source = source_in(&temp)
+            let source = source_sharing(&temp, &roads)
                 .with_generator(white.clone())
                 .with_disk_cache(d.clone())
                 .with_roads(roads.clone());
@@ -2646,7 +2721,7 @@ mod tests {
                 FOREVER,
                 Some(shut()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             assert_eq!(road_tiles(&name, 1024, &RoadModel::DEFAULT), [TILE]);
             // A road wait would last FOREVER: the bound is far below it.
             let size = tokio::time::timeout(Duration::from_secs(5), source.size(&name)).await;
@@ -2668,7 +2743,7 @@ mod tests {
                 LONG,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             // The gate opens while the probe waits, before its deadline.
             let (size, ()) = tokio::join!(source.size(&name), async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2695,7 +2770,7 @@ mod tests {
                 LONG,
                 hold.clone(),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             hold_the_permit(&roads).await;
             let (size, ()) = tokio::join!(source.size(&name), async {
                 tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -2719,7 +2794,7 @@ mod tests {
                 cap.as_millis() as u64,
                 hold.clone(),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             hold_the_permit(&roads).await;
             let started = Instant::now();
             assert_eq!(source.size(&name).await, 152, "committed without roads");
@@ -2741,7 +2816,7 @@ mod tests {
                 LONG,
                 Some(shut()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             source.remember((name.row, name.col, name.zoom), false);
             // A road wait would last LONG: the bound is far below it.
             let size = tokio::time::timeout(Duration::from_secs(5), source.size(&name)).await;
@@ -2760,7 +2835,7 @@ mod tests {
                 30,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             let layout = source.layout(&name);
             let (size, ()) = tokio::join!(source.size(&name), async { gate.add_permits(1) });
             assert_eq!(size, layout.total_len, "lit by the road");
@@ -2993,8 +3068,9 @@ mod tests {
             let start = LitLayout::new(16, 4).payload_start();
             let session = |temp: &TempDir| {
                 let white = Arc::new(White::default());
-                let roads = RoadService::new(temp.path().join("xp"), vec![], None);
-                let source = source_in(temp)
+                let roads =
+                    RoadService::new(temp.path().join("xp"), vec![], None, LitDiskPermits::new());
+                let source = source_sharing(temp, &roads)
                     .with_generator(white.clone())
                     .with_disk_cache(d.clone())
                     .with_roads(roads);
@@ -3093,9 +3169,10 @@ mod tests {
             temp: &TempDir,
             d: &Arc<dyn crate::cache::Cache>,
         ) -> (NightLitSource, Arc<RoadService>, Arc<RoadSegments>) {
-            let roads = RoadService::new(temp.path().join("xp"), vec![], None);
+            let roads =
+                RoadService::new(temp.path().join("xp"), vec![], None, LitDiskPermits::new());
             let seen = Arc::new(RoadSegments::default());
-            let source = source_in(temp)
+            let source = source_sharing(temp, &roads)
                 .with_generator(seen.clone())
                 .with_disk_cache(d.clone())
                 .with_roads(roads.clone());
@@ -3179,8 +3256,8 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let name = lit_name();
             let xp = xp_install(&temp, Some(road_across(&name)));
-            let roads = RoadService::new(xp.clone(), vec![], None);
-            let source = source_in(&temp)
+            let roads = RoadService::new(xp.clone(), vec![], None, LitDiskPermits::new());
+            let source = source_sharing(&temp, &roads)
                 .with_disk_cache(disk())
                 .with_roads(roads.clone());
             assert!(roads.identities((10, 10)).await.is_some(), "index built");
@@ -3215,7 +3292,7 @@ mod tests {
                 FOREVER,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp).with_roads(roads.clone());
+            let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             let other = name_at(38.5, -122.5);
             let (ready, ()) = tokio::join!(roads.footprint(&[(38, -123)], Purpose::Probe), async {
                 gate.add_permits(1)
@@ -3247,7 +3324,7 @@ mod tests {
                 FOREVER,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp)
+            let source = source_sharing(&temp, &roads)
                 .with_generator(Arc::new(White::default()))
                 .with_roads(roads.clone());
             let layout = LitLayout::new(16, 4);
@@ -3527,7 +3604,7 @@ mod tests {
                 30,
                 Some(gate.clone()),
             );
-            let source = source_in(&temp)
+            let source = source_sharing(&temp, &roads)
                 .with_generator(Arc::new(White::default()))
                 .with_roads(roads.clone());
             let tiles = road_tiles(&name, 1024, &RoadModel::DEFAULT);

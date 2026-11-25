@@ -54,7 +54,9 @@ use super::merge::{MergedRoads, Merger};
 use super::packs::PackIndex;
 use super::stats::{BuildRecord, Stats, WaitCounters};
 use crate::cache::Cache;
-use crate::night::{decode_entry_unsized, encode_entry, FileIdentity, LitFingerprint};
+use crate::night::{
+    decode_entry_unsized, encode_entry, FileIdentity, LitDiskPermits, LitFingerprint,
+};
 
 pub use super::stats::StatsSnapshot;
 
@@ -363,9 +365,9 @@ pub struct RoadService {
     ready_at: DashMap<Tile, Instant>,
     /// Held by a build.
     extract: Arc<Semaphore>,
-    /// The lit disk tier's permits, held by the write of a build's entries;
-    /// the lit source takes these too (`disk_permits`).
-    disk_io: Arc<Semaphore>,
+    /// The lit disk tier's permits, given at construction and shared with
+    /// the lit source; held by the write of a build's entries.
+    disk_io: LitDiskPermits,
     /// Tiles whose entries are waiting for their write or being written.
     writes_pending: Arc<std::sync::atomic::AtomicUsize>,
     stats: Stats,
@@ -472,14 +474,30 @@ impl Drop for PendingGuard {
 }
 
 impl RoadService {
-    pub fn new(install: PathBuf, skip: Vec<PathBuf>, disk: Option<Arc<dyn Cache>>) -> Arc<Self> {
-        Self::with_config(install, skip, disk, RoadServiceConfig::default())
+    /// A service over the X-Plane installation at `install`, leaving out
+    /// the packs in `skip`. `disk` is the lit disk tier (`None` when caching
+    /// is off), whose writes take `disk_permits`: the session's one set,
+    /// shared with the lit source.
+    pub fn new(
+        install: PathBuf,
+        skip: Vec<PathBuf>,
+        disk: Option<Arc<dyn Cache>>,
+        disk_permits: LitDiskPermits,
+    ) -> Arc<Self> {
+        Self::with_config(
+            install,
+            skip,
+            disk,
+            disk_permits,
+            RoadServiceConfig::default(),
+        )
     }
 
     pub(crate) fn with_config(
         install: PathBuf,
         skip: Vec<PathBuf>,
         disk: Option<Arc<dyn Cache>>,
+        disk_permits: LitDiskPermits,
         config: RoadServiceConfig,
     ) -> Arc<Self> {
         // LRU, not moka's default TinyLFU: admission by popularity would
@@ -515,7 +533,7 @@ impl RoadService {
             identities: DashMap::new(),
             ready_at: DashMap::new(),
             extract: Arc::new(Semaphore::new(permits)),
-            disk_io: Arc::new(Semaphore::new(crate::night::service::LIT_DISK_PERMITS)),
+            disk_io: disk_permits,
             writes_pending: Arc::default(),
             stats: Stats::default(),
             summary_started: AtomicBool::new(false),
@@ -677,10 +695,9 @@ impl RoadService {
         self.stats.snapshot()
     }
 
-    /// The lit disk tier's permits, which the writes of road entries take:
-    /// the lit source shares them, so the tier's work stays within them.
-    pub(crate) fn disk_permits(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.disk_io)
+    /// The lit disk tier's permits this service was given.
+    pub(crate) fn disk_permits(&self) -> &LitDiskPermits {
+        &self.disk_io
     }
 
     /// Whether the tile cache holds the tile.
@@ -1219,10 +1236,10 @@ impl RoadService {
         }
         // Counted until the task ends, however it ends.
         let slot = WriteSlot(Arc::clone(&self.writes_pending));
-        let disk_io = Arc::clone(&self.disk_io);
+        let disk_io = self.disk_io.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            let Ok(_permit) = disk_io.acquire().await else {
+            let Some(_permit) = disk_io.acquire().await else {
                 return;
             };
             for (key, entry) in entries {
@@ -1612,7 +1629,13 @@ pub(crate) mod tests {
     /// A service that waits `LONG` for its roads, so a test that expects
     /// them does not depend on how fast the machine builds a tile.
     fn patient(install: &Path, disk: Option<Arc<dyn Cache>>) -> Arc<RoadService> {
-        RoadService::with_config(install.into(), vec![], disk, config(LONG, LONG))
+        RoadService::with_config(
+            install.into(),
+            vec![],
+            disk,
+            LitDiskPermits::new(),
+            config(LONG, LONG),
+        )
     }
 
     /// A tile-cache budget that holds `tiles` test tiles of at most two
@@ -1953,7 +1976,7 @@ pub(crate) mod tests {
     async fn dsf_hints_are_ignored_past_the_backlog_but_probes_are_not() {
         let t = install(None);
         let (c, _gate) = gated(30, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         // The gate stays shut, so every build stays pending.
         let tiles: Vec<Tile> = (0..ROAD_HINT_BACKLOG as i32 + 1).map(|k| (10, k)).collect();
         for &tile in &tiles {
@@ -2207,7 +2230,7 @@ pub(crate) mod tests {
     async fn concurrent_footprints_build_a_tile_once() {
         let t = install(None);
         let (c, gate) = gated(LONG, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         // Both callers are waiting on the build before the gate opens.
         let (a, b, ()) = tokio::join!(
             svc.footprint(&[TILE], Purpose::Probe),
@@ -2223,7 +2246,7 @@ pub(crate) mod tests {
     async fn callers_that_stop_waiting_share_one_build_and_never_cancel_it() {
         let t = install(None);
         let (c, gate) = gated(30, 30);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         // The gate is shut: both callers give up on a build still waiting.
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
         assert!(!svc.footprint(&[TILE], Purpose::Generate).await.complete);
@@ -2261,7 +2284,13 @@ pub(crate) mod tests {
             extract_permits: 1,
             ..config(LONG, LONG)
         };
-        let svc = RoadService::with_config(t.path().into(), vec![], Some(d.clone()), c);
+        let svc = RoadService::with_config(
+            t.path().into(),
+            vec![],
+            Some(d.clone()),
+            LitDiskPermits::new(),
+            c,
+        );
         for &tile in &tiles {
             svc.ensure(tile, Trigger::DsfOpen);
         }
@@ -2298,7 +2327,13 @@ pub(crate) mod tests {
             write_backlog: 1,
             ..config(LONG, LONG)
         };
-        let svc = RoadService::with_config(t.path().into(), vec![], Some(d.clone() as _), c);
+        let svc = RoadService::with_config(
+            t.path().into(),
+            vec![],
+            Some(d.clone() as _),
+            LitDiskPermits::new(),
+            c,
+        );
         assert!(svc.footprint(&[u], Purpose::Generate).await.complete);
         let deadline = Instant::now() + Duration::from_secs(5);
         while d.sets_waiting() == 0 && Instant::now() < deadline {
@@ -2331,13 +2366,15 @@ pub(crate) mod tests {
         let t = sevenz_install(&tiles);
         let gate = Arc::new(Semaphore::new(0));
         let d = Arc::new(Loads::with_set_gate(disk(), Arc::clone(&gate)));
+        let permits = LitDiskPermits::new();
         let svc = RoadService::with_config(
             t.path().into(),
             vec![],
             Some(d.clone() as _),
+            permits.clone(),
             config(LONG, LONG),
         );
-        let disk_io = svc.disk_permits();
+        let disk_io = permits.semaphore();
         let all = disk_io.available_permits() as u32;
         assert_eq!(all as usize, crate::night::service::LIT_DISK_PERMITS);
         let held = disk_io.acquire_many(all).await.unwrap();
@@ -2381,7 +2418,7 @@ pub(crate) mod tests {
             tile_cache_bytes: budget,
             ..config(LONG, LONG)
         };
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let a = svc.footprint(&[TILE], Purpose::Probe).await;
         let b = svc.footprint(&[other], Purpose::Probe).await;
         assert!(a.complete && b.complete);
@@ -2416,7 +2453,7 @@ pub(crate) mod tests {
             tile_cache_bytes: budget,
             ..config(LONG, LONG)
         };
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let mut old = 0;
         for _ in 0..5 {
             let r = svc.footprint(&[TILE], Purpose::Probe).await;
@@ -2440,7 +2477,7 @@ pub(crate) mod tests {
         let t = install(None);
         let wait = Duration::from_millis(500);
         let (c, _gate) = gated(500, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         // The gate stays shut: the build outlasts every deadline.
         let first = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(!first.complete && first.timed_out);
@@ -2466,7 +2503,7 @@ pub(crate) mod tests {
         let t = install(None);
         let wait = Duration::from_millis(1_000);
         let (c, _gate) = gated(1_000, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let s = Arc::clone(&svc);
         let first = tokio::spawn(async move { s.footprint(&[TILE], Purpose::Probe).await });
         // The second probe asks 400 ms after the first: had it a wait of its
@@ -2486,7 +2523,7 @@ pub(crate) mod tests {
     async fn probe_and_generate_deadlines_are_independent() {
         let t = install(None);
         let (c, gate) = gated(30, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
         let (r, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Generate), async {
             gate.add_permits(1)
@@ -2502,7 +2539,7 @@ pub(crate) mod tests {
     async fn an_evicted_tile_asked_for_after_its_first_deadline_is_waited_for() {
         let t = install(None);
         let (c, gate) = gated(LONG, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let (first, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
             gate.add_permits(1)
         });
@@ -2545,7 +2582,7 @@ pub(crate) mod tests {
         let failing = (47, 6);
         write_install(t.path(), failing, &[("High", Some(b"garbage".to_vec()))]);
         let (c, gate) = gated(LONG, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         svc.ensure(TILE, Trigger::DsfOpen);
         assert_eq!(svc.builds_pending(), 1);
         let absent = (10, 10);
@@ -2598,7 +2635,7 @@ pub(crate) mod tests {
     async fn a_footprint_past_a_building_tiles_deadline_times_out() {
         let t = install(None);
         let (c, _gate) = gated(30, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(!r.complete && r.timed_out);
         let s = svc.stats_snapshot();
@@ -2611,7 +2648,7 @@ pub(crate) mod tests {
     async fn generate_waits_and_timeouts_are_counted_apart() {
         let t = install(None);
         let (c, _gate) = gated(LONG, 30);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         assert!(svc.footprint(&[TILE], Purpose::Generate).await.timed_out);
         let s = svc.stats_snapshot();
         assert_eq!((s.generate_waits, s.generate_timeouts), (1, 1));
@@ -2622,7 +2659,7 @@ pub(crate) mod tests {
     async fn a_wait_that_ends_ready_is_a_wait_and_no_timeout() {
         let t = install(None);
         let (c, gate) = gated(LONG, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let (r, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
             gate.add_permits(1)
         });
@@ -2690,7 +2727,7 @@ pub(crate) mod tests {
         // waits for none; its tiles' lead times are still noted.
         let t = install(None);
         let (c, gate) = gated(LONG, LONG);
-        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         let noted = || svc.test.leads_noted.load(Ordering::SeqCst);
         svc.ensure(TILE, Trigger::Probe);
         assert_eq!(svc.builds_pending(), 1, "the probe started the build");

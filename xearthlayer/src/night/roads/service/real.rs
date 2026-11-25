@@ -53,6 +53,7 @@ fn service(skip: Vec<PathBuf>, disk: Option<Arc<dyn Cache>>) -> Arc<RoadService>
         INSTALL.into(),
         skip,
         disk,
+        LitDiskPermits::new(),
         RoadServiceConfig {
             probe_wait: Duration::from_secs(600),
             generate_wait: Duration::from_secs(600),
