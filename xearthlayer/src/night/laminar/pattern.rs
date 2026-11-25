@@ -1,7 +1,5 @@
 //! Laminar lit textures decoded to pixels, for the lit generator to sample.
 
-use std::path::Path;
-
 use crate::dds::layout::level_len;
 use crate::dds::DdsFormat;
 
@@ -68,15 +66,11 @@ pub fn decode_dxt1(bytes: &[u8], ground_scale_m: f64) -> Option<LitPattern> {
     })
 }
 
-/// Read and decode a lit texture file.
-pub fn load_pattern(path: &Path, ground_scale_m: f64) -> Option<LitPattern> {
-    decode_dxt1(&std::fs::read(path).ok()?, ground_scale_m)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dds::{DdsFormat, DdsHeader};
+    use std::path::Path;
 
     /// A 4 x 4 DXT1 file whose single block is solid `c0` (indices all 0).
     fn solid(c0: u16) -> Vec<u8> {
@@ -127,7 +121,7 @@ mod tests {
         if !path.is_file() {
             return;
         }
-        let p = load_pattern(path, 4096.0).unwrap();
+        let p = decode_dxt1(&std::fs::read(path).unwrap(), 4096.0).unwrap();
         assert_eq!(p.size, 1024);
         assert!(p.rgb.iter().any(|c| c.iter().any(|&v| v > 64)), "has light");
     }

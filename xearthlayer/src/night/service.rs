@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
+use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{reach_deg, RoadField};
 use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
 use super::roads::RoadModel;
@@ -37,8 +38,8 @@ use super::stats::{
     WriteBackSkip,
 };
 use super::{
-    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
-    FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
+    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
+    ArtRecord, FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
     TextureSettingSource,
 };
 use crate::cache::Cache;
@@ -122,29 +123,6 @@ pub fn lit_generation_permits(cores: usize) -> usize {
     (cores / 8).clamp(MIN_LIT_GENERATION_PERMITS, MAX_LIT_GENERATION_PERMITS)
 }
 
-/// Extra attempts at a recipe read that failed with an I/O error before the
-/// tile is given up on for the session.
-const RECIPE_RETRIES: u32 = 2;
-const RECIPE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Calls `attempt` until it succeeds, at most `retries + 1` times.
-fn with_retries<T, E>(
-    retries: u32,
-    delay: std::time::Duration,
-    mut attempt: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
-    let mut left = retries;
-    loop {
-        match attempt() {
-            Err(_) if left > 0 => {
-                left -= 1;
-                std::thread::sleep(delay);
-            }
-            result => return result,
-        }
-    }
-}
-
 /// A recipe that could not be read, even after retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unreadable;
@@ -175,7 +153,7 @@ impl SessionRecipes {
         if self.given_up.contains(&(lat, lon)) {
             return Err(Unreadable);
         }
-        with_retries(RECIPE_RETRIES, RECIPE_RETRY_DELAY, || {
+        with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
             self.store.get_with_region(lat, lon)
         })
         .map_err(|e| {
@@ -287,10 +265,13 @@ pub struct NightLitSource {
     summary_started: AtomicBool,
 }
 
-/// A generated part of a footprint, and how complete its roads were.
+/// A generated part of a footprint, how complete its roads were, and the
+/// first doubt its Laminar art lookups met (an art file given up on after
+/// I/O errors, or one the lit fingerprint does not cover).
 struct Generated {
     bytes: Bytes,
     roads: RoadsState,
+    art_doubt: Option<ArtDoubt>,
 }
 
 /// Whether a generation had every road tile it could draw.
@@ -322,20 +303,21 @@ impl RoadsState {
 /// [`WriteBackSkip`]'s order. Roads still building make it a payload kept
 /// nowhere (a later generation may have them). Without a fingerprint there
 /// is no safe disk entry. A failed road tile has no roads this session, but
-/// a later session may read it. An art file that failed to read this
-/// session may make the payload differ from a later session's under the
-/// same fingerprint. `art_failed` is asked only when the rest allow a
-/// write-back.
+/// a later session may read it. A doubt among the payload's Laminar art
+/// lookups (`art_doubted`: a file given up on after I/O errors, or one the
+/// fingerprint does not cover) may make the payload differ from a later
+/// session's under the same fingerprint; a file that is missing or does not
+/// decode does not, as its dark class is the same every session.
 fn write_back_skip(
     roads: RoadsState,
     fingerprinted: bool,
-    art_failed: impl FnOnce() -> bool,
+    art_doubted: bool,
 ) -> Option<WriteBackSkip> {
     match roads {
         RoadsState::TimedOut => Some(WriteBackSkip::RoadsLate),
         _ if !fingerprinted => Some(WriteBackSkip::NoFingerprint),
         RoadsState::Failed => Some(WriteBackSkip::RoadFailed),
-        RoadsState::Complete if art_failed() => Some(WriteBackSkip::ArtFailed),
+        RoadsState::Complete if art_doubted => Some(WriteBackSkip::ArtFailed),
         RoadsState::Complete => None,
     }
 }
@@ -464,9 +446,11 @@ impl NightLitSource {
     }
 
     /// Disk first, then generation; a generated payload is written back
-    /// without waiting, unless an art file failed to read this session or a
-    /// road tile was missing. `Err` is a payload not to keep in memory:
-    /// black, or generated while a road tile was late. Without a disk tier
+    /// without waiting, unless [`write_back_skip`] gives a reason not to (a
+    /// road tile missing, no fingerprint, a doubt among its art lookups).
+    /// When the reason is the art, a debug line names the file and why; a
+    /// payload skipped for an earlier reason logs none. `Err` is a payload
+    /// not to keep in memory: black, or generated while a road tile was late. Without a disk tier
     /// this is `generate`. Sets `from_disk` when the payload is read from
     /// the disk tier.
     async fn load_or_generate(
@@ -508,12 +492,30 @@ impl NightLitSource {
             from_disk.store(true, Ordering::Relaxed);
             return Ok(payload);
         }
+        let (row, col, zoom) = (name.row, name.col, name.zoom);
         let generated = self.generate(name, &layout).await;
         let skip = generated
             .as_ref()
-            .and_then(|g| write_back_skip(g.roads, fp.is_some(), || self.art.had_failure()));
+            .and_then(|g| write_back_skip(g.roads, fp.is_some(), g.art_doubt.is_some()));
         if let Some(skip) = skip {
             self.stats.record_write_back_skipped(skip);
+        }
+        if let (
+            Some(WriteBackSkip::ArtFailed),
+            Some(Generated {
+                art_doubt: Some(doubt),
+                ..
+            }),
+        ) = (skip, &generated)
+        {
+            debug!(
+                row,
+                col,
+                zoom,
+                file = %doubt.file.display(),
+                reason = doubt.kind.reason(),
+                "Night lighting: lit texture kept off disk; an art file it uses may differ next session"
+            );
         }
         let (Some(fp), None, Some(Generated { bytes: payload, .. })) = (&fp, skip, &generated)
         else {
@@ -628,7 +630,10 @@ impl NightLitSource {
                     .get(&(lat, lon))
                     .map_or(LedRegion::Unknown, |(_, g)| *g)
             };
-            let patterns = |n: &str| art.pattern(n);
+            // The doubts this payload's art lookups meet decide whether it
+            // may be kept on disk.
+            let art_record = ArtRecord::default();
+            let patterns = |n: &str| art.pattern_recorded(n, &art_record);
             // The tiles' handles are dropped once rastered: the road cache
             // alone keeps merged roads.
             let roads = RoadField::raster(&owned, size, &road_tiles, &road_model);
@@ -644,7 +649,11 @@ impl NightLitSource {
                 roads: &roads,
                 road_model: &road_model,
             });
-            Some((super::generator::encode_visible(image), roads.stats))
+            Some((
+                super::generator::encode_visible(image),
+                roads.stats,
+                art_record.into_doubt(),
+            ))
         })
         .await;
         let result = match generated {
@@ -658,7 +667,7 @@ impl NightLitSource {
                 );
                 None
             }
-            Ok(Some((Ok(bytes), road))) => {
+            Ok(Some((Ok(bytes), road, art_doubt))) => {
                 debug!(
                     row = name.row,
                     col = name.col,
@@ -676,9 +685,10 @@ impl NightLitSource {
                 Some(Generated {
                     bytes,
                     roads: roads_state,
+                    art_doubt,
                 })
             }
-            Ok(Some((Err(e), _))) => {
+            Ok(Some((Err(e), _, _))) => {
                 warn!(error = %e, "Night lighting: lit encode failed; texture served black");
                 None
             }
@@ -754,6 +764,8 @@ impl NightLitSource {
             // The field reads every tile the generator could read for this
             // footprint, once each; an unreadable one counts as dark.
             let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
+            // `lit_terrain` records no doubt, which is safe here: the probe
+            // decides a size, and a size is never persisted.
             if RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some()) {
                 ProbeAnswer::Recipe
             } else if road_tiles.iter().any(|roads| {
@@ -912,10 +924,12 @@ fn memory_only(generated: Option<Generated>) -> Result<Bytes, Uncached> {
         Some(Generated {
             bytes,
             roads: RoadsState::Complete | RoadsState::Failed,
+            ..
         }) => Ok(bytes),
         Some(Generated {
             bytes,
             roads: RoadsState::TimedOut,
+            ..
         }) => Err(Uncached(Some(bytes))),
         None => Err(Uncached(None)),
     }
@@ -1052,30 +1066,6 @@ mod tests {
     }
 
     #[test]
-    fn retries_stop_at_the_first_success() {
-        let mut calls = 0;
-        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
-            calls += 1;
-            if calls < 2 {
-                Err("transient")
-            } else {
-                Ok(7)
-            }
-        });
-        assert_eq!((r, calls), (Ok(7), 2));
-    }
-
-    #[test]
-    fn retries_give_up_after_the_limit() {
-        let mut calls = 0;
-        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
-            calls += 1;
-            Err("down")
-        });
-        assert_eq!((r, calls), (Err("down"), 3));
-    }
-
-    #[test]
     fn night_permits_fit_a_third_of_the_headroom() {
         const {
             assert!(
@@ -1118,6 +1108,7 @@ mod tests {
     mod night_source {
         use super::super::*;
         use crate::fuse::{DdsFilename, TextureKind};
+        use crate::night::laminar::art::FlakyArtFiles;
         use crate::night::roads::dsf::test_dsf::{install, Builder};
         use crate::night::roads::service::RoadServiceConfig;
         use crate::night::{FixedTextureSetting, LaminarArt, RecipeStore};
@@ -1724,29 +1715,159 @@ mod tests {
             assert_eq!(calls(&second), 1, "regenerated, not decoded");
         }
 
-        #[tokio::test]
-        async fn an_art_read_failure_writes_nothing() {
-            let temp = TempDir::new().unwrap();
-            let disk = disk();
-            let name = name_at(37.20, -122.725);
-            let source = source_in(&temp).with_disk_cache(disk.clone());
-            // The lit texture exists but does not decode.
-            std::fs::write(
-                temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds"),
-                b"DDS ",
+        /// The fixture's lit texture as the art resolves it (normalized),
+        /// which is the path its reads are made with.
+        fn fixture_lit_file(temp: &TempDir) -> std::path::PathBuf {
+            temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds")
+        }
+
+        /// A session over the fixture tree in `temp` (written when absent)
+        /// whose art files are read through `files`.
+        fn source_reading_art(
+            temp: &TempDir,
+            files: Arc<dyn crate::night::ArtFiles>,
+        ) -> NightLitSource {
+            if !temp.path().join("art").exists() {
+                write_tree(temp);
+            }
+            NightLitSource::new(
+                Arc::new(RecipeStore::new(vec![temp.path().join("pkg")])),
+                Arc::new(LaminarArt::with_files(temp.path().join("art"), files)),
+                Arc::new(FixedTextureSetting(4)),
             )
-            .unwrap();
-            let layout = LitLayout::new(16, 4);
-            assert!(
-                source.served_payload(&name, &layout).await.0.is_some(),
-                "still served from memory"
-            );
-            settle(&disk, &name).await;
-            assert!(disk
-                .get(&crate::night::lit_cache_key(&name))
+        }
+
+        async fn on_disk(disk: &Arc<dyn crate::cache::Cache>, name: &DdsFilename) -> bool {
+            disk.get(&crate::night::lit_cache_key(name))
                 .await
                 .unwrap()
-                .is_none());
+                .is_some()
+        }
+
+        #[tokio::test]
+        async fn an_undecodable_lit_texture_keeps_every_payload_on_disk() {
+            // A lit texture that reads but does not decode darkens its class
+            // the same way every session (the fingerprint covers the file),
+            // so payloads drawn with the dark class are written too.
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            std::fs::write(fixture_lit_file(&temp), b"DDS ").unwrap();
+            let disk = disk();
+            let files = Arc::new(FlakyArtFiles::new(fixture_lit_file(&temp), 0));
+            let source = source_reading_art(&temp, files.clone()).with_disk_cache(disk.clone());
+            let layout = LitLayout::new(16, 4);
+            let (other, uses) = (dark_name(), lit_name());
+            let other_bytes = source.served_payload(&other, &layout).await.0.unwrap();
+            assert_eq!(files.reads(), 0, "the other footprint does not use it");
+            let uses_bytes = source.served_payload(&uses, &layout).await.0.unwrap();
+            assert_eq!(files.reads(), 1, "this one does");
+            let snap = counted(&source, |s| s.disk_writes == 2).await;
+            assert_eq!(snap.write_backs_skipped, [0; 4]);
+            assert!(on_disk(&disk, &other).await);
+            assert!(on_disk(&disk, &uses).await);
+
+            // The next session reads both back.
+            let next_generator = Arc::new(White::default());
+            let next = source_in(&temp)
+                .with_generator(next_generator.clone())
+                .with_disk_cache(disk.clone());
+            assert_eq!(
+                next.served_payload(&other, &layout).await.0,
+                Some(other_bytes)
+            );
+            assert_eq!(
+                next.served_payload(&uses, &layout).await.0,
+                Some(uses_bytes)
+            );
+            assert_eq!(calls(&next_generator), 0, "both from disk");
+        }
+
+        #[tokio::test]
+        async fn a_lit_texture_whose_first_read_fails_is_lit_and_written() {
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let name = lit_name();
+            let layout = LitLayout::new(16, 4);
+            let expected = source_in(&temp).served_payload(&name, &layout).await.0;
+            assert!(
+                expected.as_ref().unwrap().iter().any(|&b| b != 0),
+                "the class lights this footprint"
+            );
+            let disk = disk();
+            let files = Arc::new(FlakyArtFiles::new(fixture_lit_file(&temp), 1));
+            let source = source_reading_art(&temp, files.clone()).with_disk_cache(disk.clone());
+            let payload = source.served_payload(&name, &layout).await.0;
+            assert_eq!(files.reads(), 2, "read again after the failure");
+            assert_eq!(payload, expected, "lit as with a clean read");
+            counted(&source, |s| s.disk_writes == 1).await;
+            assert!(on_disk(&disk, &name).await);
+        }
+
+        #[tokio::test]
+        async fn a_lit_texture_unreadable_on_every_attempt_keeps_only_its_payloads_off_disk() {
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let disk = disk();
+            let files = Arc::new(FlakyArtFiles::new(fixture_lit_file(&temp), usize::MAX));
+            let source = source_reading_art(&temp, files.clone()).with_disk_cache(disk.clone());
+            let layout = LitLayout::new(16, 4);
+            let (other, uses) = (dark_name(), lit_name());
+            let log = crate::night::test_log::LogCapture::start();
+            assert!(source.served_payload(&uses, &layout).await.0.is_some());
+            assert!(source.served_payload(&other, &layout).await.0.is_some());
+            counted(&source, |s| s.disk_writes == 1).await;
+            let log = log.text();
+            assert!(!on_disk(&disk, &uses).await, "may light next session");
+            assert!(on_disk(&disk, &other).await, "does not use the file");
+            let kept_off: Vec<_> = log
+                .lines()
+                .filter(|l| l.contains("lit texture kept off disk"))
+                .collect();
+            assert_eq!(kept_off.len(), 1, "{log}");
+            assert!(kept_off[0].contains("uw5_FAR_LIT.dds"), "{log}");
+            assert_eq!(
+                files.reads(),
+                1 + crate::night::retry::READ_RETRIES as usize
+            );
+            // Kept in memory for the session.
+            assert_eq!(
+                source.served_payload(&uses, &layout).await.1,
+                ReadOutcome::MemoryHit
+            );
+        }
+
+        #[tokio::test]
+        async fn a_lit_texture_outside_the_fingerprint_keeps_its_payloads_off_disk() {
+            // Lit, but from a file the fingerprint walk does not cover: it
+            // may change without changing the fingerprint.
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let outside = temp.path().join("outside/uw5_FAR_LIT.dds");
+            std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+            std::fs::rename(fixture_lit_file(&temp), &outside).unwrap();
+            std::fs::write(
+                temp.path().join("art/terrain12/u.ter"),
+                "TEXTURE_LIT ../../outside/uw5_FAR_LIT.dds\n",
+            )
+            .unwrap();
+            let disk = disk();
+            let source = source_in(&temp).with_disk_cache(disk.clone());
+            let (other, uses) = (dark_name(), lit_name());
+            let log = crate::night::test_log::LogCapture::start();
+            let payload = source.served_payload(&uses, &LitLayout::new(16, 4)).await.0;
+            assert!(payload.unwrap().iter().any(|&b| b != 0), "lit");
+            source.served_payload(&other, &LitLayout::new(16, 4)).await;
+            let snap = counted(&source, |s| s.disk_writes == 1).await;
+            assert_eq!(snap.write_backs_skipped(WriteBackSkip::ArtFailed), 1);
+            assert!(!on_disk(&disk, &uses).await);
+            assert!(on_disk(&disk, &other).await);
+            let log = log.text();
+            assert!(
+                log.lines().any(|l| l.contains("kept off disk")
+                    && l.contains("not covered by the lit fingerprint")
+                    && l.contains("outside/uw5_FAR_LIT.dds")),
+                "{log}"
+            );
         }
 
         #[tokio::test]
@@ -2586,13 +2707,14 @@ mod tests {
         fn a_write_back_is_skipped_for_the_first_reason_that_applies() {
             use RoadsState::{Complete, Failed, TimedOut};
             use WriteBackSkip::{ArtFailed, NoFingerprint, RoadFailed, RoadsLate};
-            let never = || -> bool { panic!("art asked although the rest skip") };
-            assert_eq!(write_back_skip(TimedOut, false, never), Some(RoadsLate));
-            assert_eq!(write_back_skip(Failed, false, never), Some(NoFingerprint));
-            assert_eq!(write_back_skip(Complete, false, never), Some(NoFingerprint));
-            assert_eq!(write_back_skip(Failed, true, never), Some(RoadFailed));
-            assert_eq!(write_back_skip(Complete, true, || true), Some(ArtFailed));
-            assert_eq!(write_back_skip(Complete, true, || false), None);
+            for art in [false, true] {
+                assert_eq!(write_back_skip(TimedOut, false, art), Some(RoadsLate));
+                assert_eq!(write_back_skip(Failed, false, art), Some(NoFingerprint));
+                assert_eq!(write_back_skip(Complete, false, art), Some(NoFingerprint));
+                assert_eq!(write_back_skip(Failed, true, art), Some(RoadFailed));
+            }
+            assert_eq!(write_back_skip(Complete, true, true), Some(ArtFailed));
+            assert_eq!(write_back_skip(Complete, true, false), None);
         }
 
         #[tokio::test]
@@ -2668,14 +2790,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_art_read_failure_counts_a_skipped_write_back() {
+        async fn an_art_file_given_up_on_counts_a_skipped_write_back() {
             let temp = TempDir::new().unwrap();
-            let source = source_in(&temp).with_disk_cache(disk());
-            std::fs::write(
-                temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds"),
-                b"DDS ",
-            )
-            .unwrap();
+            write_tree(&temp);
+            let files = Arc::new(FlakyArtFiles::new(fixture_lit_file(&temp), usize::MAX));
+            let source = source_reading_art(&temp, files).with_disk_cache(disk());
             assert!(source
                 .served_payload(&lit_name(), &LitLayout::new(16, 4))
                 .await

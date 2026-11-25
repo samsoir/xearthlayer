@@ -630,9 +630,25 @@ Inside:
   updates and brightness changes need no cache clear. Write-back is
   fire-and-forget, only for payloads built from a complete set of recipes
   (black is never
-  written), and never after an art file failed to read or decode this
-  session (`LaminarArt::had_failure`), since that failure is invisible to
-  the fingerprint. Disk work runs under `LIT_DISK_PERMITS` (2). Evicting is
+  written), and never for a payload one of whose own Laminar art lookups
+  met a doubt (#435): a file given up on after I/O errors, or a file the
+  fingerprint walk does not cover (outside the art root, under a symlink
+  below it, or named other than `library.txt`, `*.ter` or `*_LIT.dds`).
+  Either could read differently next session under the same fingerprint.
+  The generator looks art up through `LaminarArt::pattern_recorded`, which
+  notes each doubt in the payload's `ArtRecord`; such a payload stays in
+  memory, and a debug line (`Night lighting: lit texture kept off disk`)
+  names the file and the reason. Art reads go through the `ArtFiles` seam
+  (`read`, `is_file`), are single-flight (one `OnceLock` per key) and are
+  retried like recipes (`night/retry.rs`: two more attempts, 50 ms apart).
+  A missing file is not retried. A missing file, a non-UTF-8 `library.txt`
+  or `.ter`, a `.ter` without lit lines and a lit texture that is not square
+  DXT1 make their class dark. When the walk covers the file this is settled
+  under the fingerprint, so those payloads are written. The walk runs before
+  the first art read, so a file replaced while XEL runs files a payload only
+  under the older identity. Until #435 one art failure of any kind stopped
+  every lit disk write for the session, and an unusable file did so in every
+  session. Disk work runs under `LIT_DISK_PERMITS` (2). Evicting is
   safe: a payload regenerates to the same bytes, or to full-size black once
   one of its recipes has been given up on, and the size never changes. The
   tier reports no dashboard metrics yet; its counts are in the lit serving
@@ -667,7 +683,8 @@ the metrics system and the dashboard shows nothing of it. The line has:
   timed out but were all ready once the permit was held (#427).
 - **Write-backs skipped**, one reason per payload in this order:
   `roads_late` (kept nowhere), then `no_fingerprint`, `road_failed` and
-  `art_failed` (each kept in memory only).
+  `art_failed` (each kept in memory only; `art_failed` means one of the
+  payload's own art lookups met a doubt, see the lit disk tier).
 - **Payload cache**: hits, joins, misses, `payload_hit_rate` (true hits
   over all lookups), size evictions (an `eviction_listener`; setting one
   turns on moka's per-key lock for inserts, which the per-key coalescing
@@ -1344,7 +1361,7 @@ rastered, so the tile cache alone keeps merged roads.
 
 **Memory and disk.** A payload is written to the lit tier only when every
 road tile it asked for was ready (and, as before, every recipe was read
-and no art file failed). A payload generated while a road tile was still
+and none of its art lookups met a doubt). A payload generated while a road tile was still
 building past its deadline is served but kept neither in memory nor on
 disk: a timeout is transient, so the next read generates again, with the
 roads once they are ready (while the tile is still building past the
@@ -1550,8 +1567,9 @@ degrades to black, at the narrowest scope it affects (R19):
 
 | Failure | Black for | Logged |
 |---|---|---|
-| No X-Plane installation found, or `library.txt` missing or unreadable | Every lit texture this session | Once |
-| A palette name that does not resolve, a `.ter` without a lit texture, a missing or undecodable lit file | That class only | Once per name |
+| No X-Plane installation found, or `library.txt` missing or not UTF-8 | Every lit texture this session | Once |
+| A palette name that does not resolve, a `.ter` without a lit texture, a missing or undecodable lit file | That class only (payloads are still written to the lit tier) | Once per name |
+| A `library.txt`, `.ter` or `_LIT.dds` that cannot be read (I/O error after two retries, 50 ms apart), or an art file the lit fingerprint does not cover | That class, for the session if unreadable; payloads that use it are kept in memory only | Once per file as a warning when given up on; at debug for each payload kept off disk |
 | A recipe rejected by the reading rules, or from a newer major version | That 1° tile | Once per file |
 | A recipe that cannot be read (I/O error after two retries, 50 ms apart) | That tile, for the session: probes treat it as having no light, and any lit footprint whose generation needs it is served full-size black, not cached (memory or disk) | Once per tile, when it is given up on |
 | No recipe for a tile | That tile | Never (normal for countryside) |
