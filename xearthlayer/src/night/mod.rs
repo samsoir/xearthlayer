@@ -16,7 +16,7 @@ pub mod prefs;
 pub mod recipe;
 pub mod roads;
 pub mod service;
-pub mod stats;
+pub(crate) mod stats;
 pub mod store;
 
 pub use disk::{

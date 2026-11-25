@@ -10,7 +10,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use moka::notification::RemovalCause;
@@ -28,9 +28,11 @@ pub enum ReadOutcome {
     /// A read of a lit file that did not reach the visible levels: the
     /// header and black levels, no payload asked for.
     Blank,
-    /// The visible levels without loading them: from the payload cache, or
-    /// from another read's load of them that this read joined.
+    /// The visible levels from the payload cache.
     MemoryHit,
+    /// The visible levels from another read's load of them, in flight when
+    /// this read asked: neither a hit nor a load of its own.
+    Joined,
     /// The visible levels loaded from the lit disk tier.
     DiskHit,
     /// The visible levels generated.
@@ -47,11 +49,25 @@ impl ReadOutcome {
             Self::Dark => "dark",
             Self::Blank => "blank",
             Self::MemoryHit => "memory",
+            Self::Joined => "joined",
             Self::DiskHit => "disk",
             Self::Generated => "generated",
             Self::Black => "black",
         }
     }
+}
+
+/// What one payload cache lookup did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadLookup {
+    /// The payload was in the cache when asked for, and its load did not run.
+    Hit,
+    /// The payload was not in the cache when asked for, and its load did not
+    /// run: the lookup joined another's load in flight. Also, rarely, a
+    /// payload inserted between the two checks.
+    Joined,
+    /// Its load ran: a miss.
+    Loaded,
 }
 
 /// What a probe answered, and from what.
@@ -107,14 +123,14 @@ impl From<EntryReject> for DiskMiss {
 }
 
 /// Why a payload generated with a lit disk tier present was not written
-/// back: the first reason found, in the order the source checks them.
+/// back. One reason per payload, the first in declaration order that
+/// applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteBackSkip {
-    /// No fingerprint could be computed. Kept in memory unless its roads
-    /// were late.
-    NoFingerprint,
     /// A road tile was still building at the deadline: kept nowhere.
     RoadsLate,
+    /// No fingerprint could be computed: kept in memory only.
+    NoFingerprint,
     /// A road tile failed: kept in memory only.
     RoadFailed,
     /// An art file failed to read this session: kept in memory only.
@@ -137,14 +153,16 @@ pub struct GenerationRecord {
     pub payload: bool,
 }
 
-/// What one probe did, recorded once when it answered.
+/// What one probe did, recorded once when it answered or found another
+/// probe's answer after its permit wait.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeRecord {
-    /// Waiting for the footprint's road tiles.
-    pub road_wait: Duration,
+    /// Waiting for the footprint's road tiles; `None` without road lights.
+    pub road_wait: Option<Duration>,
     /// From asking for a probe permit to holding one.
     pub permit_wait: Duration,
-    /// Its answer, when it was the one committed.
+    /// Its answer, when it was the one committed (`None` when another
+    /// probe's answer was committed first).
     pub committed: Option<ProbeAnswer>,
 }
 
@@ -152,7 +170,7 @@ pub struct ProbeRecord {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LitStatsSnapshot {
     /// By [`ReadOutcome`], in its declaration order.
-    pub reads: [u64; 6],
+    pub reads: [u64; 7],
     /// Committed probe answers by [`ProbeAnswer`]: recipe, road, dark.
     pub probes: [u64; 3],
     /// Generations by their road tiles: complete, timed out, failed.
@@ -163,9 +181,11 @@ pub struct LitStatsSnapshot {
     pub roads_ready_at_permit: u64,
     /// Write-backs skipped by [`WriteBackSkip`], in its declaration order.
     pub write_backs_skipped: [u64; 4],
-    /// Payload cache lookups whose load did not run.
+    /// See [`PayloadLookup::Hit`].
     pub payload_hits: u64,
-    /// Payload cache lookups whose load ran.
+    /// See [`PayloadLookup::Joined`].
+    pub payload_joins: u64,
+    /// See [`PayloadLookup::Loaded`].
     pub payload_misses: u64,
     /// Payloads evicted for size.
     pub payload_evictions: u64,
@@ -201,6 +221,25 @@ impl LitStatsSnapshot {
         self.disk_misses[miss as usize]
     }
 
+    /// Hits over every payload lookup, joins and loads included; `None`
+    /// without any.
+    pub fn payload_hit_rate(&self) -> Option<f64> {
+        hit_rate(self.payload_hits, self.payload_joins + self.payload_misses)
+    }
+
+    /// Hits over the disk lookups that could hit: without a fingerprint no
+    /// entry is looked up, and a read error says nothing of the entry.
+    pub fn disk_hit_rate(&self) -> Option<f64> {
+        let could_hit = [
+            DiskMiss::Absent,
+            DiskMiss::Corrupt,
+            DiskMiss::Fingerprint,
+            DiskMiss::Length,
+        ];
+        let misses = could_hit.iter().map(|&m| self.disk_misses(m)).sum();
+        hit_rate(self.disk_hits, misses)
+    }
+
     /// The counts since `earlier`.
     fn since(&self, earlier: &Self) -> Self {
         fn each<const N: usize>(a: [u64; N], b: [u64; N]) -> [u64; N] {
@@ -214,6 +253,7 @@ impl LitStatsSnapshot {
             roads_ready_at_permit: self.roads_ready_at_permit - earlier.roads_ready_at_permit,
             write_backs_skipped: each(self.write_backs_skipped, earlier.write_backs_skipped),
             payload_hits: self.payload_hits - earlier.payload_hits,
+            payload_joins: self.payload_joins - earlier.payload_joins,
             payload_misses: self.payload_misses - earlier.payload_misses,
             payload_evictions: self.payload_evictions - earlier.payload_evictions,
             disk_hits: self.disk_hits - earlier.disk_hits,
@@ -230,9 +270,10 @@ pub struct LitWindow {
     /// Counts within the window.
     pub delta: LitStatsSnapshot,
     /// Read latency by [`ReadOutcome`], probe included.
-    pub reads: [Option<LatencySummary>; 6],
+    pub reads: [Option<LatencySummary>; 7],
     pub generation_permit_wait: Option<LatencySummary>,
     pub generation: Option<LatencySummary>,
+    /// Probe waits for road tiles, with road lights only.
     pub probe_road_wait: Option<LatencySummary>,
     pub probe_permit_wait: Option<LatencySummary>,
     /// Waits for the disk permit of a lookup (write-backs are not timed).
@@ -250,14 +291,21 @@ impl LitWindow {
     }
 }
 
+/// The samples of one window, taken out whole under the lock and
+/// summarised (sorted) after it is released.
 #[derive(Default)]
-struct Window {
-    reads: [LatencyWindow; 6],
+struct Samples {
+    reads: [LatencyWindow; 7],
     generation_permit_wait: LatencyWindow,
     generation: LatencyWindow,
     probe_road_wait: LatencyWindow,
     probe_permit_wait: LatencyWindow,
     disk_permit_wait: LatencyWindow,
+}
+
+#[derive(Default)]
+struct Window {
+    samples: Samples,
     /// The counters when the previous window closed.
     last: LitStatsSnapshot,
 }
@@ -296,9 +344,17 @@ pub struct Gauge {
 impl Gauge {
     /// One more until the guard drops.
     pub fn enter(&self) -> GaugeGuard<'_> {
+        self.arrive();
+        GaugeGuard(self)
+    }
+
+    fn arrive(&self) {
         let now = self.now.fetch_add(1, Ordering::Relaxed) + 1;
         self.peak.fetch_max(now, Ordering::Relaxed);
-        GaugeGuard(self)
+    }
+
+    fn leave(&self) {
+        self.now.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// How many now.
@@ -317,7 +373,28 @@ pub struct GaugeGuard<'a>(&'a Gauge);
 
 impl Drop for GaugeGuard<'_> {
     fn drop(&mut self) {
-        self.0.now.fetch_sub(1, Ordering::Relaxed);
+        self.0.leave();
+    }
+}
+
+/// One write-back in flight, from before its task is spawned until the
+/// guard drops; it owns the statistics so it can move into the task.
+pub struct PendingWriteBack(Arc<LitStats>);
+
+impl PendingWriteBack {
+    /// The write ended, written or not.
+    pub fn finished(&self, written: bool) {
+        add(if written {
+            &self.0.disk_writes
+        } else {
+            &self.0.disk_write_failures
+        });
+    }
+}
+
+impl Drop for PendingWriteBack {
+    fn drop(&mut self) {
+        self.0.write_backs_pending.leave();
     }
 }
 
@@ -328,13 +405,14 @@ fn micros(d: Duration) -> u64 {
 /// The lit source's statistics.
 #[derive(Default)]
 pub struct LitStats {
-    reads: Tally<6>,
+    reads: Tally<7>,
     probes: Tally<3>,
     generation_roads: Tally<3>,
     generations_black: AtomicU64,
     roads_ready_at_permit: AtomicU64,
     write_backs_skipped: Tally<4>,
     payload_hits: AtomicU64,
+    payload_joins: AtomicU64,
     payload_misses: AtomicU64,
     payload_evictions: AtomicU64,
     disk_hits: AtomicU64,
@@ -343,8 +421,8 @@ pub struct LitStats {
     disk_write_failures: AtomicU64,
     /// Generations waiting for a permit.
     pub generations_waiting: Gauge,
-    /// Write-backs in flight.
-    pub write_backs_pending: Gauge,
+    /// Write-backs in flight (see [`LitStats::write_back`]).
+    write_backs_pending: Gauge,
     window: Mutex<Window>,
 }
 
@@ -353,7 +431,7 @@ impl LitStats {
     pub fn record_read(&self, outcome: ReadOutcome, elapsed: Duration) {
         self.reads.add(outcome as usize);
         if let Ok(mut w) = self.window.lock() {
-            w.reads[outcome as usize].record(micros(elapsed));
+            w.samples.reads[outcome as usize].record(micros(elapsed));
         }
     }
 
@@ -362,8 +440,10 @@ impl LitStats {
             self.probes.add(answer as usize);
         }
         if let Ok(mut w) = self.window.lock() {
-            w.probe_road_wait.record(micros(p.road_wait));
-            w.probe_permit_wait.record(micros(p.permit_wait));
+            if let Some(road_wait) = p.road_wait {
+                w.samples.probe_road_wait.record(micros(road_wait));
+            }
+            w.samples.probe_permit_wait.record(micros(p.permit_wait));
         }
     }
 
@@ -376,17 +456,18 @@ impl LitStats {
             add(&self.roads_ready_at_permit);
         }
         if let Ok(mut w) = self.window.lock() {
-            w.generation_permit_wait.record(micros(g.permit_wait));
-            w.generation.record(micros(g.generation));
+            w.samples
+                .generation_permit_wait
+                .record(micros(g.permit_wait));
+            w.samples.generation.record(micros(g.generation));
         }
     }
 
-    /// A payload cache lookup: `loaded` when its load ran (a miss).
-    pub fn record_payload_lookup(&self, loaded: bool) {
-        add(if loaded {
-            &self.payload_misses
-        } else {
-            &self.payload_hits
+    pub fn record_payload_lookup(&self, lookup: PayloadLookup) {
+        add(match lookup {
+            PayloadLookup::Hit => &self.payload_hits,
+            PayloadLookup::Joined => &self.payload_joins,
+            PayloadLookup::Loaded => &self.payload_misses,
         });
     }
 
@@ -406,17 +487,15 @@ impl LitStats {
             Some(miss) => self.disk_misses.add(miss as usize),
         }
         if let Ok(mut w) = self.window.lock() {
-            w.disk_permit_wait.record(micros(permit_wait));
+            w.samples.disk_permit_wait.record(micros(permit_wait));
         }
     }
 
-    /// A write-back that ended, written or not.
-    pub fn record_disk_write(&self, written: bool) {
-        add(if written {
-            &self.disk_writes
-        } else {
-            &self.disk_write_failures
-        });
+    /// A write-back about to be spawned: pending until the guard drops,
+    /// which records how it ended through [`PendingWriteBack::finished`].
+    pub fn write_back(self: &Arc<Self>) -> PendingWriteBack {
+        self.write_backs_pending.arrive();
+        PendingWriteBack(Arc::clone(self))
     }
 
     pub fn record_write_back_skipped(&self, skip: WriteBackSkip) {
@@ -433,6 +512,7 @@ impl LitStats {
             roads_ready_at_permit: get(&self.roads_ready_at_permit),
             write_backs_skipped: self.write_backs_skipped.get(),
             payload_hits: get(&self.payload_hits),
+            payload_joins: get(&self.payload_joins),
             payload_misses: get(&self.payload_misses),
             payload_evictions: get(&self.payload_evictions),
             disk_hits: get(&self.disk_hits),
@@ -444,19 +524,24 @@ impl LitStats {
 
     /// Closes the window: its counts and latencies, or `None` when nothing
     /// happened in it. The peaks alone do not make a window active.
+    /// The samples are moved out under the lock and sorted after it, so
+    /// reads recording meanwhile do not wait for the sort.
     pub fn take_window(&self) -> Option<LitWindow> {
         let now = self.snapshot();
-        let mut w = self.window.lock().ok()?;
-        let delta = now.since(&w.last);
-        w.last = now;
+        let (delta, mut samples) = {
+            let mut w = self.window.lock().ok()?;
+            let delta = now.since(&w.last);
+            w.last = now;
+            (delta, std::mem::take(&mut w.samples))
+        };
         let summary = LitWindow {
             delta,
-            reads: std::array::from_fn(|i| w.reads[i].take()),
-            generation_permit_wait: w.generation_permit_wait.take(),
-            generation: w.generation.take(),
-            probe_road_wait: w.probe_road_wait.take(),
-            probe_permit_wait: w.probe_permit_wait.take(),
-            disk_permit_wait: w.disk_permit_wait.take(),
+            reads: std::array::from_fn(|i| samples.reads[i].take()),
+            generation_permit_wait: samples.generation_permit_wait.take(),
+            generation: samples.generation.take(),
+            probe_road_wait: samples.probe_road_wait.take(),
+            probe_permit_wait: samples.probe_permit_wait.take(),
+            disk_permit_wait: samples.disk_permit_wait.take(),
             generations_waiting_peak: self.generations_waiting.take_peak(),
             write_backs_pending_peak: self.write_backs_pending.take_peak(),
         };
@@ -486,17 +571,18 @@ impl LitStats {
         let read = |o: ReadOutcome| ms(w.read(o));
         let skipped = |s: WriteBackSkip| d.write_backs_skipped(s);
         let miss = |m: DiskMiss| d.disk_misses(m);
-        let disk_misses: u64 = d.disk_misses.iter().sum();
         debug!(
             reads_dark = d.reads(ReadOutcome::Dark),
             reads_blank = d.reads(ReadOutcome::Blank),
             reads_memory = d.reads(ReadOutcome::MemoryHit),
+            reads_joined = d.reads(ReadOutcome::Joined),
             reads_disk = d.reads(ReadOutcome::DiskHit),
             reads_generated = d.reads(ReadOutcome::Generated),
             reads_black = d.reads(ReadOutcome::Black),
             read_dark_ms = read(ReadOutcome::Dark),
             read_blank_ms = read(ReadOutcome::Blank),
             read_memory_ms = read(ReadOutcome::MemoryHit),
+            read_joined_ms = read(ReadOutcome::Joined),
             read_disk_ms = read(ReadOutcome::DiskHit),
             read_generated_ms = read(ReadOutcome::Generated),
             read_black_ms = read(ReadOutcome::Black),
@@ -514,19 +600,19 @@ impl LitStats {
             roads_timed_out = d.generation_roads(RoadsState::TimedOut),
             roads_failed = d.generation_roads(RoadsState::Failed),
             roads_ready_at_permit = d.roads_ready_at_permit,
-            memory_only_road_failed = skipped(WriteBackSkip::RoadFailed),
-            memory_only_art_failed = skipped(WriteBackSkip::ArtFailed),
-            memory_only_no_fingerprint = skipped(WriteBackSkip::NoFingerprint),
-            write_backs_skipped = d.write_backs_skipped.iter().sum::<u64>(),
+            write_back_skipped_roads_late = skipped(WriteBackSkip::RoadsLate),
+            write_back_skipped_no_fingerprint = skipped(WriteBackSkip::NoFingerprint),
+            write_back_skipped_road_failed = skipped(WriteBackSkip::RoadFailed),
+            write_back_skipped_art_failed = skipped(WriteBackSkip::ArtFailed),
             payload_hits = d.payload_hits,
+            payload_joins = d.payload_joins,
             payload_misses = d.payload_misses,
-            payload_hit_rate = hit_rate(d.payload_hits, d.payload_misses),
+            payload_hit_rate = d.payload_hit_rate(),
             payload_evictions = d.payload_evictions,
             payload_entries,
             payload_bytes,
             disk_hits = d.disk_hits,
-            disk_misses,
-            disk_hit_rate = hit_rate(d.disk_hits, disk_misses),
+            disk_hit_rate = d.disk_hit_rate(),
             disk_miss_absent = miss(DiskMiss::Absent),
             disk_miss_error = miss(DiskMiss::ReadError),
             disk_miss_corrupt = miss(DiskMiss::Corrupt),
@@ -589,6 +675,10 @@ mod tests {
         // enum is the last counter of its array.
         let s = LitStatsSnapshot::default();
         assert_eq!(ReadOutcome::Black as usize + 1, s.reads.len());
+        assert_eq!(
+            ReadOutcome::Joined as usize,
+            ReadOutcome::MemoryHit as usize + 1
+        );
         assert_eq!(ProbeAnswer::Dark as usize + 1, s.probes.len());
         assert_eq!(RoadsState::Failed as usize + 1, s.generation_roads.len());
         assert_eq!(
@@ -653,9 +743,9 @@ mod tests {
     #[test]
     fn a_window_reports_only_its_own_counts() {
         let s = LitStats::default();
-        s.record_payload_lookup(true);
+        s.record_payload_lookup(PayloadLookup::Loaded);
         s.take_window().unwrap();
-        s.record_payload_lookup(false);
+        s.record_payload_lookup(PayloadLookup::Hit);
         s.record_payload_removal(RemovalCause::Size);
         s.record_payload_removal(RemovalCause::Explicit);
         let w = s.take_window().unwrap();
@@ -675,8 +765,10 @@ mod tests {
         s.record_disk_lookup(MS, None);
         s.record_disk_lookup(MS, Some(DiskMiss::Fingerprint));
         s.record_disk_lookup(MS, Some(EntryReject::Length.into()));
-        s.record_disk_write(true);
-        s.record_disk_write(false);
+        let stats = Arc::new(s);
+        let s = stats.as_ref();
+        stats.write_back().finished(true);
+        stats.write_back().finished(false);
         s.record_write_back_skipped(WriteBackSkip::ArtFailed);
         let snap = s.snapshot();
         assert_eq!(snap.disk_hits, 1);
@@ -691,17 +783,58 @@ mod tests {
     #[test]
     fn only_a_committed_probe_answer_is_counted() {
         let s = LitStats::default();
-        let probe = |committed| ProbeRecord {
-            road_wait: 5 * MS,
+        let probe = |road_wait, committed| ProbeRecord {
+            road_wait,
             permit_wait: MS,
             committed,
         };
-        s.record_probe(&probe(Some(ProbeAnswer::Road)));
-        s.record_probe(&probe(None));
-        assert_eq!(s.snapshot().probes, [0, 1, 0]);
+        s.record_probe(&probe(Some(5 * MS), Some(ProbeAnswer::Road)));
+        s.record_probe(&probe(Some(5 * MS), None));
+        s.record_probe(&probe(None, Some(ProbeAnswer::Dark)));
+        assert_eq!(s.snapshot().probes, [0, 1, 1]);
         let w = s.take_window().unwrap();
-        assert_eq!(w.probe_road_wait.unwrap().count, 2, "both waited");
+        assert_eq!(w.probe_road_wait.unwrap().count, 2, "with roads only");
+        assert_eq!(w.probe_permit_wait.unwrap().count, 3, "every probe waited");
         assert_eq!(w.probe_permit_wait.unwrap().max_us, 1_000);
+    }
+
+    #[test]
+    fn a_pending_write_back_counts_until_it_drops() {
+        let s = Arc::new(LitStats::default());
+        let pending = s.write_back();
+        assert_eq!(s.write_backs_pending.now(), 1);
+        drop(pending);
+        assert_eq!(s.write_backs_pending.now(), 0);
+        let snap = s.snapshot();
+        assert_eq!((snap.disk_writes, snap.disk_write_failures), (0, 0));
+        assert_eq!(s.write_backs_pending.take_peak(), 1);
+    }
+
+    #[test]
+    fn the_payload_hit_rate_counts_only_hits_and_joins_as_lookups() {
+        let s = LitStats::default();
+        assert_eq!(s.snapshot().payload_hit_rate(), None);
+        s.record_payload_lookup(PayloadLookup::Hit);
+        s.record_payload_lookup(PayloadLookup::Joined);
+        s.record_payload_lookup(PayloadLookup::Joined);
+        s.record_payload_lookup(PayloadLookup::Loaded);
+        let snap = s.snapshot();
+        assert_eq!(
+            (snap.payload_hits, snap.payload_joins, snap.payload_misses),
+            (1, 2, 1)
+        );
+        assert_eq!(snap.payload_hit_rate(), Some(0.25));
+    }
+
+    #[test]
+    fn the_disk_hit_rate_leaves_out_lookups_that_could_not_hit() {
+        let s = LitStats::default();
+        s.record_disk_lookup(MS, None);
+        s.record_disk_lookup(MS, Some(DiskMiss::Absent));
+        s.record_disk_lookup(MS, Some(DiskMiss::NoFingerprint));
+        s.record_disk_lookup(MS, Some(DiskMiss::ReadError));
+        assert_eq!(s.snapshot().disk_hit_rate(), Some(0.5));
+        assert_eq!(LitStats::default().snapshot().disk_hit_rate(), None);
     }
 
     #[test]
