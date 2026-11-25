@@ -604,7 +604,53 @@ Inside:
   the fingerprint. Disk work runs under `LIT_DISK_PERMITS` (2). Evicting is
   safe: a payload regenerates to the same bytes, or to full-size black once
   one of its recipes has been given up on, and the size never changes. The
-  tier reports no dashboard metrics yet.
+  tier reports no dashboard metrics yet; its counts are in the lit serving
+  summary below.
+
+**Lit serving statistics** (`night/stats.rs`, #426). `LitStats` counts lit
+serving as the road service's `Stats` does: atomic counters, latencies in
+`metrics::LatencyWindow`s, and a `Night lighting: summary` line at debug
+every 60 s that logs nothing for a window without activity. The summary
+task, started on the first `size` or `read` inside a runtime, holds the
+statistics and the payload cache only weakly, so it ends with the source.
+Latency samples are moved out of their lock before they are sorted, so a
+summary never holds up a read. Log only: `DiskTier::Lit` has no counters in
+the metrics system and the dashboard shows nothing of it. The line has:
+
+- **Reads** by outcome, each with `median/p95/max` latency (probe
+  included): `dark` (the minimal DDS), `blank` (header or the black levels
+  above the payload), `memory` (a payload already in the memory cache),
+  `joined` (a read that waited on another read's load of the same payload),
+  `disk`, `generated` and `black`. A memory hit is a `try_get_with` call
+  whose load did not run on a payload that was cached before the call
+  (`contains_key`, which leaves the LRU order alone); a load that did not
+  run on a payload that was not cached is a join. A larger cache would
+  have saved a memory hit, never a join.
+- **Probes** by the source of the committed answer (`recipe` first, then
+  `road`, then `dark`), with probe permit wait and, with road lights on,
+  road wait. A probe that finds another probe's answer after its permit
+  wait records its waits but no answer.
+- **Generations**: count and black generations; permit wait and generation
+  time, timed apart; `generations_waiting_peak`; road state (complete,
+  timed out, failed); `roads_ready_at_permit`, generations whose roads had
+  timed out but were all ready once the permit was held (#427).
+- **Write-backs skipped**, one reason per payload in this order:
+  `roads_late` (kept nowhere), then `no_fingerprint`, `road_failed` and
+  `art_failed` (each kept in memory only).
+- **Payload cache**: hits, joins, misses, `payload_hit_rate` (true hits
+  over all lookups), size evictions (an `eviction_listener`; setting one
+  turns on moka's per-key lock for inserts, which the per-key coalescing
+  already made uncontended), entries and weighted size.
+- **Lit disk tier**: hits; misses by reason (`absent`, `error`, `corrupt`,
+  `fingerprint`, `length`, `no_fingerprint`; `disk::check_entry` says why
+  an entry is rejected); `disk_hit_rate` over the lookups that could hit
+  (no-fingerprint lookups and read errors left out); writes and write
+  failures; `write_backs_pending_peak`, counted from before the write-back
+  is spawned; and the lookup's disk permit wait.
+
+The per-event lines carry the same split: `lit texture generated` has
+`permit_wait_ms` beside `ms`, `lit probe` has `answer` and `road_wait_ms`,
+and `lit read` has `from` (the read outcome) and `us`.
 
 ### FUSE changes
 
