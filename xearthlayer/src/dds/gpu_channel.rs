@@ -19,8 +19,9 @@
 //! `DdsEncoder` encodes the image with its fallback compressor (ISPC). The
 //! health turns Failed, for the rest of the session, on a panic the loop
 //! catches, on a lost device (the callback `create_gpu_resources` registers)
-//! and on [`MISSES_BEFORE_FAILED`] tiles in a row past their
-//! [`TILE_DEADLINE`] ([`HangRule`]). Then the worker hands its whole queue
+//! and on [`MISSES_BEFORE_FAILED`] tiles in a row that missed: past their
+//! [`TILE_DEADLINE`], or failed in time, as every tile does on a destroyed
+//! device ([`HangRule`]). Then the worker hands its whole queue
 //! back (close the channel, answer every request in it) and
 //! ends, and the channel hands every later image back without sending it. A
 //! tile past its deadline on a GPU not yet failed hands back only the
@@ -55,17 +56,22 @@ mod inner {
     /// milliseconds on a working GPU; the FUSE generation timeout is 10 s.
     pub const TILE_DEADLINE: Duration = Duration::from_secs(2);
 
-    /// Tiles in a row past [`TILE_DEADLINE`] that fail the GPU (#420).
+    /// Tiles in a row past [`TILE_DEADLINE`], or failed, that fail the GPU
+    /// (#420).
     pub const MISSES_BEFORE_FAILED: u32 = 3;
 
-    /// When the worker gives up on a GPU that stops making progress: a tile
-    /// that takes [`deadline`](Self::deadline) or longer is a miss, and
-    /// [`misses`](Self::misses) in a row fail the GPU. A tile in time resets
-    /// the count. The default is [`TILE_DEADLINE`] and
+    /// When the worker gives up on a GPU that stops making progress or
+    /// fails every tile: a tile that takes [`deadline`](Self::deadline) or
+    /// longer is a miss, and so is one that fails in time (a destroyed
+    /// device refuses every submission at once, with no panic and no hang);
+    /// [`misses`](Self::misses) in a row fail the GPU. A tile that succeeds
+    /// in time resets the count. The default is [`TILE_DEADLINE`] and
     /// [`MISSES_BEFORE_FAILED`]; tests shorten the deadline.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct HangRule {
+        /// The time one tile may take, from the worker taking it.
         pub deadline: Duration,
+        /// Missed tiles in a row that fail the GPU.
         pub misses: u32,
     }
 
@@ -177,9 +183,14 @@ mod inner {
     /// owns `queue_wait` and `process`. A processor should give up at
     /// `deadline` (the loop's [`HangRule`]), as [`WgpuTileProcessor`] does by
     /// giving each level's poll what remains of it; the loop counts a call
-    /// that ends at or past it as a miss either way. A panic is caught by
-    /// the loop (see [`spawn_tile_worker`]).
+    /// that ends at or past it as a miss either way, and an error in time as
+    /// one too. A panic is caught by the loop (see [`spawn_tile_worker`]).
+    ///
+    /// Must be `Send`: the loop moves it onto the worker's blocking thread,
+    /// where it stays.
     pub trait TileProcessor: Send {
+        /// Compresses `levels` mip levels of `image` in `format`, giving up
+        /// at `deadline`, and fills the stages of `timing` it performs.
         fn process(
             &mut self,
             image: RgbaImage,
@@ -678,8 +689,7 @@ mod inner {
         health: SharedGpuHealth,
         rule: HangRule,
     ) {
-        // Tiles in a row that ended at or past their deadline.
-        let mut misses = 0;
+        let mut misses = Misses::default();
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("GPU pipeline worker: shutdown signal received");
@@ -739,29 +749,32 @@ mod inner {
 
             match result {
                 Ok(result) => {
+                    let late = timing.process >= rule.deadline;
+                    let error = match (&result, late) {
+                        (Err(e), false) => Some(e.to_string()),
+                        _ => None,
+                    };
                     let reply = GpuEncodeReply::Processed { result, timing };
-                    if timing.process < rule.deadline {
-                        misses = 0;
+                    if !late && error.is_none() {
+                        misses.clear();
                         let _ = response.send(reply);
                         continue;
                     }
-                    misses += 1;
+                    misses.record(error);
                     tracing::debug!(
-                        misses,
+                        misses = misses.count,
+                        late,
                         process_ms = timing.process.as_millis() as u64,
-                        "GPU tile missed its deadline"
+                        "GPU tile missed its deadline or failed"
                     );
-                    // The queue is handed back before the late tile is
-                    // answered, so it is the queue that waited behind that
-                    // tile, never a request its caller sent after the reply.
-                    let failed = misses >= rule.misses;
+                    // The queue is handed back before the tile is answered,
+                    // so it is the queue that waited behind that tile, never
+                    // a request its caller sent after the reply.
+                    let failed = misses.count >= rule.misses;
                     if failed {
-                        health.fail(format!(
-                            "{misses} tiles in a row missed the GPU's {} ms deadline",
-                            rule.deadline.as_millis()
-                        ));
+                        health.fail(misses.reason(rule.deadline));
                         hand_back_all(&mut rx, health.failure().unwrap_or_default());
-                    } else {
+                    } else if late {
                         // The queue behind a slow tile goes to the CPU now
                         // rather than wait for the next one.
                         hand_back_queued(&mut rx, "a GPU tile ahead of it missed its deadline");
@@ -784,6 +797,49 @@ mod inner {
         }
 
         tracing::info!("GPU pipeline worker shutting down");
+    }
+
+    /// The worker's tiles in a row that missed: ended at or past the
+    /// deadline, or failed in time. A tile that succeeds in time clears it.
+    #[derive(Default)]
+    struct Misses {
+        count: u32,
+        /// How many of them failed in time, rather than ran late.
+        failed: u32,
+        /// The last in-time failure's error.
+        last_error: Option<String>,
+    }
+
+    impl Misses {
+        fn clear(&mut self) {
+            *self = Self::default();
+        }
+
+        /// One more miss: `error` is the failure of a tile in time, `None`
+        /// for a late tile (whose error, if any, is the deadline's).
+        fn record(&mut self, error: Option<String>) {
+            self.count += 1;
+            if let Some(error) = error {
+                self.failed += 1;
+                self.last_error = Some(error);
+            }
+        }
+
+        /// The health's reason when these misses fail the GPU.
+        fn reason(&self, deadline: Duration) -> String {
+            let n = self.count;
+            let ms = deadline.as_millis();
+            match &self.last_error {
+                None => format!("{n} tiles in a row missed the GPU's {ms} ms deadline"),
+                Some(e) if self.failed == n => {
+                    format!("{n} tiles in a row failed on the GPU, the last with: {e}")
+                }
+                Some(e) => format!(
+                    "{n} tiles in a row failed on the GPU or missed its {ms} ms deadline, \
+                     the last failure: {e}"
+                ),
+            }
+        }
     }
 
     /// Answers `request` with its own image, untouched.
@@ -836,8 +892,8 @@ mod inner {
     /// - when the GPU fails (#420): the processor panics (the request in
     ///   progress fails with the panic's message), `health` is failed from
     ///   outside (the device was lost), or `rule.misses` tiles in a row end
-    ///   at or past `rule.deadline`. `health` turns Failed with the reason,
-    ///   and every queued request is handed back.
+    ///   at or past `rule.deadline` or fail before it. `health` turns Failed
+    ///   with the reason, and every queued request is handed back.
     ///
     /// A tile past its deadline that does not fail the GPU hands back the
     /// requests queued behind it.
@@ -1460,6 +1516,128 @@ mod tests {
         let (image, why) = returned_by(&channel, 24).await;
         assert_eq!((image.width(), why.as_str()), (24, reason));
         assert_eq!(calls.load(Ordering::SeqCst), 3, "never sent");
+    }
+
+    /// A processor that fails every tile at once, as on a device whose
+    /// submissions are refused.
+    fn refusing(calls: &Arc<AtomicUsize>) -> impl TileProcessor {
+        let seen = Arc::clone(calls);
+        FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            Err(DdsError::CompressionFailed(format!(
+                "GPU poll failed: submission {n} refused"
+            )))
+        })
+    }
+
+    /// Tiles that fail in a row are misses too: a destroyed device fails
+    /// each tile at once, with no panic and no hang (seen on hardware with
+    /// `Device::destroy`). `misses` of them fail the GPU with the last
+    /// error, the queue behind them comes back, and the channel hands every
+    /// later image back without sending it.
+    #[tokio::test]
+    async fn failed_tiles_in_a_row_fail_the_gpu_and_hand_the_queue_back() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let health = SharedGpuHealth::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handle = spawn_tile_worker(
+            refusing(&calls),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+
+        // Two failures, one tile at a time: each fails, the GPU does not.
+        for width in [4, 8] {
+            let reply = queue(&tx, &[width]).pop().unwrap();
+            let (result, _) = processed(reply_of(reply).await);
+            assert!(result.is_err());
+            assert!(!health.is_failed(), "two failures are not a lost GPU");
+        }
+        // The third, with two more queued behind it.
+        let mut replies = queue(&tx, &[12, 16, 20]).into_iter();
+        let (result, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(
+            error_text(&result),
+            "Compression failed: GPU poll failed: submission 2 refused"
+        );
+        let reason = "3 tiles in a row failed on the GPU, the last with: \
+                      Compression failed: GPU poll failed: submission 2 refused";
+        for (reply, width) in replies.zip([16, 20]) {
+            let (image, why) = returned(reply_of(reply).await);
+            assert_eq!((image.width(), why.as_str()), (width, reason));
+        }
+        loop_ends(handle, Duration::from_secs(1)).await;
+        assert_eq!(health.failure(), Some(reason));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let channel = Arc::new(GpuEncoderChannel::new(tx, health));
+        let (image, why) = returned_by(&channel, 24).await;
+        assert_eq!((image.width(), why.as_str()), (24, reason));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "never sent");
+    }
+
+    /// Failed and late tiles count together, and the reason names both.
+    #[tokio::test]
+    async fn failed_and_late_tiles_in_a_row_fail_the_gpu_together() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let health = SharedGpuHealth::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let handle = spawn_tile_worker(
+            FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                    std::thread::sleep(OVERRUN);
+                    return Ok(vec![0; 8]);
+                }
+                Err(DdsError::CompressionFailed("mapping refused".to_string()))
+            }),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+        for width in [4, 8, 12] {
+            let reply = queue(&tx, &[width]).pop().unwrap();
+            let _ = processed(reply_of(reply).await);
+        }
+        loop_ends(handle, Duration::from_secs(1)).await;
+        assert_eq!(
+            health.failure(),
+            Some(
+                "3 tiles in a row failed on the GPU or missed its 40 ms deadline, \
+                 the last failure: Compression failed: mapping refused"
+            )
+        );
+    }
+
+    /// One failed tile is not a lost GPU, and a tile that succeeds resets
+    /// the count: failures not in a row never fail the GPU.
+    #[tokio::test]
+    async fn a_tile_that_succeeds_resets_the_failures() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let health = SharedGpuHealth::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let _worker = spawn_tile_worker(
+            FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+                if seen.fetch_add(1, Ordering::SeqCst) % 3 == 2 {
+                    Ok(vec![0; 8])
+                } else {
+                    Err(DdsError::CompressionFailed("transient".to_string()))
+                }
+            }),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+        for width in [4, 8, 12, 16, 20, 24, 28, 32, 36] {
+            let reply = queue(&tx, &[width]).pop().unwrap();
+            let _ = processed(reply_of(reply).await);
+        }
+        assert_eq!(health.health(), GpuHealth::Healthy);
     }
 
     /// A tile in time resets the count: misses that are not in a row never

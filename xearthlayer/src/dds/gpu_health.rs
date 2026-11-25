@@ -5,11 +5,11 @@
 //! The health starts [`GpuHealth::Healthy`] and turns
 //! [`GpuHealth::Failed`] once, for good (there is no respawn): on a panic the
 //! worker loop caught, on a device lost for a reason other than an explicit
-//! `Device::destroy` ([`device_lost`]), or when the worker's tiles miss their
-//! deadline too many times in a row (`gpu_channel::HangRule`). The first
-//! failure's reason is kept; whoever records it logs the one WARN. From then
-//! on every tile is handed back to its caller, which encodes it on the CPU
-//! (`DdsEncoder`'s fallback compressor, ISPC in the service).
+//! `Device::destroy` ([`device_lost`]), or when too many of the worker's
+//! tiles in a row miss their deadline or fail (`gpu_channel::HangRule`). The
+//! first failure's reason is kept; whoever records it logs the one WARN. From
+//! then on every tile is handed back to its caller, which encodes it on the
+//! CPU (`DdsEncoder`'s fallback compressor, ISPC in the service).
 
 use std::sync::{Arc, OnceLock};
 
@@ -22,7 +22,7 @@ pub enum GpuHealth {
     /// rest of the session.
     Failed {
         /// Why: the panic's message, the device-lost message, or the missed
-        /// deadlines.
+        /// deadlines and failed tiles.
         reason: String,
     },
 }
