@@ -173,11 +173,7 @@ mod tests {
     use crate::night::laminar::LitPattern;
 
     fn solid() -> LitPattern {
-        LitPattern {
-            size: 4,
-            rgb: vec![[200, 100, 50]; 16],
-            ground_scale_m: 4096.0,
-        }
+        LitPattern::new(4, vec![[200, 100, 50]; 16], 4096.0)
     }
 
     /// 32 x 32 random texels: every copy and rotation looks different.
@@ -188,11 +184,7 @@ mod tests {
                 [(unit(h) * 255.0) as u8, (unit(h >> 8) * 255.0) as u8, 0]
             })
             .collect();
-        LitPattern {
-            size: 32,
-            rgb,
-            ground_scale_m: 4096.0,
-        }
+        LitPattern::new(32, rgb, 4096.0)
     }
 
     fn points() -> impl Iterator<Item = (f64, f64)> {
@@ -277,11 +269,7 @@ mod tests {
                 ]
             })
             .collect();
-        LitPattern {
-            size,
-            rgb,
-            ground_scale_m: 4096.0,
-        }
+        LitPattern::new(size, rgb, 4096.0)
     }
 
     #[test]

@@ -514,13 +514,8 @@ mod tests {
     }
 
     fn red(name: &str) -> Option<Arc<LitPattern>> {
-        (name == "lib/g10/terrain10/urban_tmp_sdry3.ter").then(|| {
-            Arc::new(LitPattern {
-                size: 4,
-                rgb: vec![[255, 0, 0]; 16],
-                ground_scale_m: 4096.0,
-            })
-        })
+        (name == "lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .then(|| Arc::new(LitPattern::new(4, vec![[255, 0, 0]; 16], 4096.0)))
     }
 
     fn generate(
@@ -818,11 +813,11 @@ mod tests {
     /// A white 4 x 4 pattern: stochastic tiling of a solid colour is that colour,
     /// so a texel's value is its class weight times the gain times 255.
     fn white(_: &str) -> Option<Arc<LitPattern>> {
-        Some(Arc::new(LitPattern {
-            size: 4,
-            rgb: vec![[255, 255, 255]; 16],
-            ground_scale_m: 4096.0,
-        }))
+        Some(Arc::new(LitPattern::new(
+            4,
+            vec![[255, 255, 255]; 16],
+            4096.0,
+        )))
     }
 
     fn speckled(class: &str) -> Option<Arc<LitPattern>> {
@@ -833,11 +828,7 @@ mod tests {
                     [(unit(h) * 255.0) as u8, (unit(h >> 8) * 255.0) as u8, 0]
                 })
                 .collect();
-            Arc::new(LitPattern {
-                size: 32,
-                rgb,
-                ground_scale_m: 4096.0,
-            })
+            Arc::new(LitPattern::new(32, rgb, 4096.0))
         })
     }
 
@@ -924,11 +915,11 @@ mod tests {
     }
 
     fn orange(_: &str) -> Option<Arc<LitPattern>> {
-        Some(Arc::new(LitPattern {
-            size: 4,
-            rgb: vec![[200, 120, 50]; 16],
-            ground_scale_m: 4096.0,
-        }))
+        Some(Arc::new(LitPattern::new(
+            4,
+            vec![[200, 120, 50]; 16],
+            4096.0,
+        )))
     }
 
     /// A whole tile of class 1 under bright radiance.
@@ -1078,13 +1069,7 @@ mod tests {
         let name = name_at(37.5, -122.5);
         let mut changed = 0;
         for rgb in [[200u8, 120, 50], [255, 160, 60], [90, 40, 10], [56, 36, 18]] {
-            let pattern = move |_: &str| {
-                Some(Arc::new(LitPattern {
-                    size: 4,
-                    rgb: vec![rgb; 16],
-                    ground_scale_m: 4096.0,
-                }))
-            };
+            let pattern = move |_: &str| Some(Arc::new(LitPattern::new(4, vec![rgb; 16], 4096.0)));
             for byte in (1u8..=255).step_by(2).chain([255]) {
                 let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
                 let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
@@ -1144,13 +1129,8 @@ mod tests {
                 ..LedModel::DEFAULT
             };
             for rgb in colours {
-                let pattern = move |_: &str| {
-                    Some(Arc::new(LitPattern {
-                        size: 4,
-                        rgb: vec![rgb; 16],
-                        ground_scale_m: 4096.0,
-                    }))
-                };
+                let pattern =
+                    move |_: &str| Some(Arc::new(LitPattern::new(4, vec![rgb; 16], 4096.0)));
                 for byte in (1u8..=255).step_by(2).chain([255]) {
                     let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
                     let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());

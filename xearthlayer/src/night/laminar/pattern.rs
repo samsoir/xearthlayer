@@ -8,42 +8,91 @@ use crate::night::math::floor_i64;
 #[derive(Debug, Clone, PartialEq)]
 pub struct LitPattern {
     /// Width and height in pixels (Laminar's are square).
-    pub size: u32,
+    size: u32,
+    /// How a tap wraps, decided from `size` when the pattern is made.
+    wrap: Wrap,
     /// Row-major RGB, `size * size` entries.
     pub rgb: Vec<[u8; 3]>,
     /// Metres of ground one copy of the pattern covers.
     pub ground_scale_m: f64,
 }
 
+/// How a texel index wraps into `0..size`: with a mask when the size is a
+/// power of two (every stock Laminar lit texture is 1024 px), which gives
+/// the index `rem_euclid` gives for every `i64`, and with `rem_euclid`
+/// otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    /// `size - 1`.
+    Mask(i64),
+    /// `size`.
+    Euclid(i64),
+}
+
+impl Wrap {
+    fn of(size: u32) -> Self {
+        if size.is_power_of_two() {
+            Wrap::Mask(i64::from(size) - 1)
+        } else {
+            Wrap::Euclid(i64::from(size))
+        }
+    }
+}
+
 impl LitPattern {
-    /// Bilinear sample at pattern coordinates `(u, v)` in repeats; the
-    /// pattern wraps, so any real `u`, `v` is valid.
+    /// A `size` x `size` pattern of row-major `rgb` covering
+    /// `ground_scale_m` metres per copy.
     ///
-    /// A tap wraps with a mask when the size is a power of two (every stock
-    /// Laminar lit texture is 1024 px), which gives the index `rem_euclid`
-    /// gives for every `i64`, and with `rem_euclid` otherwise.
+    /// # Panics
+    ///
+    /// When `size` is 0 or `rgb` does not hold `size * size` texels.
+    pub fn new(size: u32, rgb: Vec<[u8; 3]>, ground_scale_m: f64) -> Self {
+        assert!(size > 0, "a lit pattern has texels");
+        assert_eq!(
+            rgb.len() as u64,
+            u64::from(size) * u64::from(size),
+            "a {size} px pattern holds {size} x {size} texels"
+        );
+        Self {
+            size,
+            wrap: Wrap::of(size),
+            rgb,
+            ground_scale_m,
+        }
+    }
+
+    /// Width and height in pixels.
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Bilinear sample at pattern coordinates `(u, v)` in repeats; the
+    /// pattern wraps, so any real `u`, `v` is valid. A tap wraps as the
+    /// pattern's [`Wrap`] says, decided once when it was made.
     pub fn sample(&self, u: f64, v: f64) -> [f32; 3] {
         let n = self.size as f64;
         let (x, y) = (u * n - 0.5, v * n - 0.5);
         let (x0, y0) = (floor_i64(x), floor_i64(y));
         let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
-        let size = i64::from(self.size);
-        let (xa, xb, ya, yb) = if self.size.is_power_of_two() {
-            let wrap = |i: i64| (i & (size - 1)) as usize;
-            (
-                wrap(x0),
-                wrap(x0.wrapping_add(1)),
-                wrap(y0),
-                wrap(y0.wrapping_add(1)),
-            )
-        } else {
-            let wrap = |i: i64| i.rem_euclid(size) as usize;
-            (
-                wrap(x0),
-                wrap(x0.wrapping_add(1)),
-                wrap(y0),
-                wrap(y0.wrapping_add(1)),
-            )
+        let (xa, xb, ya, yb) = match self.wrap {
+            Wrap::Mask(mask) => {
+                let wrap = |i: i64| (i & mask) as usize;
+                (
+                    wrap(x0),
+                    wrap(x0.wrapping_add(1)),
+                    wrap(y0),
+                    wrap(y0.wrapping_add(1)),
+                )
+            }
+            Wrap::Euclid(size) => {
+                let wrap = |i: i64| i.rem_euclid(size) as usize;
+                (
+                    wrap(x0),
+                    wrap(x0.wrapping_add(1)),
+                    wrap(y0),
+                    wrap(y0.wrapping_add(1)),
+                )
+            }
         };
         let at = |x: usize, y: usize| self.rgb[y * self.size as usize + x];
         let mut out = [0.0f32; 3];
@@ -80,11 +129,7 @@ pub fn decode_dxt1(bytes: &[u8], ground_scale_m: f64) -> Option<LitPattern> {
         }
     }
     let rgb = rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2]]).collect();
-    Some(LitPattern {
-        size: w,
-        rgb,
-        ground_scale_m,
-    })
+    Some(LitPattern::new(w, rgb, ground_scale_m))
 }
 
 #[cfg(test)]
@@ -105,10 +150,33 @@ mod tests {
     #[test]
     fn decodes_a_solid_block() {
         let p = decode_dxt1(&solid(0xF800), 4096.0).unwrap();
-        assert_eq!(p.size, 4);
+        assert_eq!(p.size(), 4);
         assert_eq!(p.rgb.len(), 16);
         assert!(p.rgb.iter().all(|&c| c == [255, 0, 0]), "{:?}", p.rgb[0]);
         assert_eq!(p.ground_scale_m, 4096.0);
+    }
+
+    #[test]
+    fn the_wrap_is_decided_when_the_pattern_is_made() {
+        for (size, wrap) in [
+            (1, Wrap::Mask(0)),
+            (4, Wrap::Mask(3)),
+            (1024, Wrap::Mask(1023)),
+            (3, Wrap::Euclid(3)),
+            (12, Wrap::Euclid(12)),
+        ] {
+            let n = (size * size) as usize;
+            let p = LitPattern::new(size, vec![[0; 3]; n], 4096.0);
+            assert_eq!((p.size(), p.wrap), (size, wrap));
+        }
+        let decoded = decode_dxt1(&solid(0xF800), 4096.0).unwrap();
+        assert_eq!(decoded.wrap, Wrap::Mask(3));
+    }
+
+    #[test]
+    #[should_panic(expected = "texels")]
+    fn a_pattern_must_hold_size_squared_texels() {
+        LitPattern::new(4, vec![[0; 3]; 15], 4096.0);
     }
 
     #[test]
@@ -143,7 +211,7 @@ mod tests {
             return;
         }
         let p = decode_dxt1(&std::fs::read(path).unwrap(), 4096.0).unwrap();
-        assert_eq!(p.size, 1024);
+        assert_eq!(p.size(), 1024);
         assert!(p.rgb.iter().any(|c| c.iter().any(|&v| v > 64)), "has light");
     }
 }

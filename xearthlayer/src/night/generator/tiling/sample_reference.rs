@@ -51,13 +51,13 @@ pub(crate) fn sample_cached(
 
 /// `LitPattern::sample` before #437.
 pub(crate) fn pattern_sample(p: &LitPattern, u: f64, v: f64) -> [f32; 3] {
-    let n = p.size as f64;
+    let n = p.size() as f64;
     let (x, y) = (u * n - 0.5, v * n - 0.5);
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
-    let wrap = |i: f64| (i as i64).rem_euclid(p.size as i64) as usize;
+    let wrap = |i: f64| (i as i64).rem_euclid(p.size() as i64) as usize;
     let (xa, xb, ya, yb) = (wrap(x0), wrap(x0 + 1.0), wrap(y0), wrap(y0 + 1.0));
-    let at = |x: usize, y: usize| p.rgb[y * p.size as usize + x];
+    let at = |x: usize, y: usize| p.rgb[y * p.size() as usize + x];
     let mut out = [0.0f32; 3];
     for (ch, o) in out.iter_mut().enumerate() {
         let top = at(xa, ya)[ch] as f32 * (1.0 - fx) + at(xb, ya)[ch] as f32 * fx;
