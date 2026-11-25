@@ -368,6 +368,9 @@ impl RecipeField {
 }
 
 #[cfg(test)]
+pub(crate) mod lookup_reference;
+
+#[cfg(test)]
 pub(crate) mod tests_support {
     use crate::night::recipe::{BrightnessScale, Grid, Recipe};
     use std::sync::Arc;
@@ -728,5 +731,100 @@ mod tests {
             recipes,
             |_| true
         ));
+    }
+
+    /// A class weight with its weight as bits, for exact comparison.
+    type WeightBits = ((i32, i32), usize, u8, u64);
+
+    fn weight_bits(out: &[ClassWeight]) -> Vec<WeightBits> {
+        out.iter()
+            .map(|w| (w.tile, w.slot, w.index, w.weight.to_bits()))
+            .collect()
+    }
+
+    /// Asserts that the class weights and the radiance at every point of
+    /// the `lats` x `lons` grid are those of the code before #437, bit for
+    /// bit. Returns the number of points with a class weight.
+    pub(crate) fn assert_matches_reference(
+        field: &RecipeField,
+        lats: &[f64],
+        lons: &[f64],
+    ) -> usize {
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        let mut weighted = 0;
+        for &lat in lats {
+            for &lon in lons {
+                field.class_weights(lat, lon, &mut got);
+                lookup_reference::class_weights(field, lat, lon, &mut want);
+                assert_eq!(
+                    weight_bits(&got),
+                    weight_bits(&want),
+                    "weights at {lat}, {lon}"
+                );
+                weighted += usize::from(!want.is_empty());
+                let (r, reference) = (
+                    field.radiance(lat, lon),
+                    lookup_reference::radiance(field, lat, lon),
+                );
+                assert_eq!(r.to_bits(), reference.to_bits(), "radiance at {lat}, {lon}");
+            }
+        }
+        weighted
+    }
+
+    /// Six tiles around (0, 0), so coordinates run negative and the sweep
+    /// crosses the equator, the prime meridian and lon 1: (-1, -1) sets the
+    /// grids (120 class, 8 brightness cells per degree), (-1, 0) has another
+    /// class grid, (0, 0) another brightness grid, (-1, 1) matches, and
+    /// (0, -1) and (0, 1) have no recipe. Classes 0 to 4 in diagonal bands,
+    /// so neighbouring cells merge and split; brightness from 0 to 255.
+    fn mixed_field() -> RecipeField {
+        let classes = |r: usize, c: usize| ((r * 7 + c * 3) % 5) as u8;
+        let bright = |r: usize, c: usize| ((r * 53 + c * 29) % 256) as u8;
+        let sw = synthetic(-1, -1, 120, classes, 8, bright);
+        let other_class = synthetic(-1, 0, 60, classes, 8, bright);
+        let other_bright = synthetic(0, 0, 120, classes, 4, bright);
+        let east = synthetic(-1, 1, 120, classes, 8, bright);
+        let lookup = move |a: i32, b: i32| match (a, b) {
+            (-1, -1) => Some(sw.clone()),
+            (-1, 0) => Some(other_class.clone()),
+            (0, 0) => Some(other_bright.clone()),
+            (-1, 1) => Some(east.clone()),
+            _ => None,
+        };
+        RecipeField::new(&footprint(0.4, -0.6, -0.5, 1.4), &lookup)
+    }
+
+    /// `n` evenly spaced values over `[lo, hi]`, with each of `lines`, its
+    /// neighbours one ulp away, and `-0.0`.
+    fn axis(lo: f64, hi: f64, n: usize, lines: &[f64]) -> Vec<f64> {
+        let mut v: Vec<f64> = (0..n)
+            .map(|k| lo + (hi - lo) * k as f64 / (n - 1) as f64)
+            .collect();
+        for &l in lines {
+            v.extend([l, l.next_up(), l.next_down()]);
+        }
+        v.push(-0.0);
+        v
+    }
+
+    #[test]
+    fn sampling_matches_the_code_before_437_on_a_dense_sweep() {
+        let field = mixed_field();
+        let lats = axis(-0.62, 0.42, 420, &[0.0, -0.5, 0.25]);
+        let lons = axis(-0.52, 1.42, 780, &[0.0, 1.0, -0.25]);
+        let weighted = assert_matches_reference(&field, &lats, &lons);
+        assert!(
+            weighted > lats.len() * lons.len() / 3,
+            "{weighted} weighted"
+        );
+    }
+
+    #[test]
+    fn sampling_matches_the_code_before_437_without_any_recipe() {
+        let field = RecipeField::new(&footprint(37.6, 37.4, -122.6, -122.4), &|_, _| None);
+        let lats = axis(37.39, 37.61, 40, &[]);
+        let lons = axis(-122.61, -122.39, 40, &[]);
+        assert_eq!(assert_matches_reference(&field, &lats, &lons), 0);
     }
 }

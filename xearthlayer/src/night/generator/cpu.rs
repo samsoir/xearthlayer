@@ -417,6 +417,44 @@ mod tests {
         );
     }
 
+    /// Every texel of the 128 px golden fixture samples the field and the
+    /// pattern as the code before #437 did, bit for bit: class weights,
+    /// radiance, and the speckled pattern at every class.
+    #[test]
+    fn the_fixture_samples_as_before_437() {
+        use crate::night::generator::field::lookup_reference;
+        use crate::night::generator::tiling::sample_reference;
+        let n = name_at(37.20, -122.725);
+        let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &golden);
+        let pattern = speckled("lib/g10/terrain10/urban_tmp_sdry3.ter").unwrap();
+        let (mut cache, mut reference_cache) = (CornerCache::default(), CornerCache::default());
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        let mut weighted = 0;
+        for (&lat, &y) in lats.iter().zip(&ys) {
+            for (&lon, &x) in lons.iter().zip(&xs) {
+                field.class_weights(lat, lon, &mut got);
+                lookup_reference::class_weights(&field, lat, lon, &mut want);
+                let bits = |w: &[super::super::field::ClassWeight]| {
+                    w.iter()
+                        .map(|w| (w.tile, w.slot, w.index, w.weight.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got), bits(&want), "weights at {lat}, {lon}");
+                let radiance = field.radiance(lat, lon);
+                let reference = lookup_reference::radiance(&field, lat, lon);
+                assert_eq!(radiance.to_bits(), reference.to_bits(), "at {lat}, {lon}");
+                for _ in &want {
+                    let c = sample_cached(&pattern, x, y, &mut cache);
+                    let r = sample_reference::sample_cached(&pattern, x, y, &mut reference_cache);
+                    assert_eq!(c.map(f32::to_bits), r.map(f32::to_bits), "at {x}, {y}");
+                }
+                weighted += usize::from(!want.is_empty());
+            }
+        }
+        assert!(weighted > 128 * 128 / 4, "{weighted} weighted texels");
+    }
+
     /// The generator's tone path is byte for byte the `powf` path it
     /// replaced (#436), at several models, brightnesses and regions.
     #[test]

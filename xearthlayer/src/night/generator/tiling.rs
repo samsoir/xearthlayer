@@ -163,6 +163,9 @@ fn barycentric(q: (f64, f64), p: [(f64, f64); 3]) -> [f64; 3] {
 }
 
 #[cfg(test)]
+pub(crate) mod sample_reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::night::generator::noise::{hash2, unit};
@@ -259,5 +262,105 @@ mod tests {
                 assert_eq!(fresh, sample_cached(&p, x + d, y - d, &mut cache));
             }
         }
+    }
+
+    /// `size` x `size` random texels.
+    fn speckled_of(size: u32) -> LitPattern {
+        let rgb = (0..i64::from(size * size))
+            .map(|i| {
+                let h = hash2(i, 0, 99);
+                [
+                    (unit(h) * 255.0) as u8,
+                    (unit(h >> 8) * 255.0) as u8,
+                    (h >> 40) as u8,
+                ]
+            })
+            .collect();
+        LitPattern {
+            size,
+            rgb,
+            ground_scale_m: 4096.0,
+        }
+    }
+
+    #[test]
+    fn pattern_taps_match_the_code_before_437() {
+        // Powers of two and not, at coordinates of both signs, on and
+        // beside whole texels and whole repeats.
+        for size in [32, 24, 4, 5, 1] {
+            let p = speckled_of(size);
+            let n = f64::from(size);
+            let mut us: Vec<f64> = (-400..400).map(|k| f64::from(k) * 0.013_7).collect();
+            for k in -3 * size as i32..=3 * size as i32 {
+                let at = (f64::from(k) + 0.5) / n;
+                us.extend([at, at.next_up(), at.next_down(), f64::from(k) / n]);
+            }
+            us.extend([0.0, -0.0, 1e6 + 0.3, -1e6 - 0.3]);
+            for &u in &us {
+                for &v in us.iter().step_by(7) {
+                    let (got, want) = (p.sample(u, v), sample_reference::pattern_sample(&p, u, v));
+                    assert_eq!(
+                        got.map(f32::to_bits),
+                        want.map(f32::to_bits),
+                        "{size} at {u}, {v}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stochastic_sampling_matches_the_code_before_437() {
+        // Both signs of both axes, through the origin, a fine walk (cache
+        // hits) and jumps (misses), a pattern of a power-of-two size and not.
+        for size in [32, 24] {
+            let p = speckled_of(size);
+            let (mut cache, mut reference_cache) = (CornerCache::default(), CornerCache::default());
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            for row in -20..20 {
+                let y = f64::from(row) * 313.0;
+                points.extend((-300..300).map(|i| (f64::from(i) * 7.3, y)));
+            }
+            points.extend((0..3000).map(|i| {
+                let h = hash2(i, 7, 11);
+                (unit(h) * 4e7 - 2e7, unit(mix(h)) * 4e7 - 2e7)
+            }));
+            points.extend(points_at_cell_edges(&p));
+            points.extend([(0.0, 0.0), (-0.0, -0.0), (-0.0, 0.0), (0.0, -0.0)]);
+            for (x, y) in points {
+                let got = sample_cached(&p, x, y, &mut cache);
+                let want = sample_reference::sample_cached(&p, x, y, &mut reference_cache);
+                assert_eq!(
+                    got.map(f32::to_bits),
+                    want.map(f32::to_bits),
+                    "{size} at {x}, {y}"
+                );
+            }
+        }
+    }
+
+    /// Points on and one ulp beside the lattice's skewed cell edges, where
+    /// a floor moves to the next integer.
+    fn points_at_cell_edges(p: &LitPattern) -> Vec<(f64, f64)> {
+        let cell = p.ground_scale_m;
+        let mut out = Vec::new();
+        for i in -6..6 {
+            for j in -6..6 {
+                // Unskewed lattice corner (i, j), in metres.
+                let t = f64::from(i + j) * UNSKEW;
+                let (x, y) = ((f64::from(i) - t) * cell, (f64::from(j) - t) * cell);
+                for (dx, dy) in [
+                    (0.0, 0.0),
+                    (1e-9, 0.0),
+                    (-1e-9, 0.0),
+                    (0.0, 1e-9),
+                    (0.0, -1e-9),
+                ] {
+                    out.push((x + dx, y + dy));
+                }
+                out.push((x.next_up(), y.next_down()));
+            }
+        }
+        out
     }
 }
