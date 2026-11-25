@@ -65,8 +65,9 @@ pub struct GpuSample {
     pub failed: u64,
     /// Images the GPU did not take, handed back for the encoder's fallback
     /// to encode on the CPU (#420): the GPU had failed, its worker was not
-    /// running, or the worker handed its queue back. Neither tiles nor
-    /// failures.
+    /// running, the worker handed its queue back, or a request waited past
+    /// the deadline in the queue (`HangRule::waited_out`). Neither tiles
+    /// nor failures.
     pub fallback: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).

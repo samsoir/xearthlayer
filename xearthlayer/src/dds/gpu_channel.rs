@@ -25,9 +25,13 @@
 //! back (close the channel, answer every request in it) and
 //! ends, and the channel hands every later image back without sending it. A
 //! tile past its deadline on a GPU not yet failed hands back only the
-//! requests queued behind it, so no caller waits longer than the deadline
-//! plus the tile in progress. The one tile already inside the processor when
-//! it failed is lost and fails as before.
+//! requests queued behind it. A request the worker takes after it waited
+//! longer than the deadline in the queue, from its caller's send, is handed
+//! back too ([`HangRule::waited_out`]); that is not a miss and never fails
+//! the GPU. So no caller waits much longer than the deadline plus one tile:
+//! the tile that was in progress when its wait passed the deadline, or its
+//! own. The one tile already inside the processor when the GPU failed is
+//! lost and fails as before.
 
 mod inner {
     use std::sync::Arc;
@@ -80,6 +84,18 @@ mod inner {
         pub deadline: Duration,
         /// Missed tiles in a row that fail the GPU.
         pub misses: u32,
+    }
+
+    impl HangRule {
+        /// Whether a request that waited `queue_wait` in the queue, from its
+        /// caller starting the send, is handed back unprocessed when the
+        /// worker takes it: past the [`deadline`](Self::deadline). Such a
+        /// request is not a miss and does not fail the GPU; it bounds every
+        /// caller's wait to about the deadline plus one tile, however deep
+        /// the queue. The one place this threshold is decided.
+        pub fn waited_out(&self, queue_wait: Duration) -> bool {
+            queue_wait > self.deadline
+        }
     }
 
     impl Default for HangRule {
@@ -149,7 +165,8 @@ mod inner {
         Returned {
             /// The request's image, as it was sent.
             image: RgbaImage,
-            /// Why: the GPU's failure, or a tile ahead past its deadline.
+            /// Why: the GPU's failure, a tile ahead past its deadline, or
+            /// its own wait in the queue past the deadline.
             reason: String,
         },
     }
@@ -789,16 +806,34 @@ mod inner {
                 Err(mpsc::error::TryRecvError::Disconnected) => return Ending::Release,
             };
 
+            let queue_wait = request.sent_at.elapsed();
+            if rule.waited_out(queue_wait) {
+                // Not a miss: the GPU never saw it.
+                let waited_ms = queue_wait.as_millis() as u64;
+                tracing::debug!(
+                    waited_ms,
+                    "GPU worker handed back a tile that waited too long"
+                );
+                hand_back(
+                    request,
+                    &format!(
+                        "waited {waited_ms} ms in the queue, past the GPU's {} ms deadline",
+                        rule.deadline.as_millis()
+                    ),
+                );
+                continue;
+            }
+
             let GpuEncodeRequest {
                 image,
                 format,
                 mipmap_count,
-                sent_at,
+                sent_at: _,
                 response,
             } = request;
 
             let mut timing = GpuTileTiming {
-                queue_wait: sent_at.elapsed(),
+                queue_wait,
                 ..GpuTileTiming::default()
             };
 
@@ -1001,7 +1036,9 @@ mod inner {
     ///   with the reason, and every queued request is handed back.
     ///
     /// A tile past its deadline that does not fail the GPU hands back the
-    /// requests queued behind it.
+    /// requests queued behind it, and a request taken after waiting past
+    /// the deadline in the queue is handed back unprocessed
+    /// ([`HangRule::waited_out`]).
     ///
     /// The processor is dropped when the loop ends, except after a GPU
     /// failed by a hang or a panic, when it is leaked so that its drop
@@ -1614,8 +1651,9 @@ mod tests {
     }
 
     /// A tile past its deadline is answered, and the requests queued behind
-    /// it come back at once with their images: none waits for more than the
-    /// deadline plus the tile in progress. One miss does not fail the GPU.
+    /// it come back at once with their images rather than wait for the next
+    /// tile; with the queue-age valve, no caller waits much longer than the
+    /// deadline plus one tile. One miss does not fail the GPU.
     #[tokio::test]
     async fn a_missed_deadline_hands_the_queue_back_without_failing_the_gpu() {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -1650,6 +1688,158 @@ mod tests {
             "one miss is not a hang"
         );
         assert!(!tx.is_closed(), "the worker keeps running");
+    }
+
+    // =========================================================================
+    // The queue-age valve (#420)
+    // =========================================================================
+
+    /// A request whose caller started its send `waited` ago, and its reply.
+    fn sent_ago(
+        width: u32,
+        waited: Duration,
+    ) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) {
+        let (mut request, reply) = request(width);
+        request.sent_at = Instant::now() - waited;
+        (request, reply)
+    }
+
+    /// The threshold is the rule's deadline, from the caller's send: a
+    /// request taken after waiting longer is handed back unprocessed; one
+    /// taken in time is processed as before.
+    #[tokio::test]
+    async fn a_request_that_waited_past_the_deadline_comes_back_unprocessed() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let health = SharedGpuHealth::new();
+        let rule = HangRule {
+            deadline: Duration::from_secs(1),
+            misses: 3,
+        };
+        let (in_time, in_time_reply) = sent_ago(4, Duration::from_millis(500));
+        let (stale, stale_reply) = sent_ago(8, Duration::from_millis(1500));
+        tx.try_send(in_time).unwrap();
+        tx.try_send(stale).unwrap();
+        let _worker = spawn_tile_worker(
+            FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![0; 8])
+            }),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            rule,
+        );
+
+        let (result, _) = processed(reply_of(in_time_reply).await);
+        assert_eq!(result.unwrap().len(), 8, "taken in time: processed");
+        let (image, reason) = returned(reply_of(stale_reply).await);
+        assert_eq!(image.width(), 8, "its own image comes back");
+        assert!(
+            reason.starts_with("waited ") && reason.ends_with("past the GPU's 1000 ms deadline"),
+            "{reason}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "only the first ran");
+        assert_eq!(health.health(), GpuHealth::Healthy);
+    }
+
+    /// A request handed back for its wait is not a miss: it neither counts
+    /// towards the misses in a row nor clears them.
+    #[tokio::test]
+    async fn a_request_handed_back_for_its_wait_is_not_a_miss() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let health = SharedGpuHealth::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let handle = spawn_tile_worker(
+            FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(OVERRUN);
+                Ok(vec![0; 8])
+            }),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+        let stale = || {
+            let (request, reply) = sent_ago(16, SHORT.deadline * 2);
+            tx.try_send(request).unwrap();
+            reply
+        };
+
+        // Late, waited out, late: two misses, not three.
+        processed(reply_of(queue(&tx, &[4]).pop().unwrap()).await)
+            .0
+            .unwrap();
+        returned(reply_of(stale()).await);
+        processed(reply_of(queue(&tx, &[8]).pop().unwrap()).await)
+            .0
+            .unwrap();
+        assert_eq!(health.health(), GpuHealth::Healthy, "a wait is not a miss");
+        // Waited out, then a third late tile: the misses were not cleared.
+        returned(reply_of(stale()).await);
+        processed(reply_of(queue(&tx, &[12]).pop().unwrap()).await)
+            .0
+            .unwrap();
+        loop_ends(handle, Duration::from_secs(1)).await;
+        assert!(health.is_failed(), "nor does a wait clear the misses");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A GPU slower than the deadline over the queue depth but never late:
+    /// without the valve the k-th caller of a full queue waits k tiles.
+    /// With it every caller is answered within about the deadline plus one
+    /// tile, the ones queued too long get their images back, and the GPU
+    /// stays healthy.
+    #[tokio::test]
+    async fn no_caller_waits_much_longer_than_the_deadline_plus_one_tile() {
+        const TILE: Duration = Duration::from_millis(50);
+        let rule = HangRule {
+            deadline: Duration::from_millis(200),
+            misses: 3,
+        };
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let started = Instant::now();
+        // Twelve tiles of 50 ms: the last would wait 550 ms in the queue.
+        let widths: Vec<u32> = (1..=12).map(|i| 4 * i).collect();
+        let replies = queue(&tx, &widths);
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_tile_worker(
+            FnProcessor(|_: RgbaImage, _: &mut GpuTileTiming| {
+                std::thread::sleep(TILE);
+                Ok(vec![0; 8])
+            }),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            rule,
+        );
+
+        let (mut gpu, mut back) = (0, 0);
+        for (reply, width) in replies.into_iter().zip(widths) {
+            match reply_of(reply).await {
+                GpuEncodeReply::Processed { result, .. } => {
+                    result.unwrap();
+                    gpu += 1;
+                }
+                GpuEncodeReply::Returned { image, .. } => {
+                    assert_eq!(image.width(), width, "each caller gets its own image");
+                    back += 1;
+                }
+            }
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < rule.deadline + TILE + Duration::from_millis(150),
+            "every caller was answered within the deadline plus one tile: {waited:?}"
+        );
+        assert!(
+            gpu >= 2 && back >= 2,
+            "{gpu} on the GPU, {back} handed back"
+        );
+        assert_eq!(health.health(), GpuHealth::Healthy, "no tile was late");
     }
 
     /// `misses` tiles in a row past the deadline fail the GPU: the worker
