@@ -5,7 +5,7 @@ pub mod library;
 pub mod pattern;
 pub mod ter;
 
-pub use art::{ArtFiles, ArtRecord, DiskArtFiles, LaminarArt};
+pub use art::{ArtDoubt, ArtDoubtKind, ArtFiles, ArtRecord, DiskArtFiles, LaminarArt};
 pub use library::LibraryIndex;
 pub use pattern::LitPattern;
 pub use ter::LitTerrain;

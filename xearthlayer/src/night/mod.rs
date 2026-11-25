@@ -30,7 +30,9 @@ pub use footprint::Footprint;
 pub use generator::{
     CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, LIT_GENERATOR_VERSION,
 };
-pub use laminar::{ArtFiles, ArtRecord, DiskArtFiles, LaminarArt, LitPattern, LitTerrain};
+pub use laminar::{
+    ArtDoubt, ArtDoubtKind, ArtFiles, ArtRecord, DiskArtFiles, LaminarArt, LitPattern, LitTerrain,
+};
 pub use layout::{minimal_black_dds, LitLayout};
 pub use prefs::{
     FixedTextureSetting, StartupTextureSetting, TextureSettingSource, FULL_TEXTURE_SETTING,

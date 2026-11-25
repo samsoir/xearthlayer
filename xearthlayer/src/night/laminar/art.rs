@@ -1,18 +1,24 @@
 //! Palette names to the user's Laminar lit terrain.
 //!
 //! Every answer is remembered for the session, and each file is loaded once
-//! however many callers ask for it at the same moment. Two kinds of failure
-//! are told apart. A file that reads but has nothing usable (a `.ter`
-//! without lit lines, a lit texture that is not square DXT1) makes its class
-//! dark: a property of the files the lit fingerprint covers, so payloads
-//! drawn with it may be kept on disk. A file that cannot be read is retried
-//! with the recipe policy ([`with_retries`]); one that fails every attempt is
-//! given up on for the session, and a payload whose lookups met it is told
-//! so through an [`ArtRecord`]: a later session may read the file and light
-//! the class, under the same fingerprint.
+//! however many callers ask for it at the same moment.
+//!
+//! A lit payload may be written to the lit disk tier only when it is a
+//! function of what the lit fingerprint covers ([`LaminarArt::fingerprint`]),
+//! so every answer here says whether it is. A file that is missing, or reads
+//! but has nothing usable (not UTF-8, a `.ter` without lit lines, a lit
+//! texture that is not square DXT1), makes its class dark: when the walk
+//! covers the file, that is the same every session, and the answer is
+//! settled. Two things leave an answer in doubt ([`ArtDoubt`]): a file that
+//! fails with any other I/O error on every attempt of the recipe policy
+//! (`retry::with_retries`) is given up on for the session, and a file the walk
+//! does not cover (outside the root, reached through a symlink, or named
+//! unlike the files the walk hashes) may change without changing the
+//! fingerprint. A payload whose lookups met a doubt is told so through an
+//! [`ArtRecord`] and is kept in memory only.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -25,11 +31,14 @@ use super::ter::{parse_lit_terrain, LitTerrain};
 use crate::night::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use crate::night::FileIdentity;
 
-/// Reads of the art files: the disk in production, a seam for tests to
+/// Access to the art files: the disk in production, a seam for tests to
 /// inject I/O errors. Blocking.
 pub trait ArtFiles: Send + Sync {
+    /// The file's bytes.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
-    fn read_to_string(&self, path: &Path) -> io::Result<String>;
+    /// Whether `path` is a regular file (symlinks followed); `NotFound` when
+    /// nothing is there.
+    fn is_file(&self, path: &Path) -> io::Result<bool>;
 }
 
 /// The art files on disk.
@@ -41,67 +50,105 @@ impl ArtFiles for DiskArtFiles {
         std::fs::read(path)
     }
 
-    fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        std::fs::read_to_string(path)
+    fn is_file(&self, path: &Path) -> io::Result<bool> {
+        std::fs::metadata(path).map(|meta| meta.is_file())
     }
 }
 
-/// What the art lookups made for one payload met: the first art file among
-/// them given up on after I/O errors, if any. Such a payload may differ
-/// from a later session's under the same fingerprint, so it is not kept on
-/// disk. Shared by the generator's threads.
-#[derive(Debug, Default)]
-pub struct ArtRecord {
-    given_up: OnceLock<Arc<Path>>,
+/// Why an art answer may differ from a later session's under the same
+/// fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtDoubtKind {
+    /// The file failed with an I/O error on every attempt.
+    GivenUp,
+    /// The fingerprint walk does not cover the file.
+    Uncovered,
 }
 
-impl ArtRecord {
-    /// The first file given up on that a lookup met, if any.
-    pub fn given_up(&self) -> Option<&Path> {
-        self.given_up.get().map(|path| &**path)
-    }
-
-    /// [`Self::given_up`], owned.
-    pub fn into_given_up(self) -> Option<Arc<Path>> {
-        self.given_up.into_inner()
-    }
-
-    fn note<T>(&self, lookup: &Lookup<T>) {
-        if let Lookup::GivenUp(path) = lookup {
-            // The first file met is the one named.
-            let _ = self.given_up.set(Arc::clone(path));
+impl ArtDoubtKind {
+    /// For the log.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::GivenUp => "given up on after I/O errors",
+            Self::Uncovered => "not covered by the lit fingerprint",
         }
     }
 }
 
-/// One remembered art answer.
+/// An art file whose answer may differ next session, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtDoubt {
+    pub file: Arc<Path>,
+    pub kind: ArtDoubtKind,
+}
+
+impl ArtDoubt {
+    fn given_up(file: &Path) -> Self {
+        Self {
+            file: Arc::from(file),
+            kind: ArtDoubtKind::GivenUp,
+        }
+    }
+
+    fn uncovered(file: &Path) -> Self {
+        Self {
+            file: Arc::from(file),
+            kind: ArtDoubtKind::Uncovered,
+        }
+    }
+}
+
+/// What the art lookups made for one payload met: the first [`ArtDoubt`]
+/// among them, if any. A payload with one is not kept on disk. Shared by
+/// the generator's threads.
+#[derive(Debug, Default)]
+pub struct ArtRecord {
+    doubt: OnceLock<ArtDoubt>,
+}
+
+impl ArtRecord {
+    /// The first doubt a lookup met, if any.
+    #[cfg(test)]
+    pub fn doubt(&self) -> Option<&ArtDoubt> {
+        self.doubt.get()
+    }
+
+    /// The first doubt a lookup met, if any, owned.
+    pub fn into_doubt(self) -> Option<ArtDoubt> {
+        self.doubt.into_inner()
+    }
+
+    fn note(&self, doubt: &Option<ArtDoubt>) {
+        if let Some(doubt) = doubt {
+            // The first doubt met is the one named.
+            let _ = self.doubt.set(doubt.clone());
+        }
+    }
+}
+
+/// One remembered art answer: the value (`None` is dark) and whether it is
+/// in doubt.
 #[derive(Debug)]
-enum Lookup<T> {
-    Found(Arc<T>),
-    /// Dark by the content of the art files (deterministic under the lit
-    /// fingerprint): nothing exported under the name, no lit lines, a lit
-    /// texture that is missing or does not decode.
-    Dark,
-    /// Dark because this file was given up on after I/O errors.
-    GivenUp(Arc<Path>),
+struct Lookup<T> {
+    value: Option<Arc<T>>,
+    doubt: Option<ArtDoubt>,
 }
 
 // Derived `Clone` would ask for `T: Clone`.
 impl<T> Clone for Lookup<T> {
     fn clone(&self) -> Self {
-        match self {
-            Self::Found(t) => Self::Found(Arc::clone(t)),
-            Self::Dark => Self::Dark,
-            Self::GivenUp(path) => Self::GivenUp(Arc::clone(path)),
+        Self {
+            value: self.value.clone(),
+            doubt: self.doubt.clone(),
         }
     }
 }
 
 impl<T> Lookup<T> {
-    fn found(self) -> Option<Arc<T>> {
-        match self {
-            Self::Found(t) => Some(t),
-            Self::Dark | Self::GivenUp(_) => None,
+    fn new(value: Option<T>, doubt: Option<ArtDoubt>) -> Self {
+        Self {
+            value: value.map(Arc::new),
+            doubt,
         }
     }
 }
@@ -119,12 +166,47 @@ fn once<T>(map: &OnceMap<T>, key: &str, init: impl FnOnce() -> Lookup<T>) -> Loo
     cell.get_or_init(init).clone()
 }
 
+/// The names of the files the fingerprint walk hashes.
+fn fingerprinted_name(name: &str) -> bool {
+    name == "library.txt" || name.ends_with(".ter") || name.ends_with("_LIT.dds")
+}
+
+/// `path` with `.` and `..` resolved lexically, so the path read is the
+/// path checked against the walk. A `..` with nothing to climb stays.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A read's outcome after the retry policy.
+enum Read {
+    Bytes(Vec<u8>),
+    /// Nothing there; not retried.
+    Missing,
+    /// Every attempt failed.
+    Failed(io::Error),
+}
+
 /// The lit art of one X-Plane installation (`1000 world terrain`).
 pub struct LaminarArt {
     terrain_root: PathBuf,
+    /// `terrain_root`, normalized: the prefix of every path resolved.
+    root_lexical: PathBuf,
+    /// `terrain_root` with every symlink resolved, `None` when it is absent.
+    root_real: OnceLock<Option<PathBuf>>,
     files: Arc<dyn ArtFiles>,
-    /// The library index, or the `library.txt` given up on.
-    library: OnceLock<Result<LibraryIndex, Arc<Path>>>,
+    library: OnceLock<Lookup<LibraryIndex>>,
     resolved: OnceMap<LitTerrain>,
     /// Decoded patterns by `texture|ground scale`; Laminar has nine textures.
     patterns: OnceMap<LitPattern>,
@@ -137,10 +219,12 @@ impl LaminarArt {
         Self::with_files(terrain_root, Arc::new(DiskArtFiles))
     }
 
-    /// As [`Self::new`], reading the art files through `files`.
+    /// As [`Self::new`], reaching the art files through `files`.
     pub fn with_files(terrain_root: PathBuf, files: Arc<dyn ArtFiles>) -> Self {
         Self {
+            root_lexical: normalize(&terrain_root),
             terrain_root,
+            root_real: OnceLock::new(),
             files,
             library: OnceLock::new(),
             resolved: DashMap::new(),
@@ -151,10 +235,14 @@ impl LaminarArt {
 
     /// Digest of the art a lit texture can draw on: the library, every
     /// `.ter` and every `_LIT.dds` under the terrain root, by relative path,
-    /// size and modification time. A missing root has a fingerprint too.
+    /// size and modification time. Symlinks are not followed (a symlinked
+    /// file counts by the link's own identity, a symlinked folder is not
+    /// entered); answers that depend on such files are in doubt instead. A
+    /// missing root has a fingerprint too.
     ///
     /// Blocking directory walk (~30 ms on a real install), done once per
-    /// session.
+    /// session and before the first art file is read, so no answer is drawn
+    /// from a file older than the walk.
     pub fn fingerprint(&self) -> [u8; 32] {
         *self.fingerprint.get_or_init(|| {
             let mut files = Vec::new();
@@ -171,8 +259,7 @@ impl LaminarArt {
                         continue;
                     }
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if name == "library.txt" || name.ends_with(".ter") || name.ends_with("_LIT.dds")
-                    {
+                    if fingerprinted_name(&name) {
                         let relative = path
                             .strip_prefix(&self.terrain_root)
                             .unwrap_or(&path)
@@ -195,154 +282,264 @@ impl LaminarArt {
         })
     }
 
-    /// The decoded lit pattern a palette name stands for, or `None` (dark).
-    ///
-    /// Blocking file I/O and decoding on first use of a texture.
-    pub fn pattern(&self, palette_name: &str) -> Option<Arc<LitPattern>> {
-        self.pattern_lookup(palette_name).found()
+    /// Whether the fingerprint walk covers `path` (normalized), present or
+    /// not: it lies under the root, has a name the walk hashes, and no
+    /// component below the root is a symlink, so the walk lists it where it
+    /// is, or lists the folder it would appear in. Blocking `stat`s.
+    fn covered(&self, path: &Path) -> bool {
+        let Ok(mut relative) = path.strip_prefix(&self.root_lexical) else {
+            return false;
+        };
+        let named = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(fingerprinted_name);
+        let root = self
+            .root_real
+            .get_or_init(|| std::fs::canonicalize(&self.terrain_root).ok());
+        let (true, Some(root)) = (named, root) else {
+            return false;
+        };
+        // The deepest part of the path that exists must resolve to itself.
+        loop {
+            match std::fs::canonicalize(self.root_lexical.join(relative)) {
+                Ok(real) => return real == root.join(relative),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match relative.parent() {
+                    Some(parent) => relative = parent,
+                    None => return false,
+                },
+                Err(_) => return false,
+            }
+        }
     }
 
-    /// [`Self::pattern`], noting in `record` a file given up on that the
-    /// lookup met: what the lit generator's lookups for one payload use.
+    /// `doubt`, or else an `Uncovered` doubt when the walk does not cover
+    /// `path`.
+    fn or_uncovered(&self, doubt: Option<ArtDoubt>, path: &Path) -> Option<ArtDoubt> {
+        doubt.or_else(|| (!self.covered(path)).then(|| ArtDoubt::uncovered(path)))
+    }
+
+    /// Reads `path` under the retry policy; a missing file is not retried.
+    fn read(&self, path: &Path) -> Read {
+        let read = with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
+            match self.files.read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        });
+        match read {
+            Ok(Some(bytes)) => Read::Bytes(bytes),
+            Ok(None) => Read::Missing,
+            Err(e) => Read::Failed(e),
+        }
+    }
+
+    /// Whether `path` is a file, under the retry policy; a missing one is
+    /// not retried.
+    fn is_file(&self, path: &Path) -> io::Result<bool> {
+        with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
+            match self.files.is_file(path) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                other => other,
+            }
+        })
+    }
+
+    /// The decoded lit pattern a palette name stands for, or `None` (dark).
+    /// Generation uses [`Self::pattern_recorded`], which also says whether
+    /// the answer may be kept on disk.
+    ///
+    /// Blocking file I/O and decoding on first use of a texture.
+    #[cfg(test)]
+    pub fn pattern(&self, palette_name: &str) -> Option<Arc<LitPattern>> {
+        self.pattern_lookup(palette_name).value
+    }
+
+    /// The decoded lit pattern a palette name stands for, or `None` (dark),
+    /// noting in `record` a doubt the lookup met: what the lit generator's
+    /// lookups for one payload use.
+    ///
+    /// Blocking file I/O and decoding on first use of a texture.
     pub fn pattern_recorded(
         &self,
         palette_name: &str,
         record: &ArtRecord,
     ) -> Option<Arc<LitPattern>> {
         let lookup = self.pattern_lookup(palette_name);
-        record.note(&lookup);
-        lookup.found()
+        record.note(&lookup.doubt);
+        lookup.value
     }
 
     fn pattern_lookup(&self, palette_name: &str) -> Lookup<LitPattern> {
-        let lit = match self.terrain_lookup(palette_name) {
-            Lookup::Found(lit) => lit,
-            Lookup::Dark => return Lookup::Dark,
-            Lookup::GivenUp(path) => return Lookup::GivenUp(path),
+        let terrain = self.terrain_lookup(palette_name);
+        let Some(lit) = terrain.value else {
+            return Lookup::new(None, terrain.doubt);
         };
         let key = format!("{}|{}", lit.texture.display(), lit.ground_scale_m);
-        once(&self.patterns, &key, || self.load_pattern(&lit))
-    }
-
-    fn load_pattern(&self, lit: &LitTerrain) -> Lookup<LitPattern> {
-        let read = with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
-            self.files.read(&lit.texture)
-        });
-        let bytes = match read {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                warn!(texture = %lit.texture.display(), error = %e,
-                      "Night lighting: lit texture unreadable after retries; this class stays dark this session");
-                return Lookup::GivenUp(Arc::from(lit.texture.as_path()));
-            }
-        };
-        match decode_dxt1(&bytes, lit.ground_scale_m) {
-            Some(pattern) => Lookup::Found(Arc::new(pattern)),
-            None => {
-                warn!(texture = %lit.texture.display(),
-                      "Night lighting: lit texture is not a readable DXT1 DDS; this class stays dark");
-                Lookup::Dark
-            }
+        let pattern = once(&self.patterns, &key, || self.load_pattern(&lit));
+        Lookup {
+            value: pattern.value,
+            doubt: terrain.doubt.or(pattern.doubt),
         }
     }
 
+    /// The texture's pattern; its doubt is only its own read's (whether the
+    /// walk covers it is the terrain's answer).
+    fn load_pattern(&self, lit: &LitTerrain) -> Lookup<LitPattern> {
+        let texture = &lit.texture;
+        let bytes = match self.read(texture) {
+            Read::Bytes(bytes) => bytes,
+            Read::Missing => {
+                warn!(texture = %texture.display(),
+                      "Night lighting: lit texture missing; this class stays dark");
+                return Lookup::new(None, None);
+            }
+            Read::Failed(e) => {
+                warn!(texture = %texture.display(), error = %e,
+                      "Night lighting: lit texture unreadable after retries; this class stays dark this session");
+                return Lookup::new(None, Some(ArtDoubt::given_up(texture)));
+            }
+        };
+        let pattern = decode_dxt1(&bytes, lit.ground_scale_m);
+        if pattern.is_none() {
+            warn!(texture = %texture.display(),
+                  "Night lighting: lit texture is not a readable DXT1 DDS; this class stays dark");
+        }
+        Lookup::new(pattern, None)
+    }
+
     /// The lit terrain a recipe palette name stands for, or `None` (dark).
+    /// It does not say whether the answer is in doubt: the probe, its one
+    /// caller outside tests, decides only a size, which is never persisted.
     ///
     /// Blocking file I/O on first use of a name: call from a blocking context.
     pub fn lit_terrain(&self, palette_name: &str) -> Option<Arc<LitTerrain>> {
-        self.terrain_lookup(palette_name).found()
+        self.terrain_lookup(palette_name).value
     }
 
     fn terrain_lookup(&self, palette_name: &str) -> Lookup<LitTerrain> {
         once(&self.resolved, palette_name, || self.resolve(palette_name))
     }
 
-    /// The library index, or the `library.txt` given up on.
-    fn library(&self) -> Result<&LibraryIndex, &Arc<Path>> {
-        self.library
-            .get_or_init(|| {
-                let path = self.terrain_root.join("library.txt");
-                let read = with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
-                    self.files.read_to_string(&path)
-                });
-                match read {
-                    Ok(text) => Ok(LibraryIndex::parse(&text)),
-                    Err(e) => {
-                        warn!(path = %path.display(), error = %e,
-                              "Night lighting: Laminar library unreadable after retries; every lit texture stays dark this session");
-                        Err(Arc::from(path.as_path()))
-                    }
-                }
-            })
-            .as_ref()
+    /// Text of an art file: `Err` is the dark (or given up) answer to give.
+    fn text<T>(&self, path: &Path, what: &str) -> Result<String, Lookup<T>> {
+        match self.read(path) {
+            Read::Bytes(bytes) => String::from_utf8(bytes).map_err(|_| {
+                warn!(path = %path.display(), file = what,
+                      "Night lighting: Laminar art file is not UTF-8; it is treated as empty");
+                Lookup::new(None, self.or_uncovered(None, path))
+            }),
+            Read::Missing => {
+                warn!(path = %path.display(), file = what,
+                      "Night lighting: Laminar art file missing; it is treated as empty");
+                Err(Lookup::new(None, self.or_uncovered(None, path)))
+            }
+            Read::Failed(e) => {
+                warn!(path = %path.display(), file = what, error = %e,
+                      "Night lighting: Laminar art file unreadable after retries; it is treated as empty this session");
+                Err(Lookup::new(None, Some(ArtDoubt::given_up(path))))
+            }
+        }
+    }
+
+    fn library(&self) -> &Lookup<LibraryIndex> {
+        self.library.get_or_init(|| {
+            // The walk before the first read: a file replaced after a read
+            // and before the walk would file the answer under the new
+            // file's identity.
+            self.fingerprint();
+            let path = self.root_lexical.join("library.txt");
+            match self.text(&path, "library") {
+                Ok(text) => Lookup::new(
+                    Some(LibraryIndex::parse(&text)),
+                    self.or_uncovered(None, &path),
+                ),
+                Err(dark) => dark,
+            }
+        })
     }
 
     fn resolve(&self, palette_name: &str) -> Lookup<LitTerrain> {
-        let library = match self.library() {
-            Ok(library) => library,
-            Err(path) => return Lookup::GivenUp(Arc::clone(path)),
+        let library = self.library();
+        let Some(index) = &library.value else {
+            return Lookup::new(None, library.doubt.clone());
         };
-        let Some(file) = library.resolve(palette_name) else {
+        let Some(file) = index.resolve(palette_name) else {
             warn!(
                 name = palette_name,
                 "Night lighting: palette name not in the Laminar library; this class stays dark"
             );
-            return Lookup::Dark;
+            return Lookup::new(None, library.doubt.clone());
         };
-        let ter_path = self.terrain_root.join(file);
-        let read = with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
-            self.files.read_to_string(&ter_path)
-        });
-        let text = match read {
+        let ter_path = normalize(&self.root_lexical.join(file));
+        let text = match self.text::<LitTerrain>(&ter_path, "terrain") {
             Ok(text) => text,
-            Err(e) => {
-                warn!(name = palette_name, path = %ter_path.display(), error = %e,
-                      "Night lighting: lit terrain unreadable after retries; this class stays dark this session");
-                return Lookup::GivenUp(Arc::from(ter_path.as_path()));
-            }
+            Err(dark) => return Lookup::new(None, library.doubt.clone().or(dark.doubt)),
         };
-        let Some(ter_dir) = ter_path.parent() else {
-            return Lookup::Dark;
+        let doubt = self.or_uncovered(library.doubt.clone(), &ter_path);
+        let Some(lit) = ter_path
+            .parent()
+            .and_then(|dir| parse_lit_terrain(&text, dir))
+        else {
+            debug!(
+                name = palette_name,
+                "Night lighting: terrain has no lit texture"
+            );
+            return Lookup::new(None, doubt);
         };
-        match parse_lit_terrain(&text, ter_dir) {
-            Some(lit) if lit.texture.is_file() => Lookup::Found(Arc::new(lit)),
-            Some(lit) => {
+        let lit = LitTerrain {
+            texture: normalize(&lit.texture),
+            ..lit
+        };
+        let doubt = self.or_uncovered(doubt, &lit.texture);
+        match self.is_file(&lit.texture) {
+            Ok(true) => Lookup::new(Some(lit), doubt),
+            Ok(false) => {
                 warn!(name = palette_name, texture = %lit.texture.display(),
                       "Night lighting: lit texture missing; this class stays dark");
-                Lookup::Dark
+                Lookup::new(None, doubt)
             }
-            None => {
-                debug!(
-                    name = palette_name,
-                    "Night lighting: terrain has no lit texture"
-                );
-                Lookup::Dark
+            Err(e) => {
+                warn!(name = palette_name, texture = %lit.texture.display(), error = %e,
+                      "Night lighting: lit texture unreadable after retries; this class stays dark this session");
+                Lookup::new(None, doubt.or(Some(ArtDoubt::given_up(&lit.texture))))
             }
         }
     }
 }
 
-/// Art file reads for tests: the disk, except that the first `failures`
-/// reads of one file fail with an I/O error; every read of that file is
-/// counted, and each successful one takes `delay` longer.
+/// Art file access for tests: the disk, except that the first
+/// `read_failures` reads and `stat_failures` `is_file`s of one file fail
+/// with an I/O error. Every read of that file is counted, and each
+/// successful one takes `delay` longer.
 #[cfg(test)]
 pub(crate) struct FlakyArtFiles {
     path: PathBuf,
-    failures: std::sync::atomic::AtomicUsize,
+    read_failures: std::sync::atomic::AtomicUsize,
+    stat_failures: std::sync::atomic::AtomicUsize,
     reads: std::sync::atomic::AtomicUsize,
     delay: std::time::Duration,
 }
 
 #[cfg(test)]
 impl FlakyArtFiles {
-    /// The first `failures` reads of `path` fail (`usize::MAX`: every one).
-    pub(crate) fn new(path: PathBuf, failures: usize) -> Self {
+    /// The first `read_failures` reads of `path` fail (`usize::MAX`: every one).
+    pub(crate) fn new(path: PathBuf, read_failures: usize) -> Self {
         Self {
             path,
-            failures: failures.into(),
+            read_failures: read_failures.into(),
+            stat_failures: 0.into(),
             reads: 0.into(),
             delay: std::time::Duration::ZERO,
         }
+    }
+
+    /// The first `failures` `is_file`s of the file fail too.
+    pub(crate) fn failing_stats(self, failures: usize) -> Self {
+        self.stat_failures
+            .store(failures, std::sync::atomic::Ordering::SeqCst);
+        self
     }
 
     /// Each successful read of the file takes `delay` longer.
@@ -356,34 +553,31 @@ impl FlakyArtFiles {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn attempt(&self, path: &Path) -> io::Result<()> {
+    fn injected(failures: &std::sync::atomic::AtomicUsize) -> io::Result<()> {
         use std::sync::atomic::Ordering::SeqCst;
-        if path != self.path {
-            return Ok(());
+        match failures.fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1)) {
+            Ok(_) => Err(io::Error::other("injected I/O failure")),
+            Err(_) => Ok(()),
         }
-        self.reads.fetch_add(1, SeqCst);
-        if self
-            .failures
-            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
-            return Err(io::Error::other("injected read failure"));
-        }
-        std::thread::sleep(self.delay);
-        Ok(())
     }
 }
 
 #[cfg(test)]
 impl ArtFiles for FlakyArtFiles {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
-        self.attempt(path)?;
+        if path == self.path {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self::injected(&self.read_failures)?;
+            std::thread::sleep(self.delay);
+        }
         std::fs::read(path)
     }
 
-    fn read_to_string(&self, path: &Path) -> io::Result<String> {
-        self.attempt(path)?;
-        std::fs::read_to_string(path)
+    fn is_file(&self, path: &Path) -> io::Result<bool> {
+        if path == self.path {
+            Self::injected(&self.stat_failures)?;
+        }
+        DiskArtFiles.is_file(path)
     }
 }
 
@@ -434,11 +628,6 @@ mod tests {
         std::fs::write(lit_file(root), dds).unwrap();
     }
 
-    /// The lit texture's path as the art resolves it (through `terrain12/..`).
-    fn resolved_lit_file(art: &LaminarArt) -> PathBuf {
-        art.lit_terrain(URBAN).unwrap().texture.clone()
-    }
-
     #[test]
     fn the_fingerprint_is_stable_for_one_tree() {
         let temp = TempDir::new().unwrap();
@@ -467,6 +656,39 @@ mod tests {
     fn a_missing_root_still_has_a_fingerprint() {
         let art = LaminarArt::new(PathBuf::from("/nonexistent/1000 world terrain"));
         assert_eq!(art.fingerprint(), art.fingerprint());
+    }
+
+    /// The digest of one tree, pinned: what the walk hashes may not change,
+    /// or every user's lit disk tier would be regenerated.
+    #[test]
+    fn the_fingerprint_of_a_fixed_tree_is_pinned() {
+        let temp = TempDir::new().unwrap();
+        install_decodable(temp.path());
+        std::fs::write(temp.path().join("terrain12/notes.txt"), b"not art").unwrap();
+        let when = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for file in [
+            "library.txt",
+            "terrain12/urban_tmp_sdry3.ter",
+            "terrain12/park_tmp_sdry1.ter",
+            "terrain12/notes.txt",
+            "textures12/urban_FAR/uw5_FAR_LIT.dds",
+        ] {
+            std::fs::File::options()
+                .write(true)
+                .open(temp.path().join(file))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        let hex: String = LaminarArt::new(temp.path().to_path_buf())
+            .fingerprint()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "e181ab1beb3b44a347692a743cc4620f11da0a10507c4b5eeff69ca952f2d1bd"
+        );
     }
 
     #[test]
@@ -554,90 +776,271 @@ mod tests {
         assert!(art.pattern(URBAN).is_none());
     }
 
+    /// The doubt `record` holds, as (file, kind).
+    fn doubt(record: &ArtRecord) -> Option<(PathBuf, ArtDoubtKind)> {
+        record.doubt().map(|d| (d.file.to_path_buf(), d.kind))
+    }
+
+    /// The doubt of one fresh lookup of `name`, and whether it was lit.
+    fn lookup(art: &LaminarArt, name: &str) -> (bool, Option<(PathBuf, ArtDoubtKind)>) {
+        let record = ArtRecord::default();
+        let lit = art.pattern_recorded(name, &record).is_some();
+        (lit, doubt(&record))
+    }
+
+    fn ter_file(root: &Path) -> PathBuf {
+        root.join("terrain12/urban_tmp_sdry3.ter")
+    }
+
     #[test]
-    fn dark_content_is_not_given_up_on() {
+    fn dark_content_is_settled() {
         // Unlit, unknown and undecodable are properties of the files the
         // fingerprint covers: the same every session.
         let temp = TempDir::new().unwrap();
         install(temp.path(), true); // the lit texture does not decode
         let art = LaminarArt::new(temp.path().to_path_buf());
-        let record = ArtRecord::default();
         for name in [PARK, "lib/g10/terrain10/nope.ter", URBAN] {
-            assert!(art.pattern_recorded(name, &record).is_none(), "{name}");
+            assert_eq!(lookup(&art, name), (false, None), "{name}");
         }
-        assert_eq!(record.given_up(), None);
+    }
+
+    #[test]
+    fn a_missing_file_under_the_root_is_dark_and_settled() {
+        // Whether a file the walk would hash exists is in the fingerprint.
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), false); // no lit texture
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(lookup(&art, URBAN), (false, None), "missing texture");
+
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        std::fs::remove_file(ter_file(temp.path())).unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(lookup(&art, URBAN), (false, None), "missing .ter");
+
+        let temp = TempDir::new().unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(lookup(&art, URBAN), (false, None), "missing library");
+    }
+
+    #[test]
+    fn a_missing_file_takes_no_retries() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        std::fs::remove_file(ter_file(temp.path())).unwrap();
+        let files = Arc::new(FlakyArtFiles::new(ter_file(temp.path()), 0));
+        let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
+        assert!(art.lit_terrain(URBAN).is_none());
+        assert_eq!(files.reads(), 1);
+    }
+
+    #[test]
+    fn no_installation_is_in_doubt() {
+        // Without a root nothing is walked, so nothing is covered.
+        let root = PathBuf::from("/nonexistent/1000 world terrain");
+        let art = LaminarArt::new(root.clone());
+        assert_eq!(
+            lookup(&art, URBAN),
+            (
+                false,
+                Some((root.join("library.txt"), ArtDoubtKind::Uncovered))
+            )
+        );
+    }
+
+    #[test]
+    fn files_that_are_not_utf8_are_dark_and_settled() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        std::fs::write(ter_file(temp.path()), b"TEXTURE_LIT \xff\xfe\n").unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(lookup(&art, URBAN), (false, None), ".ter");
+
+        std::fs::write(temp.path().join("library.txt"), b"A\n\xff\n").unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(lookup(&art, URBAN), (false, None), "library");
+    }
+
+    #[test]
+    fn a_library_and_a_ter_whose_first_read_fails_are_read_again() {
+        for file in ["library.txt", "terrain12/urban_tmp_sdry3.ter"] {
+            let temp = TempDir::new().unwrap();
+            install_decodable(temp.path());
+            let files = Arc::new(FlakyArtFiles::new(temp.path().join(file), 1));
+            let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
+            assert_eq!(lookup(&art, URBAN), (true, None), "{file}");
+            assert_eq!(files.reads(), 2, "{file}: one retry");
+        }
     }
 
     #[test]
     fn an_unreadable_ter_is_given_up_on() {
         let temp = TempDir::new().unwrap();
-        install(temp.path(), true);
-        let ter = temp.path().join("terrain12/urban_tmp_sdry3.ter");
-        std::fs::remove_file(&ter).unwrap();
-        let art = LaminarArt::new(temp.path().to_path_buf());
-        let record = ArtRecord::default();
-        assert!(art.pattern_recorded(URBAN, &record).is_none());
-        assert_eq!(record.given_up(), Some(ter.as_path()));
+        install_decodable(temp.path());
+        let ter = ter_file(temp.path());
+        let files = Arc::new(FlakyArtFiles::new(ter.clone(), usize::MAX));
+        let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
+        assert_eq!(
+            lookup(&art, URBAN),
+            (false, Some((ter, ArtDoubtKind::GivenUp)))
+        );
+        assert_eq!(files.reads(), 1 + READ_RETRIES as usize);
+        assert_eq!(lookup(&art, PARK), (false, None), "another .ter");
     }
 
     #[test]
-    fn a_missing_library_is_given_up_on() {
-        let root = PathBuf::from("/nonexistent/1000 world terrain");
-        let art = LaminarArt::new(root.clone());
-        let record = ArtRecord::default();
-        assert!(art.pattern_recorded(URBAN, &record).is_none());
-        assert_eq!(record.given_up(), Some(root.join("library.txt").as_path()));
+    fn a_library_given_up_on_is_noted_by_every_later_lookup() {
+        let temp = TempDir::new().unwrap();
+        install_decodable(temp.path());
+        let library = temp.path().join("library.txt");
+        let files = Arc::new(FlakyArtFiles::new(library.clone(), usize::MAX));
+        let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
+        let given_up = Some((library, ArtDoubtKind::GivenUp));
+        assert_eq!(lookup(&art, URBAN), (false, given_up.clone()));
+        assert_eq!(lookup(&art, URBAN), (false, given_up.clone()), "cached");
+        assert_eq!(lookup(&art, PARK), (false, given_up), "another name");
+        assert_eq!(files.reads(), 1 + READ_RETRIES as usize, "read once");
     }
 
     #[test]
     fn a_lit_texture_whose_first_read_fails_is_read_again_and_lit() {
         let temp = TempDir::new().unwrap();
         install_decodable(temp.path());
-        let path = resolved_lit_file(&LaminarArt::new(temp.path().to_path_buf()));
-        let files = Arc::new(FlakyArtFiles::new(path, 1));
+        let files = Arc::new(FlakyArtFiles::new(lit_file(temp.path()), 1));
         let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
-        let record = ArtRecord::default();
-        assert!(art.pattern_recorded(URBAN, &record).is_some(), "lit");
+        assert_eq!(lookup(&art, URBAN), (true, None));
         assert_eq!(files.reads(), 2, "one retry");
-        assert_eq!(record.given_up(), None);
     }
 
     #[test]
     fn a_lit_texture_unreadable_on_every_attempt_is_given_up_on_once() {
         let temp = TempDir::new().unwrap();
         install_decodable(temp.path());
-        let path = resolved_lit_file(&LaminarArt::new(temp.path().to_path_buf()));
+        let path = lit_file(temp.path());
         let files = Arc::new(FlakyArtFiles::new(path.clone(), usize::MAX));
         let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
+        let given_up = Some((path, ArtDoubtKind::GivenUp));
         let log = logged(|| {
-            let record = ArtRecord::default();
-            assert!(art.pattern_recorded(URBAN, &record).is_none(), "dark");
-            assert_eq!(record.given_up(), Some(path.as_path()));
-            // Remembered for the session: no more reads, still recorded.
-            let later = ArtRecord::default();
-            assert!(art.pattern_recorded(URBAN, &later).is_none());
-            assert_eq!(later.into_given_up().as_deref(), Some(path.as_path()));
+            assert_eq!(lookup(&art, URBAN), (false, given_up.clone()));
+            // Remembered for the session: no more reads, still noted.
+            assert_eq!(lookup(&art, URBAN), (false, given_up));
         });
         assert_eq!(files.reads(), 1 + READ_RETRIES as usize);
         assert_eq!(log.matches("WARN").count(), 1, "{log}");
         assert!(log.contains("uw5_FAR_LIT.dds"), "{log}");
         // The probe's view of the class is unaffected: its terrain resolved.
         assert!(art.lit_terrain(URBAN).is_some());
+        assert_eq!(lookup(&art, PARK), (false, None), "other lookups");
     }
 
     #[test]
-    fn a_given_up_file_is_recorded_only_by_the_lookups_that_meet_it() {
+    fn a_lit_texture_stat_that_fails_once_is_retried() {
         let temp = TempDir::new().unwrap();
         install_decodable(temp.path());
-        let path = resolved_lit_file(&LaminarArt::new(temp.path().to_path_buf()));
-        let art = LaminarArt::with_files(
-            temp.path().to_path_buf(),
-            Arc::new(FlakyArtFiles::new(path, usize::MAX)),
+        let files = Arc::new(FlakyArtFiles::new(lit_file(temp.path()), 0).failing_stats(1));
+        let art = LaminarArt::with_files(temp.path().to_path_buf(), files);
+        assert_eq!(lookup(&art, URBAN), (true, None));
+    }
+
+    #[test]
+    fn a_lit_texture_stat_failing_every_attempt_is_given_up_on() {
+        let temp = TempDir::new().unwrap();
+        install_decodable(temp.path());
+        let path = lit_file(temp.path());
+        let files = Arc::new(FlakyArtFiles::new(path.clone(), 0).failing_stats(usize::MAX));
+        let art = LaminarArt::with_files(temp.path().to_path_buf(), files);
+        assert_eq!(
+            lookup(&art, URBAN),
+            (false, Some((path, ArtDoubtKind::GivenUp)))
         );
-        assert!(art.pattern(URBAN).is_none());
-        let park = ArtRecord::default();
-        assert!(art.pattern_recorded(PARK, &park).is_none());
-        assert_eq!(park.given_up(), None);
+        assert!(art.lit_terrain(URBAN).is_none(), "dark for the probe too");
+    }
+
+    /// `install_decodable` under `temp/root`, with the urban `.ter`
+    /// pointing at `texture` (relative to `terrain12`).
+    fn install_pointing_at(temp: &TempDir, texture: &str) -> PathBuf {
+        let root = temp.path().join("root");
+        install_decodable(&root);
+        std::fs::write(
+            ter_file(&root),
+            format!("TEXTURE_LIT {texture}\nLIT_FADE_PARAMS 3072 7000 15000\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn a_lit_texture_outside_the_root_is_in_doubt() {
+        let temp = TempDir::new().unwrap();
+        let root = install_pointing_at(&temp, "../../outside/x_LIT.dds");
+        let outside = temp.path().join("outside/x_LIT.dds");
+        let art = LaminarArt::new(root.clone());
+        let uncovered = Some((outside.clone(), ArtDoubtKind::Uncovered));
+        assert_eq!(lookup(&art, URBAN), (false, uncovered.clone()), "missing");
+
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::copy(lit_file(&root), &outside).unwrap();
+        let art = LaminarArt::new(root);
+        assert_eq!(lookup(&art, URBAN), (true, uncovered), "lit");
+    }
+
+    #[test]
+    fn a_lit_texture_the_walk_does_not_hash_is_in_doubt() {
+        let temp = TempDir::new().unwrap();
+        let root = install_pointing_at(&temp, "../textures12/urban_FAR/night.dds");
+        let texture = root.join("textures12/urban_FAR/night.dds");
+        std::fs::copy(lit_file(&root), &texture).unwrap();
+        let art = LaminarArt::new(root);
+        assert_eq!(
+            lookup(&art, URBAN),
+            (true, Some((texture, ArtDoubtKind::Uncovered)))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lit_texture_in_a_symlinked_folder_is_in_doubt() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        install_decodable(&root);
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::rename(root.join("textures12"), &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("textures12")).unwrap();
+        let art = LaminarArt::new(root.clone());
+        assert_eq!(
+            lookup(&art, URBAN),
+            (true, Some((lit_file(&root), ArtDoubtKind::Uncovered)))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_covered() {
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        install_decodable(&real);
+        let root = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        assert_eq!(lookup(&LaminarArt::new(root), URBAN), (true, None));
+    }
+
+    #[test]
+    fn the_walk_runs_before_the_first_art_read() {
+        let temp = TempDir::new().unwrap();
+        install_decodable(temp.path());
+        let before = LaminarArt::new(temp.path().to_path_buf()).fingerprint();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert!(art.lit_terrain(URBAN).is_some());
+        std::fs::write(
+            ter_file(temp.path()),
+            "TEXTURE_LIT ../textures12/urban_FAR/uw5_FAR_LIT.dds\nLIT_FADE_PARAMS 4096 1 2\n",
+        )
+        .unwrap();
+        assert_eq!(art.fingerprint(), before, "walked before the read");
+        assert_ne!(
+            LaminarArt::new(temp.path().to_path_buf()).fingerprint(),
+            before
+        );
     }
 
     #[test]
@@ -645,9 +1048,10 @@ mod tests {
         const CALLERS: usize = 8;
         let temp = TempDir::new().unwrap();
         install_decodable(temp.path());
-        let path = resolved_lit_file(&LaminarArt::new(temp.path().to_path_buf()));
         // Slow enough that every caller arrives while the first one reads.
-        let files = Arc::new(FlakyArtFiles::new(path, 0).slowed(Duration::from_millis(50)));
+        let files = Arc::new(
+            FlakyArtFiles::new(lit_file(temp.path()), 0).slowed(Duration::from_millis(50)),
+        );
         let art = LaminarArt::with_files(temp.path().to_path_buf(), files.clone());
         let barrier = std::sync::Barrier::new(CALLERS);
         let patterns: Vec<_> = std::thread::scope(|s| {
@@ -663,6 +1067,56 @@ mod tests {
         });
         assert_eq!(files.reads(), 1, "one read and decode");
         assert!(patterns.iter().all(|p| Arc::ptr_eq(p, &patterns[0])));
+    }
+
+    /// Every global `.ter` export of the installation `XEL_LAMINAR_ART`
+    /// names is settled (no doubt), so the lit disk tier is written on a
+    /// stock install; prints the counts and the fingerprint.
+    #[test]
+    #[ignore = "needs a real Laminar installation"]
+    fn a_real_installation_is_settled() {
+        let Some(root) = std::env::var_os("XEL_LAMINAR_ART") else {
+            eprintln!("XEL_LAMINAR_ART is not set: skipped (point it at `1000 world terrain`)");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let text = std::fs::read_to_string(root.join("library.txt")).unwrap();
+        let mut names: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                match tokens.as_slice() {
+                    [kind, name, ..] if kind.starts_with("EXPORT") && name.ends_with(".ter") => {
+                        Some(*name)
+                    }
+                    [kind, _, name, ..] if kind.starts_with("EXPORT") && name.ends_with(".ter") => {
+                        Some(*name)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        let art = LaminarArt::new(root);
+        let (mut lit, mut doubts) = (0, Vec::new());
+        for name in &names {
+            let (is_lit, doubt) = lookup(&art, name);
+            lit += usize::from(is_lit);
+            doubts.extend(doubt.map(|d| (name.to_string(), d)));
+        }
+        let hex: String = art
+            .fingerprint()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        eprintln!(
+            "{} names, {lit} lit, {} in doubt; fingerprint {hex}",
+            names.len(),
+            doubts.len()
+        );
+        assert!(lit > 0);
+        assert!(doubts.is_empty(), "{doubts:?}");
     }
 
     #[test]

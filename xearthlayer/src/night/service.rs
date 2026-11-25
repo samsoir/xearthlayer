@@ -38,7 +38,7 @@ use super::stats::{
     WriteBackSkip,
 };
 use super::{
-    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
+    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
     ArtRecord, FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
     TextureSettingSource,
 };
@@ -266,12 +266,12 @@ pub struct NightLitSource {
 }
 
 /// A generated part of a footprint, how complete its roads were, and the
-/// first Laminar art file its pattern lookups met that was given up on after
-/// I/O errors this session.
+/// first doubt its Laminar art lookups met (an art file given up on after
+/// I/O errors, or one the lit fingerprint does not cover).
 struct Generated {
     bytes: Bytes,
     roads: RoadsState,
-    art_given_up: Option<Arc<std::path::Path>>,
+    art_doubt: Option<ArtDoubt>,
 }
 
 /// Whether a generation had every road tile it could draw.
@@ -303,21 +303,21 @@ impl RoadsState {
 /// [`WriteBackSkip`]'s order. Roads still building make it a payload kept
 /// nowhere (a later generation may have them). Without a fingerprint there
 /// is no safe disk entry. A failed road tile has no roads this session, but
-/// a later session may read it. An art file the payload's pattern lookups
-/// met that was given up on after I/O errors may make the payload differ
-/// from a later session's under the same fingerprint (an art file that reads
-/// but does not decode does not: its dark class is the same every session).
-/// `art_failed` is asked only when the rest allow a write-back.
+/// a later session may read it. A doubt among the payload's Laminar art
+/// lookups (`art_doubted`: a file given up on after I/O errors, or one the
+/// fingerprint does not cover) may make the payload differ from a later
+/// session's under the same fingerprint; a file that is missing or does not
+/// decode does not, as its dark class is the same every session.
 fn write_back_skip(
     roads: RoadsState,
     fingerprinted: bool,
-    art_failed: impl FnOnce() -> bool,
+    art_doubted: bool,
 ) -> Option<WriteBackSkip> {
     match roads {
         RoadsState::TimedOut => Some(WriteBackSkip::RoadsLate),
         _ if !fingerprinted => Some(WriteBackSkip::NoFingerprint),
         RoadsState::Failed => Some(WriteBackSkip::RoadFailed),
-        RoadsState::Complete if art_failed() => Some(WriteBackSkip::ArtFailed),
+        RoadsState::Complete if art_doubted => Some(WriteBackSkip::ArtFailed),
         RoadsState::Complete => None,
     }
 }
@@ -446,9 +446,11 @@ impl NightLitSource {
     }
 
     /// Disk first, then generation; a generated payload is written back
-    /// without waiting, unless its pattern lookups met an art file given up
-    /// on after I/O errors or a road tile was missing. `Err` is a payload not to keep in memory:
-    /// black, or generated while a road tile was late. Without a disk tier
+    /// without waiting, unless [`write_back_skip`] gives a reason not to (a
+    /// road tile missing, no fingerprint, a doubt among its art lookups).
+    /// When the reason is the art, a debug line names the file and why; a
+    /// payload skipped for an earlier reason logs none. `Err` is a payload
+    /// not to keep in memory: black, or generated while a road tile was late. Without a disk tier
     /// this is `generate`. Sets `from_disk` when the payload is read from
     /// the disk tier.
     async fn load_or_generate(
@@ -494,14 +496,14 @@ impl NightLitSource {
         let generated = self.generate(name, &layout).await;
         let skip = generated
             .as_ref()
-            .and_then(|g| write_back_skip(g.roads, fp.is_some(), || g.art_given_up.is_some()));
+            .and_then(|g| write_back_skip(g.roads, fp.is_some(), g.art_doubt.is_some()));
         if let Some(skip) = skip {
             self.stats.record_write_back_skipped(skip);
         }
         if let (
             Some(WriteBackSkip::ArtFailed),
             Some(Generated {
-                art_given_up: Some(file),
+                art_doubt: Some(doubt),
                 ..
             }),
         ) = (skip, &generated)
@@ -510,8 +512,9 @@ impl NightLitSource {
                 row,
                 col,
                 zoom,
-                file = %file.display(),
-                "Night lighting: lit texture kept off disk; an art file it uses was given up on this session"
+                file = %doubt.file.display(),
+                reason = doubt.kind.reason(),
+                "Night lighting: lit texture kept off disk; an art file it uses may differ next session"
             );
         }
         let (Some(fp), None, Some(Generated { bytes: payload, .. })) = (&fp, skip, &generated)
@@ -627,8 +630,8 @@ impl NightLitSource {
                     .get(&(lat, lon))
                     .map_or(LedRegion::Unknown, |(_, g)| *g)
             };
-            // The art files given up on that this payload's lookups met
-            // decide whether it may be kept on disk.
+            // The doubts this payload's art lookups meet decide whether it
+            // may be kept on disk.
             let art_record = ArtRecord::default();
             let patterns = |n: &str| art.pattern_recorded(n, &art_record);
             // The tiles' handles are dropped once rastered: the road cache
@@ -649,7 +652,7 @@ impl NightLitSource {
             Some((
                 super::generator::encode_visible(image),
                 roads.stats,
-                art_record.into_given_up(),
+                art_record.into_doubt(),
             ))
         })
         .await;
@@ -664,7 +667,7 @@ impl NightLitSource {
                 );
                 None
             }
-            Ok(Some((Ok(bytes), road, art_given_up))) => {
+            Ok(Some((Ok(bytes), road, art_doubt))) => {
                 debug!(
                     row = name.row,
                     col = name.col,
@@ -682,7 +685,7 @@ impl NightLitSource {
                 Some(Generated {
                     bytes,
                     roads: roads_state,
-                    art_given_up,
+                    art_doubt,
                 })
             }
             Ok(Some((Err(e), _, _))) => {
@@ -761,6 +764,8 @@ impl NightLitSource {
             // The field reads every tile the generator could read for this
             // footprint, once each; an unreadable one counts as dark.
             let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
+            // `lit_terrain` records no doubt, which is safe here: the probe
+            // decides a size, and a size is never persisted.
             if RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some()) {
                 ProbeAnswer::Recipe
             } else if road_tiles.iter().any(|roads| {
@@ -1710,11 +1715,10 @@ mod tests {
             assert_eq!(calls(&second), 1, "regenerated, not decoded");
         }
 
-        /// The fixture's lit texture as the art resolves it (through the
-        /// `.ter`'s folder), which is the path its reads are made with.
+        /// The fixture's lit texture as the art resolves it (normalized),
+        /// which is the path its reads are made with.
         fn fixture_lit_file(temp: &TempDir) -> std::path::PathBuf {
-            temp.path()
-                .join("art/terrain12/../textures12/urban_FAR/uw5_FAR_LIT.dds")
+            temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds")
         }
 
         /// A session over the fixture tree in `temp` (written when absent)
@@ -1829,6 +1833,40 @@ mod tests {
             assert_eq!(
                 source.served_payload(&uses, &layout).await.1,
                 ReadOutcome::MemoryHit
+            );
+        }
+
+        #[tokio::test]
+        async fn a_lit_texture_outside_the_fingerprint_keeps_its_payloads_off_disk() {
+            // Lit, but from a file the fingerprint walk does not cover: it
+            // may change without changing the fingerprint.
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let outside = temp.path().join("outside/uw5_FAR_LIT.dds");
+            std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+            std::fs::rename(fixture_lit_file(&temp), &outside).unwrap();
+            std::fs::write(
+                temp.path().join("art/terrain12/u.ter"),
+                "TEXTURE_LIT ../../outside/uw5_FAR_LIT.dds\n",
+            )
+            .unwrap();
+            let disk = disk();
+            let source = source_in(&temp).with_disk_cache(disk.clone());
+            let (other, uses) = (dark_name(), lit_name());
+            let log = crate::night::test_log::LogCapture::start();
+            let payload = source.served_payload(&uses, &LitLayout::new(16, 4)).await.0;
+            assert!(payload.unwrap().iter().any(|&b| b != 0), "lit");
+            source.served_payload(&other, &LitLayout::new(16, 4)).await;
+            let snap = counted(&source, |s| s.disk_writes == 1).await;
+            assert_eq!(snap.write_backs_skipped(WriteBackSkip::ArtFailed), 1);
+            assert!(!on_disk(&disk, &uses).await);
+            assert!(on_disk(&disk, &other).await);
+            let log = log.text();
+            assert!(
+                log.lines().any(|l| l.contains("kept off disk")
+                    && l.contains("not covered by the lit fingerprint")
+                    && l.contains("outside/uw5_FAR_LIT.dds")),
+                "{log}"
             );
         }
 
@@ -2669,13 +2707,14 @@ mod tests {
         fn a_write_back_is_skipped_for_the_first_reason_that_applies() {
             use RoadsState::{Complete, Failed, TimedOut};
             use WriteBackSkip::{ArtFailed, NoFingerprint, RoadFailed, RoadsLate};
-            let never = || -> bool { panic!("art asked although the rest skip") };
-            assert_eq!(write_back_skip(TimedOut, false, never), Some(RoadsLate));
-            assert_eq!(write_back_skip(Failed, false, never), Some(NoFingerprint));
-            assert_eq!(write_back_skip(Complete, false, never), Some(NoFingerprint));
-            assert_eq!(write_back_skip(Failed, true, never), Some(RoadFailed));
-            assert_eq!(write_back_skip(Complete, true, || true), Some(ArtFailed));
-            assert_eq!(write_back_skip(Complete, true, || false), None);
+            for art in [false, true] {
+                assert_eq!(write_back_skip(TimedOut, false, art), Some(RoadsLate));
+                assert_eq!(write_back_skip(Failed, false, art), Some(NoFingerprint));
+                assert_eq!(write_back_skip(Complete, false, art), Some(NoFingerprint));
+                assert_eq!(write_back_skip(Failed, true, art), Some(RoadFailed));
+            }
+            assert_eq!(write_back_skip(Complete, true, true), Some(ArtFailed));
+            assert_eq!(write_back_skip(Complete, true, false), None);
         }
 
         #[tokio::test]
