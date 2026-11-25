@@ -30,6 +30,9 @@ pub struct StatsSnapshot {
     pub answered_before_roads: u64,
     pub tiles_ready: u64,
     pub tiles_failed: u64,
+    /// Road cache entries never written because the write backlog was
+    /// full: the next session extracts their DSFs again.
+    pub road_writes_dropped: u64,
 }
 
 impl StatsSnapshot {
@@ -45,6 +48,7 @@ impl StatsSnapshot {
             answered_before_roads: self.answered_before_roads - earlier.answered_before_roads,
             tiles_ready: self.tiles_ready - earlier.tiles_ready,
             tiles_failed: self.tiles_failed - earlier.tiles_failed,
+            road_writes_dropped: self.road_writes_dropped - earlier.road_writes_dropped,
         }
     }
 }
@@ -98,6 +102,7 @@ pub struct Stats {
     answered_before_roads: AtomicU64,
     tiles_ready: AtomicU64,
     tiles_failed: AtomicU64,
+    road_writes_dropped: AtomicU64,
     window: Mutex<Window>,
 }
 
@@ -162,6 +167,12 @@ impl Stats {
         add(&self.answered_before_roads, 1);
     }
 
+    /// A built tile's `entries` road cache entries dropped, the write
+    /// backlog being full.
+    pub fn record_writes_dropped(&self, entries: u64) {
+        add(&self.road_writes_dropped, entries);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         let (probe_waits, probe_timeouts) = self.probe.get();
@@ -176,6 +187,7 @@ impl Stats {
             answered_before_roads: get(&self.answered_before_roads),
             tiles_ready: get(&self.tiles_ready),
             tiles_failed: get(&self.tiles_failed),
+            road_writes_dropped: get(&self.road_writes_dropped),
         }
     }
 
@@ -231,6 +243,7 @@ impl Stats {
             generate_waits = d.generate_waits,
             generate_timeouts = d.generate_timeouts,
             answered_before_roads = d.answered_before_roads,
+            road_writes_dropped = d.road_writes_dropped,
             extracted,
             extract_median_ms,
             extract_p95_ms,
@@ -329,6 +342,23 @@ mod tests {
         assert_eq!((snap.probe_waits, snap.probe_timeouts), (1, 0));
         assert_eq!((snap.generate_waits, snap.generate_timeouts), (1, 1));
         assert_eq!(snap.answered_before_roads, 0);
+    }
+
+    #[test]
+    fn dropped_road_writes_are_counted_and_reported_per_window() {
+        let s = Stats::default();
+        s.record_writes_dropped(3);
+        let w = s.take_window().expect("a drop is something that happened");
+        assert_eq!(
+            w.delta,
+            StatsSnapshot {
+                road_writes_dropped: 3,
+                ..StatsSnapshot::default()
+            }
+        );
+        s.record_writes_dropped(2);
+        assert_eq!(s.take_window().unwrap().delta.road_writes_dropped, 2);
+        assert_eq!(s.snapshot().road_writes_dropped, 5, "cumulative");
     }
 
     #[test]

@@ -383,7 +383,6 @@ pub struct RoadService {
 #[derive(Default)]
 struct TestProbes {
     writes_peak: std::sync::atomic::AtomicUsize,
-    writes_dropped: std::sync::atomic::AtomicUsize,
     /// Road entry writes waiting for a lit disk permit.
     writes_awaiting_permit: std::sync::atomic::AtomicUsize,
     index_builds: std::sync::atomic::AtomicUsize,
@@ -1223,8 +1222,7 @@ impl RoadService {
                 (n < backlog).then_some(n + 1)
             });
         if admitted.is_err() {
-            #[cfg(test)]
-            self.test.writes_dropped.fetch_add(1, Ordering::SeqCst);
+            self.stats.record_writes_dropped(entries.len() as u64);
             debug!(
                 lat = tile.0,
                 lon = tile.1,
@@ -2373,9 +2371,9 @@ pub(crate) mod tests {
         assert!(r.complete);
         assert_eq!(d.sets_waiting(), 1, "U's write is still blocked");
         assert_eq!(
-            svc.test.writes_dropped.load(Ordering::SeqCst),
+            svc.stats_snapshot().road_writes_dropped,
             1,
-            "T's entries: the backlog is full"
+            "T's entry: the backlog is full"
         );
         gate.add_permits(1);
         assert_eq!(entries(&svc, &(d.clone() as _)).await, 1, "U's entry");
