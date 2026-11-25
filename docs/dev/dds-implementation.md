@@ -24,7 +24,7 @@ xearthlayer/src/dds/
 │                     compress_level / compress_level_into (pad one level to whole
 │                     blocks, compress it into a new buffer or a given slice)
 ├── gpu_channel.rs  - GpuEncoderChannel (GPU worker)
-├── mipmap.rs       - Mipmap chain generation with box filtering
+├── mipmap.rs       - Mipmap chain generation, box filter in linear light
 ├── encoder.rs      - Main DDS encoder API
 └── mod.rs          - Public API exports
 ```
@@ -172,37 +172,62 @@ A 4096×4096 tile carries the full chain, 13 levels down to 1×1:
 
 ### Mipmap Downsample
 `MipmapGenerator::downsample_box_2x` (`dds/mipmap.rs`) builds each level from
-the one above with a 2×2 box filter, on raw RGBA bytes (#389). Each output row
-takes three passes: the two source rows are added byte by byte into a `u16`
-scratch row, adjacent pixel pairs of that row are added into a second scratch
-row of block sums, and each block sum `s = a + b + c + d` becomes its average
-through `block_average`, rounded half to even: `(s + 1 + ((s >> 2) & 1)) >> 2`
-(#394). An odd last row or column of the source is dropped.
+the one above with a 2×2 box filter in linear light, on raw RGBA bytes (#389).
+R, G and B are sRGB-encoded, so each value is taken to 16-bit linear light
+through a 256-entry table (IEC 61966-2-1, rounded to nearest), the four are
+added, and the sum `s` becomes its mean rounded half to even,
+`(s + 1 + ((s >> 2) & 1)) >> 2` (#394), which a 65,536-entry table takes back
+to the nearest sRGB byte. Alpha is coverage, not light: the mean of its stored
+values, rounded the same way. An odd last row or column of the source is
+dropped.
 
-The rounding keeps every level as bright as the one above it. Truncating
-`s / 4`, as the encoder did before #394, loses three eighths of a step per
-level on noisy imagery, so a tile's fifth level was about two steps darker
-than its source and its smallest about four and a half (out of 255). Rounding
-half up gains an eighth of a step per level instead; half to even has no bias.
-`every_level_keeps_the_source_mean_within_half_a_step` holds the mean of every
-level of a 4096 chain within half a step of the source's, which truncation and
-half-up both fail. A sum of 1020 averages to 255, so opaque alpha stays opaque.
+**Why linear light**: averaging the stored sRGB
+values loses light wherever neighbours differ. Black beside white gave 128,
+about a fifth of the light, where half the light is 188. Measured on Apple
+imagery (five ZL12 tiles, levels 2 to 4), towns came out 1.5 percentage points
+of luminance darker, coast 1.4, mountains 1.2 and farmland 1.0; at level 4 a
+town was 21% darker than in linear light. Uniform areas such as forest, fields
+and water barely change. Distant terrain is shown from these levels, so it
+grew darker and flatter towards the horizon.
 
-The passes are separate so that each is a contiguous loop the compiler
-vectorises. Folding the rounding into the pair pass made the chain about twice
-as slow: the compiler vectorised it across the 4-byte pixel stride, with a
-shuffle for every pixel. The 4096×4096 chain takes about 6 to 7 ms on one core,
-about a tenth more than the truncating two-pass version and half the earlier
-per-pixel loop (about 13 ms). Both encoder backends use it: the CPU path
-through `MipmapStream`, and the GPU worker, where it runs on the single worker
-thread for every tile. Night lighting does not: its levels are averaged in
-linear light by `lit_chain` (see `night-lighting-design.md`).
+The tables are 16 bits wide because near black one sRGB step is only about 20
+of 65,535 linear steps. The quantisation costs at most one step against an
+exact average in f64 (`downsample_is_within_one_step_of_the_exact_light_average`);
+every byte round-trips through both tables, so a uniform colour keeps its value
+at every level.
+
+**Why half to even:** each level is built from the one above, so a bias in the
+rounding accumulates down the chain. Truncating `s / 4`, as the encoder did
+before #394, lost three eighths of a step per level; rounding half up gains an
+eighth. `every_level_keeps_the_source_light_within_half_a_step` holds the mean
+light of every level of a 4096 chain within half a step of the source's. A
+sum of four whites (or of 1020 for alpha) averages to white, so opaque stays
+opaque.
+
+The whole 4096×4096 chain takes about 14 ms on one core (release build, Ryzen
+7 9800X3D, `time_the_4096_mip_chain`), against 4.7 ms for the stored-value
+average and about 42 ms for the ISPC encode of the tile. The CPU backends,
+ISPC and software, use it through `MipmapStream`, and so does a GPU tile that
+falls back to ISPC. The GPU worker builds its levels on the GPU with the same
+filter and the same two tables (`MipmapGenerator::FILTER`, `dds/gpu_mips.rs`),
+byte for byte, so this cost is not paid there.
+Night lighting does not: its levels are averaged by `lit_chain` (see
+`night-lighting-design.md`), which averages each level from the f32 light of
+the whole level above and uses a 2.2
+gamma, and whose bytes are versioned with the generator.
+
+Tiles already in the DDS disk cache keep the levels they were encoded with
+until the cache's GC replaces them. Deleting the DDS tier
+(`{cache_dir}/{provider}/dds/`) while XEarthLayer is stopped has them rebuilt
+as they are next needed, from the chunk cache, downloading only chunks it no
+longer holds (the chunk tier has its own budget); `cache
+clear` deletes the chunk tier too.
 
 ### Compression Algorithm
 - **Endpoint Selection**: Bounding box method (min/max per channel)
 - **Color Quantization**: RGB565 format (5-6-5 bits)
 - **Index Generation**: Perceptual color distance with green weighting
-- **Mipmap Filtering**: Box filter (2×2 average, see [Mipmap Downsample](#mipmap-downsample))
+- **Mipmap Filtering**: Box filter (2×2 average in linear light, see [Mipmap Downsample](#mipmap-downsample))
 
 ### File Format Compliance
 - Microsoft DirectDraw Surface specification

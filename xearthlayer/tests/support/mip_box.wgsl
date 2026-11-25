@@ -31,7 +31,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read> encode_lut: array<u32>;
 
 // The average of four values from their sum, rounded half to even: the
-// CPU's `block_average`, for any sum.
+// CPU's `quarter_half_to_even`, for any sum.
 fn average4(sum: u32) -> u32 {
     return (sum + 1u + ((sum >> 2u) & 1u)) >> 2u;
 }

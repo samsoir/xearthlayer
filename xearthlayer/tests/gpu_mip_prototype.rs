@@ -82,7 +82,7 @@ impl Tables {
     }
 }
 
-/// The CPU's `block_average`: four values' average from their sum, half to
+/// The CPU's `quarter_half_to_even`: four values' average from their sum, half to
 /// even.
 fn average4(sum: u32) -> u32 {
     (sum + 1 + ((sum >> 2) & 1)) >> 2

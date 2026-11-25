@@ -175,8 +175,9 @@ The mip shader is byte-identical to `downsample_box_2x` at every level,
 padding included (#394's round half to even, odd sizes truncated as on the
 CPU), checked on both GPUs for 4096 tiles and odd and sub-block sizes. Its
 filter follows the CPU chain's (`MipmapGenerator::FILTER`, `MipFilter`), so
-the two paths change together: today stored values; #467's linear light is a
-tested shader variant nothing wires yet. The shader's uniform buffers are
+the two paths change together: linear light since #467, with the CPU chain's
+own tables; the stored-value filter it replaced stays as a tested shader
+variant nothing wires. The shader's uniform buffers are
 written through the queue, never mapped at creation, so rebuilding resources
 on a destroyed device fails tiles (and #420 fails the GPU) rather than
 panicking.
