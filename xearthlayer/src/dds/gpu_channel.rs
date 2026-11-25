@@ -143,6 +143,7 @@ mod inner {
         /// The GPU did not take the tile: the image comes back unchanged for
         /// the caller to encode on the CPU (#420).
         Returned {
+            /// The request's image, as it was sent.
             image: RgbaImage,
             /// Why: the GPU's failure, or a tile ahead past its deadline.
             reason: String,
