@@ -278,13 +278,17 @@ mod inner {
                 .unwrap_or(false)
         }
 
-        /// Shut down the GPU pipeline by closing the channel.
+        /// Drops this handle's sender: every later call fails with "GPU
+        /// worker has been shut down".
         ///
-        /// Once the requests already buffered are served, the worker's
-        /// `try_recv()` reports the channel disconnected and the loop ends,
-        /// releasing the GPU resources. Required because
-        /// `spawn_blocking` threads are not cancelled by tokio runtime
-        /// shutdown — the channel must be explicitly closed.
+        /// When it was the last sender, the worker serves the requests
+        /// already buffered and then ends, releasing the GPU. To stop the
+        /// worker without serving its queue, cancel its shutdown token
+        /// instead (the service does): between tiles the worker closes the
+        /// channel and fails every request in it, and every one whose sender
+        /// already holds a slot, reading until no sender holds one (#464),
+        /// then ends. One or the other is required because `spawn_blocking`
+        /// threads are not cancelled by tokio runtime shutdown.
         pub fn shutdown(&mut self) {
             self.sender.take();
         }
