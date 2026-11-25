@@ -292,6 +292,30 @@ draws from those levels, read dimmer and more orange than the near ground.
 Each level is now averaged from the linear values of the level above, not
 from its rounded bytes, so every level keeps the light and colour of the
 first.
+The linear values come from the shared 256-entry table (`linear_table`),
+and each averaged level is stored through `led::ByteEncoder`, which gives
+exactly the byte the sRGB encode followed by rounding gives, without a
+`powf` per channel (#439). Every generated texel is opaque, so an alpha of
+exactly 1.0 is stored as 255 without rounding.
+
+**What lit bytes depend on.** A lit payload is a function of its inputs
+(recipes, Laminar art, road networks, `night.brightness`, the texture
+setting), of the CPU's ISPC kernel class and of the platform's libm. ISPC
+compiles one BC1 kernel per instruction set and picks one at run time; on
+x86 the kernels with FMA (AVX2, AVX-512) round differently from those
+without (SSE2, SSE4, AVX) and give other bytes for most images, though they
+agree on the golden test's fixture. `powf`, `exp`, `log`, `tan`, `atan`,
+`sinh` and `cos` come from the platform's libm (glibc on Linux), and
+`led::ByteEncoder` builds its thresholds at first use by bisection with
+`powf`, so the chain's encode still depends on libm although it no longer
+calls `powf` per texel. `ByteEncoder` is exact wherever the platform's
+`powf(x, 1/2.2)` never decreases, which `the_byte_encoder_exhaustive` has
+checked on x86 glibc; it is to be run on Apple Silicon before 0.5.1.
+`floor` and `round` are Rust's own routines and exact. The lit fingerprint
+covers none of this: a lit cache moved between machines, or kept across a
+libm update, can serve bytes another machine would have made slightly
+differently, which is harmless. Byte-identity tests and before/after
+comparisons must run on one machine.
 
 **BC1 floor.** BC1 stores colours as RGB565, so below about 4 in stored
 value red and blue round to 0 while green keeps a 4: very dim texels
@@ -484,8 +508,15 @@ For each texel of the first visible level, the CPU implementation:
 7. **Adds road light** where the road raster reaches the texel, in linear
    light, including texels the recipe leaves dark (see Road lights).
 
-`encode_visible` then averages the lower levels from the first visible
-level in linear light (see Mips in linear light), dims the fade levels,
+`encode_visible` returns a zeroed payload of the layout's length when the
+first visible level is opaque black (the probe answered lit but the
+generator lit nothing; 1 texture in 99 in the #436 sample): ISPC's BC1
+kernels encode an opaque black block as eight zero bytes, which the repair
+leaves, and a test pins the full path's zeros against the shortcut from
+4 to 2048 px, square and not (#439). Otherwise it
+averages the lower levels from the first visible
+level in linear light (see Mips in linear light), dims the fade levels
+(through one 256-entry table per gain, the full levels only floored),
 floors every level (see BC1 floor), BC1-encodes each level through
 `dds::compress_level` with `IspcCompressor` named, whatever
 `texture.compressor` says, and repairs the blocks of each level whose
@@ -1590,6 +1621,13 @@ lights).
   measured to give it, and other targets run its structural checks
   (exact length, no introduced tint, light at every level). The payload
   is allocated at exactly its length, and an empty level is an error.
+  The table encode is checked against the code it replaced (#439): the
+  shared decode table bit for bit, the chain encode against `led::encode`
+  and rounding on special values and on floats either side of every byte
+  boundary, `lit_chain` and `dim` against their former forms on every
+  byte value at each fade gain, and `encode_visible` on six images.
+  `led::ByteEncoder` itself is checked on every float from 0 to 1 by an
+  ignored test, `the_byte_encoder_exhaustive`, run in release.
   The service keeps no payload whose encode failed, lights only the
   payload of a read spanning the uploaded top and the payload, and
   writes only the payload to disk.
