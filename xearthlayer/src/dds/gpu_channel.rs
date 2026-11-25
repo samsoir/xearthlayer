@@ -679,8 +679,32 @@ mod inner {
         }
     }
 
+    /// What the worker does with its processor once the loop ends.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ending {
+        /// Drop it, releasing the GPU: after a shutdown, a closed channel, a
+        /// device lost (wgpu's wait for the queue returns at once on a lost
+        /// device) or tiles that failed in time.
+        Release,
+        /// Leave it undropped for the rest of the process: the GPU failed by
+        /// a hang (a late tile among the misses) or a panic (see
+        /// [`run_worker_loop`]).
+        Abandon,
+    }
+
     /// The worker loop, on the worker's thread; [`spawn_tile_worker`] says
     /// what ends it and how each request is answered.
+    ///
+    /// When the GPU failed by a hang or a panic, the processor is leaked
+    /// rather than dropped (#420). Dropping [`WgpuTileProcessor`] drops the
+    /// last handles to its device and queue, and wgpu-core's `Queue` drop
+    /// waits for the GPU to go idle with no timeout: on a GPU that stopped
+    /// making progress that pins this thread for good, and the runtime's
+    /// drop at exit waits for it, so XEarthLayer could not quit. The same
+    /// drop panics on any error but a lost device, outside the loop's
+    /// `catch_unwind`, and after a panic nothing is known of the device.
+    /// The GPU is never used again in the session, and the process's exit
+    /// reclaims what is leaked.
     pub(super) fn run_worker_loop<P: TileProcessor>(
         mut processor: P,
         mut rx: mpsc::Receiver<GpuEncodeRequest>,
@@ -688,11 +712,31 @@ mod inner {
         health: SharedGpuHealth,
         rule: HangRule,
     ) {
+        let ending = serve(&mut processor, &mut rx, &shutdown, &health, rule);
+        tracing::info!("GPU pipeline worker shutting down");
+        match ending {
+            Ending::Release => drop(processor),
+            Ending::Abandon => {
+                tracing::debug!("GPU worker leaves the failed GPU's device undropped");
+                std::mem::forget(processor);
+            }
+        }
+    }
+
+    /// The loop itself: serves requests until something ends it, and says
+    /// what is to become of the processor.
+    fn serve<P: TileProcessor>(
+        processor: &mut P,
+        rx: &mut mpsc::Receiver<GpuEncodeRequest>,
+        shutdown: &CancellationToken,
+        health: &SharedGpuHealth,
+        rule: HangRule,
+    ) -> Ending {
         let mut misses = Misses::default();
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("GPU pipeline worker: shutdown signal received");
-                let failed = drain(&mut rx, |request| {
+                let failed = drain(rx, |request| {
                     let _ = request
                         .response
                         .send(GpuEncodeReply::failed(SHUT_DOWN, GpuTileTiming::default()));
@@ -700,12 +744,12 @@ mod inner {
                 if failed > 0 {
                     tracing::debug!(failed, "GPU worker failed its queue at shutdown");
                 }
-                break;
+                return Ending::Release;
             }
             // Failed from outside the loop: the device was lost.
             if let Some(reason) = health.failure() {
-                hand_back_all(&mut rx, reason);
-                break;
+                hand_back_all(rx, reason);
+                return Ending::Release;
             }
 
             let request = match rx.try_recv() {
@@ -714,7 +758,7 @@ mod inner {
                     std::thread::sleep(IDLE_POLL);
                     continue;
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return Ending::Release,
             };
 
             let GpuEncodeRequest {
@@ -780,15 +824,19 @@ mod inner {
                     let failed = misses.count >= rule.misses;
                     if failed {
                         health.fail(misses.reason(rule.deadline));
-                        hand_back_all(&mut rx, health.failure().unwrap_or_default());
+                        hand_back_all(rx, health.failure().unwrap_or_default());
                     } else if late {
                         // The queue behind a slow tile goes to the CPU now
                         // rather than wait for the next one.
-                        hand_back_queued(&mut rx, "a GPU tile ahead of it missed its deadline");
+                        hand_back_queued(rx, "a GPU tile ahead of it missed its deadline");
                     }
                     let _ = response.send(reply);
                     if failed {
-                        break;
+                        return if misses.hung() {
+                            Ending::Abandon
+                        } else {
+                            Ending::Release
+                        };
                     }
                 }
                 Err(panic_info) => {
@@ -797,13 +845,11 @@ mod inner {
                     health.fail(message.clone());
                     // The image was inside the processor: this tile is lost.
                     let _ = response.send(GpuEncodeReply::failed(message, timing));
-                    hand_back_all(&mut rx, health.failure().unwrap_or_default());
-                    break;
+                    hand_back_all(rx, health.failure().unwrap_or_default());
+                    return Ending::Abandon;
                 }
             }
         }
-
-        tracing::info!("GPU pipeline worker shutting down");
     }
 
     /// The worker's tiles in a row that missed: ended at or past the
@@ -830,6 +876,12 @@ mod inner {
                 self.failed += 1;
                 self.last_error = Some(error);
             }
+        }
+
+        /// Whether any of them ran late: the GPU may have stopped making
+        /// progress, not just refused the work.
+        fn hung(&self) -> bool {
+            self.count > self.failed
         }
 
         /// The health's reason when these misses fail the GPU.
@@ -921,6 +973,10 @@ mod inner {
     ///
     /// A tile past its deadline that does not fail the GPU hands back the
     /// requests queued behind it.
+    ///
+    /// The processor is dropped when the loop ends, except after a GPU
+    /// failed by a hang or a panic, when it is leaked so that its drop
+    /// cannot pin the thread (see `run_worker_loop`).
     ///
     /// Returns a `JoinHandle` that resolves when the loop ends.
     pub fn spawn_tile_worker<P: TileProcessor + 'static>(
@@ -1760,6 +1816,156 @@ mod tests {
             processed(reply_of(reply).await).0.unwrap();
         }
         assert_eq!(health.health(), GpuHealth::Healthy);
+    }
+
+    // =========================================================================
+    // What the loop does with its processor at the end (#420)
+    // =========================================================================
+
+    /// A processor whose drop takes `hold` (as dropping a hung GPU's queue
+    /// would, forever) and then reports it.
+    struct DropProbe<P> {
+        inner: P,
+        hold: Duration,
+        dropped: std::sync::mpsc::Sender<()>,
+    }
+
+    impl<P: TileProcessor> TileProcessor for DropProbe<P> {
+        fn process(
+            &mut self,
+            image: RgbaImage,
+            format: DdsFormat,
+            levels: usize,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+        ) -> Result<Vec<u8>, DdsError> {
+            self.inner.process(image, format, levels, deadline, timing)
+        }
+    }
+
+    impl<P> Drop for DropProbe<P> {
+        fn drop(&mut self) {
+            std::thread::sleep(self.hold);
+            let _ = self.dropped.send(());
+        }
+    }
+
+    /// Long enough that a loop which dropped the processor misses
+    /// [`loop_ends`]'s bound.
+    const HUNG_DROP: Duration = Duration::from_secs(2);
+
+    fn probe<P: TileProcessor>(
+        inner: P,
+        hold: Duration,
+    ) -> (DropProbe<P>, std::sync::mpsc::Receiver<()>) {
+        let (dropped, rx) = std::sync::mpsc::channel();
+        let probe = DropProbe {
+            inner,
+            hold,
+            dropped,
+        };
+        (probe, rx)
+    }
+
+    /// A GPU failed by late tiles is a GPU that may never finish its work,
+    /// and wgpu's `Queue` drop waits for it with no timeout: the worker
+    /// leaves the processor undropped, and its thread ends at once.
+    #[tokio::test]
+    async fn a_gpu_failed_by_late_tiles_is_left_undropped() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (processor, dropped) = probe(overrunning(), HUNG_DROP);
+        let health = SharedGpuHealth::new();
+        let handle = spawn_tile_worker(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+        // One at a time: a late tile hands back the queue behind it.
+        for width in [4, 8, 12] {
+            reply_of(queue(&tx, &[width]).pop().unwrap()).await;
+        }
+        assert!(health.is_failed());
+        loop_ends(handle, Duration::from_millis(500)).await;
+        assert!(dropped.try_recv().is_err(), "the processor was not dropped");
+    }
+
+    /// The same after a panic: nothing is known of the device it left.
+    #[tokio::test]
+    async fn a_processor_that_panicked_is_left_undropped() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let reply = queue(&tx, &[4]).pop().unwrap();
+        let (processor, dropped) = probe(
+            FnProcessor(
+                |_: RgbaImage, _: &mut GpuTileTiming| -> Result<Vec<u8>, DdsError> {
+                    panic!("device lost")
+                },
+            ),
+            HUNG_DROP,
+        );
+        let handle = spawn(processor, rx, CancellationToken::new());
+        reply_of(reply).await;
+        loop_ends(handle, Duration::from_millis(500)).await;
+        assert!(dropped.try_recv().is_err(), "the processor was not dropped");
+    }
+
+    /// Every other end releases the GPU: a shutdown, a closed channel, a
+    /// device lost (its queue's drop returns at once), and tiles that fail
+    /// in time (a destroyed device).
+    #[tokio::test]
+    async fn every_other_end_drops_the_processor() {
+        let ok = || FnProcessor(|_: RgbaImage, _: &mut GpuTileTiming| Ok(vec![0; 8]));
+        let within = Duration::from_secs(1);
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (processor, dropped) = probe(ok(), Duration::ZERO);
+        let shutdown = CancellationToken::new();
+        let handle = spawn(processor, rx, shutdown.clone());
+        shutdown.cancel();
+        loop_ends(handle, within).await;
+        assert_eq!(dropped.try_recv(), Ok(()), "shutdown");
+        drop(tx);
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (processor, dropped) = probe(ok(), Duration::ZERO);
+        let handle = spawn(processor, rx, CancellationToken::new());
+        drop(tx);
+        loop_ends(handle, within).await;
+        assert_eq!(dropped.try_recv(), Ok(()), "closed channel");
+
+        let (_tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (processor, dropped) = probe(ok(), Duration::ZERO);
+        let health = SharedGpuHealth::new();
+        let handle = spawn_tile_worker(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            HangRule::default(),
+        );
+        device_lost(&health, wgpu::DeviceLostReason::Unknown, "driver reset");
+        loop_ends(handle, within).await;
+        assert_eq!(dropped.try_recv(), Ok(()), "device lost");
+
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &[4, 8, 12]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (processor, dropped) = probe(refusing(&calls), Duration::ZERO);
+        let health = SharedGpuHealth::new();
+        let handle = spawn_tile_worker(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            SHORT,
+        );
+        for reply in replies {
+            reply_of(reply).await;
+        }
+        loop_ends(handle, within).await;
+        assert!(health.is_failed());
+        assert_eq!(dropped.try_recv(), Ok(()), "tiles failed in time");
     }
 
     // =========================================================================
