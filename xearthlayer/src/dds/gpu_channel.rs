@@ -50,6 +50,10 @@ mod inner {
     /// The failure every request still queued at shutdown is answered with.
     const SHUT_DOWN: &str = "GPU worker shut down";
 
+    /// The GPU's failure when its worker refuses a send while it is not
+    /// shut down.
+    const WORKER_STOPPED: &str = "GPU worker stopped unexpectedly";
+
     /// How long an idle worker sleeps between looks at its channel, its
     /// shutdown token and its health.
     const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -214,11 +218,16 @@ mod inner {
     /// An image the GPU does not take comes back as
     /// [`ChainOutcome::Returned`]: while the worker's `health` is Failed
     /// (never sent), when the channel is closed (the request comes back with
-    /// the send error), and when the worker hands it back (#420).
+    /// the send error), and when the worker hands it back (#420). A closed
+    /// channel while the worker's shutdown token is not cancelled is a
+    /// worker that stopped unexpectedly, and fails the health.
     pub struct GpuEncoderChannel {
         sender: Option<mpsc::Sender<GpuEncodeRequest>>,
         stats: Arc<GpuEncodeStats>,
         health: SharedGpuHealth,
+        /// The worker's shutdown token: a send the worker refuses while it
+        /// is not cancelled means the worker stopped unexpectedly.
+        shutdown: CancellationToken,
     }
 
     /// What became of a request after the send.
@@ -232,12 +241,18 @@ mod inner {
 
     impl GpuEncoderChannel {
         /// Create a new channel handle wrapping the given sender, with the
-        /// health its worker publishes.
-        pub fn new(sender: mpsc::Sender<GpuEncodeRequest>, health: SharedGpuHealth) -> Self {
+        /// health its worker publishes and the token that shuts the worker
+        /// down.
+        pub fn new(
+            sender: mpsc::Sender<GpuEncodeRequest>,
+            health: SharedGpuHealth,
+            shutdown: CancellationToken,
+        ) -> Self {
             Self {
                 sender: Some(sender),
                 stats: Arc::default(),
                 health,
+                shutdown,
             }
         }
 
@@ -335,9 +350,18 @@ mod inner {
             let (result, timing) = match sent {
                 Sent::Refused(image) => {
                     self.stats.record_fallback();
+                    // The worker closes its channel when it is shut down or
+                    // after failing the health. Neither: it stopped
+                    // unexpectedly (a panic outside the loop's
+                    // `catch_unwind`), and the GPU is failed, so the Status
+                    // pane stops showing it and no later tile is sent.
+                    if !self.shutdown.is_cancelled() {
+                        self.health.fail(WORKER_STOPPED);
+                    }
+                    let reason = self.health.failure().unwrap_or("GPU worker is not running");
                     return Ok(ChainOutcome::Returned {
                         image,
-                        reason: "GPU worker is not running".to_string(),
+                        reason: reason.to_string(),
                     });
                 }
                 Sent::Dropped => {
@@ -1050,8 +1074,19 @@ mod inner {
         tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown, health.clone());
-        Ok((GpuEncoderChannel::new(tx, health), handle, selection))
+        let handle = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            shutdown.clone(),
+            health.clone(),
+        );
+        Ok((
+            GpuEncoderChannel::new(tx, health, shutdown),
+            handle,
+            selection,
+        ))
     }
 }
 
@@ -1297,7 +1332,7 @@ mod tests {
 
         assert!(tx.is_closed());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let channel = Arc::new(GpuEncoderChannel::new(tx, health));
+        let channel = Arc::new(GpuEncoderChannel::new(tx, health, CancellationToken::new()));
         let (image, reason) = returned_by(&channel, 4).await;
         assert_eq!(image.width(), 4);
         assert_eq!(reason, "GPU device lost: driver reset");
@@ -1663,7 +1698,7 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        let channel = Arc::new(GpuEncoderChannel::new(tx, health));
+        let channel = Arc::new(GpuEncoderChannel::new(tx, health, CancellationToken::new()));
         let (image, why) = returned_by(&channel, 24).await;
         assert_eq!((image.width(), why.as_str()), (24, reason));
         assert_eq!(calls.load(Ordering::SeqCst), 3, "never sent");
@@ -1723,7 +1758,7 @@ mod tests {
         assert_eq!(health.failure(), Some(reason));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
-        let channel = Arc::new(GpuEncoderChannel::new(tx, health));
+        let channel = Arc::new(GpuEncoderChannel::new(tx, health, CancellationToken::new()));
         let (image, why) = returned_by(&channel, 24).await;
         assert_eq!((image.width(), why.as_str()), (24, reason));
         assert_eq!(calls.load(Ordering::SeqCst), 3, "never sent");
@@ -1978,7 +2013,7 @@ mod tests {
     }
 
     fn handle(tx: mpsc::Sender<GpuEncodeRequest>) -> GpuEncoderChannel {
-        GpuEncoderChannel::new(tx, SharedGpuHealth::new())
+        GpuEncoderChannel::new(tx, SharedGpuHealth::new(), CancellationToken::new())
     }
 
     #[test]
@@ -2024,14 +2059,44 @@ mod tests {
         }
     }
 
-    /// The worker is gone (its receiver dropped): the send error returns the
-    /// request, and the image comes back to the caller instead of failing
-    /// it (#420). The GPU is not failed by it: a closed channel without a
-    /// failure is a worker that was shut down.
+    /// The worker is gone (its receiver dropped) while nobody shut it down:
+    /// it stopped unexpectedly (a panic outside the loop's `catch_unwind`).
+    /// The send error returns the request and the image comes back to the
+    /// caller (#420), and the GPU is failed, so the Status pane stops
+    /// showing it and no later tile is sent.
     #[tokio::test]
-    async fn a_send_on_a_closed_channel_hands_the_image_back() {
+    async fn a_send_refused_while_not_shutting_down_fails_the_gpu() {
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
         let channel = Arc::new(handle(tx));
+        drop(rx);
+
+        let (image, reason) = returned_by(&channel, 8).await;
+        assert_eq!(image.width(), 8);
+        assert_eq!(reason, "GPU worker stopped unexpectedly");
+        assert_eq!(
+            channel.health().failure(),
+            Some("GPU worker stopped unexpectedly")
+        );
+        let (image, reason) = returned_by(&channel, 12).await;
+        assert_eq!(
+            (image.width(), reason.as_str()),
+            (12, "GPU worker stopped unexpectedly")
+        );
+    }
+
+    /// A send refused after the worker's shutdown token was cancelled is a
+    /// worker shut down on purpose: the image comes back, the GPU is not
+    /// failed.
+    #[tokio::test]
+    async fn a_send_refused_after_shutdown_hands_the_image_back_only() {
+        let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let channel = Arc::new(GpuEncoderChannel::new(
+            tx,
+            SharedGpuHealth::new(),
+            shutdown.clone(),
+        ));
+        shutdown.cancel();
         drop(rx);
 
         let (image, reason) = returned_by(&channel, 8).await;
@@ -2051,14 +2116,15 @@ mod tests {
     ) -> (GpuEncoderChannel, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let health = SharedGpuHealth::new();
+        let shutdown = CancellationToken::new();
         let worker = spawn_tile_worker(
             processor,
             rx,
-            CancellationToken::new(),
+            shutdown.clone(),
             health.clone(),
             HangRule::default(),
         );
-        (GpuEncoderChannel::new(tx, health), worker)
+        (GpuEncoderChannel::new(tx, health, shutdown), worker)
     }
 
     fn mock_channel() -> (GpuEncoderChannel, Option<mpsc::Receiver<GpuEncodeRequest>>) {
@@ -2247,7 +2313,11 @@ mod tests {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let raw = tx.clone();
         let health = SharedGpuHealth::new();
-        let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+        let channel = Arc::new(GpuEncoderChannel::new(
+            tx,
+            health.clone(),
+            CancellationToken::new(),
+        ));
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
         let processor = FnProcessor(move |_: RgbaImage, _: &mut GpuTileTiming| {
@@ -2541,15 +2611,16 @@ mod tests {
     ) -> (GpuEncoderChannel, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
         let health = SharedGpuHealth::new();
+        let shutdown = CancellationToken::new();
         let worker = spawn_gpu_worker(
             device,
             queue,
             compressor,
             rx,
-            tokio_util::sync::CancellationToken::new(),
+            shutdown.clone(),
             health.clone(),
         );
-        (GpuEncoderChannel::new(tx, health), worker)
+        (GpuEncoderChannel::new(tx, health, shutdown), worker)
     }
 
     /// Single request through the pipeline worker with overlap loop.

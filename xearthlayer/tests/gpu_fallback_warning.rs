@@ -75,7 +75,11 @@ async fn a_gpu_failure_logs_one_warning_however_many_tiles_fall_back() {
 
     let (tx, rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
     let health = SharedGpuHealth::new();
-    let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+    let channel = Arc::new(GpuEncoderChannel::new(
+        tx,
+        health.clone(),
+        CancellationToken::new(),
+    ));
     let encoder = Arc::new(DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),

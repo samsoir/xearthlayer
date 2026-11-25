@@ -455,7 +455,11 @@ mod gpu_stress {
             tokio_util::sync::CancellationToken::new(),
             health.clone(),
         );
-        let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+        let channel = Arc::new(GpuEncoderChannel::new(
+            tx,
+            health.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
         let encoder = Arc::new(
             DdsEncoder::new(DdsFormat::BC1)
                 .with_mipmap_compressor(

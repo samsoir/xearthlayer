@@ -131,7 +131,11 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
 
     let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
     let health = SharedGpuHealth::new();
-    let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+    let channel = Arc::new(GpuEncoderChannel::new(
+        tx,
+        health.clone(),
+        CancellationToken::new(),
+    ));
     let encoder = Arc::new(DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),
