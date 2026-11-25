@@ -1170,12 +1170,15 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_unwinding_through_the_manager_unmounts_the_ortho_session() {
-        // #418: the panic hook no longer unmounts, so a panic on the main
-        // thread during `run` relies on this drop. A stand-in for the FUSE
-        // task records whether it was told to unmount; the mountpoint is a
-        // temporary folder that is not in the mount table, so no unmount
-        // command runs.
+    fn a_panic_unwinding_through_the_manager_signals_its_ortho_session_to_unmount() {
+        // #418: the panic hook never unmounts, so a panic on the main thread
+        // during `run` relies on the unwind reaching the session. This holds
+        // through `unmount_all` in `Drop`, and through the field drop of
+        // `consolidated_session` alone, which is also declared before the
+        // service that owns the runtime; the order against a real service is
+        // not checked here. A stand-in for the FUSE task records whether it
+        // was told to unmount; the mountpoint is a temporary folder that is
+        // not in the mount table, so no unmount command runs.
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
