@@ -197,15 +197,25 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     // Key features' state for the Status pane: what the service actually
     // selected and resolved, not what the configuration asked for.
     dashboard.set_feature_status(FeatureStatus {
-        encoder: match (orchestrator.gpu_adapter(), orchestrator.gpu_warning()) {
-            (Some(adapter), Some(_)) => EncoderStatus::GpuSharedWithSim(adapter.clone()),
-            (Some(adapter), None) => EncoderStatus::Gpu(adapter.clone()),
-            // No adapter means a CPU encoder: a GPU that fails to start
-            // stops the service rather than falling back.
-            (None, _) => match CompressorKind::parse(&cfg.texture.compressor) {
-                Some(CompressorKind::Software) => EncoderStatus::Software,
-                _ => EncoderStatus::Ispc,
-            },
+        encoder: {
+            let backend = CompressorKind::parse(&cfg.texture.compressor);
+            let hybrid = backend == Some(CompressorKind::Hybrid);
+            match (orchestrator.gpu_adapter(), orchestrator.gpu_warning()) {
+                (Some(adapter), Some(_)) => EncoderStatus::GpuSharedWithSim {
+                    adapter: adapter.clone(),
+                    hybrid,
+                },
+                (Some(adapter), None) => EncoderStatus::Gpu {
+                    adapter: adapter.clone(),
+                    hybrid,
+                },
+                // No adapter means a CPU encoder: a GPU that fails to start
+                // stops the service rather than falling back.
+                (None, _) => match backend {
+                    Some(CompressorKind::Software) => EncoderStatus::Software,
+                    _ => EncoderStatus::Ispc,
+                },
+            }
         },
         night: orchestrator.night_lighting(),
         xworld_pro,

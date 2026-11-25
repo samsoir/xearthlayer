@@ -607,7 +607,9 @@ impl ConfigKey {
             ConfigKey::CacheMemorySize => Box::new(SizeSpec),
             ConfigKey::CacheDiskSize => Box::new(SizeSpec),
             ConfigKey::CacheDdsDiskRatio => Box::new(FloatRangeSpec::new(0.0, 1.0)),
-            ConfigKey::TextureCompressor => Box::new(OneOfSpec::new(&["software", "ispc", "gpu"])),
+            ConfigKey::TextureCompressor => {
+                Box::new(OneOfSpec::new(crate::system::CompressorKind::VALUES))
+            }
             ConfigKey::TextureGpuDevice => Box::new(NonEmptyStringSpec),
             ConfigKey::GenerationThreads => Box::new(PositiveIntegerSpec),
             ConfigKey::GenerationTimeout => Box::new(PositiveIntegerSpec),
@@ -1484,6 +1486,7 @@ mod tests {
         assert!(key.validate("software").is_ok());
         assert!(key.validate("ispc").is_ok());
         assert!(key.validate("gpu").is_ok());
+        assert!(key.validate("hybrid").is_ok());
         assert!(key.validate("invalid").is_err());
     }
 

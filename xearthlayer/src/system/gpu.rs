@@ -303,10 +303,11 @@ pub fn find_adapter<'a>(
 /// Pure selection logic operating on metadata-only adapter records.
 ///
 /// Returns the index of the first adapter matching `gpu_device`, or
-/// `None` if no match is found. Exposed at module visibility so the
-/// round-trip test can verify the inverse of [`GpuAdapter::config_value`]
-/// without needing live `wgpu::Adapter` instances.
-fn select_index(adapters: &[GpuAdapter], gpu_device: &str) -> Option<usize> {
+/// `None` if no match is found. The rule the encoder selects its adapter
+/// by, so the setup wizard proposes the configured GPU exactly when it
+/// would be used; it also lets the round-trip test verify the inverse of
+/// [`GpuAdapter::config_value`] without live `wgpu::Adapter` instances.
+pub fn select_index(adapters: &[GpuAdapter], gpu_device: &str) -> Option<usize> {
     let needle = gpu_device.to_lowercase();
     let target_kind = match needle.as_str() {
         "integrated" => Some(GpuKind::Integrated),

@@ -107,10 +107,11 @@ disk_size = {}
 dds_disk_ratio = {}
 
 [texture]
-; Texture compressor backend: software, ispc (SIMD), or gpu (wgpu)
+; Texture compressor backend: software, ispc (SIMD), gpu (wgpu), or hybrid
+; (gpu, and ispc for a tile the GPU worker cannot take at once)
 ; ispc is recommended for best CPU performance
 compressor = {}
-; GPU device selector for gpu compressor: integrated, discrete, or adapter name substring
+; GPU device selector for the gpu and hybrid compressors: integrated, discrete, or adapter name substring
 gpu_device = {}
 
 [generation]

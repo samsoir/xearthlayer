@@ -43,8 +43,8 @@ pub use encoder_policy::{
 pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
 pub use gpu::{
     disown_display, enumerate as enumerate_gpus, enumerate_raw as enumerate_gpus_raw,
-    exclude_implicit_vulkan_layers, find_adapter as find_gpu, GpuAdapter, GpuKind, GpuSelectError,
-    GpuSelection,
+    exclude_implicit_vulkan_layers, find_adapter as find_gpu, select_index as select_gpu_index,
+    GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use macfuse::{

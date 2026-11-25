@@ -91,7 +91,7 @@ pub struct CacheSettings {
 /// Texture configuration.
 #[derive(Debug, Clone)]
 pub struct TextureSettings {
-    /// Compressor backend: "software", "ispc", or "gpu"
+    /// Compressor backend: "software", "ispc", "gpu", or "hybrid"
     pub compressor: String,
     /// GPU device selector: "integrated", "discrete", or adapter name substring
     pub gpu_device: String,

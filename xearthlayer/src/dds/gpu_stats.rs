@@ -3,7 +3,8 @@
 //!
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel) records
 //! every request it sends: the stages of each encoded tile, and a count of
-//! the requests that came back without one. In the service, a task started
+//! the requests that came back without one. With `texture.compressor =
+//! hybrid` it also counts the tiles it encoded with ISPC instead. In the service, a task started
 //! by `service::builder::create_encoder` closes the window every
 //! `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
 //! logs one `GPU encode sample` line. Anything else holding a channel must
@@ -62,6 +63,10 @@ pub struct GpuSample {
     /// a worker not running or gone before replying, or a handle already
     /// shut down.
     pub failed: u64,
+    /// Tiles `texture.compressor = hybrid` encoded with ISPC on the calling
+    /// thread because the worker's queue was taken or the worker had
+    /// stopped. Not in [`tiles`](Self::tiles), which counts the worker's.
+    pub overflowed: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).
     pub depth_now: usize,
@@ -75,9 +80,13 @@ impl GpuSample {
         self.total.map_or(0, |s| s.count as u64) + self.unsampled
     }
 
-    /// Nothing was encoded, failed or waiting during the sample.
+    /// Nothing was encoded, overflowed, failed or waiting during the sample.
     fn is_idle(&self) -> bool {
-        self.tiles() == 0 && self.failed == 0 && self.depth_max == 0 && self.depth_now == 0
+        self.tiles() == 0
+            && self.overflowed == 0
+            && self.failed == 0
+            && self.depth_max == 0
+            && self.depth_now == 0
     }
 }
 
@@ -87,6 +96,7 @@ impl GpuSample {
 pub struct GpuEncodeStats {
     window: Mutex<StageWindows>,
     failed: AtomicU64,
+    overflowed: AtomicU64,
     depth: AtomicUsize,
     depth_peak: AtomicUsize,
 }
@@ -120,6 +130,11 @@ impl GpuEncodeStats {
         self.failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one tile encoded with ISPC instead of the worker.
+    pub fn record_overflowed(&self) {
+        self.overflowed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Requests in the channel now: buffered, blocked in `blocking_send` on
     /// a full channel, and in progress. The channel's own
     /// `max_capacity() - capacity()` sees only the buffered ones.
@@ -136,12 +151,13 @@ impl GpuEncodeStats {
     }
 
     /// Closes the sample: its figures, and a new sample started. `None`
-    /// when nothing was encoded, failed or waiting in it.
+    /// when nothing was encoded, overflowed, failed or waiting in it.
     pub fn take_sample(&self) -> Option<GpuSample> {
         let depth_now = self.depth();
         // The next sample's peak starts from what is in the channel now.
         let depth_max = self.depth_peak.swap(depth_now, Ordering::Relaxed);
         let failed = self.failed.swap(0, Ordering::Relaxed);
+        let overflowed = self.overflowed.swap(0, Ordering::Relaxed);
         let mut w = self.window.lock().ok()?;
         w.recorded = 0;
         let sample = GpuSample {
@@ -154,6 +170,7 @@ impl GpuEncodeStats {
             total: w.total.take(),
             unsampled: std::mem::take(&mut w.unsampled),
             failed,
+            overflowed,
             depth_now,
             depth_max: depth_max.max(depth_now),
         };
@@ -183,6 +200,7 @@ impl GpuEncodeStats {
             tiles = s.tiles(),
             unsampled = s.unsampled,
             failed = s.failed,
+            ispc_overflow = s.overflowed,
             depth_now = s.depth_now,
             depth_max = s.depth_max,
             total_p50_ms,
@@ -392,6 +410,7 @@ mod tests {
             ("tiles", "1"),
             ("unsampled", "0"),
             ("failed", "0"),
+            ("ispc_overflow", "0"),
             ("depth_now", "0"),
             ("depth_max", "0"),
             ("total_max_ms", "16.23"),
@@ -404,6 +423,32 @@ mod tests {
         ] {
             assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
         }
+    }
+
+    #[test]
+    fn overflowed_tiles_are_counted_apart_from_the_workers() {
+        let stats = GpuEncodeStats::default();
+        stats.record_overflowed();
+        stats.record_overflowed();
+        stats.record_encoded(&timing(1), ms(16));
+
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overflowed), (1, 2));
+        assert!(stats.take_sample().is_none(), "the count starts again");
+    }
+
+    #[test]
+    fn a_sample_of_overflowed_tiles_only_is_logged() {
+        let stats = GpuEncodeStats::default();
+        stats.record_overflowed();
+
+        let events = capture_events(|| stats.log_sample());
+        let line = events
+            .iter()
+            .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
+            .expect("a sample line");
+        assert_eq!(line.get("tiles").map(String::as_str), Some("0"));
+        assert_eq!(line.get("ispc_overflow").map(String::as_str), Some("1"));
     }
 
     #[test]
