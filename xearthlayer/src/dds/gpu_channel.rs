@@ -1570,6 +1570,12 @@ mod inner {
     /// empty, so the first request to arrive is the one [`next_take`] would
     /// take; demand wins a tie (`biased`).
     ///
+    /// Returns at once when both channels are closed: the last senders
+    /// may go between the worker's look at the queues and this wait, and
+    /// with neither channel left to wait on, only a shutdown or a failure
+    /// would wake it, so the loop would never see that every sender is
+    /// gone.
+    ///
     /// tokio's channels and `CancellationToken` need no runtime to be
     /// awaited: the worker blocks on its own thread with `pollster`.
     pub(super) fn wait_for_work(
@@ -1579,6 +1585,10 @@ mod inner {
     ) -> Woken {
         let demand_open = state(&queues.demand) != QueueState::Closed;
         let prefetch_open = state(&queues.prefetch) != QueueState::Closed;
+        if !demand_open && !prefetch_open {
+            // `take` sees both closed and the loop ends.
+            return Woken::Signal;
+        }
         let WorkerQueues { demand, prefetch } = queues;
         let woken = |lane, request: Option<GpuEncodeRequest>| {
             request.map_or(Woken::Signal, |request| Woken::Request(lane, request))
@@ -3662,6 +3672,33 @@ mod tests {
         let stopped = CancellationToken::new();
         stopped.cancel();
         assert!(woken_lane(wait_for_work(&mut queues, &stopped, &health)).is_none());
+    }
+
+    /// Given both lanes closed, an idle worker does not wait: every sender
+    /// went between its look at the queues and its wait, and nothing would
+    /// ever wake it but a shutdown or a failure. It returns at once, and
+    /// the loop sees both channels closed and ends.
+    #[test]
+    fn an_idle_worker_with_both_lanes_closed_does_not_wait() {
+        use super::inner::{wait_for_work, Woken};
+        let (demand_tx, prefetch_tx, mut queues) = lanes();
+        drop((demand_tx, prefetch_tx));
+        // On a thread of its own, so a regression fails within the guard
+        // rather than hang the run.
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let woken = wait_for_work(
+                &mut queues,
+                &CancellationToken::new(),
+                &SharedGpuHealth::new(),
+            );
+            let _ = done_tx.send(matches!(woken, Woken::Signal));
+        });
+        assert_eq!(
+            done.recv_timeout(GUARD),
+            Ok(true),
+            "woken at once, with no request"
+        );
     }
 
     /// The worker blocks while idle and is woken by what it waits for: a
