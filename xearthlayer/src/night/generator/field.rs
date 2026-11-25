@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::gain::gain;
 use super::RecipeLookup;
-use crate::night::footprint::Footprint;
+use crate::night::footprint::{wrap_tile_lon, Footprint};
 use crate::night::recipe::{Grid, RadianceCurve, Recipe};
 
 mod sampler;
@@ -31,9 +31,14 @@ pub enum Layer {
 }
 
 /// The 1 degree tile `(lat0, lon0)` holding global cell `(row, col)` of a
-/// layer with `ny` x `nx` cells per degree.
+/// layer with `ny` x `nx` cells per degree, the longitude wrapped into
+/// [-180, 180): columns past either end of the world continue across the
+/// antimeridian.
 fn tile_of(row: i64, col: i64, ny: i64, nx: i64) -> (i64, i64) {
-    (89 - row.div_euclid(ny), col.div_euclid(nx) - 180)
+    (
+        89 - row.div_euclid(ny),
+        col.div_euclid(nx).rem_euclid(360) - 180,
+    )
 }
 
 /// The recipes one footprint (plus margin) touches, fetched once.
@@ -46,7 +51,12 @@ fn tile_of(row: i64, col: i64, ny: i64, nx: i64) -> (i64, i64) {
 ///
 /// The recipes sit in a small row-major table of tile slots (a field spans
 /// at most a few tiles each way), so a cell read is index arithmetic, not a
-/// hash lookup.
+/// hash lookup. Slots run west to east from the field's west edge without
+/// wrapping, so a field across the antimeridian is contiguous; the recipes
+/// and the tiles the slots report are those of the wrapped longitudes.
+/// Positions near the line keep their own longitudes, so the pattern
+/// tiling and the warp noise (functions of position, not periodic around
+/// the world) are not continuous across it.
 pub struct RecipeField {
     footprint: Footprint,
     south0: i64,
@@ -64,30 +74,21 @@ pub struct RecipeField {
 
 impl RecipeField {
     pub fn new(footprint: &Footprint, lookup: RecipeLookup<'_>) -> Self {
-        let tiles = footprint.expanded(FIELD_MARGIN_DEG).tiles();
-        let (mut south0, mut north0, mut west0, mut east0) = (0i64, -1i64, 0i64, -1i64);
-        if let Some(&(lat, lon)) = tiles.first() {
-            (south0, north0, west0, east0) = (lat.into(), lat.into(), lon.into(), lon.into());
-        }
-        for &(lat, lon) in &tiles {
-            south0 = south0.min(lat.into());
-            north0 = north0.max(lat.into());
-            west0 = west0.min(lon.into());
-            east0 = east0.max(lon.into());
-        }
-        let (lats, lons) = (north0 - south0 + 1, east0 - west0 + 1);
-        let mut slots: Vec<Option<Arc<Recipe>>> = vec![None; (lats * lons) as usize];
-        for (lat, lon) in tiles {
-            let i = (i64::from(lat) - south0) * lons + (i64::from(lon) - west0);
-            slots[i as usize] = lookup(lat, lon);
-        }
+        let (lat_range, lon_range) = footprint.expanded(FIELD_MARGIN_DEG).tile_ranges();
+        let (south0, north0) = (i64::from(*lat_range.start()), i64::from(*lat_range.end()));
+        let (west0, east0) = (i64::from(*lon_range.start()), i64::from(*lon_range.end()));
+        let (lats, lons) = ((north0 - south0 + 1).max(0), (east0 - west0 + 1).max(0));
+        let tiles: Vec<(i32, i32)> = (0..lats * lons)
+            .map(|i| {
+                let lon = (west0 + i % lons) as i32;
+                ((south0 + i / lons) as i32, wrap_tile_lon(lon))
+            })
+            .collect();
+        let slots: Vec<Option<Arc<Recipe>>> = tiles.iter().map(|&(a, b)| lookup(a, b)).collect();
         // Slots run south to north, then west to east: the first filled one
         // is the smallest (lat, lon) key.
         let first = slots.iter().flatten().next();
         let dims = |g: &Grid| (g.height, g.width);
-        let tiles = (0..lats * lons)
-            .map(|i| ((south0 + i / lons) as i32, (west0 + i % lons) as i32))
-            .collect();
         Self {
             tiles,
             footprint: *footprint,
@@ -114,11 +115,11 @@ impl RecipeField {
         self.slots.len()
     }
 
-    /// The slot of tile `(lat0, lon0)`, or `None` outside the field.
+    /// The slot of tile `(lat0, lon0)`, its longitude wrapped or not, or
+    /// `None` outside the field.
     fn slot_of(&self, lat0: i64, lon0: i64) -> Option<usize> {
-        let (dy, dx) = (lat0 - self.south0, lon0 - self.west0);
-        ((0..self.lats).contains(&dy) && (0..self.lons).contains(&dx))
-            .then(|| (dy * self.lons + dx) as usize)
+        let (dy, dx) = (lat0 - self.south0, (lon0 - self.west0).rem_euclid(360));
+        ((0..self.lats).contains(&dy) && dx < self.lons).then(|| (dy * self.lons + dx) as usize)
     }
 
     /// The tile `(lat0, lon0)` of `slot` (below `slot_count`).
@@ -948,6 +949,51 @@ mod tests {
         let mut unmasked = FieldSampler::with_class_mask(&field, axes, false);
         assert!(!(0..lats.len()).any(|i| (0..lons.len()).any(|j| unmasked.skips_class(i, j))));
         assert_sampler_matches_reference(&mut unmasked, &field, &lats, &lons);
+    }
+
+    /// A recipe for `(lat0, lon0)` lit and bright everywhere, on 120 class
+    /// and 8 brightness cells per degree.
+    fn bright_tile(lat0: i32, lon0: i32) -> Arc<Recipe> {
+        synthetic(lat0, lon0, 120, |_, _| 1, 8, |_, _| 200)
+    }
+
+    #[test]
+    fn a_footprint_on_the_antimeridian_reads_the_tile_across_it() {
+        // Taveuni, Fiji: tile (-17, -180) east of the line, nothing west.
+        let across = bright_tile(-17, -180);
+        let lookup = move |a: i32, b: i32| ((a, b) == (-17, -180)).then(|| across.clone());
+        let east_edge = RecipeField::new(&footprint(-16.6, -16.7, 179.95, 180.0), &lookup);
+        assert!(east_edge.recipe(-17, -180).is_some());
+        // On the line, bilinear brightness is halfway between the last
+        // cell west of it (no recipe) and the first east of it (200), whose
+        // centres are 1/16 degree either side.
+        let scale = BrightnessScale::default();
+        let at_line = east_edge.radiance(-16.65, 180.0);
+        assert!(
+            (at_line - scale.radiance_at(100.0)).abs() < 1e-9,
+            "{at_line}"
+        );
+        assert!(east_edge.radiance(-16.65, 179.999_999) > 0.0);
+        assert_eq!(east_edge.radiance(-16.65, 179.9), 0.0, "no recipe west");
+        // The class warp reaches the tile's westmost cells, under its own
+        // key and palette.
+        let mut out = Vec::new();
+        east_edge.class_weights(-16.65, 179.999_9, &mut out);
+        assert!(!out.is_empty(), "class weight across the line");
+        for w in &out {
+            assert_eq!(w.tile, (-17, -180));
+            assert_eq!(east_edge.palette_name(w.tile, w.index), Some("lit"));
+        }
+        // The other way: a footprint on the line's east side reads 179.
+        let west_tile = bright_tile(-17, 179);
+        let lookup = move |a: i32, b: i32| ((a, b) == (-17, 179)).then(|| west_tile.clone());
+        let west_edge = RecipeField::new(&footprint(-16.6, -16.7, -180.0, -179.95), &lookup);
+        assert!(west_edge.radiance(-16.65, -179.999_999) > 0.0);
+        west_edge.class_weights(-16.65, -179.999_9, &mut out);
+        assert!(!out.is_empty() && out.iter().all(|w| w.tile == (-17, 179)));
+        // The probe sees the light across the line.
+        assert!(east_edge.has_light(|_| true));
+        assert!(west_edge.has_light(|_| true));
     }
 
     #[test]

@@ -145,9 +145,13 @@ impl RoadField {
         let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut segments = 0usize;
         for tile in tiles {
-            // The chains near the footprint and its reach.
-            let (south, west) = (fp.south - reach, fp.west - reach);
-            let (north, east) = (fp.north + reach, fp.east + reach);
+            // A tile across the antimeridian from the footprint (its key
+            // wrapped into [-180, 180)) is drawn 360 degrees over, beside it.
+            let shift = antimeridian_shift(tile.tile.1, &fp);
+            // The chains near the footprint and its reach, in the tile's
+            // own longitudes.
+            let (south, west) = (fp.south - reach, fp.west - reach - shift);
+            let (north, east) = (fp.north + reach, fp.east + reach - shift);
             let mut northings: Option<Northings> = None;
             tile.for_each_chain_near(south, west, north, east, |chain| {
                 let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
@@ -158,7 +162,9 @@ impl RoadField {
                     chain
                         .points()
                         .zip(chain.lat_steps())
-                        .map(|((lon, lat), &step)| (mercator(0.0, lon).0, ys.at(step, lat))),
+                        .map(|((lon, lat), &step)| {
+                            (mercator(0.0, lon + shift).0, ys.at(step, lat))
+                        }),
                 );
                 segments += pts.len().saturating_sub(1);
                 match model.lamps {
@@ -518,6 +524,14 @@ fn falloff(u: f32) -> f32 {
     e
 }
 
+/// Degrees to add to the longitudes of tile `lon0`'s roads to draw them
+/// beside `fp`: 0, or 360 either way for a tile across the antimeridian
+/// (a footprint by the line asks for the wrapped tile across it).
+fn antimeridian_shift(lon0: i32, fp: &Footprint) -> f64 {
+    let middle = (fp.west + fp.east) / 2.0;
+    360.0 * ((middle - (f64::from(lon0) + 0.5)) / 360.0).round()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -613,6 +627,41 @@ pub(crate) mod tests {
     /// The `crossing` road rastered with the default model.
     pub(crate) fn crossing_field(name: &DdsFilename, size: u32) -> RoadField {
         RoadField::raster(name, size, &[crossing(name)], &RoadModel::DEFAULT)
+    }
+
+    #[test]
+    fn roads_across_the_antimeridian_light_the_texture_at_it() {
+        // The ZL16 texture whose east edge is the line, at Taveuni, and a
+        // road 30 m past the line, in tile (-17, -180).
+        let mut name = name_at_zoom(-16.8, 179.95, 16);
+        name.col = (1 << 16) - 16;
+        let f = Footprint::from_name(&name);
+        assert_eq!(f.east, 180.0);
+        let road = |lon: f64| vec![(100, vec![(lon, f.north + 0.01), (lon, f.south - 0.01)])];
+        let across = merged((-17, -180), &road(-179.999_7));
+        let field = RoadField::raster(&name, 256, &[across], &RoadModel::DEFAULT);
+        assert!(field.stats.lit_texels > 0, "the glow crosses the line");
+        // The texels it lights are those a road 30 m inside the line lights
+        // in their mirror image: the east columns, not the west ones.
+        let lit_cols = |field: &RoadField| {
+            (0..256u32)
+                .filter_map(|i| field.row(i))
+                .flat_map(|row| row.iter().enumerate().filter(|(_, &v)| v > 0.0))
+                .map(|(j, _)| j)
+                .collect::<Vec<_>>()
+        };
+        assert!(lit_cols(&field).iter().all(|&j| j >= 192));
+        // The westmost texture is lit by a road just across in tile 179.
+        name.col = 0;
+        let f = Footprint::from_name(&name);
+        let road = vec![(
+            100,
+            vec![(179.999_7, f.north + 0.01), (179.999_7, f.south - 0.01)],
+        )];
+        let across = merged((-17, 179), &road);
+        let field = RoadField::raster(&name, 256, &[across], &RoadModel::DEFAULT);
+        assert!(field.stats.lit_texels > 0);
+        assert!(lit_cols(&field).iter().all(|&j| j < 64));
     }
 
     #[test]

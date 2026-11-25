@@ -4,6 +4,7 @@
 //! generator's sampling model.
 
 use std::f64::consts::PI;
+use std::ops::RangeInclusive;
 
 use crate::fuse::DdsFilename;
 use crate::night::generator::tiling::mercator;
@@ -49,13 +50,30 @@ impl Footprint {
         }
     }
 
-    /// South-west corners of every 1 degree tile the footprint touches.
+    /// South-west corners of every 1 degree tile the footprint touches,
+    /// longitudes wrapped into [-180, 180): a footprint grown past the
+    /// antimeridian touches the tiles across it (180 is -180, -181 is 179).
     pub fn tiles(&self) -> Vec<(i32, i32)> {
-        let lats = (self.south.floor() as i32)..=(self.north.ceil() as i32 - 1);
-        let lons = (self.west.floor() as i32)..=(self.east.ceil() as i32 - 1);
-        lats.flat_map(|lat| lons.clone().map(move |lon| (lat, lon)))
+        let (lats, lons) = self.tile_ranges();
+        lats.flat_map(|lat| lons.clone().map(move |lon| (lat, wrap_tile_lon(lon))))
             .collect()
     }
+
+    /// The tile latitudes and longitudes the footprint touches, south to
+    /// north and west to east, longitudes not wrapped: past the
+    /// antimeridian they run on to 180 or down to -181, so the ranges stay
+    /// contiguous.
+    pub(crate) fn tile_ranges(&self) -> (RangeInclusive<i32>, RangeInclusive<i32>) {
+        (
+            (self.south.floor() as i32)..=(self.north.ceil() as i32 - 1),
+            (self.west.floor() as i32)..=(self.east.ceil() as i32 - 1),
+        )
+    }
+}
+
+/// A 1 degree tile's longitude wrapped into [-180, 180).
+pub fn wrap_tile_lon(lon: i32) -> i32 {
+    (lon + 180).rem_euclid(360) - 180
 }
 
 /// The texel centres of a `size` x `size` lit texture: per column (west
@@ -140,6 +158,25 @@ mod tests {
         assert!(c.lats[0] < f.north && c.lats[7] > f.south);
         assert_eq!(c.xs[3], mercator(0.0, c.lons[3]).0);
         assert_eq!(c.ys[3], mercator(c.lats[3], 0.0).1);
+    }
+
+    #[test]
+    fn tiles_wrap_across_the_antimeridian() {
+        // East edge on the line: the margin reaches tile 180, which is -180.
+        let east = fp(-16.6, -16.7, 179.95, 180.0).expanded(0.01);
+        assert_eq!(east.tiles(), vec![(-17, 179), (-17, -180)]);
+        // West edge on the line: tile -181 is 179.
+        let west = fp(-16.6, -16.7, -180.0, -179.95).expanded(0.01);
+        assert_eq!(west.tiles(), vec![(-17, 179), (-17, -180)]);
+        // The ranges stay unwrapped, so they are contiguous.
+        assert_eq!(east.tile_ranges(), (-17..=-17, 179..=180));
+        assert_eq!(west.tile_ranges(), (-17..=-17, -181..=-180));
+        assert_eq!(wrap_tile_lon(180), -180);
+        assert_eq!(wrap_tile_lon(-181), 179);
+        assert_eq!(wrap_tile_lon(539), 179);
+        for lon in -180..180 {
+            assert_eq!(wrap_tile_lon(lon), lon);
+        }
     }
 
     #[test]

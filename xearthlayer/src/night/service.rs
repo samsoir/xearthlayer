@@ -2395,6 +2395,29 @@ mod tests {
         }
 
         #[test]
+        fn a_footprint_on_the_antimeridian_asks_for_the_tile_across_it() {
+            // The ZL16 texture whose east edge is the line, at Taveuni.
+            let mut name = name_at(-16.8, 179.95);
+            name.col = (1 << 16) - 16;
+            assert_eq!(Footprint::from_name(&name).east, 180.0);
+            let size = LitLayout::new(name.zoom, 4).first_visible;
+            let fields = field_tiles(&name);
+            let roads = road_tiles(&name, size, &RoadModel::DEFAULT);
+            for tiles in [&fields, &roads] {
+                assert!(tiles.contains(&(-17, 179)), "{tiles:?}");
+                assert!(tiles.contains(&(-17, -180)), "{tiles:?}");
+                assert!(
+                    tiles.iter().all(|t| (-180..180).contains(&t.1)),
+                    "{tiles:?}"
+                );
+            }
+            // And the westmost texture asks for tile 179.
+            name.col = 0;
+            assert!(field_tiles(&name).contains(&(-17, 179)));
+            assert!(road_tiles(&name, size, &RoadModel::DEFAULT).contains(&(-17, 179)));
+        }
+
+        #[test]
         fn road_tiles_follow_the_glow_reach_past_the_field_margin() {
             // A wide glow: its reach is far beyond the recipe field's margin.
             let mut model = RoadModel::DEFAULT;
