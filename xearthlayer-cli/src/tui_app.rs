@@ -396,7 +396,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
 }
 
 /// Wait for the startup thread, calling `on_tick` every `tick` until it
-/// finishes, and return what it returned.
+/// finishes and once more after it returned, and return what it returned.
 ///
 /// A panic on the startup thread is resumed on this one. Waiting for a result
 /// the thread would never deliver left the loading screen up forever with the
@@ -414,7 +414,12 @@ fn wait_for_init<T>(
         std::thread::sleep(tick);
     }
     match init.join() {
-        Ok(value) => value,
+        // The join orders everything the thread sent (its final `Complete`)
+        // before this last tick; `is_finished` alone does not.
+        Ok(value) => {
+            on_tick();
+            value
+        }
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -580,6 +585,32 @@ mod tests {
         });
 
         assert!(ticks > 0, "the loading screen is drawn while startup runs");
+    }
+
+    #[test]
+    fn progress_sent_just_before_the_thread_finishes_still_reaches_a_tick() {
+        // The startup thread sends `Complete` as its last act; a tick after
+        // it finishes must still drain it, or "All services initialized"
+        // never reaches the log.
+        let last = within(Duration::from_secs(10), || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut last = None;
+            std::thread::scope(|s| {
+                let init = s.spawn(move || tx.send("complete").unwrap());
+                // Finished before the wait starts: the loop never ticks.
+                while !init.is_finished() {
+                    std::thread::yield_now();
+                }
+                wait_for_init(init, Duration::from_millis(1), || {
+                    while let Ok(progress) = rx.try_recv() {
+                        last = Some(progress);
+                    }
+                })
+            });
+            last
+        });
+
+        assert_eq!(last, Some("complete"));
     }
 
     #[test]
