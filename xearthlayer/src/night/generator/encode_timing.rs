@@ -1,18 +1,29 @@
-//! Release-build timing of the lit encode stages before and after #439,
-//! on real textures from the developer's installation, which is only
-//! read. The inputs are named by environment variables read here only:
-//! `XEL_NIGHT_PACKAGES`, the packages directory (every `*_ortho` package
-//! under it is used), and `XEL_LAMINAR_ART`, Laminar's `1000 world
+//! Release-build timing and peak memory of the lit encode, before #439 and
+//! #440 and now, on real textures from the developer's installation, which
+//! is only read. The inputs are named by environment variables read here
+//! only: `XEL_NIGHT_PACKAGES`, the packages directory (every `*_ortho`
+//! package under it is used), and `XEL_LAMINAR_ART`, Laminar's `1000 world
 //! terrain` directory. Without them the test says so and times nothing.
 //! `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo test --release -p
-//! xearthlayer --lib time_the_lit_encode_stages -- --ignored --nocapture`.
+//! xearthlayer --lib time_the_lit_encode -- --ignored --nocapture`.
+//!
+//! "Before" is the encoder before #439 (`encode_visible_reference`), whose
+//! memory is also #439's: the whole chain at once, a copy of the first
+//! level and a linear copy of it with four channels. Peak memory is
+//! measured by [`CountingAllocator`], which this module makes the global
+//! allocator of the library's unit tests; it counts per thread, so tests
+//! running beside a measurement do not disturb it.
 
 use image::RgbaImage;
 
-use super::tests::{dim_reference, lit_chain_reference, name_at, solid};
+use super::counting_alloc::{held_at_peak, CountingAllocator};
+use super::tests::{encode_visible_reference, name_at, solid};
 use super::*;
 use crate::night::roads::field::RoadField;
 use crate::night::roads::RoadModel;
+
+#[global_allocator]
+static COUNTING: CountingAllocator = CountingAllocator;
 
 /// The ZL16 textures of the recipe tiles under `roots`, sampled evenly
 /// to at most `tiles` tiles, three positions in each.
@@ -59,57 +70,50 @@ fn timed<T>(f: impl FnOnce() -> T) -> (f64, T) {
     (started.elapsed().as_secs_f64() * 1e3, out)
 }
 
-/// `lit_chain`, `dim` and `bc1_levels` of `img`, in ms, by the encoder
-/// before #439 and by today's, each the least of `runs`; asserts both
-/// payloads and `encode_visible`'s are the same bytes.
-fn stage_times(img: &RgbaImage, runs: usize) -> ([f64; 3], [f64; 3], f64) {
-    let (mut before, mut after, mut visible) = ([f64::MAX; 3], [f64::MAX; 3], f64::MAX);
-    let least = |acc: &mut [f64; 3], t: [f64; 3]| {
-        for (a, t) in acc.iter_mut().zip(t) {
-            *a = a.min(t);
-        }
-    };
-    for _ in 0..runs {
-        let (t0, mut chain) = timed(|| lit_chain_reference(img));
-        let (t1, ()) = timed(|| {
-            for (n, level) in chain.iter_mut().enumerate() {
-                dim_reference(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
-            }
-        });
-        let (t2, old) = timed(|| bc1_levels(&chain).unwrap());
-        least(&mut before, [t0, t1, t2]);
-
-        let (t0, mut chain) = timed(|| lit_chain(img));
-        let (t1, ()) = timed(|| {
-            for (n, level) in chain.iter_mut().enumerate() {
-                dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
-            }
-        });
-        let (t2, new) = timed(|| bc1_levels(&chain).unwrap());
-        least(&mut after, [t0, t1, t2]);
-        assert!(new == old, "the stages changed a byte");
-
-        let owned = img.clone();
-        let (t, payload) = timed(|| encode_visible(owned).unwrap());
-        visible = visible.min(t);
-        assert!(payload[..] == old[..], "encode_visible changed a byte");
-    }
-    (before, after, visible)
+/// One encoder's least time over the runs, in ms, and its peak, in bytes
+/// held beyond what its caller holds (the input not included).
+#[derive(Clone, Copy, Default)]
+struct Cost {
+    ms: f64,
+    peak: usize,
 }
 
-/// Release-build timing of the encode stages before and after #439, on
-/// real ZL16 textures at 1024 px and on a black one, one thread. Every
-/// payload is also checked byte for byte against the encoder before
-/// #439. Inputs as the module says.
+/// The cost of encoding `img` by the encoder before #439 and #440 and by
+/// `encode_visible`, the least time of `runs` and the largest peak; asserts
+/// both payloads are the same bytes.
+fn encode_costs(img: &RgbaImage, runs: usize) -> (Cost, Cost) {
+    let mut costs = [Cost {
+        ms: f64::MAX,
+        peak: 0,
+    }; 2];
+    let mut record = |which: usize, ms: f64, peak: usize| {
+        costs[which].ms = costs[which].ms.min(ms);
+        costs[which].peak = costs[which].peak.max(peak);
+    };
+    for _ in 0..runs {
+        let (ms, (old, peak)) = timed(|| held_at_peak(|| encode_visible_reference(img)));
+        record(0, ms, peak);
+        let owned = img.clone();
+        let (ms, (new, peak)) = timed(|| held_at_peak(|| encode_visible(owned).unwrap()));
+        record(1, ms, peak);
+        assert!(new[..] == old[..], "encode_visible changed a byte");
+    }
+    (costs[0], costs[1])
+}
+
+/// Release-build time and peak memory of the lit encode before #439 and
+/// #440 and now, on real ZL16 textures at 1024 px and on a black one, one
+/// thread. Every payload is also checked byte for byte against the encoder
+/// before #439. Inputs as the module says.
 #[test]
 #[ignore]
-fn time_the_lit_encode_stages() {
+fn time_the_lit_encode() {
     let (Some(packages), Some(art)) = (
         std::env::var_os("XEL_NIGHT_PACKAGES"),
         std::env::var_os("XEL_LAMINAR_ART"),
     ) else {
         eprintln!(
-            "time_the_lit_encode_stages: set XEL_NIGHT_PACKAGES (the packages \
+            "time_the_lit_encode: set XEL_NIGHT_PACKAGES (the packages \
              directory; every *_ortho package under it is used) and \
              XEL_LAMINAR_ART (Laminar's `1000 world terrain`); nothing timed"
         );
@@ -159,33 +163,26 @@ fn time_the_lit_encode_stages() {
         }
     }
     if textures.is_empty() {
-        eprintln!("time_the_lit_encode_stages: no lit texture under {roots:?}; nothing timed");
+        eprintln!("time_the_lit_encode: no lit texture under {roots:?}; nothing timed");
         return;
     }
+    const MIB: f64 = (1 << 20) as f64;
     let report = |label: &str, images: &[RgbaImage]| {
-        let (mut before, mut after, mut visible) = ([0.0; 3], [0.0; 3], 0.0);
+        let (mut before, mut after) = (Cost::default(), Cost::default());
         for img in images {
-            let (b, a, v) = stage_times(img, RUNS);
-            for c in 0..3 {
-                before[c] += b[c] / images.len() as f64;
-                after[c] += a[c] / images.len() as f64;
-            }
-            visible += v / images.len() as f64;
+            let (b, a) = encode_costs(img, RUNS);
+            before.ms += b.ms / images.len() as f64;
+            after.ms += a.ms / images.len() as f64;
+            before.peak = before.peak.max(b.peak);
+            after.peak = after.peak.max(a.peak);
         }
-        let total = |t: [f64; 3]| t.iter().sum::<f64>();
         println!(
-            "{label}: ms per texture, before -> after: lit_chain {:.2} -> {:.2}, \
-             dim {:.2} -> {:.2}, bc1_levels {:.2} -> {:.2}, total {:.2} -> {:.2}; \
-             encode_visible {:.2}",
-            before[0],
-            after[0],
-            before[1],
-            after[1],
-            before[2],
-            after[2],
-            total(before),
-            total(after),
-            visible
+            "{label}: per texture, before -> after: {:.2} -> {:.2} ms; \
+             peak beyond the input {:.2} -> {:.2} MiB",
+            before.ms,
+            after.ms,
+            before.peak as f64 / MIB,
+            after.peak as f64 / MIB,
         );
     };
     report(
@@ -193,7 +190,7 @@ fn time_the_lit_encode_stages() {
         &textures,
     );
     report(
-        &format!("black at {SIZE} px (stages without the shortcut)"),
+        &format!("black at {SIZE} px (the shortcut after)"),
         &[solid(SIZE, [0; 3])],
     );
 }
