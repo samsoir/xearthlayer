@@ -2433,10 +2433,13 @@ mod tests {
 
     /// A processor that waits for the test's word before each tile, so the
     /// test can queue requests behind a tile the worker has already taken.
-    /// A dropped sender lets every tile through.
+    /// A dropped sender lets every tile through. With `starts`, it reports
+    /// each tile's width as it reaches the gate: the worker has then
+    /// claimed the request and is inside the processor.
     struct Gated<P> {
         inner: P,
         gate: std::sync::mpsc::Receiver<()>,
+        starts: Option<mpsc::UnboundedSender<u32>>,
     }
 
     impl<P: TileProcessor> TileProcessor for Gated<P> {
@@ -2449,6 +2452,9 @@ mod tests {
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError> {
+            if let Some(starts) = &self.starts {
+                let _ = starts.send(image.width());
+            }
             let _ = self.gate.recv();
             self.inner
                 .process(image, format, levels, deadline, timing, payload)
@@ -2459,7 +2465,40 @@ mod tests {
     /// per message.
     fn gated<P: TileProcessor>(inner: P) -> (Gated<P>, std::sync::mpsc::Sender<()>) {
         let (open, gate) = std::sync::mpsc::channel();
-        (Gated { inner, gate }, open)
+        let starts = None;
+        (
+            Gated {
+                inner,
+                gate,
+                starts,
+            },
+            open,
+        )
+    }
+
+    /// [`gated`], reporting each tile's width as it starts ([`next_start`]).
+    fn gated_reporting<P: TileProcessor>(
+        inner: P,
+    ) -> (
+        Gated<P>,
+        std::sync::mpsc::Sender<()>,
+        mpsc::UnboundedReceiver<u32>,
+    ) {
+        let (processor, open) = gated(inner);
+        let (starts_tx, starts) = mpsc::unbounded_channel();
+        let processor = Gated {
+            starts: Some(starts_tx),
+            ..processor
+        };
+        (processor, open, starts)
+    }
+
+    /// The width of the next tile the processor started, within the guard.
+    async fn next_start(starts: &mut mpsc::UnboundedReceiver<u32>) -> u32 {
+        tokio::time::timeout(GUARD, starts.recv())
+            .await
+            .expect("a tile starts within the guard")
+            .expect("the worker is alive")
     }
 
     /// The worker loop around `processor` on `clock`, with the production
@@ -3400,9 +3439,9 @@ mod tests {
     #[tokio::test]
     async fn a_caller_cancelled_while_its_tile_is_encoded_waits_for_it() {
         let clock = FakeClock::new();
-        let (channel, raw, rx) = handle_and_raw(&clock);
+        let (channel, _raw, rx) = handle_and_raw(&clock);
         let (inner, _) = recording();
-        let (processor, open) = gated(inner);
+        let (processor, open, mut starts) = gated_reporting(inner);
         let _worker = spawn_with(
             processor,
             rx,
@@ -3420,8 +3459,11 @@ mod tests {
             cancel.clone(),
         ));
         assert!(futures::poll!(&mut caller).is_pending());
-        waits_for("the tile is taken", || all_taken(&raw)).await;
-        // Taken, held at the gate: claimed by the worker.
+        // Inside the processor, held at the gate: the worker claimed the
+        // request before it started the tile. Taken off the channel is not
+        // enough: a cancel between the take and the claim lets the caller
+        // leave first.
+        assert_eq!(next_start(&mut starts).await, 8);
         cancel.cancel();
         assert!(
             futures::poll!(&mut caller).is_pending(),
