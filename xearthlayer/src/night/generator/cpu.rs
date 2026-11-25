@@ -59,6 +59,9 @@ impl CpuLitGenerator {
         let mut regions: Vec<Option<LedRegion>> = vec![None; field.slot_count()];
         let mut weights = Vec::with_capacity(4);
         let mut corners = CornerCache::default();
+        // A patch is about 53 ZL16 texels wide: neighbouring texels reuse
+        // its jittered centres instead of hashing them again.
+        let mut patches = led::PatchCache::default();
         let mut road_light = RoadLight::new(request);
         // A field rastered for another size would put glow on the wrong
         // texels: it is left out rather than misplaced.
@@ -138,7 +141,7 @@ impl CpuLitGenerator {
                 }
                 let (mut led_kelvin, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
-                    let patch = led::patch_at(x, y);
+                    let patch = led::patch_at_cached(x, y, &mut patches);
                     patch_here = Some(patch);
                     if patch.u < share / wsum {
                         led_kelvin = Some(led::patch_kelvin(kelvin / wsum, &patch));
