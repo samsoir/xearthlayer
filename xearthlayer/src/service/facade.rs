@@ -83,14 +83,16 @@ pub struct XEarthLayerService {
     gc_scheduler_handles: Vec<JoinHandle<()>>,
     /// GC scheduler shutdown token for graceful shutdown (shared by all daemons).
     gc_scheduler_shutdown: Option<CancellationToken>,
-    /// GPU pipeline worker handle (when `texture.compressor = gpu`).
+    /// GPU pipeline worker handle (when `texture.compressor` is `gpu` or
+    /// `hybrid`).
     /// Awaited during shutdown to ensure GPU resources are released cleanly.
     gpu_worker_handle: Option<JoinHandle<()>>,
     /// Shutdown token for the GPU pipeline worker.
     gpu_shutdown: Option<CancellationToken>,
-    /// The GPU the encoder selected (when `texture.compressor = gpu`).
+    /// The GPU the encoder selected (when `texture.compressor` is `gpu` or
+    /// `hybrid`).
     gpu_adapter: Option<crate::system::GpuAdapter>,
-    /// The encoder policy's contention warning, when `gpu` was honoured on
+    /// The encoder policy's contention warning, when `gpu` or `hybrid` was honoured on
     /// a host whose only GPU is the one X-Plane renders with (#203).
     gpu_warning: Option<String>,
 }

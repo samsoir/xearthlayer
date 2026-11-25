@@ -28,8 +28,8 @@ use xearthlayer::config::{
 };
 use xearthlayer::provider::catalog::{find as find_provider, PROVIDERS};
 use xearthlayer::system::{
-    enumerate_gpus, CompressorKind, DefaultEncoderPolicy, EncoderPolicy, GpuAdapter,
-    HardwareProfile, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
+    enumerate_gpus, select_gpu_index, CompressorKind, DefaultEncoderPolicy, EncoderPolicy,
+    GpuAdapter, HardwareProfile, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
 };
 
 use crate::error::CliError;
@@ -49,10 +49,10 @@ pub struct SetupConfig {
     pub disk_cache_size: usize,
     /// Fraction of disk cache budget allocated to encoded DDS tiles
     pub dds_disk_ratio: f64,
-    /// Texture compressor backend: "software", "ispc", or "gpu"
+    /// Texture compressor backend: "software", "ispc", "gpu", or "hybrid"
     pub texture_compressor: String,
-    /// GPU device selector when compressor is "gpu". Ignored otherwise but
-    /// always written to keep the config file shape consistent.
+    /// GPU device selector when compressor is "gpu" or "hybrid". Ignored
+    /// otherwise but always written to keep the config file shape consistent.
     pub texture_gpu_device: String,
     /// Imagery provider (`provider.type`).
     pub provider_type: String,
@@ -896,7 +896,7 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
     println!(
         "{}",
         style(
-            "⚠  Do NOT select the GPU that X-Plane uses for rendering — this will\n   cause frame drops. If unsure, keep the default (ISPC)."
+            "⚠  Do NOT select the GPU that X-Plane uses for rendering — this will\n   cause frame drops. If unsure, choose ISPC."
         )
         .yellow()
     );
@@ -907,10 +907,16 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
         items.push(format!("GPU: {}", adapter));
     }
 
+    let existing = ConfigFile::load().unwrap_or_default();
     let idx = Select::with_theme(theme)
         .with_prompt("Encoding backend")
         .items(&items)
-        .default(0)
+        .default(default_encoding_index(
+            &existing.texture.compressor,
+            &existing.texture.gpu_device,
+            candidates,
+            &hw.adapters,
+        ))
         .interact()
         .map_err(|e| CliError::Config(format!("Selection error: {}", e)))?;
 
@@ -924,18 +930,53 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
     } else {
         let adapter = &candidates[idx - 1];
         let gpu_device = adapter.config_value(&hw.adapters);
-        let decision = policy.select(&hw, Some(CompressorKind::Gpu));
+        let overflow = Confirm::with_theme(theme)
+            .with_prompt("Encode tiles on the CPU (ISPC) while the GPU is busy? (hybrid)")
+            .default(default_overflow(&existing.texture.compressor))
+            .interact()
+            .map_err(|e| CliError::Config(format!("Confirm error: {}", e)))?;
+        let kind = if overflow {
+            CompressorKind::Hybrid
+        } else {
+            CompressorKind::Gpu
+        };
+        let decision = policy.select(&hw, Some(kind));
         if let Some(warning) = &decision.warning {
             println!("{}", style(format!("⚠  {warning}")).yellow());
         }
         println!(
-            "  {} GPU: {} (config: {})",
+            "  {} {}: {} (config: {})",
             style("✓").green(),
+            decision.backend,
             adapter,
             gpu_device
         );
         Ok((decision.backend.config_value().to_string(), gpu_device))
     }
+}
+
+/// The encoding menu's default: the GPU `gpu_device` selects (item `1 + i`
+/// for `candidates[i]`), by the rule the encoder selects it with, when
+/// `gpu` or `hybrid` is set and that GPU is offered; ISPC (item 0)
+/// otherwise, so a reconfigure keeps the choice.
+fn default_encoding_index(
+    compressor: &str,
+    gpu_device: &str,
+    candidates: &[GpuAdapter],
+    adapters: &[GpuAdapter],
+) -> usize {
+    if !CompressorKind::parse(compressor).is_some_and(CompressorKind::uses_gpu) {
+        return 0;
+    }
+    select_gpu_index(adapters, gpu_device)
+        .and_then(|selected| candidates.iter().position(|c| *c == adapters[selected]))
+        .map_or(0, |i| i + 1)
+}
+
+/// The hybrid question's default: no when `gpu` is set, so a reconfigure
+/// keeps it, yes otherwise.
+fn default_overflow(compressor: &str) -> bool {
+    CompressorKind::parse(compressor) != Some(CompressorKind::Gpu)
 }
 
 /// Enumerate adapters while showing a spinner — wgpu's first call can
@@ -1031,6 +1072,45 @@ mod tests {
         );
         assert_eq!(network_level_warning(NetworkLevel::High), None);
         assert_eq!(network_level_warning(NetworkLevel::Low), None);
+    }
+
+    fn adapter(name: &str, kind: xearthlayer::system::GpuKind) -> GpuAdapter {
+        GpuAdapter {
+            name: name.to_string(),
+            kind,
+            backend: "vulkan".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_encoding_menu_defaults_to_the_configured_gpu_while_it_is_offered() {
+        use xearthlayer::system::GpuKind;
+        let gpus = [
+            adapter("AMD Radeon Graphics", GpuKind::Integrated),
+            adapter("NVIDIA GeForce RTX 4090", GpuKind::Discrete),
+        ];
+        let index = |compressor, device| default_encoding_index(compressor, device, &gpus, &gpus);
+
+        assert_eq!(index("hybrid", "integrated"), 1);
+        assert_eq!(index("gpu", "discrete"), 2);
+        assert_eq!(index("ispc", "integrated"), 0, "a CPU encoder stays ISPC");
+        assert_eq!(index("software", "discrete"), 0);
+        assert_eq!(index("hybrid", "Intel Arc"), 0, "a GPU no longer offered");
+        assert_eq!(
+            index("gpu", "rtx"),
+            2,
+            "a name substring, as the encoder reads it"
+        );
+    }
+
+    #[test]
+    fn the_hybrid_question_keeps_gpu_and_recommends_hybrid_otherwise() {
+        assert!(!default_overflow("gpu"));
+        assert!(default_overflow("hybrid"));
+        assert!(
+            default_overflow("ispc"),
+            "a new GPU choice is offered hybrid"
+        );
     }
 
     #[test]

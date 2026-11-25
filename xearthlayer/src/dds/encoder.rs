@@ -245,6 +245,31 @@ impl DdsEncoder {
     }
 }
 
+/// The compressed chain of `image` with `compressor`, without a header:
+/// `mipmap_count` levels from full size, at most the full chain.
+///
+/// The same bytes [`DdsEncoder`] writes behind its header for that
+/// compressor, so a tile the GPU channel overflows to ISPC is the tile
+/// `texture.compressor = ispc` makes.
+pub(crate) fn compress_chain(
+    compressor: &dyn ImageCompressor,
+    image: RgbaImage,
+    format: DdsFormat,
+    mipmap_count: usize,
+) -> Result<Vec<u8>, DdsError> {
+    let (width, height) = image.dimensions();
+    let requested = u32::try_from(mipmap_count).unwrap_or(u32::MAX);
+    let levels = layout::chain_levels(width, height, Some(requested));
+    let mut payload = vec![0; layout::chain_len(width, height, levels, format)];
+    compress_chain_into(
+        compressor,
+        MipmapStream::new(image, levels as usize),
+        format,
+        &mut payload,
+    )?;
+    Ok(payload)
+}
+
 /// Compress `levels`, largest first, back to back into `payload` with
 /// [`compress_level_into`]; together they must fill it exactly.
 ///

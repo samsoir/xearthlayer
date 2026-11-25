@@ -39,7 +39,11 @@ fn expected_bc1_payload(width: u32, height: u32, levels: usize) -> usize {
 async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let (channel, _worker, _adapter) =
-        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(&gpu_device(), shutdown) {
+        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::WhenBusy::Wait,
+            shutdown,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping: no usable GPU ({e})");
@@ -102,7 +106,11 @@ async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
 async fn gpu_worker_survives_sub_block_levels() {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let (channel, _worker, _adapter) =
-        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(&gpu_device(), shutdown) {
+        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channel(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::WhenBusy::Wait,
+            shutdown,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping: no usable GPU ({e})");

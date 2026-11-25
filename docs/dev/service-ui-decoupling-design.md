@@ -419,7 +419,7 @@ Phase 5 removes the old in-process path, replaces `xearthlayer run` with a conve
 
 ### GPU Feature Flag Convergence
 
-The `gpu-encode` Cargo feature flag is removed in 0.5.0. GPU-accelerated DDS compression (`wgpu` + `block_compression`) is compiled unconditionally into the daemon binary. Users select the compressor backend at runtime via `texture.compressor` in config (software, ispc, or gpu). This eliminates the doubled build matrix that the feature flag created — no more separate GPU release artifacts.
+The `gpu-encode` Cargo feature flag is removed in 0.5.0. GPU-accelerated DDS compression (`wgpu` + `block_compression`) is compiled unconditionally into the daemon binary. Users select the compressor backend at runtime via `texture.compressor` in config (software, ispc, gpu, or hybrid). This eliminates the doubled build matrix that the feature flag created — no more separate GPU release artifacts.
 
 ### Package Model
 

@@ -15,6 +15,7 @@
 //! show a progress indicator.
 
 use std::fmt;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use thiserror::Error;
 
 /// A GPU adapter classification, mirroring `wgpu::DeviceType` but without
@@ -243,13 +244,25 @@ fn implicit_layers_setting(current: Option<&std::ffi::OsStr>) -> Option<&'static
 ///
 /// **This is blocking and slow** (see module docs). Returns an empty
 /// vector if no adapters are visible.
+///
+/// Every enumeration uses the process's one instance, one enumeration at a
+/// time. Parallel tests crashed the Vulkan stack three ways (loader 1.4.309,
+/// NVIDIA 620.73): creating instances concurrently (the loader jumped to
+/// address 0 while another thread was in the NVIDIA ICD's `dlopen`),
+/// enumerating one instance concurrently (the same in the NVIDIA driver's
+/// `vkGetPhysicalDeviceProperties2`), and enumerating a fresh instance while
+/// another instance's device was in use (the loader's `dlclose` of an ICD).
 pub fn enumerate_raw() -> Vec<wgpu::Adapter> {
-    // No display handle: this is a headless compute probe, and wgpu 30 makes
-    // the choice explicit instead of defaulting it.
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: PROBE_BACKENDS,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    static INSTANCE: LazyLock<Mutex<wgpu::Instance>> = LazyLock::new(|| {
+        // No display handle: this is a headless compute probe, and wgpu 30
+        // makes the choice explicit instead of defaulting it.
+        Mutex::new(wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: PROBE_BACKENDS,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        }))
     });
+    // A panic mid-enumeration leaves the instance as valid as before.
+    let instance = INSTANCE.lock().unwrap_or_else(PoisonError::into_inner);
     pollster::block_on(instance.enumerate_adapters(PROBE_BACKENDS))
 }
 
@@ -290,10 +303,11 @@ pub fn find_adapter<'a>(
 /// Pure selection logic operating on metadata-only adapter records.
 ///
 /// Returns the index of the first adapter matching `gpu_device`, or
-/// `None` if no match is found. Exposed at module visibility so the
-/// round-trip test can verify the inverse of [`GpuAdapter::config_value`]
-/// without needing live `wgpu::Adapter` instances.
-fn select_index(adapters: &[GpuAdapter], gpu_device: &str) -> Option<usize> {
+/// `None` if no match is found. The rule the encoder selects its adapter
+/// by, so the setup wizard proposes the configured GPU exactly when it
+/// would be used; it also lets the round-trip test verify the inverse of
+/// [`GpuAdapter::config_value`] without live `wgpu::Adapter` instances.
+pub fn select_index(adapters: &[GpuAdapter], gpu_device: &str) -> Option<usize> {
     let needle = gpu_device.to_lowercase();
     let target_kind = match needle.as_str() {
         "integrated" => Some(GpuKind::Integrated),

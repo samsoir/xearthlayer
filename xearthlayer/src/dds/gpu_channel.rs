@@ -17,16 +17,28 @@ mod inner {
 
     use block_compression::{CompressionVariant, GpuBlockCompressor};
     use image::RgbaImage;
+    use tokio::sync::mpsc::error::TrySendError;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
     use crate::dds::compressor::MipmapCompressor;
     use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::layout;
-    use crate::dds::{DdsError, DdsFormat};
+    use crate::dds::{DdsError, DdsFormat, IspcCompressor};
 
     /// Bounded channel capacity for GPU encode requests.
     pub const CHANNEL_CAPACITY: usize = 32;
+
+    /// What a tile does when the worker's queue has no room.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WhenBusy {
+        /// Wait for room (`texture.compressor = gpu`); a stopped worker is
+        /// an error.
+        Wait,
+        /// Encode with ISPC on the calling thread instead
+        /// (`texture.compressor = hybrid`), also when the worker stopped.
+        EncodeWithIspc,
+    }
 
     /// How long an idle worker sleeps between looks at its channel and its
     /// shutdown token.
@@ -118,16 +130,53 @@ mod inner {
     /// the mipmap iteration internally, eliminating per-level channel round-trips.
     pub struct GpuEncoderChannel {
         sender: Option<mpsc::Sender<GpuEncodeRequest>>,
+        when_busy: WhenBusy,
         stats: Arc<GpuEncodeStats>,
     }
 
     impl GpuEncoderChannel {
-        /// Create a new channel handle wrapping the given sender.
+        /// Create a new channel handle wrapping the given sender. A full
+        /// channel blocks the caller until the worker takes a request
+        /// ([`WhenBusy::Wait`]).
         pub fn new(sender: mpsc::Sender<GpuEncodeRequest>) -> Self {
             Self {
                 sender: Some(sender),
+                when_busy: WhenBusy::Wait,
                 stats: Arc::default(),
             }
+        }
+
+        /// A handle following `when_busy` and the receiver for its worker,
+        /// on the queue that goes with the policy: [`CHANNEL_CAPACITY`] to
+        /// wait in, or one request to overflow from.
+        ///
+        /// With [`WhenBusy::EncodeWithIspc`] a tile never waits for room in
+        /// the queue: one that finds it full, or the worker stopped, is
+        /// encoded with ISPC on the calling thread. One tile waits besides
+        /// the one the worker encodes; a deeper queue would only add queue
+        /// wait, as ISPC on one thread is about as fast as the worker. A
+        /// tile the worker accepts is still waited for. The calling thread
+        /// is a tile task's, which holds a CPU-pool permit, so the CPU pool
+        /// stays the only limit on concurrent encodes. ISPC and the GPU
+        /// kernel give different bytes for the same tile; both are valid
+        /// BC1.
+        pub fn with_policy(when_busy: WhenBusy) -> (Self, mpsc::Receiver<GpuEncodeRequest>) {
+            let capacity = match when_busy {
+                WhenBusy::Wait => CHANNEL_CAPACITY,
+                WhenBusy::EncodeWithIspc => 1,
+            };
+            let (tx, rx) = mpsc::channel(capacity);
+            let channel = Self {
+                when_busy,
+                ..Self::new(tx)
+            };
+            (channel, rx)
+        }
+
+        /// The sender, for tests that put a request in the queue themselves.
+        #[cfg(test)]
+        pub(crate) fn sender(&self) -> &mpsc::Sender<GpuEncodeRequest> {
+            self.sender.as_ref().expect("not shut down")
         }
 
         /// The stage timings of the tiles answered through this channel,
@@ -155,6 +204,25 @@ mod inner {
         /// shutdown — the channel must be explicitly closed.
         pub fn shutdown(&mut self) {
             self.sender.take();
+        }
+
+        /// Encodes a tile the worker could not take with ISPC, on this
+        /// thread: the chain `texture.compressor = ispc` writes. Counted as
+        /// overflowed when encoded, as failed otherwise.
+        fn encode_overflow(&self, request: GpuEncodeRequest) -> Result<Vec<u8>, DdsError> {
+            let _span = tracing::debug_span!(target: "profiling", "gpu_overflow_ispc").entered();
+            let result = crate::dds::encoder::compress_chain(
+                &IspcCompressor,
+                request.image,
+                request.format,
+                request.mipmap_count,
+            );
+            if result.is_ok() {
+                self.stats.record_overflowed();
+            } else {
+                self.stats.record_failed();
+            }
+            result
         }
     }
 
@@ -184,9 +252,6 @@ mod inner {
             )
             .entered();
 
-            // Counted from before the send (which blocks on a full channel)
-            // until the reply or the failure is back.
-            let in_channel = self.stats.enter();
             let sent_at = Instant::now();
             let (resp_tx, resp_rx) = oneshot::channel();
             let request = GpuEncodeRequest {
@@ -197,16 +262,33 @@ mod inner {
                 response: resp_tx,
             };
 
-            let reply = sender
-                .blocking_send(request)
-                .map_err(|_| DdsError::CompressionFailed("GPU worker is not running".to_string()))
-                .and_then(|()| {
-                    resp_rx.blocking_recv().map_err(|_| {
-                        DdsError::CompressionFailed(
-                            "GPU worker dropped response channel".to_string(),
-                        )
+            // In the queue depth until the reply or the failure is back:
+            // from before a send that waits for room (it blocks on a full
+            // channel), from acceptance for one that overflows, so a tile
+            // handed to ISPC is never counted.
+            let in_channel;
+            let sent = match self.when_busy {
+                WhenBusy::Wait => {
+                    in_channel = self.stats.enter();
+                    sender.blocking_send(request).map_err(|_| {
+                        DdsError::CompressionFailed("GPU worker is not running".to_string())
                     })
-                });
+                }
+                WhenBusy::EncodeWithIspc => match sender.try_send(request) {
+                    Ok(()) => {
+                        in_channel = self.stats.enter();
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(request) | TrySendError::Closed(request)) => {
+                        return self.encode_overflow(request);
+                    }
+                },
+            };
+            let reply = sent.and_then(|()| {
+                resp_rx.blocking_recv().map_err(|_| {
+                    DdsError::CompressionFailed("GPU worker dropped response channel".to_string())
+                })
+            });
             let total = sent_at.elapsed();
             drop(in_channel);
             let reply = match reply {
@@ -546,6 +628,10 @@ mod inner {
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("GPU pipeline worker: shutdown signal received");
+                // Queued requests are dropped, so their callers see the
+                // response channel closed; drained as after a panic.
+                rx.close();
+                while rx.blocking_recv().is_some() {}
                 break;
             }
 
@@ -611,8 +697,16 @@ mod inner {
                         timing,
                     ));
 
-                    // Drain remaining queued requests
-                    while let Ok(req) = rx.try_recv() {
+                    // Closed first, so no request is sent while the queue
+                    // drains: a caller with `WhenBusy::EncodeWithIspc`
+                    // encodes with ISPC, one that waits fails at once.
+                    // Drained with `blocking_recv`, which returns `None`
+                    // only once no sender holds a slot: a `try_send` that
+                    // took its slot before the close and sends after it is
+                    // answered too, where `try_recv` would leave its caller
+                    // waiting forever.
+                    rx.close();
+                    while let Some(req) = rx.blocking_recv() {
                         let _ = req.response.send(GpuEncodeReply::failed(
                             "GPU worker terminated after panic",
                             GpuTileTiming::default(),
@@ -668,6 +762,10 @@ mod inner {
 
     /// Create a [`GpuEncoderChannel`] with a full-tile streaming worker.
     ///
+    /// The handle follows `when_busy` ([`GpuEncoderChannel::with_policy`]):
+    /// callers wait for room (`texture.compressor = gpu`) or overflow to
+    /// ISPC (`hybrid`).
+    ///
     /// Initializes GPU resources and spawns the worker thread. Returns the
     /// channel handle, the worker `JoinHandle`, and the selection: the
     /// adapter chosen (for display; the worker owns the device) with the
@@ -683,6 +781,7 @@ mod inner {
     /// Returns `DdsError` if GPU initialization fails.
     pub fn create_gpu_encoder_channel(
         gpu_device: &str,
+        when_busy: WhenBusy,
         shutdown: CancellationToken,
     ) -> Result<
         (
@@ -696,9 +795,9 @@ mod inner {
 
         tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (channel, rx) = GpuEncoderChannel::with_policy(when_busy);
         let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
-        Ok((GpuEncoderChannel::new(tx), handle, selection))
+        Ok((channel, handle, selection))
     }
 }
 
@@ -707,9 +806,10 @@ pub use inner::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dds::compressor::tests::varied;
     use crate::dds::compressor::{ImageCompressor, MipmapCompressor};
     use crate::dds::gpu_stats::GpuEncodeStats;
-    use crate::dds::{DdsError, DdsFormat, MipmapStream, SoftwareCompressor};
+    use crate::dds::{DdsError, DdsFormat, IspcCompressor, MipmapStream, SoftwareCompressor};
     use image::RgbaImage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1040,6 +1140,110 @@ mod tests {
             msg.contains("GPU worker"),
             "error should mention GPU worker, got: {msg}"
         );
+    }
+
+    // =========================================================================
+    // The overflow handle (`texture.compressor = hybrid`)
+    // =========================================================================
+
+    /// What `texture.compressor = ispc` writes behind the header for
+    /// `image`: the bytes an overflowed tile must have.
+    fn ispc_payload(image: RgbaImage, levels: usize) -> Vec<u8> {
+        let dds = crate::dds::DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(IspcCompressor))
+            .with_mipmap_count(levels)
+            .encode(image)
+            .expect("ISPC encodes the reference");
+        dds[crate::dds::layout::HEADER_LEN..].to_vec()
+    }
+
+    /// An overflow handle whose one queue slot is taken by a tile of width
+    /// 4, with no worker: the next tile overflows. Returns the receiver too,
+    /// to see what reached the queue.
+    fn taken_overflow_channel() -> (GpuEncoderChannel, mpsc::Receiver<GpuEncodeRequest>) {
+        let (channel, rx) = GpuEncoderChannel::with_policy(WhenBusy::EncodeWithIspc);
+        let (waiting, _reply) = request(4);
+        channel
+            .sender()
+            .try_send(waiting)
+            .expect("room for one tile");
+        (channel, rx)
+    }
+
+    #[test]
+    fn each_policy_has_its_queue() {
+        let (channel, _rx) = GpuEncoderChannel::with_policy(WhenBusy::Wait);
+        assert_eq!(channel.sender().max_capacity(), CHANNEL_CAPACITY);
+        let (channel, _rx) = GpuEncoderChannel::with_policy(WhenBusy::EncodeWithIspc);
+        assert_eq!(channel.sender().max_capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn overflow_sends_a_tile_to_a_worker_with_room() {
+        let (channel, rx) = GpuEncoderChannel::with_policy(WhenBusy::EncodeWithIspc);
+        let worker = FnProcessor(|_: RgbaImage, _: &mut GpuTileTiming| Ok(vec![0xAB; 8]));
+        let _worker = spawn_tile_worker(worker, rx, CancellationToken::new());
+
+        let (result, channel) = tokio::task::spawn_blocking(move || {
+            let result = channel.compress_mipmap_chain(varied(64, 64), DdsFormat::BC1, 1);
+            (result, channel)
+        })
+        .await
+        .expect("the caller does not panic");
+
+        assert_eq!(result.expect("the worker encoded it"), vec![0xAB; 8]);
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overflowed, s.failed), (1, 0, 0));
+    }
+
+    #[test]
+    fn overflow_encodes_what_ispc_writes_when_the_queue_is_taken() {
+        let (channel, mut rx) = taken_overflow_channel();
+        let image = varied(64, 64);
+        let expected = ispc_payload(image.clone(), 7);
+
+        let result = channel.compress_mipmap_chain(image, DdsFormat::BC1, 7);
+
+        assert_eq!(result.expect("ISPC encoded it"), expected);
+        let queued: Vec<u32> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|r| r.image.width())
+            .collect();
+        assert_eq!(queued, [4], "only the waiting tile reached the queue");
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overflowed, s.failed), (0, 1, 0));
+        assert_eq!(
+            (s.depth_now, s.depth_max),
+            (0, 0),
+            "an overflowed tile is never in the queue depth"
+        );
+    }
+
+    #[test]
+    fn overflow_encodes_with_ispc_when_the_worker_stopped() {
+        let (channel, rx) = GpuEncoderChannel::with_policy(WhenBusy::EncodeWithIspc);
+        drop(rx);
+        let image = varied(64, 64);
+        let expected = ispc_payload(image.clone(), 7);
+
+        let result = channel.compress_mipmap_chain(image, DdsFormat::BC1, 7);
+
+        assert_eq!(result.expect("ISPC encoded it"), expected);
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overflowed, s.failed), (0, 1, 0));
+    }
+
+    #[test]
+    fn overflow_that_fails_to_encode_counts_as_failed() {
+        let (channel, _rx) = taken_overflow_channel();
+
+        let result = channel.compress_mipmap_chain(RgbaImage::new(0, 0), DdsFormat::BC1, 1);
+
+        assert!(
+            matches!(result, Err(DdsError::InvalidDimensions(0, 0))),
+            "{result:?}"
+        );
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overflowed, s.failed), (0, 0, 1));
     }
 
     // =========================================================================
@@ -1375,7 +1579,7 @@ mod tests {
     async fn test_create_gpu_encoder_channel_convenience() {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (channel, worker_handle, _adapter) =
-            match create_gpu_encoder_channel("integrated", shutdown) {
+            match create_gpu_encoder_channel("integrated", WhenBusy::Wait, shutdown) {
                 Ok(r) => r,
                 Err(_) => return,
             };

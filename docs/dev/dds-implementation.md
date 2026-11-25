@@ -140,7 +140,7 @@ Adding a format requires:
 ## CLI Integration
 
 The encoder has no command-line options. XEarthLayer always encodes BC1 with the full
-mipmap chain; `texture.compressor` chooses the backend (`software`, `ispc` or `gpu`).
+mipmap chain; `texture.compressor` chooses the backend (`software`, `ispc`, `gpu` or `hybrid`).
 See `docs/configuration.md`.
 
 ## Test Results

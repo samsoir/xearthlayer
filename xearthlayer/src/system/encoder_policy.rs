@@ -26,15 +26,23 @@ pub enum CompressorKind {
     Ispc,
     /// wgpu compute shaders on a GPU.
     Gpu,
+    /// The GPU worker, and ISPC on the calling thread for a tile that finds
+    /// the worker's one-tile queue taken.
+    Hybrid,
 }
 
 impl CompressorKind {
+    /// Every `texture.compressor` value, the one list the config key, the
+    /// parser and the error messages name.
+    pub const VALUES: &'static [&'static str] = &["software", "ispc", "gpu", "hybrid"];
+
     /// Parse a `texture.compressor` value. `None` for anything unknown.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "software" => Some(Self::Software),
             "ispc" => Some(Self::Ispc),
             "gpu" => Some(Self::Gpu),
+            "hybrid" => Some(Self::Hybrid),
             _ => None,
         }
     }
@@ -45,7 +53,14 @@ impl CompressorKind {
             Self::Software => "software",
             Self::Ispc => "ispc",
             Self::Gpu => "gpu",
+            Self::Hybrid => "hybrid",
         }
+    }
+
+    /// The backend puts tiles on a GPU, so it shares that GPU with X-Plane
+    /// when it is the only one.
+    pub fn uses_gpu(self) -> bool {
+        matches!(self, Self::Gpu | Self::Hybrid)
     }
 }
 
@@ -107,7 +122,7 @@ pub trait EncoderPolicy: Send + Sync {
 }
 
 /// The shipped rules: honour an explicit preference, warn when it is `gpu`
-/// on a shared-GPU host, and choose ISPC when there is no preference. GPU
+/// or `hybrid` on a shared-GPU host, and choose ISPC when there is no preference. GPU
 /// is never auto-selected.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultEncoderPolicy;
@@ -115,15 +130,15 @@ pub struct DefaultEncoderPolicy;
 impl EncoderPolicy for DefaultEncoderPolicy {
     fn select(&self, hw: &HardwareProfile, user_pref: Option<CompressorKind>) -> EncoderDecision {
         match user_pref {
-            Some(CompressorKind::Gpu) if hw.shares_render_gpu() => {
+            Some(backend) if backend.uses_gpu() && hw.shares_render_gpu() => {
                 let gpu = &hw.adapters[0];
                 EncoderDecision {
-                    backend: CompressorKind::Gpu,
+                    backend,
                     warning: Some(format!(
                         "GPU acceleration is on {} ({}), the only GPU, which X-Plane renders \
                          with: encoding will compete with the simulator for it. Set \
-                         texture.compressor = ispc to encode on the CPU, or keep gpu only for \
-                         prewarming while X-Plane is closed.",
+                         texture.compressor = ispc to encode on the CPU, or keep {backend} only \
+                         for prewarming while X-Plane is closed.",
                         gpu.name,
                         gpu.kind.display().to_lowercase()
                     )),
@@ -174,14 +189,21 @@ mod tests {
 
     #[test]
     fn compressor_kind_round_trips_through_its_config_value() {
-        for kind in [
+        let kinds = [
             CompressorKind::Software,
             CompressorKind::Ispc,
             CompressorKind::Gpu,
-        ] {
+            CompressorKind::Hybrid,
+        ];
+        for kind in kinds {
             assert_eq!(CompressorKind::parse(kind.config_value()), Some(kind));
             assert_eq!(kind.to_string(), kind.config_value());
         }
+        assert_eq!(
+            kinds.map(CompressorKind::config_value),
+            CompressorKind::VALUES,
+            "VALUES names every backend"
+        );
         assert_eq!(CompressorKind::parse("gpu"), Some(CompressorKind::Gpu));
         assert_eq!(CompressorKind::parse("cuda"), None);
         assert_eq!(CompressorKind::parse(""), None);
@@ -242,6 +264,21 @@ mod tests {
 
         let decision = DefaultEncoderPolicy.select(&lone_discrete(), Some(CompressorKind::Gpu));
         assert!(decision.warning.is_some(), "a lone discrete GPU warns too");
+    }
+
+    #[test]
+    fn hybrid_on_a_shared_gpu_host_is_honoured_with_the_same_warning() {
+        let decision = DefaultEncoderPolicy.select(&apple_silicon(), Some(CompressorKind::Hybrid));
+        assert_eq!(decision.backend, CompressorKind::Hybrid);
+        let warning = decision.warning.expect("hybrid uses the shared GPU too");
+        assert!(warning.contains("Apple M2 Max"), "names the GPU: {warning}");
+        assert!(
+            warning.contains("keep hybrid only"),
+            "names the value set: {warning}"
+        );
+
+        let decision = DefaultEncoderPolicy.select(&igpu_and_dgpu(), Some(CompressorKind::Hybrid));
+        assert_eq!(decision.warning, None, "a second GPU: silent");
     }
 
     #[test]

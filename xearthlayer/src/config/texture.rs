@@ -41,7 +41,7 @@ pub struct TextureConfig {
     format: DdsFormat,
     /// Mipmap levels to emit; `None` means the full chain for the texture size
     mipmap_count: Option<usize>,
-    /// Compressor backend: "software", "ispc", or "gpu"
+    /// Compressor backend: "software", "ispc", "gpu", or "hybrid"
     compressor: String,
     /// GPU device selector: "integrated", "discrete", or adapter name substring
     gpu_device: String,

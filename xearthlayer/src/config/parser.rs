@@ -108,19 +108,18 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         // config loads whatever the line says, and `config upgrade` drops it.
         if let Some(v) = section.get("compressor") {
             let v = v.to_lowercase();
-            match v.as_str() {
-                "software" | "ispc" | "gpu" => {
-                    config.texture.compressor = v;
-                }
-                _ => {
-                    return Err(ConfigFileError::InvalidValue {
-                        section: "texture".to_string(),
-                        key: "compressor".to_string(),
-                        value: v,
-                        reason: "must be 'software', 'ispc', or 'gpu'".to_string(),
-                    });
-                }
+            if crate::system::CompressorKind::parse(&v).is_none() {
+                return Err(ConfigFileError::InvalidValue {
+                    section: "texture".to_string(),
+                    key: "compressor".to_string(),
+                    value: v,
+                    reason: format!(
+                        "must be one of: {}",
+                        crate::system::CompressorKind::VALUES.join(", ")
+                    ),
+                });
             }
+            config.texture.compressor = v;
         }
         if let Some(v) = section.get("gpu_device") {
             config.texture.gpu_device = v.to_string();

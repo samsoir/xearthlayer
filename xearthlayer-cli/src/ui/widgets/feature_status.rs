@@ -23,10 +23,13 @@ use crate::ui::symbols::{self, SymbolSet};
 /// Texture encoding: the GPU that was selected, or the CPU encoder in use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderStatus {
-    Gpu(GpuAdapter),
-    /// `texture.compressor = gpu` honoured on a host whose only GPU is the
-    /// one X-Plane renders with, so encoding competes with the sim (#203).
-    GpuSharedWithSim(GpuAdapter),
+    /// The GPU worker; `hybrid` when tiles it has no room for are encoded
+    /// with ISPC (`texture.compressor = hybrid`).
+    Gpu { adapter: GpuAdapter, hybrid: bool },
+    /// `texture.compressor = gpu` or `hybrid` honoured on a host whose only
+    /// GPU is the one X-Plane renders with, so encoding competes with the
+    /// sim (#203).
+    GpuSharedWithSim { adapter: GpuAdapter, hybrid: bool },
     /// The ISPC SIMD encoder on the CPU.
     Ispc,
     /// The pure-Rust encoder on the CPU.
@@ -158,7 +161,7 @@ impl<'a> FeatureStatusWidget<'a> {
 
     fn encoder_line(&self) -> Line<'static> {
         let mut spans = vec![styled("Tile Processing Engine, ", TEXT)];
-        let (mark, adapter) = match &self.status.encoder {
+        let (mark, gpu) = match &self.status.encoder {
             EncoderStatus::Software => {
                 spans.push(styled("Software", Color::Red));
                 (self.feature_mark(symbols::ENGINE, Mark::CHECK), None)
@@ -167,21 +170,27 @@ impl<'a> FeatureStatusWidget<'a> {
                 spans.push(styled("ISPC", Color::LightBlue));
                 (self.feature_mark(symbols::ENGINE, Mark::CHECK), None)
             }
-            EncoderStatus::Gpu(adapter) => (
+            EncoderStatus::Gpu { adapter, hybrid } => (
                 self.feature_mark(symbols::ENGINE, Mark::CHECK),
-                Some(adapter),
+                Some((adapter, *hybrid)),
             ),
             // The warning outranks the emoji: it is the one thing to see.
-            EncoderStatus::GpuSharedWithSim(adapter) => (Mark::WARNING, Some(adapter)),
+            EncoderStatus::GpuSharedWithSim { adapter, hybrid } => {
+                (Mark::WARNING, Some((adapter, *hybrid)))
+            }
         };
-        if let Some(adapter) = adapter {
+        if let Some((adapter, hybrid)) = gpu {
             spans.push(styled(
                 format!("GPU {}", adapter.kind.display().to_lowercase()),
                 gpu_colour(adapter.kind),
             ));
             spans.push(styled(format!(" ({})", adapter.short_name()), TEXT));
+            if hybrid {
+                spans.push(styled(" + ", TEXT));
+                spans.push(styled("ISPC", Color::LightBlue));
+            }
         }
-        if matches!(self.status.encoder, EncoderStatus::GpuSharedWithSim(_)) {
+        if matches!(self.status.encoder, EncoderStatus::GpuSharedWithSim { .. }) {
             spans.push(styled(", ", TEXT));
             spans.push(styled("shared with X-Plane", WARN));
         }
@@ -342,9 +351,16 @@ mod tests {
         adapter("AMD Radeon 780M", GpuKind::Integrated)
     }
 
+    fn gpu(adapter: GpuAdapter) -> EncoderStatus {
+        EncoderStatus::Gpu {
+            adapter,
+            hybrid: false,
+        }
+    }
+
     fn all_on() -> FeatureStatus {
         FeatureStatus {
-            encoder: EncoderStatus::Gpu(radeon()),
+            encoder: gpu(radeon()),
             night: NightLighting::Lit,
             xworld_pro: XworldProStatus::Active(vec!["America", "Europe"]),
             startup_warnings: 0,
@@ -591,22 +607,22 @@ mod tests {
                 Color::LightBlue,
             ),
             (
-                EncoderStatus::Gpu(radeon()),
+                gpu(radeon()),
                 "Tile Processing Engine, GPU integrated (AMD Radeon 780M)",
                 Color::Green,
             ),
             (
-                EncoderStatus::Gpu(adapter("NVIDIA GeForce RTX 4080", GpuKind::Discrete)),
+                gpu(adapter("NVIDIA GeForce RTX 4080", GpuKind::Discrete)),
                 "Tile Processing Engine, GPU discrete (NVIDIA GeForce RTX 4080)",
                 Color::Yellow,
             ),
             (
-                EncoderStatus::Gpu(adapter("virtio-gpu", GpuKind::Virtual)),
+                gpu(adapter("virtio-gpu", GpuKind::Virtual)),
                 "Tile Processing Engine, GPU virtual (virtio-gpu)",
                 Color::Green,
             ),
             (
-                EncoderStatus::Gpu(adapter("llvmpipe", GpuKind::Cpu)),
+                gpu(adapter("llvmpipe", GpuKind::Cpu)),
                 "Tile Processing Engine, GPU software fallback (llvmpipe)",
                 Color::Red,
             ),
@@ -625,7 +641,7 @@ mod tests {
     #[test]
     fn the_adapter_is_named_without_the_drivers_additions() {
         let status = FeatureStatus {
-            encoder: EncoderStatus::Gpu(adapter(
+            encoder: gpu(adapter(
                 "AMD Ryzen 9 9950X3D 16-Core Processor (RADV RAPHAEL_MENDOCINO)",
                 GpuKind::Integrated,
             )),
@@ -639,13 +655,45 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_names_ispc_beside_the_gpu() {
+        for (encoder, expected) in [
+            (
+                EncoderStatus::Gpu {
+                    adapter: radeon(),
+                    hybrid: true,
+                },
+                "  ✓  Tile Processing Engine, GPU integrated (AMD Radeon 780M) + ISPC",
+            ),
+            (
+                EncoderStatus::GpuSharedWithSim {
+                    adapter: radeon(),
+                    hybrid: true,
+                },
+                "  !  Tile Processing Engine, GPU integrated (AMD Radeon 780M) + ISPC, shared with X-Plane",
+            ),
+        ] {
+            let status = FeatureStatus {
+                encoder,
+                ..all_on()
+            };
+            let (buf, rows) = render(&status, SymbolSet::Plain);
+            assert_eq!(rows[1], expected);
+            let ispc = rows[1][..rows[1].find("ISPC").unwrap()].chars().count() as u16;
+            assert_eq!(buf[(ispc, 1)].fg, Color::LightBlue);
+        }
+    }
+
+    #[test]
     fn gpu_encoding_on_the_sims_own_gpu_is_a_warning_with_either_symbol_set() {
         let status = FeatureStatus {
-            encoder: EncoderStatus::GpuSharedWithSim(GpuAdapter {
-                name: "Apple M2 Max".to_string(),
-                kind: GpuKind::Integrated,
-                backend: "metal".to_string(),
-            }),
+            encoder: EncoderStatus::GpuSharedWithSim {
+                adapter: GpuAdapter {
+                    name: "Apple M2 Max".to_string(),
+                    kind: GpuKind::Integrated,
+                    backend: "metal".to_string(),
+                },
+                hybrid: false,
+            },
             ..all_on()
         };
         for symbols in [SymbolSet::Emoji, SymbolSet::Plain] {
