@@ -133,6 +133,10 @@ pub enum WriteBackSkip {
     NoFingerprint,
     /// A road tile failed: kept in memory only.
     RoadFailed,
+    /// A road tile's roads were read from DSFs other than those the lit
+    /// fingerprint names: a DSF changed while the session ran (#430). Kept
+    /// in memory only.
+    RoadSourcesChanged,
     /// A Laminar art lookup for the payload met a doubt: a file given up on
     /// after I/O errors this session, or one the lit fingerprint does not
     /// cover. Kept in memory only.
@@ -185,7 +189,7 @@ pub struct LitStatsSnapshot {
     /// Generations whose roads timed out and were all ready at the permit.
     pub roads_ready_at_permit: u64,
     /// Write-backs skipped by [`WriteBackSkip`], in its declaration order.
-    pub write_backs_skipped: [u64; 4],
+    pub write_backs_skipped: [u64; 5],
     /// See [`PayloadLookup::Hit`].
     pub payload_hits: u64,
     /// See [`PayloadLookup::Joined`].
@@ -416,7 +420,7 @@ pub struct LitStats {
     generation_roads: Tally<3>,
     generations_black: AtomicU64,
     roads_ready_at_permit: AtomicU64,
-    write_backs_skipped: Tally<4>,
+    write_backs_skipped: Tally<5>,
     payload_hits: AtomicU64,
     payload_joins: AtomicU64,
     payload_misses: AtomicU64,
@@ -609,6 +613,7 @@ impl LitStats {
             write_back_skipped_roads_late = skipped(WriteBackSkip::RoadsLate),
             write_back_skipped_no_fingerprint = skipped(WriteBackSkip::NoFingerprint),
             write_back_skipped_road_failed = skipped(WriteBackSkip::RoadFailed),
+            write_back_skipped_road_sources_changed = skipped(WriteBackSkip::RoadSourcesChanged),
             write_back_skipped_art_failed = skipped(WriteBackSkip::ArtFailed),
             payload_hits = d.payload_hits,
             payload_joins = d.payload_joins,

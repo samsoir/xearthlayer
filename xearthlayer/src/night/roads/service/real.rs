@@ -6,6 +6,7 @@
 //! --nocapture`.
 
 use super::*;
+use crate::night::roads::dsf::read_dsf_file;
 use crate::xworld_pro::SCENERY_PACKS_FILE;
 
 const INSTALL: &str = "/media/FlightSim/X-Plane 12-beta";

@@ -26,6 +26,7 @@ use futures::future::BoxFuture;
 use moka::policy::EvictionPolicy;
 use tracing::{debug, warn};
 
+use super::disk::TileDsfs;
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{
     CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, RecipeLookup,
@@ -34,7 +35,9 @@ use super::layout::minimal_black_dds;
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{crosses_footprint, reach_deg, RoadField};
 use super::roads::merge::MergedRoads;
-use super::roads::service::{FootprintRoads, Purpose, RoadService, TileNow, Trigger};
+use super::roads::service::{
+    FootprintRoads, Purpose, ReadFrom, ReadyTile, RoadService, TileNow, Trigger,
+};
 use super::roads::RoadModel;
 use super::stats::{
     DiskMiss, GenerationRecord, LitStats, PayloadLookup, ProbeAnswer, ProbeRecord, ReadOutcome,
@@ -312,6 +315,8 @@ pub struct NightLitSource {
 struct Generated {
     bytes: Bytes,
     roads: RoadsState,
+    /// The DSFs each road tile it drew was read from.
+    read_from: Vec<Arc<ReadFrom>>,
     art_doubt: Option<ArtDoubt>,
 }
 
@@ -344,23 +349,40 @@ impl RoadsState {
 /// [`WriteBackSkip`]'s order. Roads still building make it a payload kept
 /// nowhere (a later generation may have them). Without a fingerprint there
 /// is no safe disk entry. A failed road tile has no roads this session, but
-/// a later session may read it. A doubt among the payload's Laminar art
-/// lookups (`art_doubted`: a file given up on after I/O errors, or one the
-/// fingerprint does not cover) may make the payload differ from a later
-/// session's under the same fingerprint; a file that is missing or does not
-/// decode does not, as its dark class is the same every session.
+/// a later session may read it. Roads read from DSFs other than those the
+/// fingerprint names (`roads_agree` false: a DSF changed while the session
+/// ran) would be served under a fingerprint that does not describe them. A
+/// doubt among the payload's Laminar art lookups (`art_doubted`: a file
+/// given up on after I/O errors, or one the fingerprint does not cover) may
+/// make the payload differ from a later session's under the same
+/// fingerprint; a file that is missing or does not decode does not, as its
+/// dark class is the same every session.
 fn write_back_skip(
     roads: RoadsState,
     fingerprinted: bool,
+    roads_agree: bool,
     art_doubted: bool,
 ) -> Option<WriteBackSkip> {
     match roads {
         RoadsState::TimedOut => Some(WriteBackSkip::RoadsLate),
         _ if !fingerprinted => Some(WriteBackSkip::NoFingerprint),
         RoadsState::Failed => Some(WriteBackSkip::RoadFailed),
+        RoadsState::Complete if !roads_agree => Some(WriteBackSkip::RoadSourcesChanged),
         RoadsState::Complete if art_doubted => Some(WriteBackSkip::ArtFailed),
         RoadsState::Complete => None,
     }
+}
+
+/// Whether every road tile the fingerprint names (`fingerprinted`, from the
+/// session's identity pass) was read from the DSFs it names, by the build
+/// whose roads were drawn (`read_from`). A tile drawn from no build is not.
+fn roads_agree(fingerprinted: &[TileDsfs], read_from: &[Arc<ReadFrom>]) -> bool {
+    fingerprinted.iter().all(|(tile, identities)| {
+        read_from
+            .iter()
+            .find(|r| r.tile == *tile)
+            .is_some_and(|r| r.agrees_with(identities))
+    })
 }
 
 /// A payload served but not kept in the memory cache, or `None` (black):
@@ -446,6 +468,7 @@ impl NightLitSource {
             Some(roads) => roads.footprint(&self.road_tiles(name, size), purpose).await,
             None => FootprintRoads {
                 tiles: Vec::new(),
+                read_from: Vec::new(),
                 complete: true,
                 timed_out: false,
             },
@@ -514,7 +537,10 @@ impl NightLitSource {
             return Err(Uncached(None));
         };
         let permit_wait = asked.elapsed();
-        let fp = self.fingerprint(&name).await;
+        let (fp, road_dsfs) = match self.fingerprint_with_roads(&name).await {
+            Some((fp, road_dsfs)) => (Some(fp), road_dsfs),
+            None => (None, Vec::new()),
+        };
         let stored = match &fp {
             Some(fp) => match disk.get(&key).await {
                 Ok(Some(entry)) => check_entry(entry, fp, layout.payload_len()).map_err(Into::into),
@@ -538,11 +564,24 @@ impl NightLitSource {
         }
         let (row, col, zoom) = (name.row, name.col, name.zoom);
         let generated = self.generate(name, &layout).await;
-        let skip = generated
-            .as_ref()
-            .and_then(|g| write_back_skip(g.roads, fp.is_some(), g.art_doubt.is_some()));
+        let skip = generated.as_ref().and_then(|g| {
+            write_back_skip(
+                g.roads,
+                fp.is_some(),
+                roads_agree(&road_dsfs, &g.read_from),
+                g.art_doubt.is_some(),
+            )
+        });
         if let Some(skip) = skip {
             self.stats.record_write_back_skipped(skip);
+        }
+        if skip == Some(WriteBackSkip::RoadSourcesChanged) {
+            debug!(
+                row,
+                col,
+                zoom,
+                "Night lighting: lit texture kept off disk; a road DSF changed since its roads were read"
+            );
         }
         if let (
             Some(WriteBackSkip::ArtFailed),
@@ -582,14 +621,26 @@ impl NightLitSource {
         Ok(payload)
     }
 
-    /// Fingerprint of every input `name`'s payload is generated from, or
-    /// `None` when computing it failed (a recipe that cannot be loaded among
-    /// them). Recipe identities are those taken when each recipe was loaded,
-    /// so a file replaced mid-session does not lend the payload its identity.
-    /// Road DSF identities are taken once per tile per session, in priority
-    /// order. The art walk, recipe loads and DSF `stat`s run on the blocking
-    /// pool; the caller holds a disk permit and none of them takes another.
+    /// Fingerprint of every input `name`'s payload is generated from (see
+    /// [`Self::fingerprint_with_roads`]).
+    #[cfg(test)]
     async fn fingerprint(&self, name: &DdsFilename) -> Option<LitFingerprint> {
+        self.fingerprint_with_roads(name).await.map(|(fp, _)| fp)
+    }
+
+    /// Fingerprint of every input `name`'s payload is generated from, and
+    /// the road DSF identities in it, or `None` when computing it failed (a
+    /// recipe that cannot be loaded among them). Recipe identities are those
+    /// taken when each recipe was loaded, so a file replaced mid-session does
+    /// not lend the payload its identity. Road DSF identities are taken once
+    /// per tile per session, in priority order; a payload is written under
+    /// them only when its roads were read from those DSFs (#430). The art
+    /// walk, recipe loads and DSF `stat`s run on the blocking pool; the
+    /// caller holds a disk permit and none of them takes another.
+    async fn fingerprint_with_roads(
+        &self,
+        name: &DdsFilename,
+    ) -> Option<(LitFingerprint, Vec<TileDsfs>)> {
         let session = *self
             .session
             .get_or_try_init(|| {
@@ -633,7 +684,7 @@ impl NightLitSource {
             .collect::<Option<Vec<_>>>()?,
             None => Vec::new(),
         };
-        Some(footprint_fingerprint(session, &identities, &roads))
+        Some((footprint_fingerprint(session, &identities, &roads), roads))
     }
 
     /// The generated visible levels of the footprint. Waits for its roads
@@ -662,7 +713,7 @@ impl NightLitSource {
         let roads_state = RoadsState::of(&found);
         let roads_ready_at_permit =
             asked_roads == RoadsState::TimedOut && roads_state == RoadsState::Complete;
-        let road_tiles = found.tiles;
+        let (road_tiles, read_from) = (found.tiles, found.read_from);
         let started = Instant::now();
         let (recipes, art, generator, owned, size, brightness, road_model) = (
             Arc::clone(&self.recipes),
@@ -745,6 +796,7 @@ impl NightLitSource {
                 Some(Generated {
                     bytes,
                     roads: roads_state,
+                    read_from,
                     art_doubt,
                 })
             }
@@ -979,13 +1031,22 @@ fn read_part(reached: bool, payload: bool) -> &'static str {
 fn recheck(asked: &[(i32, i32)], held: FootprintRoads, now: Vec<TileNow>) -> FootprintRoads {
     let mut out = FootprintRoads {
         tiles: Vec::with_capacity(asked.len()),
+        read_from: Vec::with_capacity(asked.len()),
         complete: true,
         timed_out: false,
     };
     for (&tile, now) in asked.iter().zip(now) {
-        let held = held.tiles.iter().find(|r| r.tile == tile).cloned();
+        let held = held
+            .tiles
+            .iter()
+            .position(|r| r.tile == tile)
+            .map(|i| (Arc::clone(&held.tiles[i]), Arc::clone(&held.read_from[i])));
         match (held, now) {
-            (Some(roads), _) | (None, TileNow::Ready(roads)) => out.tiles.push(roads),
+            (Some((roads, read_from)), _)
+            | (None, TileNow::Ready(ReadyTile { roads, read_from })) => {
+                out.tiles.push(roads);
+                out.read_from.push(read_from);
+            }
             (None, TileNow::Failed) => out.complete = false,
             (None, TileNow::Building | TileNow::Absent) => {
                 out.complete = false;
@@ -1841,7 +1902,7 @@ mod tests {
             let uses_bytes = source.served_payload(&uses, &layout).await.0.unwrap();
             assert_eq!(files.reads(), 1, "this one does");
             let snap = counted(&source, |s| s.disk_writes == 2).await;
-            assert_eq!(snap.write_backs_skipped, [0; 4]);
+            assert_eq!(snap.write_backs_skipped, [0; 5]);
             assert!(on_disk(&disk, &other).await);
             assert!(on_disk(&disk, &uses).await);
 
@@ -2471,7 +2532,7 @@ mod tests {
             );
             let snap = counted(&source, |s| s.disk_writes == 1).await;
             assert!(on_disk(&d, &name).await, "written to the disk tier");
-            assert_eq!(snap.write_backs_skipped, [0; 4]);
+            assert_eq!(snap.write_backs_skipped, [0; 5]);
             assert_eq!(snap.generation_roads(RoadsState::TimedOut), 1, "at its ask");
             assert_eq!(snap.roads_ready_at_permit, 1);
             assert_eq!(
@@ -2485,8 +2546,10 @@ mod tests {
         fn a_recheck_keeps_what_the_wait_had_and_adds_what_came_since() {
             let (a, b, c, d) = ((1, 1), (1, 2), (1, 3), (1, 4));
             let merged = |t| Arc::new(crate::night::roads::merge::MergedRoads::empty(t));
+            let ready = |t| TileNow::Ready(ReadyTile::unread(merged(t)));
             let held_a = merged(a);
             let held = FootprintRoads {
+                read_from: vec![ReadyTile::unread(Arc::clone(&held_a)).read_from],
                 tiles: vec![Arc::clone(&held_a)],
                 complete: false,
                 timed_out: true,
@@ -2496,13 +2559,15 @@ mod tests {
                 held.clone(),
                 vec![
                     TileNow::Absent, // evicted since: the wait's copy is kept
-                    TileNow::Ready(merged(b)),
+                    ready(b),
                     TileNow::Building,
                     TileNow::Failed,
                 ],
             );
             let tiles: Vec<_> = late.tiles.iter().map(|r| r.tile).collect();
             assert_eq!(tiles, [a, b], "in the order asked");
+            let read: Vec<_> = late.read_from.iter().map(|r| r.tile).collect();
+            assert_eq!(read, tiles, "each with what it was read from");
             assert!(Arc::ptr_eq(&late.tiles[0], &held_a));
             assert_eq!(RoadsState::of(&late), RoadsState::TimedOut);
 
@@ -2513,11 +2578,7 @@ mod tests {
             );
             assert_eq!(RoadsState::of(&failed), RoadsState::Failed);
 
-            let healed = recheck(
-                &[a, b],
-                held,
-                vec![TileNow::Absent, TileNow::Ready(merged(b))],
-            );
+            let healed = recheck(&[a, b], held, vec![TileNow::Absent, ready(b)]);
             assert_eq!(RoadsState::of(&healed), RoadsState::Complete);
             assert_eq!(healed.tiles.len(), 2);
         }
@@ -2973,6 +3034,144 @@ mod tests {
             );
         }
 
+        /// Records the road segments of every request it is handed.
+        #[derive(Default)]
+        struct RoadSegments(std::sync::Mutex<Vec<usize>>);
+
+        impl RoadSegments {
+            fn seen(&self) -> Vec<usize> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        impl crate::night::LitGenerator for RoadSegments {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.lock().unwrap().push(r.roads.stats.segments);
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        /// The fixture tile's road DSF under `temp/xp`.
+        fn road_dsf(temp: &TempDir) -> std::path::PathBuf {
+            temp.path()
+                .join("xp/Custom Scenery/Roads/Earth nav data/+30-130/+37-123.dsf")
+        }
+
+        /// Rewrites the road DSF with a road of two segments across `name`
+        /// (the first version has one), another length and a later mtime.
+        fn rewrite_road_dsf(temp: &TempDir, name: &DdsFilename) {
+            let path = road_dsf(temp);
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let f = Footprint::from_name(name);
+            let lon = (f.west + f.east) / 2.0;
+            let mut b = Builder::new(TILE.0, TILE.1);
+            b.props.push(("sim/overlay".into(), "1".into()));
+            b.road(
+                TILE.0,
+                TILE.1,
+                100,
+                &[
+                    (lon, f.north + 0.005),
+                    (lon + 0.001, (f.north + f.south) / 2.0),
+                    (lon, f.south - 0.005),
+                ],
+            );
+            let bytes = b.bytes();
+            assert_ne!(bytes.len() as u64, std::fs::metadata(&path).unwrap().len());
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime + Duration::from_secs(10))
+                .unwrap();
+        }
+
+        /// A session over the tree in `temp` with roads, the lit disk tier
+        /// `d` and a generator recording road segments.
+        fn road_session(
+            temp: &TempDir,
+            d: &Arc<dyn crate::cache::Cache>,
+        ) -> (NightLitSource, Arc<RoadService>, Arc<RoadSegments>) {
+            let roads = RoadService::new(temp.path().join("xp"), vec![], None);
+            let seen = Arc::new(RoadSegments::default());
+            let source = source_in(temp)
+                .with_generator(seen.clone())
+                .with_disk_cache(d.clone())
+                .with_roads(roads.clone());
+            (source, roads, seen)
+        }
+
+        #[tokio::test]
+        async fn roads_read_from_a_dsf_replaced_since_are_not_written_under_its_identity() {
+            // #430 case 1: the tile is built from the first DSF, which is
+            // replaced before the session's identity pass. The payload has
+            // the first DSF's roads, the fingerprint the second's.
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = lit_name();
+            let layout = LitLayout::new(16, 4);
+            xp_install(&temp, Some(road_across(&name)));
+            let (a, roads, seen) = road_session(&temp, &d);
+            roads.ensure(TILE, Trigger::DsfOpen);
+            until_ready(&roads, TILE).await;
+            rewrite_road_dsf(&temp, &name);
+            let (payload, outcome) = a.served_payload(&name, &layout).await;
+            assert!(payload.is_some(), "served");
+            assert_eq!(outcome, ReadOutcome::Generated);
+            assert_eq!(seen.seen(), [1], "the first DSF's road");
+            let snap = a.stats.snapshot();
+            assert_eq!(
+                snap.write_backs_skipped(WriteBackSkip::RoadSourcesChanged),
+                1
+            );
+            assert_eq!(snap.write_backs_skipped, [0, 0, 0, 1, 0], "and no other");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!on_disk(&d, &name).await, "no entry written");
+            assert_eq!(
+                a.served_payload(&name, &layout).await.1,
+                ReadOutcome::MemoryHit,
+                "kept in memory"
+            );
+
+            // The next session reads the second DSF and generates with it.
+            let (b, _, seen) = road_session(&temp, &d);
+            assert_eq!(
+                b.served_payload(&name, &layout).await.1,
+                ReadOutcome::Generated
+            );
+            assert_eq!(seen.seen(), [2], "the second DSF's road");
+            counted(&b, |s| s.disk_writes == 1).await;
+        }
+
+        #[tokio::test]
+        async fn a_tile_rebuilt_from_a_replaced_dsf_is_not_written_under_the_old_identity() {
+            // #430 case 2: the identity pass sees the first DSF; the file is
+            // replaced, the tile evicted and rebuilt from the second.
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = lit_name();
+            let layout = LitLayout::new(16, 4);
+            xp_install(&temp, Some(road_across(&name)));
+            let (a, roads, seen) = road_session(&temp, &d);
+            roads.ensure(TILE, Trigger::DsfOpen);
+            until_ready(&roads, TILE).await;
+            let first = a.fingerprint(&name).await.unwrap();
+            rewrite_road_dsf(&temp, &name);
+            roads.evict(TILE).await;
+            assert!(a.served_payload(&name, &layout).await.0.is_some());
+            assert_eq!(seen.seen(), [2], "drawn from the rebuild");
+            assert_eq!(a.fingerprint(&name).await.unwrap(), first, "the old one");
+            assert_eq!(
+                a.stats
+                    .snapshot()
+                    .write_backs_skipped(WriteBackSkip::RoadSourcesChanged),
+                1
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!on_disk(&d, &name).await, "no entry written");
+        }
+
         #[cfg(unix)]
         #[tokio::test]
         async fn a_road_dsf_that_cannot_be_stated_leaves_no_fingerprint() {
@@ -3156,15 +3355,24 @@ mod tests {
         #[test]
         fn a_write_back_is_skipped_for_the_first_reason_that_applies() {
             use RoadsState::{Complete, Failed, TimedOut};
-            use WriteBackSkip::{ArtFailed, NoFingerprint, RoadFailed, RoadsLate};
+            use WriteBackSkip::{
+                ArtFailed, NoFingerprint, RoadFailed, RoadSourcesChanged, RoadsLate,
+            };
             for art in [false, true] {
-                assert_eq!(write_back_skip(TimedOut, false, art), Some(RoadsLate));
-                assert_eq!(write_back_skip(Failed, false, art), Some(NoFingerprint));
-                assert_eq!(write_back_skip(Complete, false, art), Some(NoFingerprint));
-                assert_eq!(write_back_skip(Failed, true, art), Some(RoadFailed));
+                for agree in [false, true] {
+                    let skip = |roads, fp| write_back_skip(roads, fp, agree, art);
+                    assert_eq!(skip(TimedOut, false), Some(RoadsLate));
+                    assert_eq!(skip(Failed, false), Some(NoFingerprint));
+                    assert_eq!(skip(Complete, false), Some(NoFingerprint));
+                    assert_eq!(skip(Failed, true), Some(RoadFailed));
+                }
+                assert_eq!(
+                    write_back_skip(Complete, true, false, art),
+                    Some(RoadSourcesChanged)
+                );
             }
-            assert_eq!(write_back_skip(Complete, true, true), Some(ArtFailed));
-            assert_eq!(write_back_skip(Complete, true, false), None);
+            assert_eq!(write_back_skip(Complete, true, true, true), Some(ArtFailed));
+            assert_eq!(write_back_skip(Complete, true, true, false), None);
         }
 
         #[tokio::test]
@@ -3252,7 +3460,7 @@ mod tests {
                 .is_some());
             let snap = source.stats.snapshot();
             assert_eq!(snap.write_backs_skipped(WriteBackSkip::ArtFailed), 1);
-            assert_eq!(snap.write_backs_skipped, [0, 0, 0, 1], "and no other");
+            assert_eq!(snap.write_backs_skipped, [0, 0, 0, 0, 1], "and no other");
         }
 
         #[tokio::test]
@@ -3283,7 +3491,7 @@ mod tests {
             let snap = source.stats.snapshot();
             assert_eq!((snap.generations(), snap.generations_black), (1, 1));
             assert_eq!(snap.reads(ReadOutcome::Black), 1);
-            assert_eq!(snap.write_backs_skipped, [0; 4]);
+            assert_eq!(snap.write_backs_skipped, [0; 5]);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

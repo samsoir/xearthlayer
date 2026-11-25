@@ -41,7 +41,16 @@ pub fn read_dsf_file(
     keep: impl Fn(u8) -> bool,
     mode: ReadMode,
 ) -> Result<(DsfRoads, DsfFileStats), DsfError> {
-    let mut file = File::open(path).map_err(io_error)?;
+    read_dsf_open(File::open(path).map_err(io_error)?, keep, mode)
+}
+
+/// [`read_dsf_file`] over a file already open at its start, so a caller
+/// can take the identity of the very file it reads from the handle.
+pub fn read_dsf_open(
+    mut file: File,
+    keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
+) -> Result<(DsfRoads, DsfFileStats), DsfError> {
     let file_bytes = file.metadata().map_err(io_error)?.len();
     let mut magic = Vec::with_capacity(SEVENZ_MAGIC.len());
     (&mut file)

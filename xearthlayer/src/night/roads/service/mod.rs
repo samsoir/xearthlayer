@@ -48,7 +48,7 @@ use tokio::sync::{watch, OnceCell, Semaphore};
 use tracing::{debug, warn};
 
 use super::codec::{decode_roads, encode_roads};
-use super::dsf::{read_dsf_file, DsfFileStats, DsfRoads, ReadMode};
+use super::dsf::{read_dsf_open, DsfError, DsfFileStats, DsfRoads, ReadMode};
 use super::is_lit_subtype;
 use super::merge::{MergedRoads, Merger};
 use super::packs::PackIndex;
@@ -210,12 +210,70 @@ pub struct DsfIdentity {
 impl DsfIdentity {
     /// Blocking: one `stat`.
     fn of(path: &Path) -> std::io::Result<Self> {
-        let id = FileIdentity::from_metadata(&std::fs::metadata(path)?);
-        Ok(Self {
+        Ok(Self::from_metadata(path, &std::fs::metadata(path)?))
+    }
+
+    fn from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Self {
+        let id = FileIdentity::from_metadata(metadata);
+        Self {
             path: path.to_string_lossy().into_owned(),
             len: id.len,
             mtime_nanos: id.mtime_nanos,
-        })
+        }
+    }
+}
+
+/// Opens the DSF at `path` and takes its identity from the open file (one
+/// `fstat`), so the identity is that of the bytes read through the handle
+/// even when the path is replaced meanwhile. Blocking.
+fn open_source(path: &Path) -> std::io::Result<(std::fs::File, DsfIdentity)> {
+    let file = std::fs::File::open(path)?;
+    let id = DsfIdentity::from_metadata(path, &file.metadata()?);
+    Ok((file, id))
+}
+
+/// The DSFs a tile build read its roads from, highest priority first,
+/// each as it was when read; a source that was gone is left out (#430).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFrom {
+    pub tile: Tile,
+    pub dsfs: Vec<DsfIdentity>,
+    /// False when a zone covering the tile stopped the build before its
+    /// last source: the sources after `dsfs` were never read.
+    pub whole: bool,
+}
+
+impl ReadFrom {
+    /// Whether these are the DSFs `identities` names (an identity pass of
+    /// the tile, [`RoadService::identities`]): the same DSFs in the same
+    /// order, or, for a build a zone stopped, the DSFs it read followed by
+    /// others, which it never reached and which cannot change its roads.
+    pub fn agrees_with(&self, identities: &[DsfIdentity]) -> bool {
+        if self.whole {
+            self.dsfs == identities
+        } else {
+            identities.starts_with(&self.dsfs)
+        }
+    }
+}
+
+/// A ready tile: its merged roads and the DSFs they were read from.
+#[derive(Debug, Clone)]
+pub struct ReadyTile {
+    pub roads: Arc<MergedRoads>,
+    pub read_from: Arc<ReadFrom>,
+}
+
+impl ReadyTile {
+    /// `roads` as if read from no DSF.
+    #[cfg(test)]
+    pub(crate) fn unread(roads: Arc<MergedRoads>) -> Self {
+        let read_from = Arc::new(ReadFrom {
+            tile: roads.tile,
+            dsfs: Vec::new(),
+            whole: true,
+        });
+        Self { roads, read_from }
     }
 }
 
@@ -224,6 +282,8 @@ impl DsfIdentity {
 #[derive(Debug, Clone, Default)]
 pub struct FootprintRoads {
     pub tiles: Vec<Arc<MergedRoads>>,
+    /// What each of `tiles` was read from, in the same order.
+    pub read_from: Vec<Arc<ReadFrom>>,
     /// False when any tile is missing, for any reason.
     pub complete: bool,
     /// True when a tile was still building when its deadline passed. A
@@ -234,7 +294,7 @@ pub struct FootprintRoads {
 /// Where a tile is at one instant, as [`RoadService::tiles_now`] finds it.
 #[derive(Debug, Clone)]
 pub enum TileNow {
-    Ready(Arc<MergedRoads>),
+    Ready(ReadyTile),
     /// A build is in flight.
     Building,
     /// No roads this session.
@@ -245,13 +305,13 @@ pub enum TileNow {
 
 /// How one tile of a footprint ended.
 enum TileWait {
-    Ready(Arc<MergedRoads>),
+    Ready(ReadyTile),
     Failed,
     TimedOut,
 }
 
 /// A tile build's answer, awaited by any number of callers.
-type Pending = Shared<BoxFuture<'static, Option<Arc<MergedRoads>>>>;
+type Pending = Shared<BoxFuture<'static, Option<ReadyTile>>>;
 
 /// A tile build in flight: its answer, and when it got its extract permit
 /// (`None` until then), which starts the clock of its callers' waits.
@@ -264,7 +324,7 @@ struct Build {
 impl Build {
     /// A build that has answered `roads` and never got a permit.
     #[cfg(test)]
-    fn finished(roads: Option<Arc<MergedRoads>>) -> Self {
+    fn finished(roads: Option<ReadyTile>) -> Self {
         Self {
             roads: futures::future::ready(roads).boxed().shared(),
             permitted: watch::channel(None).1,
@@ -284,7 +344,7 @@ pub struct RoadService {
     /// a cancelled caller neither stops nor restarts it.
     index: OnceLock<Shared<BoxFuture<'static, Arc<PackIndex>>>>,
     /// Ready tiles. A failed build caches nothing.
-    tiles: moka::future::Cache<Tile, Arc<MergedRoads>>,
+    tiles: moka::future::Cache<Tile, ReadyTile>,
     /// Builds in flight, one per tile.
     pending: DashMap<Tile, Build>,
     /// Tiles with an unreadable DSF: no roads for the session.
@@ -337,6 +397,8 @@ struct Unreadable {
 /// A tile's merge and what it cost.
 struct Merged {
     roads: MergedRoads,
+    /// The DSFs merged or passed over, as read.
+    read_from: ReadFrom,
     /// Disk entries to write once the tile is known to be good.
     writes: Vec<(String, Bytes)>,
     /// Sources that existed and were reached.
@@ -351,6 +413,8 @@ struct Merged {
 
 /// One DSF read from its file, after it was offered to the merger.
 struct Extracted {
+    /// The file's identity, from the handle it was read through.
+    read_id: DsfIdentity,
     stats: DsfFileStats,
     absorbed: Absorbed,
     /// A base mesh read only to its header.
@@ -424,13 +488,13 @@ impl RoadService {
         let tiles = moka::future::Cache::builder()
             .eviction_policy(EvictionPolicy::lru())
             .max_capacity(config.tile_cache_bytes)
-            .weigher(|_, v: &Arc<MergedRoads>| v.bytes().try_into().unwrap_or(u32::MAX))
-            .eviction_listener(|tile: Arc<Tile>, roads: Arc<MergedRoads>, cause| {
+            .weigher(|_, v: &ReadyTile| v.roads.bytes().try_into().unwrap_or(u32::MAX))
+            .eviction_listener(|tile: Arc<Tile>, ready: ReadyTile, cause| {
                 if cause == RemovalCause::Size {
                     debug!(
                         lat = tile.0,
                         lon = tile.1,
-                        bytes_held = roads.bytes(),
+                        bytes_held = ready.roads.bytes(),
                         "Night roads: LRU"
                     );
                 }
@@ -506,6 +570,7 @@ impl RoadService {
         let now = Instant::now();
         let mut out = FootprintRoads {
             tiles: Vec::with_capacity(found.len()),
+            read_from: Vec::with_capacity(found.len()),
             complete: true,
             timed_out: false,
         };
@@ -513,7 +578,10 @@ impl RoadService {
         for (_, state, tile_waited) in found {
             waited |= tile_waited;
             match state {
-                TileWait::Ready(roads) => out.tiles.push(roads),
+                TileWait::Ready(ready) => {
+                    out.tiles.push(ready.roads);
+                    out.read_from.push(ready.read_from);
+                }
                 TileWait::Failed => out.complete = false,
                 TileWait::TimedOut => {
                     out.complete = false;
@@ -536,9 +604,12 @@ impl RoadService {
     }
 
     /// The identities of every DSF of `tile`, highest priority first,
-    /// taken once per tile per session (X-Plane does not change a DSF it
-    /// has loaded). Metadata only; a file that is gone (NotFound) is left
-    /// out. `None` when the pass failed: a source whose `stat` failed for
+    /// taken once per tile per session. Metadata only; a file that is gone
+    /// (NotFound) is left out. A DSF can still change while the session
+    /// runs (a pack updated between flights, an overlay link rebuilt), so
+    /// these need not be the DSFs a tile's roads were read from: the lit
+    /// source writes a payload under them only when they agree with the
+    /// build's [`ReadFrom`] (#430). `None` when the pass failed: a source whose `stat` failed for
     /// another reason, or a panic. A failed pass is not kept, so a later
     /// call tries again. The `stat`s run on the blocking pool under the
     /// caller's permit, if any: this takes none.
@@ -578,11 +649,11 @@ impl RoadService {
     pub async fn tiles_now(&self, tiles: &[Tile]) -> Vec<TileNow> {
         let mut out = Vec::with_capacity(tiles.len());
         for &tile in tiles {
-            let now = if let Some(roads) = self.tiles.get(&tile).await {
-                TileNow::Ready(roads)
+            let now = if let Some(ready) = self.tiles.get(&tile).await {
+                TileNow::Ready(ready)
             } else if let Some(build) = self.pending.get(&tile).map(|b| b.roads.clone()) {
                 match settled(&build) {
-                    TileWait::Ready(roads) => TileNow::Ready(roads),
+                    TileWait::Ready(ready) => TileNow::Ready(ready),
                     TileWait::Failed => TileNow::Failed,
                     TileWait::TimedOut => TileNow::Building,
                 }
@@ -766,10 +837,7 @@ impl RoadService {
                         .svc
                         .tiles
                         .optionally_get_with(tile, async move {
-                            builder
-                                .build_tile(tile, trigger, permitted_tx)
-                                .await
-                                .map(Arc::new)
+                            builder.build_tile(tile, trigger, permitted_tx).await
                         })
                         .await;
                     guard.answered = true;
@@ -790,7 +858,7 @@ impl RoadService {
         tile: Tile,
         trigger: Trigger,
         permitted: watch::Sender<Option<Instant>>,
-    ) -> Option<MergedRoads> {
+    ) -> Option<ReadyTile> {
         #[cfg(test)]
         if let Some(gate) = &self.config.gate {
             if let Ok(p) = gate.acquire().await {
@@ -853,7 +921,10 @@ impl RoadService {
                     total_ms = record.total_us / 1000,
                     "Night roads: tile ready"
                 );
-                Some(m.roads)
+                Some(ReadyTile {
+                    roads: Arc::new(m.roads),
+                    read_from: Arc::new(m.read_from),
+                })
             }
             Err(u) => {
                 if self.failed.insert(tile) {
@@ -886,17 +957,19 @@ impl RoadService {
     ) -> Result<Merged, Unreadable> {
         let mut merger = Merger::new(tile);
         let mut writes = vec![];
+        let mut read = Vec::with_capacity(sources.len());
         let (mut dsfs, mut reached, mut overlays_read, mut base_skipped) = (0, 0, 0, 0);
         for path in sources {
             reached += 1;
-            let Some(id) = self.identity_of(path, record).await? else {
+            let Some(stated) = self.identity_of(path, record).await? else {
                 continue;
             };
             dsfs += 1;
-            let absorbed;
-            (merger, absorbed) = self
-                .take(merger, tile, path, &id, record, &mut writes)
+            let (absorbed, id);
+            (merger, absorbed, id) = self
+                .take(merger, tile, path, &stated, record, &mut writes)
                 .await?;
+            read.push(id.clone());
             match absorbed {
                 Absorbed::Merged => {
                     overlays_read += 1;
@@ -912,6 +985,11 @@ impl RoadService {
         record.cpu_us += cpu;
         Ok(Merged {
             roads,
+            read_from: ReadFrom {
+                tile,
+                dsfs: read,
+                whole: reached == sources.len(),
+            },
             writes,
             dsfs,
             overlays_read,
@@ -944,10 +1022,13 @@ impl RoadService {
     }
 
     /// Offers one source to `merger`: from its stored extraction when the
-    /// disk tier has one, else from its file. Only an overlay's extraction
-    /// is ever stored, so a base mesh costs a lookup that misses and a read
-    /// of its header. A compressed overlay read from its file leaves its
-    /// entry in `writes`.
+    /// disk tier has one for the source as `id` (its `stat`) says it is,
+    /// else from its file. Only an overlay's extraction is ever stored, so
+    /// a base mesh costs a lookup that misses and a read of its header. A
+    /// compressed overlay read from its file leaves its entry in `writes`.
+    /// Also returns the identity of what was taken: `id` for a stored
+    /// extraction, else that of the file read, taken from its handle, so a
+    /// file replaced since `id` is never stamped with it (#430).
     async fn take(
         &self,
         mut merger: Merger,
@@ -956,8 +1037,9 @@ impl RoadService {
         id: &DsfIdentity,
         record: &mut BuildRecord,
         writes: &mut Vec<(String, Bytes)>,
-    ) -> Result<(Merger, Absorbed), Unreadable> {
-        let (key, fp) = (cache_key(tile, &id.path), entry_fingerprint(id));
+    ) -> Result<(Merger, Absorbed, DsfIdentity), Unreadable> {
+        let key = cache_key(tile, &id.path);
+        let fp = entry_fingerprint(id);
         let lookup = Instant::now();
         let stored = match &self.disk {
             Some(disk) => disk
@@ -990,7 +1072,7 @@ impl RoadService {
                     segments,
                     "Night roads: DSF cache hit"
                 );
-                return Ok((merger, absorbed));
+                return Ok((merger, absorbed, id.clone()));
             }
         }
 
@@ -998,9 +1080,14 @@ impl RoadService {
         let p = path.to_path_buf();
         let (m, read, read_us, cpu) = on_blocking_pool(&id.path, move || {
             let t = Instant::now();
-            let read = read_dsf_file(&p, is_lit_subtype, ReadMode::OverlaysOnly);
+            let read = open_source(&p)
+                .map_err(|e| DsfError::Io(e.to_string()))
+                .and_then(|(file, read_id)| {
+                    read_dsf_open(file, is_lit_subtype, ReadMode::OverlaysOnly)
+                        .map(|read| (read, read_id))
+                });
             let read_us = micros(t.elapsed());
-            let read = read.map(|(roads, stats)| {
+            let read = read.map(|((roads, stats), read_id)| {
                 let head_only = !roads.overlay;
                 let (payload, mut encode_us) = timed(|| {
                     (cache && stats.compressed && !head_only).then(|| encode_roads(&roads))
@@ -1008,9 +1095,11 @@ impl RoadService {
                 let absorbed = absorb(&mut merger, tile, &roads);
                 let (segments_kept, exclusions) = (roads.chains.len(), roads.exclusions.len());
                 drop(roads);
-                let (entry, us) = timed(|| payload.map(|p| encode_entry(&fp, &p)));
+                let (entry, us) =
+                    timed(|| payload.map(|p| encode_entry(&entry_fingerprint(&read_id), &p)));
                 encode_us += us;
                 Extracted {
+                    read_id,
                     stats,
                     absorbed,
                     head_only,
@@ -1049,7 +1138,7 @@ impl RoadService {
             "Night roads: DSF extracted"
         );
         writes.extend(x.entry.map(|e| (key, e)));
-        Ok((merger, x.absorbed))
+        Ok((merger, x.absorbed, x.read_id))
     }
 
     /// The tile's DSF paths, highest priority first.
@@ -2034,6 +2123,84 @@ pub(crate) mod tests {
         );
     }
 
+    // What a build read (#430).
+
+    #[test]
+    fn a_sources_identity_is_that_of_the_file_read_through_its_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("+46+006.dsf");
+        let first = high(None).bytes();
+        std::fs::write(&path, &first).unwrap();
+        let (file, id) = open_source(&path).unwrap();
+        // The path is replaced by another file between the open and the read.
+        let mut other = overlay(46, 6);
+        other.road(46, 6, 100, &[(6.3, 46.3), (6.4, 46.4)]);
+        other.road(46, 6, 100, &[(6.5, 46.5), (6.6, 46.6), (6.7, 46.7)]);
+        let replacement = dir.path().join("new.dsf");
+        std::fs::write(&replacement, other.bytes()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(
+            DsfIdentity::of(&path).unwrap(),
+            id,
+            "the path names the new file"
+        );
+        assert_eq!(id.len, first.len() as u64, "the identity is the old file's");
+        let (roads, _) = read_dsf_open(file, is_lit_subtype, ReadMode::OverlaysOnly).unwrap();
+        assert_eq!(roads.chains.len(), 1, "and so are the roads read");
+    }
+
+    #[test]
+    fn what_a_build_read_agrees_with_the_same_dsfs_or_a_prefix_it_stopped_at() {
+        let id = |path: &str, len| DsfIdentity {
+            path: path.into(),
+            len,
+            mtime_nanos: 1,
+        };
+        let (a, b, c) = (id("/a", 1), id("/b", 2), id("/c", 3));
+        let read = |dsfs: &[&DsfIdentity], whole| ReadFrom {
+            tile: TILE,
+            dsfs: dsfs.iter().map(|&d| d.clone()).collect(),
+            whole,
+        };
+        let pass = [a.clone(), b.clone(), c.clone()];
+        assert!(read(&[&a, &b, &c], true).agrees_with(&pass));
+        assert!(
+            !read(&[&a, &b], true).agrees_with(&pass),
+            "one appeared since"
+        );
+        assert!(read(&[&a, &b], false).agrees_with(&pass), "never reached c");
+        assert!(
+            !read(&[&a, &c], false).agrees_with(&pass),
+            "b appeared since"
+        );
+        let changed = [a.clone(), id("/b", 9), c.clone()];
+        assert!(!read(&[&a, &b, &c], true).agrees_with(&changed));
+        assert!(!read(&[&a, &b], false).agrees_with(&changed));
+        assert!(read(&[], true).agrees_with(&[]));
+    }
+
+    #[tokio::test]
+    async fn a_build_records_what_it_read() {
+        let t = install(None);
+        let svc = patient(t.path(), None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        let read = &r.read_from[0];
+        assert_eq!(read.tile, TILE);
+        assert!(read.whole);
+        assert_eq!(read.dsfs[..], svc.identities(TILE).await.unwrap()[..]);
+
+        // A zone over the whole tile stops the build at the high pack.
+        let t = install(Some("6/46/7/47"));
+        let svc = patient(t.path(), None);
+        let r = svc.footprint(&[TILE], Purpose::Probe).await;
+        let read = &r.read_from[0];
+        let pass = svc.identities(TILE).await.unwrap();
+        assert!(!read.whole);
+        assert_eq!(read.dsfs.len(), 1);
+        assert_eq!(pass.len(), 2);
+        assert!(read.agrees_with(&pass));
+    }
+
     // Coalescing, readiness and the cache.
 
     #[tokio::test]
@@ -2361,7 +2528,7 @@ pub(crate) mod tests {
         let svc = patient(t.path(), None);
         let tile = (10, 10);
         let roads = Arc::new(MergedRoads::empty(tile));
-        let done = Some(Arc::clone(&roads));
+        let done = Some(ReadyTile::unread(Arc::clone(&roads)));
         // A finished build whose tile is not (or no longer) in the cache,
         // its deadline already past.
         svc.pending.insert(tile, Build::finished(done));
@@ -2416,7 +2583,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_settled_build_is_its_answer_and_a_running_one_a_timeout() {
-        let roads = Arc::new(MergedRoads::empty(TILE));
+        let roads = ReadyTile::unread(Arc::new(MergedRoads::empty(TILE)));
         let ready: Pending = futures::future::ready(Some(roads)).boxed().shared();
         assert!(matches!(settled(&ready), TileWait::Ready(_)));
         let failed: Pending = futures::future::ready(None).boxed().shared();

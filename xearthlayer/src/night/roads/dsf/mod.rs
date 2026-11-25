@@ -28,9 +28,9 @@ mod walk;
 #[cfg(test)]
 pub(crate) mod test_dsf;
 
-pub use stream::read_dsf_file;
 #[cfg(test)]
 pub use stream::read_dsf_stream;
+pub use stream::{read_dsf_file, read_dsf_open};
 
 pub const MAX_DSF_BYTES: usize = 512 * 1024 * 1024;
 /// Ceiling on any one atom body the reader keeps (HEAD, DEFN, a PO32, an
