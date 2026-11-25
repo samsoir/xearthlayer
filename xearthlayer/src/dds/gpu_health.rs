@@ -64,10 +64,15 @@ impl SharedGpuHealth {
     /// health Failed, logs the one WARN and returns `true`; later calls keep
     /// the first reason, log nothing and return `false`.
     pub fn fail(&self, reason: impl Into<String>) -> bool {
+        self.fail_with(reason.into())
+    }
+
+    /// [`fail`](Self::fail), not generic, so the WARN has one callsite.
+    fn fail_with(&self, reason: String) -> bool {
         let mut first = false;
         let reason = self.0.get_or_init(|| {
             first = true;
-            reason.into()
+            reason
         });
         if first {
             tracing::warn!(
@@ -142,12 +147,22 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every event emitted on this thread while `f` runs.
+    /// The events emitted on this thread while `f` runs.
+    ///
+    /// Only for events no other test emits from its own threads: a callsite
+    /// caches its interest when first hit, and while one scoped dispatcher
+    /// exists tracing-core asks only the hitting thread's, so a callsite
+    /// first hit elsewhere can stay "never" here. The one WARN of a failure,
+    /// which every worker-loop test can emit, is counted in a process of its
+    /// own (`tests/gpu_fallback_warning.rs`).
     pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
         use tracing_subscriber::layer::SubscriberExt;
         let events = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Layer(Arc::clone(&events)));
-        let out = tracing::subscriber::with_default(subscriber, f);
+        let out = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
         let captured = events.lock().unwrap().clone();
         (out, captured)
     }
@@ -180,24 +195,6 @@ pub(crate) mod tests {
             }
         );
         assert!(dashboard.is_failed());
-    }
-
-    #[test]
-    fn only_the_failure_that_turns_the_health_logs_one_warning() {
-        let health = SharedGpuHealth::new();
-        let (_, events) = capture(|| {
-            health.fail("GPU worker panicked: boom");
-            health.fail("again");
-        });
-        let warnings = warnings(&events);
-        assert_eq!(warnings.len(), 1, "{events:?}");
-        assert_eq!(
-            warnings[0].fields.get("reason").map(String::as_str),
-            Some("GPU worker panicked: boom")
-        );
-        assert!(warnings[0]
-            .message()
-            .is_some_and(|m| m.contains("encoding on CPU (ISPC)")));
     }
 
     #[test]

@@ -926,7 +926,6 @@ mod tests {
     use super::*;
     use crate::dds::compressor::tests::varied;
     use crate::dds::compressor::{ChainOutcome, ImageCompressor, MipmapCompressor};
-    use crate::dds::gpu_health::tests::{capture, warnings};
     use crate::dds::gpu_health::{device_lost, GpuHealth, SharedGpuHealth};
     use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::{
@@ -1124,35 +1123,6 @@ mod tests {
             }
         );
         assert!(tx.is_closed(), "the receiver is gone with the loop");
-    }
-
-    /// A panic logs one WARN, from the health, with the panic's message.
-    /// The loop runs on this thread so its events can be captured.
-    #[test]
-    fn a_panic_logs_one_warning_with_its_message() {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let replies = queue(&tx, &[4, 8]);
-        drop(tx);
-        let processor = FnProcessor(|_: RgbaImage, _: &mut GpuTileTiming| -> Result<_, _> {
-            panic!("device lost in poll")
-        });
-        let health = SharedGpuHealth::new();
-        let ((), events) =
-            capture(|| run_worker_loop_here(processor, rx, health.clone(), HangRule::default()));
-
-        let warnings = warnings(&events);
-        assert_eq!(warnings.len(), 1, "{events:?}");
-        assert_eq!(
-            warnings[0].fields.get("reason").map(String::as_str),
-            Some("GPU worker panicked: device lost in poll")
-        );
-        assert!(
-            !events.iter().any(|e| e.level == tracing::Level::ERROR),
-            "no ERROR besides the WARN: {events:?}"
-        );
-        for reply in replies {
-            assert!(reply.blocking_recv().is_ok(), "every caller was answered");
-        }
     }
 
     /// The loop on this thread, as the worker's blocking thread runs it.
@@ -1791,7 +1761,8 @@ mod tests {
 
     /// A panic fails the tile in progress; the queued tiles and every later
     /// one are encoded by the fallback, byte for byte what ISPC makes; the
-    /// health is Failed with the panic's message and one WARN is logged.
+    /// health is Failed with the panic's message. (Its one WARN is counted
+    /// in `tests/gpu_fallback_warning.rs`, a process of its own.)
     #[test]
     fn after_a_panic_the_queue_and_every_later_tile_are_the_ispc_encode() {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -1807,7 +1778,7 @@ mod tests {
         // Distinct images, so each caller's file can be checked.
         let sizes = [16, 32, 48];
 
-        let (results, events) = std::thread::scope(|scope| {
+        let results = std::thread::scope(|scope| {
             let callers: Vec<_> = sizes
                 .iter()
                 .map(|&size| {
@@ -1817,12 +1788,11 @@ mod tests {
                 .collect();
             // Every request is queued before the worker starts.
             buffered(&raw, sizes.len());
-            let worker = scope.spawn(|| {
-                capture(|| run_worker_loop_here(processor, rx, health.clone(), HangRule::default()))
-            });
+            let worker = scope
+                .spawn(|| run_worker_loop_here(processor, rx, health.clone(), HangRule::default()));
             let results: Vec<_> = callers.into_iter().map(|c| c.join().unwrap()).collect();
-            let ((), events) = worker.join().unwrap();
-            (results, events)
+            worker.join().unwrap();
+            results
         });
 
         let mut failed = 0;
@@ -1849,7 +1819,6 @@ mod tests {
             health.failure(),
             Some("GPU worker panicked: Device::poll: device lost")
         );
-        assert_eq!(warnings(&events).len(), 1, "{events:?}");
 
         let s = channel.stats().take_sample().expect("a busy sample");
         assert_eq!(
