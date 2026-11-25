@@ -24,6 +24,7 @@ use counting_alloc::{held_at_peak, CountingAllocator};
 use lit_encode_before::encode_visible_before;
 use xearthlayer::fuse::{DdsFilename, TextureKind};
 use xearthlayer::night::generator::encode_visible;
+use xearthlayer::night::laminar::ArtRecord;
 use xearthlayer::night::roads::field::RoadField;
 use xearthlayer::night::roads::RoadModel;
 use xearthlayer::night::{
@@ -169,6 +170,8 @@ fn time_the_lit_encode() {
     };
     let model = RoadModel::DEFAULT;
     let roads = RoadField::empty(SIZE);
+    // The lookups' doubts decide disk writes in the service; unused here.
+    let record = ArtRecord::default();
     let mut textures = Vec::new();
     for name in real_texture_names(&roots, 40) {
         let img = CpuLitGenerator.generate(&LitRequest {
@@ -176,7 +179,7 @@ fn time_the_lit_encode() {
             size: SIZE,
             brightness: 1.0,
             recipes: &|a, b| store.get(a, b),
-            patterns: &|c| art.pattern(c),
+            patterns: &|c| art.pattern_recorded(c, &record),
             regions: &regions,
             led: &LedModel::DEFAULT,
             roads: &roads,
