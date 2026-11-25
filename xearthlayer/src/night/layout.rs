@@ -25,6 +25,23 @@ pub const FIRST_VISIBLE_ZL16: u32 = 1024;
 /// first visible level instead (design: Lit DDS layout, Risk).
 pub const MAX_TOP_LEVEL: u32 = 16384;
 
+/// Zeros a blank read is served from (#434): a read wholly inside the
+/// blank levels, at most this long, is a slice of [`ZEROS`] and allocates
+/// nothing. A FUSE read is at most 1 MiB.
+const STATIC_ZEROS_LEN: usize = 1 << 20;
+
+/// All zeros, in the binary's zero-initialised data: no file bytes, and no
+/// memory until a read touches it.
+static ZEROS: [u8; STATIC_ZEROS_LEN] = [0; STATIC_ZEROS_LEN];
+
+/// Whether `bytes` is a slice of [`ZEROS`].
+#[cfg(test)]
+fn is_static_zeros(bytes: &Bytes) -> bool {
+    let zeros = ZEROS.as_ptr_range();
+    let range = bytes.as_ptr_range();
+    zeros.start <= range.start && range.end <= zeros.end
+}
+
 /// The shape of one lit DDS: the levels above the first visible one (the
 /// `blank_levels`, all black but the last, which X-Plane uploads), then the
 /// visible ones.
@@ -64,15 +81,45 @@ impl LitLayout {
     }
 
     /// Bytes `[offset, offset + len)` of the all-black texture: the header,
-    /// then zero blocks (black, adds nothing to the base colour).
+    /// then zero blocks (black, adds nothing to the base colour). A read
+    /// past the header of at most `STATIC_ZEROS_LEN` bytes is a slice of a
+    /// static zero buffer, not a new one.
     pub fn read_black(&self, offset: u64, len: u32) -> Bytes {
+        let (start, end) = self.clamp(offset, len);
+        self.compose(start, end, None)
+    }
+
+    /// `[offset, offset + len)` clamped to the file.
+    fn clamp(&self, offset: u64, len: u32) -> (u64, u64) {
         let start = offset.min(self.total_len);
-        let end = start.saturating_add(u64::from(len)).min(self.total_len);
-        let mut out = vec![0u8; (end - start) as usize];
+        (
+            start,
+            start.saturating_add(u64::from(len)).min(self.total_len),
+        )
+    }
+
+    /// Bytes `[start, end)` (within the file) of the header, zeros and,
+    /// from `payload_start`, `payload` (the visible levels, of their full
+    /// length) or zeros without one. Zeros alone come from the static
+    /// buffer when they fit; anything else is one buffer, written once.
+    fn compose(&self, start: u64, end: u64, payload: Option<&Bytes>) -> Bytes {
         let header_len = self.header.len() as u64;
+        let payload_start = self.payload_start();
+        let in_payload = payload.is_some() && end > payload_start;
+        let n = (end - start) as usize;
+        if start >= header_len && !in_payload && n <= STATIC_ZEROS_LEN {
+            return Bytes::from_static(&ZEROS[..n]);
+        }
+        let mut out = vec![0u8; n];
         if start < header_len {
-            let n = (header_len.min(end) - start) as usize;
-            out[..n].copy_from_slice(&self.header[start as usize..start as usize + n]);
+            let k = (header_len.min(end) - start) as usize;
+            out[..k].copy_from_slice(&self.header[start as usize..start as usize + k]);
+        }
+        if let Some(payload) = payload.filter(|_| in_payload) {
+            let from = payload_start.max(start);
+            out[(from - start) as usize..].copy_from_slice(
+                &payload[(from - payload_start) as usize..(end - payload_start) as usize],
+            );
         }
         Bytes::from(out)
     }
@@ -91,8 +138,7 @@ impl LitLayout {
     /// Whether bytes `[offset, offset + len)` overlap the visible levels,
     /// the only generated part: everything before them is black.
     pub fn reaches_payload(&self, offset: u64, len: u32) -> bool {
-        let start = offset.min(self.total_len);
-        let end = start.saturating_add(u64::from(len)).min(self.total_len);
+        let (start, end) = self.clamp(offset, len);
         start < end && end > self.payload_start()
     }
 
@@ -106,18 +152,12 @@ impl LitLayout {
             return self.read_black(offset, len);
         };
         let payload_start = self.payload_start();
-        let start = offset.min(self.total_len);
-        let end = start.saturating_add(u64::from(len)).min(self.total_len);
+        let (start, end) = self.clamp(offset, len);
         if start >= payload_start {
             // Entirely inside the payload: a refcount slice, no copy.
             return payload.slice((start - payload_start) as usize..(end - payload_start) as usize);
         }
-        let mut out = self.read_black(start, (end - start) as u32).to_vec();
-        if end > payload_start {
-            let from = (payload_start - start) as usize;
-            out[from..].copy_from_slice(&payload[..(end - payload_start) as usize]);
-        }
-        Bytes::from(out)
+        self.compose(start, end, Some(payload))
     }
 }
 
@@ -218,6 +258,34 @@ mod lit_tests {
         assert!(l.reaches_payload(l.total_len - 1, 8));
         assert!(!l.reaches_payload(start + 8, 0), "an empty read");
         assert!(!l.reaches_payload(l.total_len, 8), "at EOF");
+    }
+
+    #[test]
+    fn a_read_inside_the_blank_levels_allocates_no_buffer() {
+        // The header, the blank levels and the payload at ZL16, setting 3.
+        let l = LitLayout::new(16, 3);
+        let payload = varied(l.payload_len());
+        let start = l.payload_start();
+        for (offset, len) in [
+            (128, 1 << 20),
+            (128 + 12_345, 999),
+            (4096, 1),
+            (start - (1 << 20), 1 << 20),
+            (start - 8, 8),
+        ] {
+            for read in [
+                l.read_black(offset, len),
+                l.read_lit(offset, len, Some(&payload)),
+                l.read_lit(offset, len, None),
+            ] {
+                assert_eq!(read.len(), len as usize, "{offset} + {len}");
+                assert!(is_static_zeros(&read), "{offset} + {len} allocated");
+            }
+        }
+        // Header bytes, the payload or more than a FUSE read: a buffer.
+        for (offset, len) in [(0, 200), (127, 2), (start - 1, 2), (128, (1 << 20) + 1)] {
+            assert!(!is_static_zeros(&l.read_lit(offset, len, Some(&payload))));
+        }
     }
 
     #[test]
