@@ -4883,6 +4883,8 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "xearthlayer-package",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -44,6 +44,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Configurable concurrency, timeout, and retry logic
    - Failed chunks are not cached (retry on next request); see Cache System for tile-level rules
    - A usable chunk is a 256×256 image (`tasks/chunk_image.rs`, #388, the one statement of it): a 200 response whose header is not one (any format `image` reads, not JPEG only) is a failed, retryable attempt and never cached (`check_header`, no pixel decode); at assembly a chunk that does not decode to one (`decode`) is painted magenta, counted in `AssembledTile::rejected`, and discarded from the chunk disk tier through `DiskCache::discard`
+   - Assembly decodes through `chunk_image::decode_into` (#390): a 3-component YCbCr or 1-component grayscale JPEG goes straight to `zune-jpeg` as RGBA into one reusable `ChunkPixels` per tile, and chunks and magenta are copied onto the canvas by row. Everything else (PNG, RGB, CMYK and YCCK JPEGs, frames whose component count does not fit their colour space) and any JPEG zune does not convert whole (the last alpha of every row is cleared first and must read 255 after) goes to `decode`, which decides every reject, so the canvas and `rejected` are byte for byte `decode`'s. `zune-jpeg`/`zune-core` stay at the versions `image` resolves
    - Retry classification lives in `executor/adapters/provider.rs` `map_provider_error`: transport failures and non-404 statuses are retryable, HTTP 404 is permanent (one attempt) because every shipped provider answers 404 only for "no tile here" (#301). The HTTP clients emit `ProviderError::HttpStatus { status, url }` for non-success responses, so callers match on the code, never on message text
    - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300). A tile whose encode finishes while its job is being cancelled is kept: when it is complete, `BuildAndCacheDdsTask` writes it to memory and DDS disk before returning `Cancelled`, unless the cancel is the executor's shutdown (#385). `JobExecutor::shutdown` cancels its own `shutting_down` token before any job token and dispatch puts it on every `TaskContext`, so a task reads `is_cancelled()` first and `is_shutting_down()` second to tell a shutdown from a kill or an error policy
 
@@ -464,7 +465,7 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/executor/task.rs` | Task trait and TaskContext, TaskOutput |
 | `xearthlayer/src/jobs/dds_generate.rs` | DdsGenerateJob - tile generation job |
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
-| `xearthlayer/src/tasks/chunk_image.rs` | What a usable chunk is: `check_header` (download path) and `decode` (assembly), 256×256, any format `image` reads |
+| `xearthlayer/src/tasks/chunk_image.rs` | What a usable chunk is: `check_header` (download path), `decode` (the reference) and `decode_into` (assembly: zune-jpeg fast path for YCbCr and grayscale JPEGs, `decode` otherwise), 256×256, any format `image` reads |
 | `xearthlayer/src/tasks/` | Task implementations (CachedTileProbe, DownloadChunks, BuildAndCacheDds, CacheGcBatch) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
 | `xearthlayer/src/dds/layout.rs` | DDS file geometry: every size in a DDS file (#391) |
@@ -614,6 +615,7 @@ the two `[package.metadata.deb]` `copyright` fields: bump them together.
 - `fuse3` - Async FUSE filesystem (multi-threaded)
 - `reqwest` - HTTP client with connection pooling
 - `image` - JPEG decoding and image manipulation
+- `zune-jpeg` + `zune-core` - The JPEG decoder `image` itself uses, called directly for chunk assembly (#390). Pinned to the versions `image` resolves, so `Cargo.lock` holds one copy; bump them with `image`
 - `clap` - CLI argument parsing
 - `ini` - Configuration file parsing
 - `tracing` - Structured logging
