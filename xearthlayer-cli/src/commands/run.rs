@@ -38,10 +38,10 @@ pub struct RunArgs {
 
 /// Run the run command.
 pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
-    // Report every panic (banner and telemetry) to stderr. The hook does not
-    // unmount (#418): a panic on this thread unwinds through here and
-    // `orchestrator`'s drop unmounts; one anywhere else is caught or ends only
-    // its own thread, and the scenery keeps being served.
+    // Report every panic to stderr. The panic handler never unmounts (#418):
+    // the mount is removed only as the process ends, when this function
+    // unwinds and `orchestrator` drops (a panic on the dashboard's startup
+    // thread is carried to this thread first).
     panic_handler::init();
 
     // Every prerequisite below was verified before dispatch. Absence here is a
