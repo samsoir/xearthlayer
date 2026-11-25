@@ -35,6 +35,14 @@ impl Grid {
         }
     }
 
+    /// Whether this is a missing layer as the reader leaves it (one zero
+    /// cell, [`Grid::empty`]). A layer of one zero cell samples as zero
+    /// everywhere, as a missing one does, so the two need not be told
+    /// apart; neither has a grid a neighbouring tile is read on.
+    pub fn is_missing(&self) -> bool {
+        self.width == 1 && self.height == 1 && self.cells == [0]
+    }
+
     /// The cell at `(row, col)`.
     pub fn get(&self, row: usize, col: usize) -> u8 {
         self.cells[row * self.width + col]
@@ -574,6 +582,15 @@ mod tests {
         let r = parse_recipe(&file(b"OXN1", &v)).unwrap();
         assert_eq!(r.class, Grid::empty());
         assert_eq!(r.brightness, Grid::empty());
+        assert!(r.class.is_missing() && r.brightness.is_missing());
+        let golden = parse_recipe(URBAN).unwrap();
+        assert!(!golden.class.is_missing() && !golden.brightness.is_missing());
+        let one = Grid {
+            width: 1,
+            height: 1,
+            cells: vec![7],
+        };
+        assert!(!one.is_missing(), "one lit cell is a layer");
         assert_eq!(r.scale, BrightnessScale::default());
     }
 

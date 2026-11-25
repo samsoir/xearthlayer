@@ -3,11 +3,13 @@
 //! floor by `f64::floor`, the warp noise evaluated once per seed, a new
 //! class entry's tile found again, and the radiance logarithm taken on
 //! every call. The production path ([`super::FieldSampler`]) must give the
-//! same bits.
+//! same bits. Since #434 the grid (and scale) a point samples on is the
+//! one `RecipeField::grid_at` chooses there, not one per field; the
+//! arithmetic on it is unchanged.
 
 use super::{
-    tile_of, ClassWeight, Layer, RecipeField, WARP_AMPLITUDE_CELLS, WARP_SEED_X, WARP_SEED_Y,
-    WARP_WAVELENGTH_CELLS,
+    tile_of, ClassWeight, Layer, LayerGrid, RecipeField, WARP_AMPLITUDE_CELLS, WARP_SEED_X,
+    WARP_SEED_Y, WARP_WAVELENGTH_CELLS,
 };
 use crate::night::generator::noise::{hash2, unit};
 
@@ -26,9 +28,10 @@ pub(crate) fn value_noise(x: f64, y: f64, seed: u64) -> f64 {
 /// `RecipeField::class_weights` before #437.
 pub(crate) fn class_weights(field: &RecipeField, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
     out.clear();
-    let Some((ny, nx)) = field.dims(Layer::Class) else {
+    let Some(grid) = field.grid_at(Layer::Class, lat, lon) else {
         return;
     };
+    let (ny, nx) = (grid.ny, grid.nx);
     let gx = (lon + 180.0) * nx as f64;
     let gy = (90.0 - lat) * ny as f64;
     let (wx, wy) = (gx / WARP_WAVELENGTH_CELLS, gy / WARP_WAVELENGTH_CELLS);
@@ -47,7 +50,7 @@ pub(crate) fn class_weights(field: &RecipeField, lat: f64, lon: f64, out: &mut V
             continue;
         }
         let (row, col) = (r0 + dr, c0 + dc);
-        let (slot, index) = match field.slot_cell(Layer::Class, ny, nx, row, col) {
+        let (slot, index) = match field.slot_cell(Layer::Class, &grid, row, col) {
             Some((s, i)) if i != 0 => (s, i),
             _ => continue,
         };
@@ -68,19 +71,20 @@ pub(crate) fn class_weights(field: &RecipeField, lat: f64, lon: f64, out: &mut V
 
 /// `RecipeField::radiance` before #437.
 pub(crate) fn radiance(field: &RecipeField, lat: f64, lon: f64) -> f64 {
-    let b = brightness_byte(field, lat, lon);
+    let Some(grid) = field.grid_at(Layer::Brightness, lat, lon) else {
+        return 0.0;
+    };
+    let b = brightness_byte(field, &grid, lat, lon);
     if b <= 0.0 {
         return 0.0;
     }
-    let scale = field.curve.scale();
+    let scale = grid.curve.scale();
     let span = (1.0 + scale.rmax_nw / scale.r0_nw).ln();
     scale.r0_nw * ((b / 255.0 * span).exp() - 1.0)
 }
 
-fn brightness_byte(field: &RecipeField, lat: f64, lon: f64) -> f64 {
-    let Some((ny, nx)) = field.dims(Layer::Brightness) else {
-        return 0.0;
-    };
+fn brightness_byte(field: &RecipeField, grid: &LayerGrid, lat: f64, lon: f64) -> f64 {
+    let (ny, nx) = (grid.ny, grid.nx);
     let u = (lon + 180.0) * nx as f64 - 0.5;
     let v = (90.0 - lat) * ny as f64 - 0.5;
     let (c0, r0) = (u.floor(), v.floor());
@@ -88,7 +92,7 @@ fn brightness_byte(field: &RecipeField, lat: f64, lon: f64) -> f64 {
     let (c0, r0) = (c0 as i64, r0 as i64);
     let at = |r: i64, c: i64| {
         field
-            .cell(Layer::Brightness, ny, nx, r, c)
+            .cell(Layer::Brightness, grid, r, c)
             .map_or(0.0, f64::from)
     };
     let top = at(r0, c0) * (1.0 - fx) + at(r0, c0 + 1) * fx;

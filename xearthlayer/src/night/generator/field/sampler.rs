@@ -9,7 +9,7 @@
 //! global cell's tile. Every value is the bits the per-point code gives.
 
 use super::{
-    ClassWeight, Layer, RecipeField, WARP_AMPLITUDE_CELLS, WARP_SEED_X, WARP_SEED_Y,
+    ClassWeight, Layer, LayerGrid, RecipeField, WARP_AMPLITUDE_CELLS, WARP_SEED_X, WARP_SEED_Y,
     WARP_WAVELENGTH_CELLS,
 };
 use crate::night::generator::noise::NoisePair;
@@ -201,7 +201,9 @@ fn unpack(word: u32) -> Option<(usize, u8)> {
     (word != 0).then_some(((word >> 8) as usize, word as u8))
 }
 
+/// One class grid of the field sampled at the texels.
 struct ClassLayer {
+    grid: LayerGrid,
     cols: Vec<ClassAxis>,
     rows: Vec<ClassAxis>,
     cells: CellTable<u32>,
@@ -209,10 +211,12 @@ struct ClassLayer {
     near: CellTable<bool>,
 }
 
+/// One brightness grid (and scale) of the field sampled at the texels.
 struct BrightnessLayer {
+    grid: LayerGrid,
     cols: Vec<BrightnessAxis>,
     rows: Vec<BrightnessAxis>,
-    /// Bytes; 0 where no recipe covers the cell.
+    /// Bytes; 0 where no recipe on this grid covers the cell.
     cells: CellTable<u8>,
 }
 
@@ -238,10 +242,19 @@ pub struct TexelAxes<'a> {
 /// With the class mask (#438), a texel whose own class cell has no class
 /// cell within `MASK_REACH_CELLS` gets its empty weights without the warp
 /// noise or a cell read: about a third of all texels on real textures.
+///
+/// A field whose tiles are on more than one grid (#434; never with version
+/// 1 recipes) has a layer per grid, each with its own tables, and a texel
+/// samples the one `RecipeField::grid_at` chooses at its position.
 pub struct FieldSampler<'f> {
     field: &'f RecipeField,
-    class: Option<ClassLayer>,
-    brightness: Option<BrightnessLayer>,
+    /// One per class grid of the field, in its order; usually one.
+    class: Vec<ClassLayer>,
+    /// One per brightness grid of the field, in its order; usually one.
+    brightness: Vec<BrightnessLayer>,
+    /// The texel positions, to choose a grid where a layer has several.
+    lats: Vec<f64>,
+    lons: Vec<f64>,
     warp: NoisePair,
     /// Reads that fell outside a built table and went to the field.
     #[cfg(test)]
@@ -265,7 +278,8 @@ impl<'f> FieldSampler<'f> {
     fn build(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64, mask: bool) -> Self {
         let TexelAxes { lats, lons } = axes;
         let budget = lons.len() * lats.len() * MAX_TABLE_CELLS_PER_TEXEL;
-        let class = field.dims(Layer::Class).map(|(ny, nx)| {
+        let class_layer = |grid: &LayerGrid| {
+            let (ny, nx) = (grid.ny, grid.nx);
             let cols: Vec<ClassAxis> = lons
                 .iter()
                 .map(|&lon| ClassAxis::of((lon + 180.0) * nx as f64))
@@ -285,7 +299,7 @@ impl<'f> FieldSampler<'f> {
                 )
             };
             let cells = CellTable::build(reach(&rows), reach(&cols), budget, |r, c| {
-                pack(field.layer_cell(Layer::Class, r, c))
+                pack(field.slot_cell(Layer::Class, grid, r, c))
             });
             let near = if mask {
                 cells.near_class()
@@ -293,13 +307,15 @@ impl<'f> FieldSampler<'f> {
                 CellTable::build(None, None, 0, |_, _| true)
             };
             ClassLayer {
+                grid: *grid,
                 cols,
                 rows,
                 cells,
                 near,
             }
-        });
-        let brightness = field.dims(Layer::Brightness).map(|(ny, nx)| {
+        };
+        let brightness_layer = |grid: &LayerGrid| {
+            let (ny, nx) = (grid.ny, grid.nx);
             let cols: Vec<BrightnessAxis> = lons
                 .iter()
                 .map(|&lon| BrightnessAxis::of((lon + 180.0) * nx as f64 - 0.5))
@@ -312,18 +328,51 @@ impl<'f> FieldSampler<'f> {
                 |axes: &[BrightnessAxis]| widen(span(axes.iter().map(|a| a.c0)), slack, 1 + slack);
             let cells = CellTable::build(reach(&rows), reach(&cols), budget, |r, c| {
                 field
-                    .layer_cell(Layer::Brightness, r, c)
+                    .slot_cell(Layer::Brightness, grid, r, c)
                     .map_or(0, |(_, b)| b)
             });
-            BrightnessLayer { cols, rows, cells }
-        });
+            BrightnessLayer {
+                grid: *grid,
+                cols,
+                rows,
+                cells,
+            }
+        };
         Self {
             field,
-            class,
-            brightness,
+            class: field.grids(Layer::Class).iter().map(class_layer).collect(),
+            brightness: field
+                .grids(Layer::Brightness)
+                .iter()
+                .map(brightness_layer)
+                .collect(),
+            lats: lats.to_vec(),
+            lons: lons.to_vec(),
             warp: NoisePair::new(WARP_SEED_X, WARP_SEED_Y),
             #[cfg(test)]
             misses: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Which of `layers` (one per grid of `layer`) texel `(row, col)`
+    /// samples, or `None` for none: the only one, or the one on the grid
+    /// the field chooses at the texel.
+    #[inline]
+    fn chosen<L>(
+        &self,
+        layer: Layer,
+        layers: &[L],
+        grid: impl Fn(&L) -> &LayerGrid,
+        row: usize,
+        col: usize,
+    ) -> Option<usize> {
+        match layers.len() {
+            0 => None,
+            1 => Some(0),
+            _ => {
+                let at = self.field.grid_at(layer, self.lats[row], self.lons[col])?;
+                layers.iter().position(|l| *grid(l) == at)
+            }
         }
     }
 
@@ -342,9 +391,10 @@ impl<'f> FieldSampler<'f> {
     /// so the weights sum to less than 1 near the edge of classified ground.
     pub fn class_weights(&mut self, row: usize, col: usize, out: &mut Vec<ClassWeight>) {
         out.clear();
-        let Some(class) = &self.class else {
+        let Some(k) = self.chosen(Layer::Class, &self.class, |l| &l.grid, row, col) else {
             return;
         };
+        let class = &self.class[k];
         let (x, y) = (class.cols[col], class.rows[row]);
         if class.near.get(y.cell, x.cell) == Some(false) {
             return;
@@ -366,7 +416,7 @@ impl<'f> FieldSampler<'f> {
             let (r, c) = (r0 + dr, c0 + dc);
             let word = class.cells.get(r, c).unwrap_or_else(|| {
                 self.missed(!class.cells.cells.is_empty());
-                pack(self.field.layer_cell(Layer::Class, r, c))
+                pack(self.field.slot_cell(Layer::Class, &class.grid, r, c))
             });
             let Some((slot, index)) = unpack(word) else {
                 continue;
@@ -384,24 +434,26 @@ impl<'f> FieldSampler<'f> {
     }
 
     /// Radiance (nW/cm2/sr) at texel `(row, col)`: the brightness byte,
-    /// bilinear between cell centres, through the field's curve; 0 where
-    /// no recipe contributes.
+    /// bilinear between cell centres, through its grid's curve; 0 where no
+    /// recipe contributes.
     pub fn radiance(&self, row: usize, col: usize) -> f64 {
-        let Some(b) = &self.brightness else {
+        let Some(k) = self.chosen(Layer::Brightness, &self.brightness, |l| &l.grid, row, col)
+        else {
             return 0.0;
         };
+        let b = &self.brightness[k];
         let (x, y) = (b.cols[col], b.rows[row]);
         let at = |r: i64, c: i64| {
             f64::from(b.cells.get(r, c).unwrap_or_else(|| {
                 self.missed(!b.cells.cells.is_empty());
                 self.field
-                    .layer_cell(Layer::Brightness, r, c)
+                    .slot_cell(Layer::Brightness, &b.grid, r, c)
                     .map_or(0, |(_, v)| v)
             }))
         };
         let top = at(y.c0, x.c0) * x.rest + at(y.c0, x.c0 + 1) * x.f;
         let bottom = at(y.c0 + 1, x.c0) * x.rest + at(y.c0 + 1, x.c0 + 1) * x.f;
-        self.field.radiance_of(top * y.rest + bottom * y.f)
+        b.grid.radiance_of(top * y.rest + bottom * y.f)
     }
 
     /// A sampler whose tables hold `slack` cells around the cells it must
@@ -415,9 +467,11 @@ impl<'f> FieldSampler<'f> {
     /// without sampling.
     #[cfg(test)]
     pub(crate) fn skips_class(&self, row: usize, col: usize) -> bool {
-        self.class
-            .as_ref()
-            .is_some_and(|c| c.near.get(c.rows[row].cell, c.cols[col].cell) == Some(false))
+        self.chosen(Layer::Class, &self.class, |l| &l.grid, row, col)
+            .is_some_and(|k| {
+                let c = &self.class[k];
+                c.near.get(c.rows[row].cell, c.cols[col].cell) == Some(false)
+            })
     }
 
     /// Reads so far that fell outside a built table and went to the field.
@@ -426,17 +480,15 @@ impl<'f> FieldSampler<'f> {
         self.misses.get()
     }
 
-    /// Whether the class and brightness tables were built: for tests of
-    /// the path that reads the field instead.
+    /// Whether every class and every brightness grid has its table built
+    /// (false for a layer the field lacks): for tests of the path that
+    /// reads the field instead.
     #[cfg(test)]
     pub(crate) fn has_tables(&self) -> (bool, bool) {
         (
-            self.class
-                .as_ref()
-                .is_some_and(|l| !l.cells.cells.is_empty()),
-            self.brightness
-                .as_ref()
-                .is_some_and(|l| !l.cells.cells.is_empty()),
+            !self.class.is_empty() && self.class.iter().all(|l| !l.cells.cells.is_empty()),
+            !self.brightness.is_empty()
+                && self.brightness.iter().all(|l| !l.cells.cells.is_empty()),
         )
     }
 }

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use super::gain::gain;
 use super::RecipeLookup;
 use crate::night::footprint::{wrap_tile_lon, Footprint};
+use crate::night::math::floor_i64;
 use crate::night::recipe::{Grid, RadianceCurve, Recipe};
 
 mod sampler;
@@ -41,13 +42,76 @@ fn tile_of(row: i64, col: i64, ny: i64, nx: i64) -> (i64, i64) {
     )
 }
 
+/// A layer's grid as a field reads it: cells per degree, and for the
+/// brightness layer the scale its bytes are read with (the class layer's is
+/// the default, unused). Tiles continue one another's cells only when their
+/// grids are equal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LayerGrid {
+    pub ny: usize,
+    pub nx: usize,
+    /// The brightness scale's curve, its logarithm taken once.
+    pub curve: RadianceCurve,
+}
+
+impl LayerGrid {
+    /// `layer` of `recipe` as read, or `None` when the recipe lacks it.
+    fn of(recipe: &Recipe, layer: Layer) -> Option<Self> {
+        let g = RecipeField::grid(recipe, layer);
+        (!g.is_missing()).then(|| Self {
+            ny: g.height,
+            nx: g.width,
+            curve: match layer {
+                Layer::Class => RadianceCurve::default(),
+                Layer::Brightness => recipe.scale.curve(),
+            },
+        })
+    }
+
+    /// Radiance of a (possibly fractional) brightness byte; 0 for none.
+    fn radiance_of(&self, b: f64) -> f64 {
+        if b <= 0.0 {
+            return 0.0;
+        }
+        self.curve.radiance_at(b)
+    }
+}
+
+/// One layer's grids across a field.
+struct LayerGrids {
+    /// Per slot: its tile's grid, `None` without a recipe or the layer.
+    slots: Vec<Option<LayerGrid>>,
+    /// The distinct grids, in slot order: one for version 1 recipes.
+    distinct: Vec<LayerGrid>,
+}
+
+impl LayerGrids {
+    fn new(slots: &[Option<Arc<Recipe>>], layer: Layer) -> Self {
+        let slots: Vec<Option<LayerGrid>> = slots
+            .iter()
+            .map(|r| r.as_deref().and_then(|r| LayerGrid::of(r, layer)))
+            .collect();
+        let mut distinct: Vec<LayerGrid> = Vec::new();
+        for g in slots.iter().flatten() {
+            if !distinct.contains(g) {
+                distinct.push(*g);
+            }
+        }
+        Self { slots, distinct }
+    }
+}
+
 /// The recipes one footprint (plus margin) touches, fetched once.
 ///
-/// Grid sizes and the brightness scale come from one recipe (the one with
-/// the smallest tile key, so the choice is deterministic) and apply to the
-/// whole field: version 1 recipes all share them, and a tile whose grid
-/// differs reads as missing. Taking them from the field rather than from the
-/// tile containing a point keeps a sample next to a missing tile correct.
+/// Each tile's layers are read on that tile's own grid and, for brightness,
+/// with its own scale, so the values at a point do not depend on which
+/// footprint asks (#434). A point samples a layer on the grid of its own
+/// tile's layer or, where its tile lacks one, of the nearest tile that has
+/// one (ties to the smaller tile key), and reads cells only from tiles on
+/// that grid: across a line where grids differ the other tile reads as
+/// missing, and a sample next to a missing tile reads its neighbour.
+/// Version 1 recipes all share one grid and scale, so a field of them
+/// reads on that one everywhere.
 ///
 /// The recipes sit in a small row-major table of tile slots (a field spans
 /// at most a few tiles each way), so a cell read is index arithmetic, not a
@@ -66,10 +130,8 @@ pub struct RecipeField {
     slots: Vec<Option<Arc<Recipe>>>,
     /// The tile `(lat0, lon0)` of each slot.
     tiles: Vec<(i32, i32)>,
-    class_dims: Option<(usize, usize)>,
-    brightness_dims: Option<(usize, usize)>,
-    /// The brightness scale's curve, its logarithm taken once.
-    curve: RadianceCurve,
+    class: LayerGrids,
+    brightness: LayerGrids,
 }
 
 impl RecipeField {
@@ -85,16 +147,11 @@ impl RecipeField {
             })
             .collect();
         let slots: Vec<Option<Arc<Recipe>>> = tiles.iter().map(|&(a, b)| lookup(a, b)).collect();
-        // Slots run south to north, then west to east: the first filled one
-        // is the smallest (lat, lon) key.
-        let first = slots.iter().flatten().next();
-        let dims = |g: &Grid| (g.height, g.width);
         Self {
             tiles,
             footprint: *footprint,
-            class_dims: first.map(|r| dims(&r.class)),
-            brightness_dims: first.map(|r| dims(&r.brightness)),
-            curve: first.map(|r| r.scale.curve()).unwrap_or_default(),
+            class: LayerGrids::new(&slots, Layer::Class),
+            brightness: LayerGrids::new(&slots, Layer::Brightness),
             south0,
             west0,
             lats,
@@ -135,66 +192,82 @@ impl RecipeField {
         self.slot_recipe(self.slot_of(lat0.into(), lon0.into())?)
     }
 
-    /// Rows and columns per degree of `layer` across the field; `None` when
-    /// the field has no recipe.
-    pub(crate) fn dims(&self, layer: Layer) -> Option<(usize, usize)> {
+    fn layer(&self, layer: Layer) -> &LayerGrids {
         match layer {
-            Layer::Class => self.class_dims,
-            Layer::Brightness => self.brightness_dims,
+            Layer::Class => &self.class,
+            Layer::Brightness => &self.brightness,
         }
     }
 
-    /// The slot and value of global cell `(row, col)` of a layer with
-    /// `ny` x `nx` cells per degree; `None` without a recipe or when that
-    /// tile's grid differs.
-    fn slot_cell(
+    /// The distinct grids of `layer` across the field, in slot order: one
+    /// for version 1 recipes, none without the layer.
+    pub(crate) fn grids(&self, layer: Layer) -> &[LayerGrid] {
+        &self.layer(layer).distinct
+    }
+
+    /// The grid `layer` is sampled on at a point: its own tile's, or where
+    /// that tile lacks the layer, the nearest tile's that has it (by the
+    /// larger of the latitude and longitude distances to the tile, ties to
+    /// the smaller tile key); `None` when no tile of the field has it.
+    ///
+    /// A field reads the tiles within `FIELD_MARGIN_DEG` of every point of
+    /// its footprint, so for grids fine enough that a sample reaches less
+    /// than that (version 1's), any field holding a point chooses the same
+    /// grid wherever the choice changes a value.
+    pub(crate) fn grid_at(&self, layer: Layer, lat: f64, lon: f64) -> Option<LayerGrid> {
+        let grids = self.layer(layer);
+        match grids.distinct.as_slice() {
+            [] => return None,
+            [one] => return Some(*one),
+            _ => {}
+        }
+        let own = self.slot_of(floor_i64(lat), floor_i64(lon));
+        if let Some(g) = own.and_then(|s| grids.slots[s]) {
+            return Some(g);
+        }
+        let gap = |x: f64, lo: f64| (lo - x).max(x - (lo + 1.0)).max(0.0);
+        let distance = |slot: usize| {
+            let (dy, dx) = (slot as i64 / self.lons, slot as i64 % self.lons);
+            let (lat0, lon0) = ((self.south0 + dy) as f64, (self.west0 + dx) as f64);
+            gap(lat, lat0).max(gap(lon, lon0))
+        };
+        grids
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, g)| Some((distance(slot), self.tiles[slot], (*g)?)))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+            .map(|(_, _, g)| g)
+    }
+
+    /// The slot and value of global cell `(row, col)` of `layer` on `grid`;
+    /// `None` without a recipe or when that tile's layer is missing or on
+    /// another grid.
+    pub(crate) fn slot_cell(
         &self,
         layer: Layer,
-        ny: usize,
-        nx: usize,
+        grid: &LayerGrid,
         row: i64,
         col: i64,
     ) -> Option<(usize, u8)> {
-        let (ny_i, nx_i) = (ny as i64, nx as i64);
-        let (lat0, lon0) = tile_of(row, col, ny_i, nx_i);
+        let (ny, nx) = (grid.ny as i64, grid.nx as i64);
+        let (lat0, lon0) = tile_of(row, col, ny, nx);
         let slot = self.slot_of(lat0, lon0)?;
-        let g = Self::grid(self.slot_recipe(slot)?, layer);
-        if g.height != ny || g.width != nx {
+        if self.layer(layer).slots[slot].as_ref() != Some(grid) {
             return None;
         }
+        let g = Self::grid(self.slot_recipe(slot)?, layer);
         Some((
             slot,
-            g.get(row.rem_euclid(ny_i) as usize, col.rem_euclid(nx_i) as usize),
+            g.get(row.rem_euclid(ny) as usize, col.rem_euclid(nx) as usize),
         ))
     }
 
-    /// The slot and value of global cell `(row, col)` of `layer` at the
-    /// field's grid; `None` without a grid, a recipe, or when that tile's
-    /// grid differs.
-    fn layer_cell(&self, layer: Layer, row: i64, col: i64) -> Option<(usize, u8)> {
-        let (ny, nx) = self.dims(layer)?;
-        self.slot_cell(layer, ny, nx, row, col)
-    }
-
-    /// The value of global cell `(row, col)` of a layer with `ny` x `nx` cells
-    /// per degree; `None` without a recipe or when that tile's grid differs.
-    pub(crate) fn cell(
-        &self,
-        layer: Layer,
-        ny: usize,
-        nx: usize,
-        row: i64,
-        col: i64,
-    ) -> Option<u8> {
-        self.slot_cell(layer, ny, nx, row, col).map(|(_, v)| v)
-    }
-
-    /// Radiance of a (possibly fractional) brightness byte; 0 for none.
-    fn radiance_of(&self, b: f64) -> f64 {
-        if b <= 0.0 {
-            return 0.0;
-        }
-        self.curve.radiance_at(b)
+    /// The value of global cell `(row, col)` of `layer` on `grid`; `None`
+    /// as for `slot_cell`.
+    #[cfg(test)]
+    pub(crate) fn cell(&self, layer: Layer, grid: &LayerGrid, row: i64, col: i64) -> Option<u8> {
+        self.slot_cell(layer, grid, row, col).map(|(_, v)| v)
     }
 
     /// Radiance (nW/cm2/sr) at a point: the brightness byte, bilinear
@@ -289,15 +362,32 @@ impl RecipeField {
     /// none of those cells gives a gain, no texel can be lit. The answer may
     /// be lit where the generator ends up black (that costs a full-size
     /// black file), never the reverse.
+    ///
+    /// With more than one grid in the field (#434), every pair of a class
+    /// grid and a brightness grid is checked over the whole footprint: a
+    /// texel samples on one of each, so this covers it.
     pub fn has_light(&self, is_lit: impl Fn(&str) -> bool) -> bool {
-        let (Some((cny, cnx)), Some((bny, bnx))) =
-            (self.dims(Layer::Class), self.dims(Layer::Brightness))
-        else {
-            return false;
-        };
+        // Per (slot, class index): unknown, lit or not.
+        let mut lit_class: Vec<Option<bool>> = vec![None; self.slots.len() * 256];
+        self.grids(Layer::Class).iter().any(|class| {
+            self.grids(Layer::Brightness)
+                .iter()
+                .any(|brightness| self.has_light_on(class, brightness, &is_lit, &mut lit_class))
+        })
+    }
+
+    /// `has_light` with the class cells of `class` and the brightness cells
+    /// of `brightness` alone.
+    fn has_light_on(
+        &self,
+        class: &LayerGrid,
+        brightness: &LayerGrid,
+        is_lit: &impl Fn(&str) -> bool,
+        lit_class: &mut [Option<bool>],
+    ) -> bool {
         let f = &self.footprint;
-        let (cy, cx) = (cny as f64, cnx as f64);
-        let (by, bx) = (bny as f64, bnx as f64);
+        let (cy, cx) = (class.ny as f64, class.nx as f64);
+        let (by, bx) = (brightness.ny as f64, brightness.nx as f64);
         // The footprint in class grid units (gy grows southwards).
         let (gx_w, gx_e) = ((f.west + 180.0) * cx, (f.east + 180.0) * cx);
         let (gy_n, gy_s) = ((90.0 - f.north) * cy, (90.0 - f.south) * cy);
@@ -306,8 +396,6 @@ impl RecipeField {
         let rows = (gy_n - reach).floor() as i64..=(gy_s + reach).floor() as i64;
         let cols = (gx_w - reach).floor() as i64..=(gx_e + reach).floor() as i64;
 
-        // Per (slot, class index): unknown, lit or not.
-        let mut lit_class: Vec<Option<bool>> = vec![None; self.slots.len() * 256];
         // The brightness cells (in brightness grid units, `u = g - 0.5`)
         // entering the bilinear sample of any point in `[lo, hi]`.
         let span = |lo: f64, hi: f64| {
@@ -323,7 +411,7 @@ impl RecipeField {
             }
             let brows = span(ty0 / cy * by, ty1 / cy * by);
             for col in cols.clone() {
-                let Some((slot, index)) = self.slot_cell(Layer::Class, cny, cnx, row, col) else {
+                let Some((slot, index)) = self.slot_cell(Layer::Class, class, row, col) else {
                     continue;
                 };
                 if index == 0 {
@@ -331,7 +419,7 @@ impl RecipeField {
                 }
                 let known = &mut lit_class[slot * 256 + usize::from(index)];
                 let lit = *known
-                    .get_or_insert_with(|| self.palette_name_in(slot, index).is_some_and(&is_lit));
+                    .get_or_insert_with(|| self.palette_name_in(slot, index).is_some_and(is_lit));
                 if !lit {
                     continue;
                 }
@@ -343,8 +431,10 @@ impl RecipeField {
                 let bcols = span(tx0 / cx * bx, tx1 / cx * bx);
                 for br in brows.clone() {
                     for bc in bcols.clone() {
-                        let b = self.cell(Layer::Brightness, bny, bnx, br, bc);
-                        if b.is_some_and(|b| gain(self.radiance_of(f64::from(b)), 1.0) > 0.0) {
+                        let b = self.slot_cell(Layer::Brightness, brightness, br, bc);
+                        if b.is_some_and(|(_, b)| {
+                            gain(brightness.radiance_of(f64::from(b)), 1.0) > 0.0
+                        }) {
                             return true;
                         }
                     }
@@ -554,12 +644,14 @@ mod tests {
             _ => None,
         };
         let field = RecipeField::new(&footprint(38.1, 37.9, -122.6, -122.4), &lookup);
+        let grid = field.grids(Layer::Brightness)[0];
+        assert_eq!((grid.ny, grid.nx), (4, 4));
         assert_eq!(
-            field.cell(Layer::Brightness, 4, 4, (89 - 38) * 4 + 3, 4 * 57 + 1),
+            field.cell(Layer::Brightness, &grid, (89 - 38) * 4 + 3, 4 * 57 + 1),
             Some(100)
         );
         assert_eq!(
-            field.cell(Layer::Brightness, 4, 4, (89 - 37) * 4, 4 * 57 + 1),
+            field.cell(Layer::Brightness, &grid, (89 - 37) * 4, 4 * 57 + 1),
             Some(200)
         );
         let scale = BrightnessScale::default();
@@ -856,7 +948,8 @@ mod tests {
         assert_eq!(full.table_misses(), 0);
         for slack in [-1, -2] {
             let mut tight = FieldSampler::with_slack(&field, axes, slack);
-            assert_eq!(tight.has_tables(), (true, true), "slack {slack}");
+            // The coarser brightness grid's table may be cut to nothing.
+            assert!(tight.has_tables().0, "slack {slack}");
             let weighted = assert_sampler_matches_reference(&mut tight, &field, &lats, &lons);
             assert!(
                 weighted > lats.len() * lons.len() / 3,
@@ -994,6 +1087,239 @@ mod tests {
         // The probe sees the light across the line.
         assert!(east_edge.has_light(|_| true));
         assert!(west_edge.has_light(|_| true));
+    }
+
+    /// `recipe` with `layer` missing, as the reader gives a recipe without it.
+    fn without(recipe: &Arc<Recipe>, layer: Layer) -> Arc<Recipe> {
+        let mut r = (**recipe).clone();
+        match layer {
+            Layer::Class => r.class = Grid::empty(),
+            Layer::Brightness => {
+                r.brightness = Grid::empty();
+                r.scale = BrightnessScale::default();
+            }
+        }
+        Arc::new(r)
+    }
+
+    /// Class weights as (tile, index, weight bits): comparable across
+    /// fields, whose slots differ.
+    fn ground_weights(out: &[ClassWeight]) -> Vec<((i32, i32), u8, u64)> {
+        out.iter()
+            .map(|w| (w.tile, w.index, w.weight.to_bits()))
+            .collect()
+    }
+
+    /// The class weights and radiance of `a` and `b` agree, bit for bit,
+    /// at every point of `lats` x `lons`; returns the lit points.
+    fn assert_fields_agree(a: &RecipeField, b: &RecipeField, lats: &[f64], lons: &[f64]) -> usize {
+        let (mut wa, mut wb, mut lit) = (Vec::new(), Vec::new(), 0);
+        for &lat in lats {
+            for &lon in lons {
+                a.class_weights(lat, lon, &mut wa);
+                b.class_weights(lat, lon, &mut wb);
+                assert_eq!(ground_weights(&wa), ground_weights(&wb), "at {lat}, {lon}");
+                let (ra, rb) = (a.radiance(lat, lon), b.radiance(lat, lon));
+                assert_eq!(ra.to_bits(), rb.to_bits(), "at {lat}, {lon}");
+                lit += usize::from(!wa.is_empty() && ra > 0.0);
+            }
+        }
+        lit
+    }
+
+    #[test]
+    fn a_first_tile_without_a_layer_hides_nothing_of_its_neighbours() {
+        // (37, -123) has the smallest key; (37, -122) is lit. A field over
+        // both, the first without one of its layers, reads that layer as a
+        // field without the first recipe does: the neighbour's own.
+        let east = synthetic(
+            37,
+            -122,
+            120,
+            |r, c| u8::from((r + c) % 3 != 0),
+            240,
+            |r, c| ((r * 41 + c * 13) % 256) as u8,
+        );
+        let west = synthetic(37, -123, 120, |_, c| u8::from(c > 60), 240, |_, _| 230);
+        let f = footprint(37.6, 37.4, -122.08, -121.9);
+        let lats: Vec<f64> = (0..60).map(|k| 37.4 + f64::from(k) * 0.2 / 59.0).collect();
+        let mut lons: Vec<f64> = (0..600)
+            .map(|k| -122.08 + f64::from(k) * 0.18 / 599.0)
+            .collect();
+        lons.extend([-122.0, (-122.0f64).next_up(), (-122.0f64).next_down()]);
+        let (lats, lons) = (&lats[..], &lons[..]);
+        for layer in [Layer::Class, Layer::Brightness] {
+            let first = without(&west, layer);
+            let (e, w) = (east.clone(), first.clone());
+            let both = RecipeField::new(&f, &move |a, b| match (a, b) {
+                (37, -123) => Some(w.clone()),
+                (37, -122) => Some(e.clone()),
+                _ => None,
+            });
+            let e = east.clone();
+            let alone =
+                RecipeField::new(&f, &move |a, b| ((a, b) == (37, -122)).then(|| e.clone()));
+            // The missing layer is the same in both fields everywhere.
+            let (mut wa, mut wb) = (Vec::new(), Vec::new());
+            for &lat in lats {
+                for &lon in lons {
+                    match layer {
+                        Layer::Class => {
+                            both.class_weights(lat, lon, &mut wa);
+                            alone.class_weights(lat, lon, &mut wb);
+                            assert_eq!(ground_weights(&wa), ground_weights(&wb), "{lat}, {lon}");
+                        }
+                        Layer::Brightness => assert_eq!(
+                            both.radiance(lat, lon).to_bits(),
+                            alone.radiance(lat, lon).to_bits(),
+                            "{lat}, {lon}"
+                        ),
+                    }
+                }
+            }
+            // East of the first tile's class reach, both layers agree.
+            let east_lons: Vec<f64> = lons.iter().copied().filter(|&l| l > -121.98).collect();
+            assert!(
+                assert_fields_agree(&both, &alone, lats, &east_lons) > 0,
+                "{layer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_footprints_agree_along_their_edge_with_a_mixed_grid_recipe() {
+        // Texture X (ZL16 col 10560) spans lon -121.992..-121.904, so its
+        // field (grown by the margin) starts in tile (37, -123); texture Y
+        // (col 10576) east of it lies in (37, -122) alone. (37, -122) is on
+        // other class and brightness grids, with another scale.
+        let zl16 = |col| {
+            Footprint::from_name(&crate::fuse::DdsFilename {
+                row: 25392,
+                col,
+                zoom: 16,
+                map_type: "BI".into(),
+                kind: crate::fuse::TextureKind::Lit,
+            })
+        };
+        let (x, y) = (zl16(10560), zl16(10576));
+        assert_eq!(
+            x.expanded(FIELD_MARGIN_DEG).tiles(),
+            vec![(37, -123), (37, -122)]
+        );
+        assert_eq!(y.expanded(FIELD_MARGIN_DEG).tiles(), vec![(37, -122)]);
+        assert_eq!(x.east, y.west);
+        let west = synthetic(37, -123, 120, |_, _| 1, 8, |_, _| 120);
+        let mut odd = (*synthetic(
+            37,
+            -122,
+            60,
+            |r, c| u8::from((r / 2 + c) % 3 != 0),
+            4,
+            |r, c| ((r * 59 + c * 7) % 256) as u8,
+        ))
+        .clone();
+        odd.scale = BrightnessScale {
+            r0_nw: 2.0,
+            rmax_nw: 500.0,
+        };
+        let odd = Arc::new(odd);
+        let lookup = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(west.clone()),
+            (37, -122) => Some(odd.clone()),
+            _ => None,
+        };
+        let (fx, fy) = (RecipeField::new(&x, &lookup), RecipeField::new(&y, &lookup));
+        let lats: Vec<f64> = (0..400)
+            .map(|k| y.south + (y.north - y.south) * f64::from(k) / 399.0)
+            .collect();
+        let edge = [x.east.next_down(), x.east, x.east.next_up()];
+        assert!(
+            assert_fields_agree(&fx, &fy, &lats, &edge) > 0,
+            "the edge is lit"
+        );
+    }
+
+    #[test]
+    fn a_tile_is_read_with_its_own_scale() {
+        let west = synthetic(37, -123, 120, |_, _| 1, 8, |_, _| 150);
+        let mut east = (*synthetic(37, -122, 120, |_, _| 1, 8, |_, _| 150)).clone();
+        let scale = BrightnessScale {
+            r0_nw: 2.0,
+            rmax_nw: 500.0,
+        };
+        east.scale = scale;
+        let east = Arc::new(east);
+        let lookup = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(west.clone()),
+            (37, -122) => Some(east.clone()),
+            _ => None,
+        };
+        let field = RecipeField::new(&footprint(37.6, 37.4, -122.3, -121.7), &lookup);
+        let want = scale.radiance(150);
+        assert!((field.radiance(37.5, -121.8) - want).abs() < 1e-9);
+        let default = BrightnessScale::default().radiance(150);
+        assert!((field.radiance(37.5, -122.2) - default).abs() < 1e-9);
+        assert!((want - default).abs() > 1.0, "the scales differ");
+    }
+
+    #[test]
+    fn a_point_reads_its_own_tiles_grid_or_the_nearest_one() {
+        // (37, -123) on 120 class cells, (37, -122) on 60, (38, -123) on
+        // 30; (38, -122) has no recipe.
+        let tile = |lat0, lon0, n| synthetic(lat0, lon0, n, |_, _| 1, 8, |_, _| 100);
+        let (a, b, c) = (tile(37, -123, 120), tile(37, -122, 60), tile(38, -123, 30));
+        let lookup = move |lat: i32, lon: i32| match (lat, lon) {
+            (37, -123) => Some(a.clone()),
+            (37, -122) => Some(b.clone()),
+            (38, -123) => Some(c.clone()),
+            _ => None,
+        };
+        let field = RecipeField::new(&footprint(38.5, 37.5, -122.5, -121.5), &lookup);
+        let class = |lat, lon| field.grid_at(Layer::Class, lat, lon).map(|g| g.nx);
+        assert_eq!(class(37.9, -121.9), Some(60), "its own tile");
+        assert_eq!(class(37.9, -122.1), Some(120));
+        assert_eq!(class(38.1, -122.1), Some(30));
+        // In (38, -122): the nearest tile with a class layer.
+        assert_eq!(class(38.01, -121.6), Some(60), "south");
+        assert_eq!(class(38.4, -121.99), Some(30), "west");
+        // At (38.125, -121.875) all three are 1/8 away (exactly): the
+        // smallest key.
+        assert_eq!(class(38.125, -121.875), Some(120));
+        // Another field holding the point chooses the same.
+        let other = RecipeField::new(&footprint(38.3, 38.001, -121.95, -121.8), &lookup);
+        for lat in [38.001, 38.005, 38.009] {
+            let at = |f: &RecipeField| f.grid_at(Layer::Class, lat, -121.9).map(|g| g.nx);
+            assert_eq!(at(&other), Some(60));
+            assert_eq!(at(&other), at(&field));
+        }
+        // Uniform fields have one grid everywhere.
+        let only = RecipeField::new(
+            &footprint(37.6, 37.4, -122.6, -122.4),
+            &golden_only(37, -123),
+        );
+        assert_eq!(only.grids(Layer::Class).len(), 1);
+        assert_eq!(
+            only.grid_at(Layer::Class, 36.0, -120.0).map(|g| g.nx),
+            Some(1200)
+        );
+    }
+
+    #[test]
+    fn the_probe_sees_light_on_a_tile_with_another_grid() {
+        // The first tile is unlit (class 0) on 120 cells; the lit one east
+        // of it is on 60, and the footprint straddles the line.
+        let dark = synthetic(37, -123, 120, |_, _| 0, 8, |_, _| 255);
+        let lit = synthetic(37, -122, 60, |_, _| 1, 4, |_, _| 255);
+        let lookup = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(dark.clone()),
+            (37, -122) => Some(lit.clone()),
+            _ => None,
+        };
+        assert!(probe(
+            footprint(37.6, 37.4, -122.08, -121.99),
+            lookup,
+            |_| true
+        ));
     }
 
     #[test]

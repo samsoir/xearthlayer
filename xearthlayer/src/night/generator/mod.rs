@@ -79,7 +79,10 @@ pub trait LitGenerator: Send + Sync {
 /// 8: the nearest level gives a quarter of the light, not an eighth.
 /// 9: texels below [`BC1_FLOOR`] encoded black.
 /// 10: BC1 endpoints repaired where they tint dim texels ([`bc1_repair`]).
-pub const LIT_GENERATOR_VERSION: u32 = 10;
+/// 11: each tile's recipe read on its own grid and scale (#434), not on
+///     those of the field's first recipe; the same bytes for version 1
+///     recipes, which share them.
+pub const LIT_GENERATOR_VERSION: u32 = 11;
 
 /// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
 pub const SRGB_GAMMA: f32 = 2.2;
@@ -359,8 +362,8 @@ mod tests {
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
     #[test]
-    fn the_bc1_repair_is_generator_version_ten() {
-        assert_eq!(LIT_GENERATOR_VERSION, 10);
+    fn per_tile_recipe_grids_are_generator_version_eleven() {
+        assert_eq!(LIT_GENERATOR_VERSION, 11);
     }
 
     fn name_at(lat: f64, lon: f64) -> DdsFilename {

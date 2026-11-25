@@ -1148,6 +1148,62 @@ mod tests {
     }
 
     #[test]
+    fn a_first_tile_without_brightness_does_not_darken_its_neighbour() {
+        // Texture col 10560 at ZL16 spans lon -121.992..-121.904, so its
+        // field, grown by the margin, starts in tile (37, -123), which has
+        // no brightness layer; (37, -122) is lit. East of the west tile's
+        // class reach, the texture is lit as it is without the west recipe
+        // (#434); before, the west recipe's missing layer set the field's
+        // brightness grid and the east tile read dark.
+        let east = synthetic(
+            37,
+            -122,
+            120,
+            |r, c| u8::from((r + c) % 4 != 0),
+            240,
+            |r, c| (128 + (r * 7 + c * 3) % 128) as u8,
+        );
+        let mut west = (*synthetic(37, -123, 120, |_, _| 1, 240, |_, _| 0)).clone();
+        west.brightness = crate::night::recipe::Grid::empty();
+        let west = Arc::new(west);
+        let both = {
+            let (w, e) = (west.clone(), east.clone());
+            move |a: i32, b: i32| match (a, b) {
+                (37, -123) => Some(w.clone()),
+                (37, -122) => Some(e.clone()),
+                _ => None,
+            }
+        };
+        let alone = move |a: i32, b: i32| ((a, b) == (37, -122)).then(|| east.clone());
+        let n = name(25392, 10560, 16);
+        assert_eq!(
+            Footprint::from_name(&n)
+                .expanded(super::super::field::FIELD_MARGIN_DEG)
+                .tiles(),
+            vec![(37, -123), (37, -122)]
+        );
+        let (a, b) = (
+            generate(&n, 128, both, speckled_any, 1.0),
+            generate(&n, 128, alone, speckled_any, 1.0),
+        );
+        let lons = TexelCentres::of(&n, 128).lons;
+        let mut lit = 0;
+        for (j, &lon) in lons.iter().enumerate().filter(|(_, &l)| l > -121.98) {
+            for i in 0..128 {
+                let (p, q) = (a.get_pixel(j as u32, i), b.get_pixel(j as u32, i));
+                assert_eq!(p, q, "at column {j} (lon {lon}), row {i}");
+                lit += usize::from(p[0] > 0);
+            }
+        }
+        assert!(lit > 0, "the east tile is lit");
+    }
+
+    /// The speckled pattern for every class.
+    fn speckled_any(_: &str) -> Option<Arc<LitPattern>> {
+        speckled("lib/g10/terrain10/urban_tmp_sdry3.ter")
+    }
+
+    #[test]
     fn class_edges_are_soft() {
         // West half of tile +37-123 lit; a ZL14 texture straddling lon -122.5.
         let half = synthetic(37, -123, 120, |_, c| u8::from(c < 60), 4, |_, _| 255);
