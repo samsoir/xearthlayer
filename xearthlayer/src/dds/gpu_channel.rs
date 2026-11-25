@@ -12,6 +12,7 @@
 //! covered without a GPU.
 
 mod inner {
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use block_compression::{CompressionVariant, GpuBlockCompressor};
@@ -20,6 +21,7 @@ mod inner {
     use tokio_util::sync::CancellationToken;
 
     use crate::dds::compressor::MipmapCompressor;
+    use crate::dds::gpu_stats::{start_sample_log, GpuEncodeStats};
     use crate::dds::layout;
     use crate::dds::{DdsError, DdsFormat};
 
@@ -45,8 +47,9 @@ mod inner {
         /// CPU mip generation ([`MipmapStream`](crate::dds::MipmapStream))
         /// and the padding of the sub-block tail.
         pub downsample: Duration,
-        /// Texture creation and `queue.write_texture`, which copies the level
-        /// into a wgpu staging buffer.
+        /// Creating the tile's output and readback buffers and each level's
+        /// texture, and `queue.write_texture`, which copies the level into a
+        /// wgpu staging buffer.
         pub upload: Duration,
         /// Command recording, submit and the blocking poll: GPU and driver.
         pub gpu: Duration,
@@ -112,6 +115,7 @@ mod inner {
     /// the mipmap iteration internally, eliminating per-level channel round-trips.
     pub struct GpuEncoderChannel {
         sender: Option<mpsc::Sender<GpuEncodeRequest>>,
+        stats: Arc<GpuEncodeStats>,
     }
 
     impl GpuEncoderChannel {
@@ -119,7 +123,14 @@ mod inner {
         pub fn new(sender: mpsc::Sender<GpuEncodeRequest>) -> Self {
             Self {
                 sender: Some(sender),
+                stats: Arc::default(),
             }
+        }
+
+        /// The stage timings of the tiles answered through this channel,
+        /// and its queue depth.
+        pub fn stats(&self) -> &Arc<GpuEncodeStats> {
+            &self.stats
         }
 
         /// Returns `true` if the receiver end is still alive.
@@ -154,12 +165,23 @@ mod inner {
                 DdsError::CompressionFailed("GPU worker has been shut down".to_string())
             })?;
 
+            let (width, height) = image.dimensions();
+            let _span = tracing::debug_span!(
+                target: "profiling",
+                "gpu_encode",
+                width,
+                height,
+                levels = mipmap_count,
+            )
+            .entered();
+
+            let sent_at = Instant::now();
             let (resp_tx, resp_rx) = oneshot::channel();
             let request = GpuEncodeRequest {
                 image, // moved, zero clones
                 format,
                 mipmap_count,
-                sent_at: Instant::now(),
+                sent_at,
                 response: resp_tx,
             };
 
@@ -170,6 +192,26 @@ mod inner {
             let reply = resp_rx.blocking_recv().map_err(|_| {
                 DdsError::CompressionFailed("GPU worker dropped response channel".to_string())
             })?;
+            let total = sent_at.elapsed();
+
+            let t = &reply.timing;
+            let encoded = reply.result.is_ok();
+            self.stats.record(t, total, encoded);
+            let us = |d: Duration| d.as_micros() as u64;
+            tracing::debug!(
+                width,
+                height,
+                levels = mipmap_count,
+                encoded,
+                queue_wait_us = us(t.queue_wait),
+                downsample_us = us(t.downsample),
+                upload_us = us(t.upload),
+                gpu_us = us(t.gpu),
+                readback_us = us(t.readback),
+                process_us = us(t.process),
+                total_us = us(total),
+                "GPU encode: tile stages"
+            );
             reply.result
         }
 
@@ -199,12 +241,24 @@ mod inner {
         layout::level_len(width, height, format) as u64
     }
 
+    /// Runs `f`, adding its wall time to `stage` inside `span` (target
+    /// `profiling`, so `run --profile` shows it).
+    fn timed<T>(stage: &mut Duration, span: tracing::Span, f: impl FnOnce() -> T) -> T {
+        let _entered = span.entered();
+        let start = Instant::now();
+        let out = f();
+        *stage += start.elapsed();
+        out
+    }
+
     /// Process a full tile: generate mipmaps, compress each level on GPU,
     /// return concatenated compressed output.
     ///
     /// The worker owns the mipmap iteration via [`MipmapStream`]. GPU output
     /// and readback buffers are pre-allocated for level 0 (largest) and reused
-    /// for smaller levels.
+    /// for smaller levels. Each stage's wall time is added to `timing`.
+    ///
+    /// [`MipmapStream`]: crate::dds::MipmapStream
     fn process_tile(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -212,6 +266,7 @@ mod inner {
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
+        timing: &mut GpuTileTiming,
     ) -> Result<Vec<u8>, DdsError> {
         let width = image.width();
         let height = image.height();
@@ -221,130 +276,178 @@ mod inner {
         // Smaller levels reuse the same buffers.
         let max_output_size = compressed_size(width, height, format);
 
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile-output"),
-            size: max_output_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let (output_buffer, readback_buffer) = timed(
+            &mut timing.upload,
+            tracing::debug_span!(target: "profiling", "gpu_buffers"),
+            || {
+                let output = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tile-output"),
+                    size: max_output_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tile-readback"),
+                    size: max_output_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                (output, readback)
+            },
+        );
 
-        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tile-readback"),
-            size: max_output_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
+        let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
         let mut result = Vec::new();
 
-        for (level_idx, level) in stream.enumerate() {
+        for level_idx in 0.. {
+            // Taking a level from the stream computes the next one: this is
+            // where the CPU downsample happens.
+            let downsample = tracing::debug_span!(
+                target: "profiling",
+                "gpu_downsample",
+                level = level_idx
+            )
+            .entered();
+            let started = Instant::now();
+            let Some(level) = stream.next() else {
+                break;
+            };
             // The GPU kernel asserts both dimensions are multiples of 4, so the
             // 2×2 and 1×1 tail of a full mipmap chain must be padded up to one
             // whole block first. Without this the worker panics and shuts down
             // for the rest of the process lifetime.
             let level = crate::dds::compressor::pad_to_block_multiple(&level);
+            timing.downsample += started.elapsed();
+            drop(downsample);
+
             let lw = level.width();
             let lh = level.height();
             let level_output_size = compressed_size(lw, lh, format);
 
-            // Create texture for this level (textures are immutable in size)
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("tile-input"),
-                size: wgpu::Extent3d {
-                    width: lw,
-                    height: lh,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+            let texture_view = timed(
+                &mut timing.upload,
+                tracing::debug_span!(target: "profiling", "gpu_upload", level = level_idx),
+                || {
+                    // Create texture for this level (textures are immutable in size)
+                    let texture = device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("tile-input"),
+                        size: wgpu::Extent3d {
+                            width: lw,
+                            height: lh,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
 
-            // Upload pixel data
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                level.as_raw(),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(lw * 4),
-                    rows_per_image: Some(lh),
-                },
-                wgpu::Extent3d {
-                    width: lw,
-                    height: lh,
-                    depth_or_array_layers: 1,
+                    // Upload pixel data
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        level.as_raw(),
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(lw * 4),
+                            rows_per_image: Some(lh),
+                        },
+                        wgpu::Extent3d {
+                            width: lw,
+                            height: lh,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+
+                    texture.create_view(&wgpu::TextureViewDescriptor::default())
                 },
             );
 
-            let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            // Dispatch compute pass
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tile-compress"),
-            });
-
-            compressor.add_compression_task(
-                variant,
-                &texture_view,
-                lw,
-                lh,
-                &output_buffer,
-                None,
-                None,
-            );
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("tile-compute"),
-                    timestamp_writes: None,
-                });
-                compressor.compress(&mut pass);
-            }
-
-            encoder.copy_buffer_to_buffer(
-                &output_buffer,
-                0,
-                &readback_buffer,
-                0,
-                level_output_size,
-            );
-
-            let sub_idx = queue.submit(std::iter::once(encoder.finish()));
-
-            // Map readback buffer and wait for completion
             let buffer_slice = readback_buffer.slice(..level_output_size);
-            let (map_tx, map_rx) = std::sync::mpsc::channel();
-            buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = map_tx.send(r);
-            });
+            let map_rx = timed(
+                &mut timing.gpu,
+                tracing::debug_span!(target: "profiling", "gpu_submit_poll", level = level_idx),
+                || -> Result<_, DdsError> {
+                    // Dispatch compute pass
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tile-compress"),
+                        });
 
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(sub_idx),
-                    timeout: Some(std::time::Duration::from_secs(10)),
-                })
-                .map_err(|e| DdsError::CompressionFailed(format!("GPU poll failed: {e}")))?;
+                    compressor.add_compression_task(
+                        variant,
+                        &texture_view,
+                        lw,
+                        lh,
+                        &output_buffer,
+                        None,
+                        None,
+                    );
 
-            map_rx
-                .recv()
-                .map_err(|_| DdsError::CompressionFailed("map_async callback never fired".into()))?
-                .map_err(|e| DdsError::CompressionFailed(format!("buffer mapping failed: {e}")))?;
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("tile-compute"),
+                            timestamp_writes: None,
+                        });
+                        compressor.compress(&mut pass);
+                    }
 
-            let data = buffer_slice.get_mapped_range().map_err(|e| {
-                DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
-            })?;
-            result.extend_from_slice(&data);
-            drop(data);
-            readback_buffer.unmap();
+                    encoder.copy_buffer_to_buffer(
+                        &output_buffer,
+                        0,
+                        &readback_buffer,
+                        0,
+                        level_output_size,
+                    );
+
+                    let sub_idx = queue.submit(std::iter::once(encoder.finish()));
+
+                    // Map readback buffer and wait for completion
+                    let (map_tx, map_rx) = std::sync::mpsc::channel();
+                    buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
+                        let _ = map_tx.send(r);
+                    });
+
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: Some(sub_idx),
+                            timeout: Some(std::time::Duration::from_secs(10)),
+                        })
+                        .map_err(|e| {
+                            DdsError::CompressionFailed(format!("GPU poll failed: {e}"))
+                        })?;
+                    Ok(map_rx)
+                },
+            )?;
+
+            timed(
+                &mut timing.readback,
+                tracing::debug_span!(target: "profiling", "gpu_readback", level = level_idx),
+                || -> Result<(), DdsError> {
+                    map_rx
+                        .recv()
+                        .map_err(|_| {
+                            DdsError::CompressionFailed("map_async callback never fired".into())
+                        })?
+                        .map_err(|e| {
+                            DdsError::CompressionFailed(format!("buffer mapping failed: {e}"))
+                        })?;
+
+                    let data = buffer_slice.get_mapped_range().map_err(|e| {
+                        DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
+                    })?;
+                    result.extend_from_slice(&data);
+                    drop(data);
+                    readback_buffer.unmap();
+                    Ok(())
+                },
+            )?;
 
             tracing::debug!(
                 level = level_idx,
@@ -388,7 +491,7 @@ mod inner {
             image: RgbaImage,
             format: DdsFormat,
             levels: usize,
-            _timing: &mut GpuTileTiming,
+            timing: &mut GpuTileTiming,
         ) -> Result<Vec<u8>, DdsError> {
             process_tile(
                 &self.device,
@@ -397,6 +500,7 @@ mod inner {
                 image,
                 format,
                 levels,
+                timing,
             )
         }
     }
@@ -455,11 +559,20 @@ mod inner {
                 "GPU pipeline: processing full tile"
             );
 
+            let tile_span = tracing::debug_span!(
+                target: "profiling",
+                "gpu_tile",
+                width = image.width(),
+                height = image.height(),
+                levels = mipmap_count,
+            )
+            .entered();
             let started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 processor.process(image, format, mipmap_count, &mut timing)
             }));
             timing.process = started.elapsed();
+            drop(tile_span);
 
             match result {
                 Ok(result) => {
@@ -538,7 +651,10 @@ mod inner {
     /// Initializes GPU resources and spawns the worker thread. Returns the
     /// channel handle, the worker `JoinHandle`, and the selection: the
     /// adapter chosen (for display; the worker owns the device) with the
-    /// host's other adapters for the encoder policy.
+    /// host's other adapters for the encoder policy. Also starts the
+    /// per-minute `GPU encode sample` line of the channel's
+    /// [`stats`](GpuEncoderChannel::stats), which ends with `shutdown` or
+    /// the channel.
     ///
     /// # Errors
     ///
@@ -559,8 +675,10 @@ mod inner {
         tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
-        Ok((GpuEncoderChannel::new(tx), handle, selection))
+        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown.clone());
+        let channel = GpuEncoderChannel::new(tx);
+        start_sample_log(Arc::downgrade(channel.stats()), shutdown);
+        Ok((channel, handle, selection))
     }
 }
 
@@ -1067,6 +1185,59 @@ mod tests {
         assert!(
             err.to_string().contains("mapping failed"),
             "error should mention mapping failure, got: {err}"
+        );
+    }
+
+    // =========================================================================
+    // Stage timing through the channel (#419 item 2)
+    // =========================================================================
+
+    /// Encodes one 4 x 4 image through `channel` from a blocking thread.
+    async fn encode_one(channel: &Arc<GpuEncoderChannel>) -> Result<Vec<u8>, DdsError> {
+        let ch = Arc::clone(channel);
+        tokio::task::spawn_blocking(move || {
+            ch.compress_mipmap_chain(RgbaImage::new(4, 4), DdsFormat::BC1, 1)
+        })
+        .await
+        .expect("spawn_blocking should not panic")
+    }
+
+    /// Every answered tile lands in the channel's stats: an encoded one with
+    /// the processor's stages and the caller's round trip, a failed one as a
+    /// failure only.
+    #[tokio::test]
+    async fn the_channel_records_each_answered_tile_in_its_stats() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let (channel, _worker) = channel_with(FnProcessor(
+            move |_: RgbaImage, timing: &mut GpuTileTiming| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Err(DdsError::CompressionFailed("simulated".into()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                timing.downsample = Duration::from_millis(1);
+                timing.upload = Duration::from_millis(2);
+                timing.gpu = Duration::from_millis(3);
+                timing.readback = Duration::from_millis(4);
+                Ok(vec![0; 8])
+            },
+        ));
+        let channel = Arc::new(channel);
+
+        encode_one(&channel).await.expect("first tile encodes");
+        encode_one(&channel).await.expect_err("second tile fails");
+
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.failed), (1, 1));
+        let max = |s: Option<crate::metrics::LatencySummary>| s.unwrap().max_us;
+        assert_eq!(max(s.downsample), 1_000);
+        assert_eq!(max(s.upload), 2_000);
+        assert_eq!(max(s.gpu), 3_000);
+        assert_eq!(max(s.readback), 4_000);
+        assert!(max(s.process) >= 5_000, "process covers the call");
+        assert!(
+            max(s.total) >= max(s.process) + max(s.queue_wait),
+            "the round trip covers the queue and the worker: {s:?}"
         );
     }
 

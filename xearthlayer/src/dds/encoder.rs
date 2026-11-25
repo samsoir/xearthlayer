@@ -224,13 +224,20 @@ impl DdsEncoder {
 
         let compressed = compressor.compress_mipmap_chain(image, self.format, count)?;
 
+        // Timed for the GPU path's stages (#419): the copy behind the header
+        // is the whole payload.
+        let assembly = tracing::debug_span!(target: "profiling", "dds_header_assembly").entered();
+        let started = std::time::Instant::now();
         let header = DdsHeader::new(width, height, count as u32, self.format);
         let mut output = header.to_bytes();
         output.extend_from_slice(&compressed);
+        let assemble_us = started.elapsed().as_micros() as u64;
+        drop(assembly);
 
         debug!(
             total_dds_bytes = output.len(),
             compressed_bytes = compressed.len(),
+            assemble_us,
             "MipmapCompressor encode complete"
         );
 

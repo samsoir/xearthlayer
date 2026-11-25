@@ -30,7 +30,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// Deliberately not configurable: traces are pooled across users and machines,
 /// so a fixed cadence removes one variable. A 12h flight adds 720 lines.
-const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Shared state handle for read-only access by reporters.
 pub type SharedMetricsState = Arc<RwLock<MetricsStateSnapshot>>;
