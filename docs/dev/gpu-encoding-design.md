@@ -94,8 +94,46 @@ pub enum CompressorBackend {
 Rather than wrapping the GPU compressor in a `Mutex` (which serializes all GPU work), a dedicated worker thread receives requests via an `mpsc` channel:
 
 ```
-BuildAndCacheDds tasks ──► bounded mpsc channel (32) ──► GPU Worker (single thread)
+demand lane   BuildAndCacheDds ──► demand channel (32)          ──┐
+                                                                  ├─► GPU worker (thread xel-gpu-encoder)
+prefetch lane BuildAndCacheDds ──► prefetch channel (CPU pool)  ──┘   demand first
 ```
+
+**Two lanes, one GPU (#421).** Each executor lane has its own encoder and
+channel (`GpuEncoderChannels`, `gpu_lanes`), so nothing on the demand side can
+name the prefetch channel. The worker takes from the demand channel whenever it
+is free and from the prefetch channel only when the demand channel is empty
+(`next_take`, a pure function of the two queues' states). The tile in progress
+is never preempted, so a demand tile waits behind at most one prefetch tile.
+The queue-age valve and the hand-back behind a late tile apply to the demand
+lane only (`GpuLane::has_deadline`); hand-back after a GPU failure and the drain
+cover both. See the adaptive prefetch design, "What the lanes share".
+
+**Awaited, with the job's cancellation (#422).** `BuildAndCacheDdsTask` awaits
+the GPU reply (`MipmapCompressor::submit_mipmap_chain`) instead of parking a
+blocking thread in `blocking_send`/`blocking_recv`, so a tile waiting for the
+GPU holds its CPU permit but no blocking-pool thread. Each request carries its
+job's cancellation token. Worker and caller race for a request through a claim
+(`RequestClaim`, decided by `admit`): a tile not yet started when its job is
+cancelled is skipped by the worker and its caller returns `Cancelled` at once;
+a started tile is finished and cached, as #385 keeps complete tiles (never under
+executor shutdown). An image handed back to the CPU is encoded with ISPC as
+blocking work under the task's CPU permit; one handed back to a cancelled job is
+not encoded and counts as cancelled.
+
+**Kept resources, output in place, no idle poll (#423).** The worker keeps its
+GPU resources (textures, output and readback buffers) across tiles, keyed by size
+and format, and discards them after any failed tile (`AfterTile`), so a late or
+failed tile never poisons the next ones: a readback buffer left mid-map by a
+timed-out poll made every later submit fail before this. `DdsEncoder` allocates
+the DDS file once at its exact size and moves it through the request
+(`GpuEncodeRequest::output`); the worker writes each level into its slice, so an
+encoded tile is one allocation with no copy behind the header, as on the CPU path
+since #393. When both channels are empty the worker blocks until a request, a
+shutdown or a GPU failure (`SharedGpuHealth::failed()`) wakes it: there is no
+poll interval. It runs on its own named thread (`WORKER_THREAD`,
+`xel-gpu-encoder`) behind a `GpuWorkerHandle`, which the service stops at
+shutdown; a stop ends the worker after the tile in progress.
 
 **Message type:**
 
@@ -105,7 +143,9 @@ struct GpuEncodeRequest {
     format: DdsFormat,
     mipmap_count: usize,
     sent_at: Instant,       // the caller starting its send: start of the queue wait
-    response: oneshot::Sender<GpuEncodeReply>, // the result and the tile's GpuTileTiming
+    output: Vec<u8>,        // the DDS file at its exact size, header written, levels to fill (#423)
+    // plus the lane, the job's cancellation token and the claim (#421, #422),
+    // and the oneshot the GpuEncodeReply (result and GpuTileTiming) comes back on
 }
 ```
 
@@ -119,13 +159,15 @@ order, so the loop's failure handling, shutdown and drain are tested without
 a GPU.
 
 **Worker loop:**
-1. Receive `GpuEncodeRequest` with owned source image
-2. Create `MipmapStream::new(image, mipmap_count)` -- worker owns the iteration
-3. For each level: upload -> dispatch compute -> readback -> append to output
-4. While GPU compresses level N, CPU downsamples to produce level N+1 (natural pipeline overlap)
-5. Return concatenated compressed bytes on the oneshot
+1. Take a request, demand first (blocking while both channels are empty)
+2. Admit it: skip it if its job was cancelled before it started, hand it back if it waited past the deadline (demand only)
+3. Create `MipmapStream::new(image, mipmap_count)` -- worker owns the iteration
+4. For each level: upload -> dispatch compute -> readback into the level's slice of the output file
+5. Return the file on the oneshot
 
-**GPU resource reuse:** Output and readback buffers are pre-allocated for level 0 size and reused across all mipmap levels within a tile. Input textures are created per level due to wgpu's immutable texture sizing.
+The CPU downsample of level N+1 does not overlap the GPU work of level N today: `MipmapStream` computes the next level before it returns the current one, and each level is a synchronous round trip. Taking that work off the worker thread is #424.
+
+**GPU resource reuse:** the worker's textures and output and readback buffers are kept across tiles of the same size and format and dropped after a failed tile (#423); within a tile, one set serves every level.
 
 ### Pipeline Overlap (Approach 3)
 
@@ -211,7 +253,7 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 
 | Stage | What it covers |
 |---|---|
-| `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. A lone tile waits mostly for the idle worker's poll, up to 10 ms |
+| `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. An idle worker blocks on its channels and wakes for a request (#423): there is no poll interval |
 | `downsample` | CPU mip generation (`MipmapStream`, which works one level ahead) and the padding of the sub-block tail |
 | `upload` | The tile's output and readback buffers, each level's texture and `queue.write_texture` |
 | `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included (no timestamp queries) |
@@ -222,10 +264,10 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 They appear in three places:
 
 - **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker), and per level `gpu_downsample` (`computes_level`), `gpu_buffers`, `gpu_upload`, `gpu_submit_poll` and `gpu_readback`, plus `dds_header_assembly` in `DdsEncoder`.
-- **The debug log**: one `GPU encode: tile stages` line per tile. Header assembly, which copies the payload behind the header, is in the encoder's own debug line (`assemble_us`), not in this one or the sample: removing that copy belongs with #423.
+- **The debug log**: one `GPU encode: tile stages` line per tile. Since #423 the worker writes the levels into the DDS file in place, so there is no header assembly copy.
 - **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply), `fallback` (tiles handed back and encoded on ISPC: after a failure, or by the queue-age valve), `health` (`healthy` or `failed`) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
 
-The queue depth (`GpuEncodeStats`, `dds/gpu_stats.rs`) is raised before `blocking_send` and lowered when the reply or the failure is back, by a guard that drops on every path. It counts callers blocked on a full channel, which the channel's own capacity (32 buffered requests) does not show.
+Each lane has its own `GpuEncodeStats` and its own `GPU encode sample` line, with a `lane` field (`demand` or `prefetch`) and a `cancelled` count (#421, #422). The queue depth is raised before the send and lowered when the reply, the failure or the caller's cancel is back, by a guard that drops on every path. It counts callers, including those waiting on a full channel, which the channel's own capacity does not show; a caller that leaves on a cancel stops counting while its request may still be buffered.
 
 ## Memory Optimization
 
@@ -299,7 +341,7 @@ ISPC on the same machine and tile, through `DdsEncoder` (`ispc_reference_on_the_
 What the numbers show:
 
 - **The single worker sets the GPU path's throughput.** Throughput is about 1 / worker total, about 55 tiles/s at best, a third of ISPC across all cores. Under a burst, a tile's latency is almost all queue wait, growing with its place in the queue.
-- **A lone tile is only a little faster than ISPC on one thread:** about 25 ms against 32 ms. Of that, 5 to 6 ms is the idle worker's 10 ms poll (`try_recv` and sleep).
+- **A lone tile is only a little faster than ISPC on one thread:** about 25 ms against 32 ms. Of that, 5 to 6 ms was the idle worker's 10 ms poll (`try_recv` and sleep), removed by #423: an idle worker now blocks and wakes for a request.
 - **The CPU downsample, which runs on the worker thread, is its largest stage on the integrated GPU.** Upload is not free there either (4.3 ms, shared memory); on the discrete GPU it is the largest stage (8.2 ms over PCIe).
 - **On this laptop, the NVIDIA driver's power management cut the discrete GPU's rate by two thirds under bursty work.** After about 7 bursts with 1 s idle gaps, the driver moved the GPU from P0 (12,001 MHz memory, PCIe gen 4) to P5 and P8 (810 and 405 MHz memory, PCIe gen 1 to 2) at 38 °C. Upload rose to 31 ms and submit-to-poll to 21 ms, and throughput fell to 14 tiles/s, in two runs out of two. Bursts back to back stayed at about 45 tiles/s. Whether a desktop GPU or another driver does the same is not known; a GPU that renders nothing else between tiles would see this load pattern in flight.
 - **Memory:** process RSS grew about 200 MB on the NVIDIA driver over a run, and between 3 and 110 MB on RADV.

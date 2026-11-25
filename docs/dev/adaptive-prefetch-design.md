@@ -221,11 +221,21 @@ disk cache and the chunk disk cache by `Arc`; writes are idempotent. Coalescing 
 per lane. The coordinator, the region state machine and the demand lane stay on
 the primary in every mode.
 
-**What the lanes share.** Besides the three caches, both lanes' job factories hold
-the same texture encoder. With the CPU backends (`software`, `ispc`) that is only
-shared code, but with `texture.compressor = gpu` every encode from both lanes goes
-through one channel to one GPU worker (`dds/gpu_channel.rs`), so a prefetch encode
-can sit ahead of a FUSE encode there.
+**What the lanes share.** Besides the three caches, with the CPU backends
+(`software`, `ispc`) both lanes' job factories hold the same texture encoder, which
+is only shared code: each lane encodes on its own CPU pool. With
+`texture.compressor = gpu` the lanes share one GPU worker (`dds/gpu_channel.rs`)
+but not a queue (#421): each lane's factory has its own encoder on its own channel
+(`RuntimeBuilder::with_prefetch_encoder`), and the worker takes the demand channel
+first, the prefetch channel only when the demand channel is empty. Prefetch is not
+paused while demand jobs download, so the GPU keeps working for prefetch meanwhile;
+the tile in progress is never preempted, so **a FUSE tile waits behind at most one
+prefetch tile**, the one the GPU is already encoding. That one tile is the bound on
+how much prefetch can delay a demand encode in GPU mode. The prefetch channel holds
+as many requests as the prefetch lane's CPU pool, which cannot have more in flight.
+#420's queue-age valve (a request that waited past the 2 s deadline is encoded on
+the CPU) applies to the demand channel only: prefetch has no deadline, so a
+prefetch tile starved by demand waits for the GPU.
 
 **Admission pause.** `DemandTracker` (`executor/demand.rs`) counts demand jobs in
 flight, a job being a FUSE cache miss that has a generation running. The count is
