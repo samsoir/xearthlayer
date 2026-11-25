@@ -36,6 +36,10 @@ All GPU configuration errors are fatal at startup (exit non-zero with actionable
 1. `gpu_device` matches no adapter (lists all available adapters)
 2. No Vulkan/Metal/DX12 runtime available
 
+A GPU that fails once XEarthLayer is running is not fatal: every tile from then
+on is encoded on the CPU with ISPC, for the rest of the session (#420). See
+[Failure and Fallback](#failure-and-fallback-420).
+
 ## Architecture
 
 ### Trait Hierarchy
@@ -55,12 +59,21 @@ pub trait MipmapCompressor: Send + Sync {
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
-    ) -> Result<Vec<u8>, DdsError>;
+    ) -> Result<ChainOutcome, DdsError>;
+}
+
+/// What a MipmapCompressor did with an image (#420)
+pub enum ChainOutcome {
+    Compressed(Vec<u8>),                          // every level, largest first
+    Returned { image: RgbaImage, reason: String }, // not taken: encode it another way
 }
 ```
 
 - `SoftwareCompressor` and `IspcCompressor` implement `ImageCompressor`
-- `GpuEncoderChannel` implements `MipmapCompressor`
+- `GpuEncoderChannel` implements `MipmapCompressor`. When it hands an image back
+  (`ChainOutcome::Returned`), `DdsEncoder` encodes it with its fallback
+  `ImageCompressor`, which the service names explicitly: `IspcCompressor`. The
+  bytes are then exactly those `texture.compressor = ispc` writes.
 
 The `format` parameter is the extension point for future formats. Only BC1 is implemented: every backend rejects any other format with `DdsError::UnsupportedFormat`, and `GpuEncoderChannel` does so before the request is sent to the worker, so the worker maps BC1 only. See [Supported formats](dds-implementation.md#supported-formats).
 
@@ -129,9 +142,68 @@ VRAM budget: pipeline depth 2 with 4096x4096 tiles ~ 160MB peak.
 ### Hardening
 
 - `map_async` errors propagated via `std::sync::mpsc` (not silently ignored)
-- Worker panic recovery via `catch_unwind` (logs error, sends failure, drains queue, breaks loop)
-- `device.on_uncaptured_error()` registered for device loss logging
+- Worker panic recovery via `catch_unwind`: the tile in progress fails, the
+  GPU turns Failed, and every queued image is handed back (see below)
+- `device.set_device_lost_callback()` registered for device loss. wgpu never
+  reports device loss to `on_uncaptured_error` (it returns early for
+  `DeviceLost`), so that handler only logs validation and out-of-memory errors
 - Structured tracing on buffer lifecycle and error paths
+
+### Failure and Fallback (#420)
+
+`SharedGpuHealth` (`dds/gpu_health.rs`) starts Healthy and turns Failed once,
+for good, keeping the first reason. There is no respawn: once failed, the GPU
+stays off for the session. It turns Failed on:
+
+- **A panic** the worker loop caught.
+- **A lost device**, reported by the device-lost callback with
+  `DeviceLostReason::Unknown` (a driver reset or fault). `Destroyed` follows
+  only an explicit `Device::destroy` and does not fail the health by itself.
+- **Three misses in a row** (`HangRule`: `TILE_DEADLINE` 2 s,
+  `MISSES_BEFORE_FAILED` 3). A miss is a tile that takes longer than the
+  deadline from when the worker takes it, or a tile that fails before it. A
+  tile that succeeds in time resets the count. Failed tiles count because a
+  destroyed Vulkan device under wgpu 30 makes every later tile fail at once,
+  with no panic and no stall; counting only slow tiles left such a GPU
+  "healthy" with every tile failing. One failure alone changes nothing.
+  Three out-of-memory failures in a row (a host short of VRAM) also turn it
+  Failed, and ISPC is then the better encoder there anyway.
+- **A worker gone without a shutdown:** a send the channel refuses while the
+  worker's shutdown token is not cancelled.
+
+The first failure logs one WARN, `GPU encoder failed, encoding on CPU (ISPC)
+for the rest of the session`, with the reason, and the dashboard's Status
+pane shows `GPU failed, encoding on CPU (ISPC): <reason>` (the fallback before
+the reason, so a narrow pane cuts only the reason).
+
+From then on the encoder checks the health before each tile and encodes on
+ISPC without sending. Images already queued are **handed back** to their
+callers (`ChainOutcome::Returned`) and encoded on ISPC, not failed: a
+GPU failure costs at most the tile in progress, and tiles keep arriving.
+
+**The queue-age safety valve.** When the worker takes a request that has
+already waited longer than the deadline in the queue (from the caller starting
+its send), it hands the image back instead of processing it
+(`HangRule::waited_out`). It is not a miss and never fails the GPU. A slow but
+never-late GPU with a full queue would otherwise make the last caller wait
+the queue's depth times the tile time, past the FUSE timeout; with the valve
+no caller waits much longer than the deadline plus one tile. This is the one
+place the threshold lives, for #464 to refine.
+
+**Draining.** At shutdown and after a failure the worker closes its queue,
+then reads it with `blocking_recv` until no sender holds a slot (`drain()`,
+#464; reported and first fixed by @mmaechtel in #459). `try_recv` missed a
+request whose sender had reserved its slot just before the close, and that
+caller waited forever with a blocking thread and a CPU permit. Every request
+is answered exactly once: processed, handed back, or, at shutdown, failed
+with `GPU worker shut down`.
+
+**A hung GPU is leaked, not dropped.** wgpu-core's `Queue::drop` waits for the
+device to go idle with no timeout, and panics outside `catch_unwind` on an
+error other than device loss. So when the GPU fails by a hang or a panic, the
+worker leaks its processor (`std::mem::forget`) instead of dropping it, and
+XEarthLayer can still exit. A clean shutdown, a lost device and tiles that
+failed in time drop it normally.
 
 ### Stage Timing and Queue Depth (#419)
 
@@ -151,7 +223,7 @@ They appear in three places:
 
 - **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker), and per level `gpu_downsample` (`computes_level`), `gpu_buffers`, `gpu_upload`, `gpu_submit_poll` and `gpu_readback`, plus `dds_header_assembly` in `DdsEncoder`.
 - **The debug log**: one `GPU encode: tile stages` line per tile. Header assembly, which copies the payload behind the header, is in the encoder's own debug line (`assemble_us`), not in this one or the sample: removing that copy belongs with #423.
-- **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
+- **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply), `fallback` (tiles handed back and encoded on ISPC: after a failure, or by the queue-age valve), `health` (`healthy` or `failed`) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
 
 The queue depth (`GpuEncodeStats`, `dds/gpu_stats.rs`) is raised before `blocking_send` and lowered when the reply or the failure is back, by a guard that drops on every path. It counts callers blocked on a full channel, which the channel's own capacity (32 buffered requests) does not show.
 
