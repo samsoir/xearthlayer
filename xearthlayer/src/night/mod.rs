@@ -19,8 +19,8 @@ pub mod service;
 pub mod store;
 
 pub use disk::{
-    decode_entry, decode_entry_unsized, encode_entry, footprint_fingerprint, lit_cache_key,
-    session_fingerprint, LitFingerprint,
+    check_entry, decode_entry, decode_entry_unsized, encode_entry, footprint_fingerprint,
+    lit_cache_key, session_fingerprint, EntryReject, LitFingerprint,
 };
 pub use footprint::Footprint;
 pub use generator::{

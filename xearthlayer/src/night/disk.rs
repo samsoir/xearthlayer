@@ -108,14 +108,47 @@ fn stamped_len(entry: &Bytes, fp: &LitFingerprint) -> Option<u64> {
     Some(u64::from_le_bytes(entry[36..44].try_into().ok()?))
 }
 
+/// Why a stored lit entry is not served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryReject {
+    /// Too short for its header, another magic, or other than as many
+    /// payload bytes as its header says (a torn write).
+    Corrupt,
+    /// Stamped with another fingerprint: an input changed.
+    Fingerprint,
+    /// Stamped with another payload length than the layout's (another
+    /// texture setting, or another layout of the levels).
+    Length,
+}
+
 /// The payload of `entry` when it carries `fp` and is exactly
-/// `expected_len` bytes long; `None` otherwise. Slices, no copy.
-pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Option<Bytes> {
-    let stored = stamped_len(&entry, fp)?;
-    if stored != expected_len || (entry.len() - ENTRY_HEADER_LEN) as u64 != expected_len {
-        return None;
+/// `expected_len` bytes long, or why not. Slices, no copy.
+pub fn check_entry(
+    entry: Bytes,
+    fp: &LitFingerprint,
+    expected_len: u64,
+) -> Result<Bytes, EntryReject> {
+    if entry.len() < ENTRY_HEADER_LEN || &entry[..4] != LIT_ENTRY_MAGIC {
+        return Err(EntryReject::Corrupt);
     }
-    Some(entry.slice(ENTRY_HEADER_LEN..))
+    if entry[4..36] != fp.0 {
+        return Err(EntryReject::Fingerprint);
+    }
+    let stored = stamped_len(&entry, fp).ok_or(EntryReject::Corrupt)?;
+    if stored != expected_len {
+        return Err(EntryReject::Length);
+    }
+    if (entry.len() - ENTRY_HEADER_LEN) as u64 != expected_len {
+        return Err(EntryReject::Corrupt);
+    }
+    Ok(entry.slice(ENTRY_HEADER_LEN..))
+}
+
+/// The payload of `entry` when it carries `fp` and is exactly
+/// `expected_len` bytes long; `None` otherwise ([`check_entry`] says why).
+/// Slices, no copy.
+pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Option<Bytes> {
+    check_entry(entry, fp, expected_len).ok()
 }
 
 /// Like [`decode_entry`] for entries whose length is not known in advance
@@ -167,6 +200,39 @@ mod tests {
             "torn write"
         );
         assert_eq!(decode_entry(Bytes::from_static(b"XEL"), &fp(1), 0), None);
+    }
+
+    #[test]
+    fn a_rejected_entry_says_why() {
+        let entry = encode_entry(&fp(1), b"payload");
+        assert_eq!(
+            check_entry(entry.clone(), &fp(1), 7).as_deref(),
+            Ok(&b"payload"[..])
+        );
+        assert_eq!(
+            check_entry(entry.clone(), &fp(2), 7),
+            Err(EntryReject::Fingerprint)
+        );
+        assert_eq!(
+            check_entry(entry.clone(), &fp(1), 8),
+            Err(EntryReject::Length)
+        );
+        assert_eq!(
+            check_entry(entry.slice(..entry.len() - 1), &fp(1), 7),
+            Err(EntryReject::Corrupt),
+            "torn write"
+        );
+        let mut bad_magic = entry.to_vec();
+        bad_magic[0] ^= 0xFF;
+        assert_eq!(
+            check_entry(Bytes::from(bad_magic), &fp(1), 7),
+            Err(EntryReject::Corrupt)
+        );
+        assert_eq!(
+            check_entry(Bytes::from_static(b"XEL"), &fp(1), 0),
+            Err(EntryReject::Corrupt),
+            "short header"
+        );
     }
 
     #[test]
