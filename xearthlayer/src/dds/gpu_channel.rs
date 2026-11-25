@@ -849,7 +849,7 @@ mod inner {
                     // The queue is handed back before the tile is answered,
                     // so it is the queue that waited behind that tile, never
                     // a request its caller sent after the reply (pinned by
-                    // `the_queue_is_handed_back_before_the_late_tile_is_answered`).
+                    // `tests/gpu_hand_back_order.rs`).
                     let failed = misses.count >= rule.misses;
                     if failed {
                         health.fail(misses.reason(rule.deadline));
@@ -1650,60 +1650,6 @@ mod tests {
             "one miss is not a hang"
         );
         assert!(!tx.is_closed(), "the worker keeps running");
-    }
-
-    /// The queue behind a late tile is handed back before the late tile is
-    /// answered, so what goes back is the queue that waited behind it, never
-    /// a request its caller sent after the reply. Seen from the worker's
-    /// own thread: when the hand-back's debug event fires, the late tile's
-    /// reply must not have been sent yet.
-    #[test]
-    fn the_queue_is_handed_back_before_the_late_tile_is_answered() {
-        use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        type Reply = Arc<Mutex<oneshot::Receiver<GpuEncodeReply>>>;
-        /// At each hand-back event, whether the late tile's reply was
-        /// already there.
-        struct AtHandBack(Reply, Arc<Mutex<Vec<bool>>>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AtHandBack {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if event.metadata().fields().field("handed").is_some() {
-                    let answered = self.0.lock().unwrap().try_recv().is_ok();
-                    self.1.lock().unwrap().push(answered);
-                }
-            }
-        }
-
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mut replies = queue(&tx, &[4, 8]).into_iter();
-        let late: Reply = Arc::new(Mutex::new(replies.next().unwrap()));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let subscriber =
-            tracing_subscriber::registry().with(AtHandBack(Arc::clone(&late), Arc::clone(&seen)));
-        drop(tx);
-        std::thread::spawn(move || {
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::callsite::rebuild_interest_cache();
-                run_worker_loop_here(overrunning(), rx, SharedGpuHealth::new(), SHORT);
-            })
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            [false],
-            "one hand-back, before the reply"
-        );
-        let late = Arc::try_unwrap(late).ok().unwrap().into_inner().unwrap();
-        assert!(processed(late.blocking_recv().unwrap()).0.is_ok());
-        let (image, _) = returned(replies.next().unwrap().blocking_recv().unwrap());
-        assert_eq!(image.width(), 8);
     }
 
     /// `misses` tiles in a row past the deadline fail the GPU: the worker
