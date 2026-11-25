@@ -415,231 +415,6 @@ mod inner {
         out
     }
 
-    /// Process a full tile: generate mipmaps, compress each level on GPU,
-    /// return concatenated compressed output.
-    ///
-    /// The worker owns the mipmap iteration via [`MipmapStream`]. GPU output
-    /// and readback buffers are pre-allocated for level 0 (largest) and reused
-    /// for smaller levels. Each stage's wall time is added to `timing`.
-    ///
-    /// Each level's poll waits for what remains until `deadline` (#420): a
-    /// GPU that stops making progress fails the tile at the deadline rather
-    /// than after a timeout per level.
-    ///
-    /// [`MipmapStream`]: crate::dds::MipmapStream
-    #[allow(clippy::too_many_arguments)]
-    fn process_tile(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        compressor: &mut GpuBlockCompressor,
-        image: RgbaImage,
-        format: DdsFormat,
-        mipmap_count: usize,
-        deadline: Instant,
-        timing: &mut GpuTileTiming,
-    ) -> Result<Vec<u8>, DdsError> {
-        let width = image.width();
-        let height = image.height();
-        let variant = compression_variant(format)?;
-
-        // Pre-allocate output and readback buffers for level 0 (largest).
-        // Smaller levels reuse the same buffers.
-        let max_output_size = compressed_size(width, height, format);
-
-        let (output_buffer, readback_buffer) = timed(
-            &mut timing.upload,
-            tracing::debug_span!(target: "profiling", "gpu_buffers"),
-            || {
-                let output = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("tile-output"),
-                    size: max_output_size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                });
-                let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("tile-readback"),
-                    size: max_output_size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                });
-                (output, readback)
-            },
-        );
-
-        let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
-        let mut result = Vec::new();
-
-        // At most `mipmap_count` takes, so a full chain makes no extra call
-        // that only finds the stream's end (one is made, and spanned, only
-        // when the count asks for more levels than the image has).
-        for level_idx in 0..mipmap_count {
-            // The stream works one level ahead: taking level `i` computes
-            // level `i + 1`, which this span names as `computes_level`. The
-            // last take computes nothing, and its span is near zero.
-            let downsample = tracing::debug_span!(
-                target: "profiling",
-                "gpu_downsample",
-                computes_level = level_idx + 1
-            )
-            .entered();
-            let started = Instant::now();
-            let Some(level) = stream.next() else {
-                break;
-            };
-            // The GPU kernel asserts both dimensions are multiples of 4, so the
-            // 2×2 and 1×1 tail of a full mipmap chain must be padded up to one
-            // whole block first. Without this the worker panics and shuts down
-            // for the rest of the process lifetime.
-            let level = crate::dds::compressor::pad_to_block_multiple(&level);
-            timing.downsample += started.elapsed();
-            drop(downsample);
-
-            let lw = level.width();
-            let lh = level.height();
-            let level_output_size = compressed_size(lw, lh, format);
-
-            let texture_view = timed(
-                &mut timing.upload,
-                tracing::debug_span!(target: "profiling", "gpu_upload", level = level_idx),
-                || {
-                    // Create texture for this level (textures are immutable in size)
-                    let texture = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("tile-input"),
-                        size: wgpu::Extent3d {
-                            width: lw,
-                            height: lh,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-
-                    // Upload pixel data
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        level.as_raw(),
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(lw * 4),
-                            rows_per_image: Some(lh),
-                        },
-                        wgpu::Extent3d {
-                            width: lw,
-                            height: lh,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-
-                    texture.create_view(&wgpu::TextureViewDescriptor::default())
-                },
-            );
-
-            let buffer_slice = readback_buffer.slice(..level_output_size);
-            let map_rx = timed(
-                &mut timing.gpu,
-                tracing::debug_span!(target: "profiling", "gpu_submit_poll", level = level_idx),
-                || -> Result<_, DdsError> {
-                    // Dispatch compute pass
-                    let mut encoder =
-                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("tile-compress"),
-                        });
-
-                    compressor.add_compression_task(
-                        variant,
-                        &texture_view,
-                        lw,
-                        lh,
-                        &output_buffer,
-                        None,
-                        None,
-                    );
-
-                    {
-                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("tile-compute"),
-                            timestamp_writes: None,
-                        });
-                        compressor.compress(&mut pass);
-                    }
-
-                    encoder.copy_buffer_to_buffer(
-                        &output_buffer,
-                        0,
-                        &readback_buffer,
-                        0,
-                        level_output_size,
-                    );
-
-                    let sub_idx = queue.submit(std::iter::once(encoder.finish()));
-
-                    // Map readback buffer and wait for completion
-                    let (map_tx, map_rx) = std::sync::mpsc::channel();
-                    buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
-                        let _ = map_tx.send(r);
-                    });
-
-                    device
-                        .poll(wgpu::PollType::Wait {
-                            submission_index: Some(sub_idx),
-                            timeout: Some(deadline.saturating_duration_since(Instant::now())),
-                        })
-                        .map_err(|e| match e {
-                            wgpu::PollError::Timeout => DdsError::CompressionFailed(format!(
-                                "GPU poll timed out at the tile's deadline, level {level_idx}"
-                            )),
-                            e => DdsError::CompressionFailed(format!("GPU poll failed: {e}")),
-                        })?;
-                    Ok(map_rx)
-                },
-            )?;
-
-            timed(
-                &mut timing.readback,
-                tracing::debug_span!(target: "profiling", "gpu_readback", level = level_idx),
-                || -> Result<(), DdsError> {
-                    map_rx
-                        .recv()
-                        .map_err(|_| {
-                            DdsError::CompressionFailed("map_async callback never fired".into())
-                        })?
-                        .map_err(|e| {
-                            DdsError::CompressionFailed(format!("buffer mapping failed: {e}"))
-                        })?;
-
-                    let data = buffer_slice.get_mapped_range().map_err(|e| {
-                        DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
-                    })?;
-                    result.extend_from_slice(&data);
-                    drop(data);
-                    readback_buffer.unmap();
-                    Ok(())
-                },
-            )?;
-
-            tracing::debug!(
-                level = level_idx,
-                width = lw,
-                height = lh,
-                compressed_bytes = level_output_size,
-                "GPU compressed mipmap level"
-            );
-
-            // `level` dropped here — CPU memory reclaimed before next downsample
-        }
-
-        Ok(result)
-    }
-
     /// The production [`TileProcessor`]: the GPU device, its queue and the
     /// `block_compression` kernels, owned by the worker thread.
     pub struct WgpuTileProcessor {
@@ -660,6 +435,235 @@ mod inner {
                 compressor,
             }
         }
+
+        /// Process a full tile: generate mipmaps, compress each level on GPU,
+        /// return concatenated compressed output.
+        ///
+        /// The worker owns the mipmap iteration via [`MipmapStream`]. GPU output
+        /// and readback buffers are pre-allocated for level 0 (largest) and reused
+        /// for smaller levels. Each stage's wall time is added to `timing`.
+        ///
+        /// Each level's poll waits for what remains until `deadline` (#420): a
+        /// GPU that stops making progress fails the tile at the deadline rather
+        /// than after a timeout per level.
+        ///
+        /// [`MipmapStream`]: crate::dds::MipmapStream
+        fn process_tile(
+            &mut self,
+            image: RgbaImage,
+            format: DdsFormat,
+            mipmap_count: usize,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+        ) -> Result<Vec<u8>, DdsError> {
+            let Self {
+                device,
+                queue,
+                compressor,
+            } = self;
+            let width = image.width();
+            let height = image.height();
+            let variant = compression_variant(format)?;
+
+            // Pre-allocate output and readback buffers for level 0 (largest).
+            // Smaller levels reuse the same buffers.
+            let max_output_size = compressed_size(width, height, format);
+
+            let (output_buffer, readback_buffer) = timed(
+                &mut timing.upload,
+                tracing::debug_span!(target: "profiling", "gpu_buffers"),
+                || {
+                    let output = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("tile-output"),
+                        size: max_output_size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("tile-readback"),
+                        size: max_output_size,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    (output, readback)
+                },
+            );
+
+            let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
+            let mut result = Vec::new();
+
+            // At most `mipmap_count` takes, so a full chain makes no extra call
+            // that only finds the stream's end (one is made, and spanned, only
+            // when the count asks for more levels than the image has).
+            for level_idx in 0..mipmap_count {
+                // The stream works one level ahead: taking level `i` computes
+                // level `i + 1`, which this span names as `computes_level`. The
+                // last take computes nothing, and its span is near zero.
+                let downsample = tracing::debug_span!(
+                    target: "profiling",
+                    "gpu_downsample",
+                    computes_level = level_idx + 1
+                )
+                .entered();
+                let started = Instant::now();
+                let Some(level) = stream.next() else {
+                    break;
+                };
+                // The GPU kernel asserts both dimensions are multiples of 4, so the
+                // 2×2 and 1×1 tail of a full mipmap chain must be padded up to one
+                // whole block first. Without this the worker panics and shuts down
+                // for the rest of the process lifetime.
+                let level = crate::dds::compressor::pad_to_block_multiple(&level);
+                timing.downsample += started.elapsed();
+                drop(downsample);
+
+                let lw = level.width();
+                let lh = level.height();
+                let level_output_size = compressed_size(lw, lh, format);
+
+                let texture_view = timed(
+                    &mut timing.upload,
+                    tracing::debug_span!(target: "profiling", "gpu_upload", level = level_idx),
+                    || {
+                        // Create texture for this level (textures are immutable in size)
+                        let texture = device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("tile-input"),
+                            size: wgpu::Extent3d {
+                                width: lw,
+                                height: lh,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: wgpu::TextureFormat::Rgba8Unorm,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+
+                        // Upload pixel data
+                        queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            level.as_raw(),
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(lw * 4),
+                                rows_per_image: Some(lh),
+                            },
+                            wgpu::Extent3d {
+                                width: lw,
+                                height: lh,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+
+                        texture.create_view(&wgpu::TextureViewDescriptor::default())
+                    },
+                );
+
+                let buffer_slice = readback_buffer.slice(..level_output_size);
+                let map_rx = timed(
+                    &mut timing.gpu,
+                    tracing::debug_span!(target: "profiling", "gpu_submit_poll", level = level_idx),
+                    || -> Result<_, DdsError> {
+                        // Dispatch compute pass
+                        let mut encoder =
+                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("tile-compress"),
+                            });
+
+                        compressor.add_compression_task(
+                            variant,
+                            &texture_view,
+                            lw,
+                            lh,
+                            &output_buffer,
+                            None,
+                            None,
+                        );
+
+                        {
+                            let mut pass =
+                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("tile-compute"),
+                                    timestamp_writes: None,
+                                });
+                            compressor.compress(&mut pass);
+                        }
+
+                        encoder.copy_buffer_to_buffer(
+                            &output_buffer,
+                            0,
+                            &readback_buffer,
+                            0,
+                            level_output_size,
+                        );
+
+                        let sub_idx = queue.submit(std::iter::once(encoder.finish()));
+
+                        // Map readback buffer and wait for completion
+                        let (map_tx, map_rx) = std::sync::mpsc::channel();
+                        buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
+                            let _ = map_tx.send(r);
+                        });
+
+                        device
+                            .poll(wgpu::PollType::Wait {
+                                submission_index: Some(sub_idx),
+                                timeout: Some(deadline.saturating_duration_since(Instant::now())),
+                            })
+                            .map_err(|e| match e {
+                                wgpu::PollError::Timeout => DdsError::CompressionFailed(format!(
+                                    "GPU poll timed out at the tile's deadline, level {level_idx}"
+                                )),
+                                e => DdsError::CompressionFailed(format!("GPU poll failed: {e}")),
+                            })?;
+                        Ok(map_rx)
+                    },
+                )?;
+
+                timed(
+                    &mut timing.readback,
+                    tracing::debug_span!(target: "profiling", "gpu_readback", level = level_idx),
+                    || -> Result<(), DdsError> {
+                        map_rx
+                            .recv()
+                            .map_err(|_| {
+                                DdsError::CompressionFailed("map_async callback never fired".into())
+                            })?
+                            .map_err(|e| {
+                                DdsError::CompressionFailed(format!("buffer mapping failed: {e}"))
+                            })?;
+
+                        let data = buffer_slice.get_mapped_range().map_err(|e| {
+                            DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
+                        })?;
+                        result.extend_from_slice(&data);
+                        drop(data);
+                        readback_buffer.unmap();
+                        Ok(())
+                    },
+                )?;
+
+                tracing::debug!(
+                    level = level_idx,
+                    width = lw,
+                    height = lh,
+                    compressed_bytes = level_output_size,
+                    "GPU compressed mipmap level"
+                );
+
+                // `level` dropped here — CPU memory reclaimed before next downsample
+            }
+
+            Ok(result)
+        }
     }
 
     impl TileProcessor for WgpuTileProcessor {
@@ -671,16 +675,7 @@ mod inner {
             deadline: Instant,
             timing: &mut GpuTileTiming,
         ) -> Result<Vec<u8>, DdsError> {
-            process_tile(
-                &self.device,
-                &self.queue,
-                &mut self.compressor,
-                image,
-                format,
-                levels,
-                deadline,
-                timing,
-            )
+            self.process_tile(image, format, levels, deadline, timing)
         }
     }
 
