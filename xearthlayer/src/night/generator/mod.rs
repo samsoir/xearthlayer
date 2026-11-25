@@ -942,6 +942,74 @@ mod tests {
         }
     }
 
+    /// `img` with every alpha replaced by a hash of the texel's position,
+    /// never 255.
+    fn with_random_alpha(img: &RgbaImage) -> RgbaImage {
+        let mut out = img.clone();
+        for (x, y, px) in out.enumerate_pixels_mut() {
+            let h = (u64::from(y) << 32 | u64::from(x)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            px.0[3] = (h >> 56) as u8 % 255;
+        }
+        out
+    }
+
+    #[test]
+    fn ispc_bc1_blocks_ignore_alpha() {
+        // Why the chain may write alpha 255 below the first level (#440):
+        // the blocks are the same whatever the alpha, at a whole-block size
+        // and at the padded 1, 2 and 3 px levels.
+        for (i, source) in [every_byte(|_, _| 255), golden_level()].iter().enumerate() {
+            for size in [256, 64, 3, 2, 1]
+                .into_iter()
+                .filter(|&s| s <= source.width())
+            {
+                // From the centre, which is lit in both sources.
+                let at = (source.width() - size).min(source.width() / 2);
+                let opaque = image::imageops::crop_imm(source, at, at, size, size).to_image();
+                assert!(
+                    opaque.pixels().any(|p| p.0[..3] != [0; 3]),
+                    "{i}: {size} px"
+                );
+                let random = with_random_alpha(&opaque);
+                assert!(random.pixels().any(|p| p.0[3] != 255), "{i}: {size} px");
+                assert_eq!(
+                    compress_level(&IspcCompressor, &random, DdsFormat::BC1).unwrap(),
+                    compress_level(&IspcCompressor, &opaque, DdsFormat::BC1).unwrap(),
+                    "{i}: {size} px"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_bc1_repair_ignores_alpha() {
+        // The nearest level of these lamps is one ISPC tints, so the repair
+        // changes blocks.
+        let mut opaque = lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]);
+        dim(&mut opaque, FADE_RAMP[0]);
+        let random = with_random_alpha(&opaque);
+        let ispc = unrepaired(&opaque);
+        let (mut from_opaque, mut from_random) = (ispc.clone(), ispc.clone());
+        bc1_repair::repair_level(&mut from_opaque, &opaque);
+        bc1_repair::repair_level(&mut from_random, &random);
+        assert_ne!(from_opaque, ispc, "the repair has work to do");
+        assert_eq!(from_random, from_opaque);
+    }
+
+    #[test]
+    fn the_payload_ignores_alpha() {
+        for img in [
+            golden_level(),
+            lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]),
+            every_byte(|_, _| 255),
+        ] {
+            let want = encode_visible_reference(&img);
+            let random = with_random_alpha(&img);
+            assert_eq!(&encode_visible_reference(&random)[..], &want[..]);
+            assert_eq!(&encode_visible(random).unwrap()[..], &want[..]);
+        }
+    }
+
     #[test]
     fn only_opaque_black_takes_the_black_shortcut() {
         let mut one_lit = solid(64, [0; 3]);
