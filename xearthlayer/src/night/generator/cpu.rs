@@ -18,12 +18,13 @@ use std::sync::Arc;
 use image::{Rgba, RgbaImage};
 use tracing::debug;
 
-use super::field::RecipeField;
+use super::field::{FieldSampler, RecipeField, TexelAxes};
 use super::led::{self, LedRegion, TonePath};
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TexelCentres};
 use crate::night::laminar::LitPattern;
+use crate::night::math::floor_i64;
 use crate::night::roads::field::RoadField;
 
 /// Palette indexes per tile: a class cell is one byte.
@@ -35,20 +36,57 @@ pub struct CpuLitGenerator;
 
 impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
-        self.generate_with(request, &led::Toner::new(request.led))
+        self.generate_with(request, &led::Toner::new(request.led), Shortcuts::ALL)
     }
 }
 
+/// Work the generator skips where it cannot change a byte (#438).
+/// Production takes every one; tests and timings turn them off to compare
+/// with the full path.
+#[derive(Debug, Clone, Copy)]
+struct Shortcuts {
+    /// The sampler's class mask: no class lookup where no class is near.
+    class_mask: bool,
+    /// No tone path for a texel whose pattern sum is black.
+    black_stop: bool,
+}
+
+impl Shortcuts {
+    const ALL: Self = Self {
+        class_mask: true,
+        black_stop: true,
+    };
+    #[cfg(test)]
+    const NONE: Self = Self {
+        class_mask: false,
+        black_stop: false,
+    };
+}
+
 impl CpuLitGenerator {
-    /// The generator with the tone path `toner`: the request's
-    /// [`led::Toner`] in production; tests pass the reference path, or one
-    /// that records what reaches it, to compare with it.
-    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, toner: &T) -> RgbaImage {
+    /// The generator with the tone path `toner` and `shortcuts`: the
+    /// request's [`led::Toner`] and all of them in production; tests pass
+    /// the reference path, or one that records what reaches it, and turn
+    /// shortcuts off, to compare.
+    fn generate_with<T: TonePath>(
+        &self,
+        request: &LitRequest<'_>,
+        toner: &T,
+        shortcuts: Shortcuts,
+    ) -> RgbaImage {
         let name = request.name;
         let size = request.size;
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
+        let mut sampler = FieldSampler::with_class_mask(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+            shortcuts.class_mask,
+        );
         // Patterns by (tile slot, palette index), resolved on first use.
         let mut patterns: Vec<Option<Option<Arc<LitPattern>>>> =
             vec![None; field.slot_count() * PALETTE_SLOTS];
@@ -57,6 +95,9 @@ impl CpuLitGenerator {
         let mut regions: Vec<Option<LedRegion>> = vec![None; field.slot_count()];
         let mut weights = Vec::with_capacity(4);
         let mut corners = CornerCache::default();
+        // A patch is about 53 ZL16 texels wide: neighbouring texels reuse
+        // its jittered centres instead of hashing them again.
+        let mut patches = led::PatchCache::default();
         let mut road_light = RoadLight::new(request);
         // A field rastered for another size would put glow on the wrong
         // texels: it is left out rather than misplaced.
@@ -77,11 +118,11 @@ impl CpuLitGenerator {
             let road_row = roads.row(i as u32);
             for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
                 let road = road_row.map_or(0.0, |r| r[j]);
-                field.class_weights(lat, lon, &mut weights);
+                sampler.class_weights(i, j, &mut weights);
                 if weights.is_empty() && road <= 0.0 {
                     continue;
                 }
-                let radiance = field.radiance(lat, lon);
+                let radiance = sampler.radiance(i, j);
                 // No class here: only the road can light the texel, and the
                 // gain is not needed.
                 let g = if weights.is_empty() {
@@ -134,9 +175,30 @@ impl CpuLitGenerator {
                     share += w.weight * tone.share;
                     kelvin += w.weight * tone.kelvin;
                 }
+                // Lit art is bright points on black: where every tap is
+                // black (or no weight has a pattern, `wsum == 0`, which
+                // leaves `rgb` zero too), the tone path gives [0, 0, 0]
+                // (luminance 0 is never toned, recoloured or raised), so it
+                // is skipped. Compared exactly: a small non-zero sum can
+                // still round to LED bytes above zero. The road draws the
+                // texel's patch itself, the one `patch_at_cached` gives.
+                if shortcuts.black_stop && rgb == [0.0; 3] {
+                    if road > 0.0 {
+                        let texel = RoadTexel {
+                            at: (lat, lon),
+                            xy: (x, y),
+                            radiance,
+                            bright,
+                            patch: None,
+                        };
+                        let bytes = road_light.over([0; 3], road, &texel);
+                        img.put_pixel(j as u32, i as u32, opaque(bytes));
+                    }
+                    continue;
+                }
                 let (mut led_kelvin, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
-                    let patch = led::patch_at(x, y);
+                    let patch = led::patch_at_cached(x, y, &mut patches);
                     patch_here = Some(patch);
                     if patch.u < share / wsum {
                         led_kelvin = Some(led::patch_kelvin(kelvin / wsum, &patch));
@@ -254,7 +316,7 @@ impl<'r> RoadLight<'r> {
         let m = r.road_model;
         let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
         let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
-        let region = self.region((led::floor_i64(lat) as i32, led::floor_i64(lon) as i32));
+        let region = self.region((floor_i64(lat) as i32, floor_i64(lon) as i32));
         let tone = r.led.tone(false, bright, region);
         // `patch.u` is below 1, so no share means sodium without a patch.
         let patch = (tone.share > 0.0)
@@ -283,6 +345,9 @@ fn unit_luminance(c: [f32; 3]) -> [f32; 3] {
 }
 
 #[cfg(test)]
+mod texel_timing;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::fuse::{DdsFilename, TextureKind};
@@ -298,7 +363,7 @@ mod tests {
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 
-    fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    pub(super) fn name_at(lat: f64, lon: f64) -> DdsFilename {
         name_at_zoom(lat, lon, 16)
     }
 
@@ -360,6 +425,294 @@ mod tests {
         }
     }
 
+    /// Road-lit output: the `crossing_field` road over a varied synthetic
+    /// recipe in its tile (classes in irregular bands, brightness from 0 up
+    /// across the cells) with the speckled pattern for every class, under
+    /// `LedModel::DEFAULT` in region Na. Captured at 2a51a20, before #437
+    /// hoisted per-texel work: the road pass reads radiance and LED patches
+    /// too, and must not move.
+    const ROAD_LED_DIGEST: u64 = 0xb267_c12f_e5c9_e022;
+
+    #[test]
+    fn the_road_lit_output_is_pinned() {
+        let n = name_at(46.5, 6.5);
+        let roads = crossing_field(&n, 128);
+        let varied = synthetic(
+            46,
+            6,
+            120,
+            |r, c| u8::from((r / 3 + c / 5) % 3 != 0),
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        );
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| varied.clone());
+        let any_speckled = |_: &str| speckled("lib/g10/terrain10/urban_tmp_sdry3.ter");
+        let request = |roads| LitRequest {
+            name: &n,
+            size: 128,
+            brightness: 1.0,
+            recipes: &recipes,
+            patterns: &any_speckled,
+            regions: &|_, _| LedRegion::Na,
+            led: &LedModel::DEFAULT,
+            roads,
+            road_model: &RoadModel::DEFAULT,
+        };
+        let img = CpuLitGenerator.generate(&request(&roads));
+        let without = CpuLitGenerator.generate(&request(&RoadField::empty(128)));
+        // The pin covers road glow over lit pattern texels and over black
+        // ground (where the road pass draws its own patch), and LED texels.
+        let (mut over_lit, mut over_black) = (0, 0);
+        for (a, b) in without.pixels().zip(img.pixels()) {
+            if a != b {
+                if a.0[..3] == [0; 3] {
+                    over_black += 1;
+                } else {
+                    over_lit += 1;
+                }
+            }
+        }
+        assert!(over_lit > 0 && over_black > 0, "{over_lit} {over_black}");
+        assert!(img.pixels().any(is_led), "the pin covers LED texels");
+        assert_eq!(
+            digest(&img),
+            ROAD_LED_DIGEST,
+            "digest {:#018x}",
+            digest(&img)
+        );
+    }
+
+    /// Every texel of the 128 px golden fixture samples the field and the
+    /// pattern as the code before #437 did, bit for bit: class weights,
+    /// radiance, and the speckled pattern at every class.
+    #[test]
+    fn the_fixture_samples_as_before_437() {
+        use crate::night::generator::field::lookup_reference;
+        use crate::night::generator::tiling::sample_reference;
+        let n = name_at(37.20, -122.725);
+        let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &golden);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
+        assert_eq!(
+            sampler.has_tables(),
+            (true, true),
+            "the fixture reads tables"
+        );
+        let pattern = speckled("lib/g10/terrain10/urban_tmp_sdry3.ter").unwrap();
+        let (mut cache, mut reference_cache) = (CornerCache::default(), CornerCache::default());
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        let mut weighted = 0;
+        for (i, (&lat, &y)) in lats.iter().zip(&ys).enumerate() {
+            for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
+                sampler.class_weights(i, j, &mut got);
+                lookup_reference::class_weights(&field, lat, lon, &mut want);
+                let bits = |w: &[super::super::field::ClassWeight]| {
+                    w.iter()
+                        .map(|w| (w.tile, w.slot, w.index, w.weight.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got), bits(&want), "weights at {lat}, {lon}");
+                let radiance = sampler.radiance(i, j);
+                let reference = lookup_reference::radiance(&field, lat, lon);
+                assert_eq!(radiance.to_bits(), reference.to_bits(), "at {lat}, {lon}");
+                for _ in &want {
+                    let c = sample_cached(&pattern, x, y, &mut cache);
+                    let r = sample_reference::sample_cached(&pattern, x, y, &mut reference_cache);
+                    assert_eq!(c.map(f32::to_bits), r.map(f32::to_bits), "at {x}, {y}");
+                }
+                weighted += usize::from(!want.is_empty());
+            }
+        }
+        assert!(weighted > 128 * 128 / 4, "{weighted} weighted texels");
+        assert_eq!(sampler.table_misses(), 0, "every read is in the tables");
+    }
+
+    /// The class mask (#438) skips only fixture texels the reference gives
+    /// no class weight, and skips some.
+    #[test]
+    fn the_class_mask_skips_only_unweighted_fixture_texels() {
+        use crate::night::generator::field::lookup_reference;
+        let n = name_at(37.20, -122.725);
+        let TexelCentres { lons, lats, .. } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &golden);
+        let sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
+        let (mut skipped, mut want) = (0, Vec::new());
+        for (i, &lat) in lats.iter().enumerate() {
+            for (j, &lon) in lons.iter().enumerate() {
+                if sampler.skips_class(i, j) {
+                    lookup_reference::class_weights(&field, lat, lon, &mut want);
+                    assert!(want.is_empty(), "skipped a weighted texel at {lat}, {lon}");
+                    skipped += 1;
+                }
+            }
+        }
+        assert!(skipped > 128 * 128 / 10, "{skipped} skipped");
+    }
+
+    /// A 32 px pattern black but for a lit square in one corner: sampled,
+    /// many texels sum to exactly black.
+    fn mostly_black(_: &str) -> Option<Arc<LitPattern>> {
+        let rgb = (0..32 * 32)
+            .map(|i| {
+                if i % 32 < 8 && i / 32 < 8 {
+                    [200, 120, 50]
+                } else {
+                    [0, 0, 0]
+                }
+            })
+            .collect();
+        Some(Arc::new(LitPattern::new(32, rgb, 4096.0)))
+    }
+
+    /// The generator's shortcuts (#438), the class mask and the stop on
+    /// black pattern sums, give the bytes of the full path: with and
+    /// without road glow, LED off, on and at full share, over classes whose
+    /// pattern is all black and classes whose pattern is mostly black.
+    #[test]
+    fn the_shortcuts_give_the_bytes_of_the_full_path() {
+        let n = name_at(46.5, 6.5);
+        let roads = crossing_field(&n, 128);
+        let mut banded = (*synthetic(
+            46,
+            6,
+            120,
+            |r, c| ((r / 3 + c / 5) % 3) as u8,
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        ))
+        .clone();
+        banded.palette = vec![String::new(), "lit".into(), "black".into()];
+        let banded = Arc::new(banded);
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| banded.clone());
+        let black = Arc::new(LitPattern::new(4, vec![[0, 0, 0]; 16], 4096.0));
+        let all_black = {
+            let black = black.clone();
+            move |_: &str| Some(black.clone())
+        };
+        let some_black = move |class: &str| match class {
+            "black" => Some(black.clone()),
+            _ => mostly_black(class),
+        };
+        let mut stopped = 0;
+        for patterns in [
+            &some_black as &(dyn Fn(&str) -> Option<Arc<LitPattern>> + Sync),
+            &all_black,
+        ] {
+            for model in [LedModel::OFF, LedModel::DEFAULT, full_share_model()] {
+                for field in [&roads, &RoadField::empty(128)] {
+                    let request = LitRequest {
+                        name: &n,
+                        size: 128,
+                        brightness: 1.0,
+                        recipes: &recipes,
+                        patterns,
+                        regions: &|_, _| LedRegion::Na,
+                        led: &model,
+                        roads: field,
+                        road_model: &RoadModel::DEFAULT,
+                    };
+                    let record = || Recording {
+                        toner: led::Toner::new(&model),
+                        inputs: Default::default(),
+                    };
+                    let (fast, full) = (record(), record());
+                    let got = CpuLitGenerator.generate_with(&request, &fast, Shortcuts::ALL);
+                    let want = CpuLitGenerator.generate_with(&request, &full, Shortcuts::NONE);
+                    assert!(got == want, "{model:?}, roads {}", !field.is_empty());
+                    let black = |r: &Recording| {
+                        r.inputs
+                            .borrow()
+                            .iter()
+                            .filter(|(s, ..)| *s == [0.0; 3])
+                            .count()
+                    };
+                    assert_eq!(black(&fast), 0, "black sums stop before the tone path");
+                    stopped += black(&full);
+                }
+            }
+        }
+        assert!(stopped > 0, "the full path met black sums");
+        // With every pattern black, the road lights texels whose class is
+        // weighted under a gain: the stop's road branch is compared above.
+        let TexelCentres { lons, lats, .. } = TexelCentres::of(&n, 128);
+        let field = RecipeField::new(&Footprint::from_name(&n), &recipes);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
+        let (mut weights, mut under_road) = (Vec::new(), 0);
+        for i in 0..128 {
+            let Some(row) = roads.row(i as u32) else {
+                continue;
+            };
+            for (j, &road) in row.iter().enumerate() {
+                sampler.class_weights(i, j, &mut weights);
+                let lit = gain(sampler.radiance(i, j), 1.0) > 0.0;
+                under_road += usize::from(road > 0.0 && lit && !weights.is_empty());
+            }
+        }
+        assert!(under_road > 0, "no weighted texel under the road");
+    }
+
+    /// The pinned generations' sampling never leaves the sampler's tables
+    /// (at their size and at larger ones), so the fallback to the field
+    /// stays a fallback: a table reach that stopped covering the warp
+    /// (`WARP_AMPLITUDE_CELLS` raised past it) fails here.
+    #[test]
+    fn pinned_generations_read_only_their_tables() {
+        // The road pin's recipe.
+        let varied = synthetic(
+            46,
+            6,
+            120,
+            |r, c| u8::from((r / 3 + c / 5) % 3 != 0),
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        );
+        let road_recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| varied.clone());
+        let inputs: [(DdsFilename, crate::night::generator::RecipeLookup<'_>); 2] = [
+            (name_at(37.20, -122.725), &golden),
+            (name_at(46.5, 6.5), &road_recipes),
+        ];
+        for (n, recipes) in &inputs {
+            for size in [128, 512] {
+                let TexelCentres { lons, lats, .. } = TexelCentres::of(n, size);
+                let field = RecipeField::new(&Footprint::from_name(n), *recipes);
+                let mut sampler = FieldSampler::new(
+                    &field,
+                    TexelAxes {
+                        lats: &lats,
+                        lons: &lons,
+                    },
+                );
+                assert_eq!(sampler.has_tables(), (true, true), "{n:?} at {size}");
+                let mut weights = Vec::new();
+                for i in 0..lats.len() {
+                    for j in 0..lons.len() {
+                        sampler.class_weights(i, j, &mut weights);
+                        sampler.radiance(i, j);
+                    }
+                }
+                assert_eq!(sampler.table_misses(), 0, "{n:?} at {size}");
+            }
+        }
+    }
+
     /// The generator's tone path is byte for byte the `powf` path it
     /// replaced (#436), at several models, brightnesses and regions.
     #[test]
@@ -392,8 +745,11 @@ mod tests {
                     road_model: &RoadModel::DEFAULT,
                 };
                 let img = CpuLitGenerator.generate(&request);
-                let reference = CpuLitGenerator
-                    .generate_with(&request, &led::powf_reference::PowfToner(&model));
+                let reference = CpuLitGenerator.generate_with(
+                    &request,
+                    &led::powf_reference::PowfToner(&model),
+                    Shortcuts::ALL,
+                );
                 assert!(lit_texels(&img) > 0);
                 assert!(img == reference, "{model:?} at {brightness} in {region:?}");
             }
@@ -405,13 +761,8 @@ mod tests {
     }
 
     fn red(name: &str) -> Option<Arc<LitPattern>> {
-        (name == "lib/g10/terrain10/urban_tmp_sdry3.ter").then(|| {
-            Arc::new(LitPattern {
-                size: 4,
-                rgb: vec![[255, 0, 0]; 16],
-                ground_scale_m: 4096.0,
-            })
-        })
+        (name == "lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .then(|| Arc::new(LitPattern::new(4, vec![[255, 0, 0]; 16], 4096.0)))
     }
 
     fn generate(
@@ -709,11 +1060,11 @@ mod tests {
     /// A white 4 x 4 pattern: stochastic tiling of a solid colour is that colour,
     /// so a texel's value is its class weight times the gain times 255.
     fn white(_: &str) -> Option<Arc<LitPattern>> {
-        Some(Arc::new(LitPattern {
-            size: 4,
-            rgb: vec![[255, 255, 255]; 16],
-            ground_scale_m: 4096.0,
-        }))
+        Some(Arc::new(LitPattern::new(
+            4,
+            vec![[255, 255, 255]; 16],
+            4096.0,
+        )))
     }
 
     fn speckled(class: &str) -> Option<Arc<LitPattern>> {
@@ -724,15 +1075,11 @@ mod tests {
                     [(unit(h) * 255.0) as u8, (unit(h >> 8) * 255.0) as u8, 0]
                 })
                 .collect();
-            Arc::new(LitPattern {
-                size: 32,
-                rgb,
-                ground_scale_m: 4096.0,
-            })
+            Arc::new(LitPattern::new(32, rgb, 4096.0))
         })
     }
 
-    fn name(row: u32, col: u32, zoom: u8) -> DdsFilename {
+    pub(super) fn name(row: u32, col: u32, zoom: u8) -> DdsFilename {
         DdsFilename {
             row,
             col,
@@ -801,6 +1148,62 @@ mod tests {
     }
 
     #[test]
+    fn a_first_tile_without_brightness_does_not_darken_its_neighbour() {
+        // Texture col 10560 at ZL16 spans lon -121.992..-121.904, so its
+        // field, grown by the margin, starts in tile (37, -123), which has
+        // no brightness layer; (37, -122) is lit. East of the west tile's
+        // class reach, the texture is lit as it is without the west recipe
+        // (#434); before, the west recipe's missing layer set the field's
+        // brightness grid and the east tile read dark.
+        let east = synthetic(
+            37,
+            -122,
+            120,
+            |r, c| u8::from((r + c) % 4 != 0),
+            240,
+            |r, c| (128 + (r * 7 + c * 3) % 128) as u8,
+        );
+        let mut west = (*synthetic(37, -123, 120, |_, _| 1, 240, |_, _| 0)).clone();
+        west.brightness = crate::night::recipe::Grid::empty();
+        let west = Arc::new(west);
+        let both = {
+            let (w, e) = (west.clone(), east.clone());
+            move |a: i32, b: i32| match (a, b) {
+                (37, -123) => Some(w.clone()),
+                (37, -122) => Some(e.clone()),
+                _ => None,
+            }
+        };
+        let alone = move |a: i32, b: i32| ((a, b) == (37, -122)).then(|| east.clone());
+        let n = name(25392, 10560, 16);
+        assert_eq!(
+            Footprint::from_name(&n)
+                .expanded(super::super::field::FIELD_MARGIN_DEG)
+                .tiles(),
+            vec![(37, -123), (37, -122)]
+        );
+        let (a, b) = (
+            generate(&n, 128, both, speckled_any, 1.0),
+            generate(&n, 128, alone, speckled_any, 1.0),
+        );
+        let lons = TexelCentres::of(&n, 128).lons;
+        let mut lit = 0;
+        for (j, &lon) in lons.iter().enumerate().filter(|(_, &l)| l > -121.98) {
+            for i in 0..128 {
+                let (p, q) = (a.get_pixel(j as u32, i), b.get_pixel(j as u32, i));
+                assert_eq!(p, q, "at column {j} (lon {lon}), row {i}");
+                lit += usize::from(p[0] > 0);
+            }
+        }
+        assert!(lit > 0, "the east tile is lit");
+    }
+
+    /// The speckled pattern for every class.
+    fn speckled_any(_: &str) -> Option<Arc<LitPattern>> {
+        speckled("lib/g10/terrain10/urban_tmp_sdry3.ter")
+    }
+
+    #[test]
     fn class_edges_are_soft() {
         // West half of tile +37-123 lit; a ZL14 texture straddling lon -122.5.
         let half = synthetic(37, -123, 120, |_, c| u8::from(c < 60), 4, |_, _| 255);
@@ -815,11 +1218,11 @@ mod tests {
     }
 
     fn orange(_: &str) -> Option<Arc<LitPattern>> {
-        Some(Arc::new(LitPattern {
-            size: 4,
-            rgb: vec![[200, 120, 50]; 16],
-            ground_scale_m: 4096.0,
-        }))
+        Some(Arc::new(LitPattern::new(
+            4,
+            vec![[200, 120, 50]; 16],
+            4096.0,
+        )))
     }
 
     /// A whole tile of class 1 under bright radiance.
@@ -969,13 +1372,7 @@ mod tests {
         let name = name_at(37.5, -122.5);
         let mut changed = 0;
         for rgb in [[200u8, 120, 50], [255, 160, 60], [90, 40, 10], [56, 36, 18]] {
-            let pattern = move |_: &str| {
-                Some(Arc::new(LitPattern {
-                    size: 4,
-                    rgb: vec![rgb; 16],
-                    ground_scale_m: 4096.0,
-                }))
-            };
+            let pattern = move |_: &str| Some(Arc::new(LitPattern::new(4, vec![rgb; 16], 4096.0)));
             for byte in (1u8..=255).step_by(2).chain([255]) {
                 let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
                 let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
@@ -1035,13 +1432,8 @@ mod tests {
                 ..LedModel::DEFAULT
             };
             for rgb in colours {
-                let pattern = move |_: &str| {
-                    Some(Arc::new(LitPattern {
-                        size: 4,
-                        rgb: vec![rgb; 16],
-                        ground_scale_m: 4096.0,
-                    }))
-                };
+                let pattern =
+                    move |_: &str| Some(Arc::new(LitPattern::new(4, vec![rgb; 16], 4096.0)));
                 for byte in (1u8..=255).step_by(2).chain([255]) {
                     let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
                     let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
@@ -1195,7 +1587,7 @@ mod tests {
     /// [`PACKAGES_VAR`] and [`ART_VAR`]: the packages directory and the
     /// Laminar art. Says on stderr what is missing, so a skipped timing
     /// never passes silently.
-    fn real_install() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    pub(super) fn real_install() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         let dir = |var: &str, what: &str| match std::env::var_os(var) {
             Some(v) if std::path::Path::new(&v).is_dir() => Some(std::path::PathBuf::from(v)),
             Some(v) => {
@@ -1568,13 +1960,18 @@ mod tests {
                     };
                     // Warm: inflates the recipes and decodes the patterns.
                     let after = CpuLitGenerator.generate(&request);
-                    let before = CpuLitGenerator.generate_with(&request, &reference);
+                    let before =
+                        CpuLitGenerator.generate_with(&request, &reference, Shortcuts::ALL);
                     assert!(after == before, "{city}: {n:?} differs from the powf path");
                     // Two rounds each, alternated; the faster of each.
                     let (mut b, mut a) = (f64::MAX, f64::MAX);
                     for _ in 0..2 {
                         let started = Instant::now();
-                        black_box(CpuLitGenerator.generate_with(&request, &reference));
+                        black_box(CpuLitGenerator.generate_with(
+                            &request,
+                            &reference,
+                            Shortcuts::ALL,
+                        ));
                         b = b.min(ms(started));
                         let started = Instant::now();
                         black_box(CpuLitGenerator.generate(&request));
@@ -1586,7 +1983,7 @@ mod tests {
                         toner,
                         inputs: Default::default(),
                     };
-                    CpuLitGenerator.generate_with(&request, &recording);
+                    CpuLitGenerator.generate_with(&request, &recording, Shortcuts::ALL);
                     let inputs = recording.inputs.into_inner();
                     let (mut b, mut a) = (f64::MAX, f64::MAX);
                     for _ in 0..3 {

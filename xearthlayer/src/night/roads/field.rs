@@ -145,9 +145,16 @@ impl RoadField {
         let mut pts: Vec<(f64, f64)> = Vec::new();
         let mut segments = 0usize;
         for tile in tiles {
-            // The chains near the footprint and its reach.
-            let (south, west) = (fp.south - reach, fp.west - reach);
-            let (north, east) = (fp.north + reach, fp.east + reach);
+            // The chains near the footprint and its reach, in the tile's
+            // own longitudes; a tile across the antimeridian is drawn
+            // `shift` degrees over, beside the footprint.
+            let RoadWindow {
+                shift,
+                south,
+                west,
+                north,
+                east,
+            } = RoadWindow::new(&fp, reach, tile.tile.1);
             let mut northings: Option<Northings> = None;
             tile.for_each_chain_near(south, west, north, east, |chain| {
                 let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
@@ -158,7 +165,9 @@ impl RoadField {
                     chain
                         .points()
                         .zip(chain.lat_steps())
-                        .map(|((lon, lat), &step)| (mercator(0.0, lon).0, ys.at(step, lat))),
+                        .map(|((lon, lat), &step)| {
+                            (mercator(0.0, lon + shift).0, ys.at(step, lat))
+                        }),
                 );
                 segments += pts.len().saturating_sub(1);
                 match model.lamps {
@@ -518,6 +527,55 @@ fn falloff(u: f32) -> f32 {
     e
 }
 
+/// Degrees to add to the longitudes of tile `lon0`'s roads to draw them
+/// beside `fp`: 0, or 360 either way for a tile across the antimeridian
+/// (a footprint by the line asks for the wrapped tile across it).
+///
+/// It relies on a footprint never spanning the line itself, which holds
+/// for every Mercator texture name (a texture's columns stop at 180): the
+/// footprint's middle is then on one side, and the shift brings the tile
+/// to that side.
+pub(crate) fn antimeridian_shift(lon0: i32, fp: &Footprint) -> f64 {
+    let middle = (fp.west + fp.east) / 2.0;
+    360.0 * ((middle - (f64::from(lon0) + 0.5)) / 360.0).round()
+}
+
+/// The box a road of tile `lon0` must meet to light a footprint: the
+/// footprint grown by the glow reach, in absolute degrees of the tile's
+/// own longitudes (shifted by [`antimeridian_shift`] for a tile across the
+/// line), and the shift that draws the tile's roads beside the footprint.
+/// The raster culls with it and the has-light probe asks
+/// [`crosses_footprint`], so the two cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RoadWindow {
+    pub shift: f64,
+    pub south: f64,
+    pub west: f64,
+    pub north: f64,
+    pub east: f64,
+}
+
+impl RoadWindow {
+    pub(crate) fn new(fp: &Footprint, reach: f64, lon0: i32) -> Self {
+        let shift = antimeridian_shift(lon0, fp);
+        Self {
+            shift,
+            south: fp.south - reach,
+            west: fp.west - reach - shift,
+            north: fp.north + reach,
+            east: fp.east + reach - shift,
+        }
+    }
+}
+
+/// Whether a road of `roads` lies within `reach` degrees of `fp`, across
+/// the antimeridian too: the has-light probe's road test, over the box the
+/// raster culls with ([`RoadWindow`]).
+pub fn crosses_footprint(roads: &MergedRoads, fp: &Footprint, reach: f64) -> bool {
+    let w = RoadWindow::new(fp, reach, roads.tile.1);
+    roads.crosses(w.south, w.west, w.north, w.east)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -613,6 +671,157 @@ pub(crate) mod tests {
     /// The `crossing` road rastered with the default model.
     pub(crate) fn crossing_field(name: &DdsFilename, size: u32) -> RoadField {
         RoadField::raster(name, size, &[crossing(name)], &RoadModel::DEFAULT)
+    }
+
+    #[test]
+    fn roads_across_the_antimeridian_light_the_texture_at_it() {
+        // The ZL16 texture whose east edge is the line, at Taveuni, and a
+        // road 30 m past the line, in tile (-17, -180).
+        let mut name = name_at_zoom(-16.8, 179.95, 16);
+        name.col = (1 << 16) - 16;
+        let f = Footprint::from_name(&name);
+        assert_eq!(f.east, 180.0);
+        let road = |lon: f64| vec![(100, vec![(lon, f.north + 0.01), (lon, f.south - 0.01)])];
+        let across = merged((-17, -180), &road(-179.999_7));
+        let field = RoadField::raster(&name, 256, &[across], &RoadModel::DEFAULT);
+        assert!(field.stats.lit_texels > 0, "the glow crosses the line");
+        // The texels it lights are those a road 30 m inside the line lights
+        // in their mirror image: the east columns, not the west ones.
+        let lit_cols = |field: &RoadField| {
+            (0..256u32)
+                .filter_map(|i| field.row(i))
+                .flat_map(|row| row.iter().enumerate().filter(|(_, &v)| v > 0.0))
+                .map(|(j, _)| j)
+                .collect::<Vec<_>>()
+        };
+        assert!(lit_cols(&field).iter().all(|&j| j >= 192));
+        // The westmost texture is lit by a road just across in tile 179.
+        name.col = 0;
+        let f = Footprint::from_name(&name);
+        let road = vec![(
+            100,
+            vec![(179.999_7, f.north + 0.01), (179.999_7, f.south - 0.01)],
+        )];
+        let across = merged((-17, 179), &road);
+        let field = RoadField::raster(&name, 256, &[across], &RoadModel::DEFAULT);
+        assert!(field.stats.lit_texels > 0);
+        assert!(lit_cols(&field).iter().all(|&j| j < 64));
+    }
+
+    /// A footprint with the given edges, at zoom 16.
+    fn edges(south: f64, north: f64, west: f64, east: f64) -> Footprint {
+        Footprint {
+            north,
+            south,
+            west,
+            east,
+            zoom: 16,
+        }
+    }
+
+    #[test]
+    fn the_antimeridian_shift_brings_a_tile_to_the_footprints_side() {
+        // A footprint whose east edge is the line.
+        let east = edges(-16.7, -16.6, 179.9945, 180.0);
+        assert_eq!(antimeridian_shift(179, &east), 0.0, "its own tile");
+        assert_eq!(antimeridian_shift(-180, &east), 360.0, "the tile across");
+        // A footprint whose west edge is the line.
+        let west = edges(-16.7, -16.6, -180.0, -179.9945);
+        assert_eq!(antimeridian_shift(-180, &west), 0.0, "its own tile");
+        assert_eq!(antimeridian_shift(179, &west), -360.0, "the tile across");
+        // Away from the line, no tile is shifted.
+        let geneva = edges(46.2, 46.21, 6.14, 6.15);
+        for lon0 in [5, 6, 7] {
+            assert_eq!(antimeridian_shift(lon0, &geneva), 0.0, "{lon0}");
+        }
+        // Nor at the prime meridian.
+        let greenwich = edges(51.47, 51.48, -0.005, 0.0);
+        assert_eq!(antimeridian_shift(-1, &greenwich), 0.0);
+        assert_eq!(antimeridian_shift(0, &greenwich), 0.0);
+    }
+
+    #[test]
+    fn the_road_window_is_the_grown_footprint_in_the_tiles_longitudes() {
+        let east = edges(-16.7, -16.6, 179.9945, 180.0);
+        assert_eq!(
+            RoadWindow::new(&east, 0.01, 179),
+            RoadWindow {
+                shift: 0.0,
+                south: -16.71,
+                west: 179.9945 - 0.01,
+                north: -16.59,
+                east: 180.01,
+            }
+        );
+        // Across the line the window sits at the tile's west edge.
+        let w = RoadWindow::new(&east, 0.01, -180);
+        assert_eq!(w.shift, 360.0);
+        assert_eq!((w.south, w.north), (-16.71, -16.59));
+        assert!((w.west - (179.9945 - 0.01 - 360.0)).abs() < 1e-9, "{w:?}");
+        assert!((w.east - (-180.0 + 0.01)).abs() < 1e-9, "{w:?}");
+        // And the other way, at the tile's east edge.
+        let west = edges(-16.7, -16.6, -180.0, -179.9945);
+        let w = RoadWindow::new(&west, 0.01, 179);
+        assert_eq!(w.shift, -360.0);
+        assert!((w.west - (180.0 - 0.01)).abs() < 1e-9, "{w:?}");
+        assert!((w.east - (-179.9945 + 0.01 + 360.0)).abs() < 1e-9, "{w:?}");
+    }
+
+    /// The ZL16 textures by the line at Taveuni: the one whose east edge is
+    /// the line, and the one whose west edge is.
+    fn textures_at_the_antimeridian() -> (Footprint, Footprint) {
+        let mut name = name_at_zoom(-16.8, 179.95, 16);
+        name.col = (1 << 16) - 16;
+        let east = Footprint::from_name(&name);
+        name.col = 0;
+        let west = Footprint::from_name(&name);
+        assert_eq!((east.east, west.west), (180.0, -180.0));
+        (east, west)
+    }
+
+    /// A north-south road at `lon` in `tile`, past `fp`'s north and south.
+    fn road_past(tile: (i32, i32), fp: &Footprint, lon: f64) -> Arc<MergedRoads> {
+        merged(
+            tile,
+            &[(100, vec![(lon, fp.north + 0.01), (lon, fp.south - 0.01)])],
+        )
+    }
+
+    #[test]
+    fn given_a_road_just_across_the_line_the_footprint_is_crossed() {
+        let (east, west) = textures_at_the_antimeridian();
+        // 30 m east of the line, in tile -180; 30 m west of it, in 179.
+        let reach = 0.001;
+        assert!(crosses_footprint(
+            &road_past((-17, -180), &east, -179.999_7),
+            &east,
+            reach
+        ));
+        assert!(crosses_footprint(
+            &road_past((-17, 179), &west, 179.999_7),
+            &west,
+            reach
+        ));
+    }
+
+    #[test]
+    fn given_no_road_near_the_line_the_footprint_is_not_crossed() {
+        let (east, west) = textures_at_the_antimeridian();
+        let reach = 0.001;
+        // Roads across the line but beyond the reach.
+        assert!(!crosses_footprint(
+            &road_past((-17, -180), &east, -179.9),
+            &east,
+            reach
+        ));
+        assert!(!crosses_footprint(
+            &road_past((-17, 179), &west, 179.9),
+            &west,
+            reach
+        ));
+        // No road at all in the tile across.
+        assert!(!crosses_footprint(&merged((-17, -180), &[]), &east, reach));
+        assert!(!crosses_footprint(&merged((-17, 179), &[]), &west, reach));
     }
 
     #[test]

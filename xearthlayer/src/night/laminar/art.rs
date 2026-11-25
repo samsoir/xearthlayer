@@ -762,7 +762,7 @@ mod tests {
         let art = LaminarArt::new(temp.path().to_path_buf());
         let p = art.pattern(URBAN).unwrap();
         assert_eq!(
-            (p.size, p.ground_scale_m, p.rgb[0]),
+            (p.size(), p.ground_scale_m, p.rgb[0]),
             (4, 3072.0, [255, 0, 0])
         );
         assert!(art.pattern(PARK).is_none());
@@ -1172,7 +1172,7 @@ mod tests {
         eprintln!(
             "pattern {} ({} px): cold {cold:?} (read and decode), warm {warm:?} per call",
             lit.texture.display(),
-            pattern.size
+            pattern.size()
         );
     }
 }

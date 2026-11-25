@@ -35,6 +35,14 @@ impl Grid {
         }
     }
 
+    /// Whether this is a missing layer as the reader leaves it (one zero
+    /// cell, [`Grid::empty`]). A layer of one zero cell samples as zero
+    /// everywhere, as a missing one does, so the two need not be told
+    /// apart; neither has a grid a neighbouring tile is read on.
+    pub fn is_missing(&self) -> bool {
+        self.width == 1 && self.height == 1 && self.cells == [0]
+    }
+
     /// The cell at `(row, col)`.
     pub fn get(&self, row: usize, col: usize) -> u8 {
         self.cells[row * self.width + col]
@@ -59,15 +67,55 @@ impl Default for BrightnessScale {
 }
 
 impl BrightnessScale {
-    /// `R = r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`.
-    pub fn radiance(&self, b: u8) -> f64 {
+    /// `R = r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`. In tests; the
+    /// generator reads radiance through a [`RadianceCurve`].
+    #[cfg(test)]
+    pub(crate) fn radiance(&self, b: u8) -> f64 {
         self.radiance_at(f64::from(b))
     }
 
     /// `radiance` for a fractional byte, as bilinear sampling produces.
+    #[cfg(test)]
+    pub(crate) fn radiance_at(&self, b: f64) -> f64 {
+        self.curve().radiance_at(b)
+    }
+
+    /// The scale with its logarithm taken once, for sampling it many times.
+    pub fn curve(&self) -> RadianceCurve {
+        RadianceCurve {
+            scale: *self,
+            span: (1.0 + self.rmax_nw / self.r0_nw).ln(),
+        }
+    }
+}
+
+/// A [`BrightnessScale`] with `ln(1 + rmax / r0)` computed once: the lit
+/// generator reads a radiance per texel, and the logarithm depends on the
+/// scale alone. Gives the bits `r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`
+/// gives with the logarithm taken on every call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadianceCurve {
+    scale: BrightnessScale,
+    span: f64,
+}
+
+impl Default for RadianceCurve {
+    fn default() -> Self {
+        BrightnessScale::default().curve()
+    }
+}
+
+impl RadianceCurve {
+    /// The scale the curve was made from.
+    #[cfg(test)]
+    pub(crate) fn scale(&self) -> BrightnessScale {
+        self.scale
+    }
+
+    /// `R = r0 * (exp(b / 255 * span) - 1)` for a fractional byte `b`, as
+    /// bilinear sampling produces, with `span` taken once.
     pub fn radiance_at(&self, b: f64) -> f64 {
-        let span = (1.0 + self.rmax_nw / self.r0_nw).ln();
-        self.r0_nw * ((b / 255.0 * span).exp() - 1.0)
+        self.scale.r0_nw * ((b / 255.0 * self.span).exp() - 1.0)
     }
 }
 
@@ -366,6 +414,26 @@ mod tests {
     }
 
     #[test]
+    fn the_curve_gives_the_scale_bits() {
+        for scale in [
+            BrightnessScale::default(),
+            BrightnessScale {
+                r0_nw: 0.37,
+                rmax_nw: 912.5,
+            },
+        ] {
+            let curve = scale.curve();
+            assert_eq!(curve.scale(), scale);
+            for k in 0..=2550 {
+                let b = f64::from(k) * 0.1;
+                let span = (1.0 + scale.rmax_nw / scale.r0_nw).ln();
+                let inline = scale.r0_nw * ((b / 255.0 * span).exp() - 1.0);
+                assert_eq!(curve.radiance_at(b).to_bits(), inline.to_bits(), "{b}");
+            }
+        }
+    }
+
+    #[test]
     fn radiance_inverts_the_log_scale() {
         let s = BrightnessScale {
             r0_nw: 1.0,
@@ -514,6 +582,15 @@ mod tests {
         let r = parse_recipe(&file(b"OXN1", &v)).unwrap();
         assert_eq!(r.class, Grid::empty());
         assert_eq!(r.brightness, Grid::empty());
+        assert!(r.class.is_missing() && r.brightness.is_missing());
+        let golden = parse_recipe(URBAN).unwrap();
+        assert!(!golden.class.is_missing() && !golden.brightness.is_missing());
+        let one = Grid {
+            width: 1,
+            height: 1,
+            cells: vec![7],
+        };
+        assert!(!one.is_missing(), "one lit cell is a layer");
         assert_eq!(r.scale, BrightnessScale::default());
     }
 

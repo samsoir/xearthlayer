@@ -383,13 +383,8 @@ mod tests {
             ((lat, lon) == (37, -123)).then(|| Arc::new(parse_recipe(URBAN).unwrap()))
         };
         let patterns = |n: &str| {
-            (n == "lib/g10/terrain10/urban_tmp_sdry3.ter").then(|| {
-                Arc::new(LitPattern {
-                    size: 4,
-                    rgb: vec![[255, 0, 0]; 16],
-                    ground_scale_m: 4096.0,
-                })
-            })
+            (n == "lib/g10/terrain10/urban_tmp_sdry3.ter")
+                .then(|| Arc::new(LitPattern::new(4, vec![[255, 0, 0]; 16], 4096.0)))
         };
         CpuLitGenerator.generate(&LitRequest {
             name,
