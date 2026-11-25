@@ -904,6 +904,34 @@ mod gpu_tests {
     use super::*;
 
     #[test]
+    fn concurrent_gpu_setup_does_not_crash() {
+        // What the GPU tests of this binary do when the harness runs them in
+        // parallel: several threads enumerating adapters while others create
+        // a device and its compute pipelines. Each enumeration used to create
+        // and drop its own wgpu instance, and the Vulkan loader or the NVIDIA
+        // driver jumped to address 0 (SIGSEGV of the whole test binary). On a
+        // host without a GPU this passes trivially.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 4;
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        if thread % 2 == 0 {
+                            let _ = create_gpu_resources("integrated");
+                        } else {
+                            let _ = crate::system::enumerate_gpus();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn test_create_gpu_resources_invalid_device() {
         let result = create_gpu_resources("nonexistent_device_12345");
         assert!(result.is_err());
