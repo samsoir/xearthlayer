@@ -13,7 +13,7 @@ use crate::night::recipe::{Grid, RadianceCurve, Recipe};
 
 mod sampler;
 
-pub use sampler::FieldSampler;
+pub use sampler::{FieldSampler, TexelAxes};
 
 /// How far beyond a footprint sampling can reach, in degrees: bilinear
 /// neighbours and the class warp stay well inside it.
@@ -202,7 +202,14 @@ impl RecipeField {
     /// the same bits.
     #[cfg(test)]
     pub(crate) fn radiance(&self, lat: f64, lon: f64) -> f64 {
-        FieldSampler::new(self, &[lon], &[lat]).radiance(0, 0)
+        FieldSampler::new(
+            self,
+            TexelAxes {
+                lats: &[lat],
+                lons: &[lon],
+            },
+        )
+        .radiance(0, 0)
     }
 }
 
@@ -257,7 +264,14 @@ impl RecipeField {
     /// [`FieldSampler`], which gives the same bits.
     #[cfg(test)]
     pub(crate) fn class_weights(&self, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
-        FieldSampler::new(self, &[lon], &[lat]).class_weights(0, 0, out);
+        FieldSampler::new(
+            self,
+            TexelAxes {
+                lats: &[lat],
+                lons: &[lon],
+            },
+        )
+        .class_weights(0, 0, out);
     }
 
     /// True when the generator may light some texel of the footprint (R7:
@@ -719,10 +733,23 @@ mod tests {
     /// Asserts that the class weights and the radiance at every point of
     /// the `lats` x `lons` grid are those of the code before #437, bit for
     /// bit: through a sampler over the grid (its cell tables), and through
-    /// the per-point calls (one-point samplers, which read the field).
-    /// Returns the number of points with a class weight.
+    /// the per-point calls (one-point samplers, which read the field). No
+    /// read misses a table the sampler built. Returns the number of points
+    /// with a class weight.
     fn assert_matches_reference(field: &RecipeField, lats: &[f64], lons: &[f64]) -> usize {
-        let mut sampler = FieldSampler::new(field, lons, lats);
+        let mut sampler = FieldSampler::new(field, TexelAxes { lats, lons });
+        let weighted = assert_sampler_matches_reference(&mut sampler, field, lats, lons);
+        assert_eq!(sampler.table_misses(), 0, "every read is in the tables");
+        weighted
+    }
+
+    /// `assert_matches_reference` through `sampler`, built over the grid.
+    fn assert_sampler_matches_reference(
+        sampler: &mut FieldSampler<'_>,
+        field: &RecipeField,
+        lats: &[f64],
+        lons: &[f64],
+    ) -> usize {
         let (mut got, mut point, mut want) = (Vec::new(), Vec::new(), Vec::new());
         let mut weighted = 0;
         for (i, &lat) in lats.iter().enumerate() {
@@ -795,7 +822,14 @@ mod tests {
         let lats = axis(-0.62, 0.42, 420, &[0.0, -0.5, 0.25]);
         let lons = axis(-0.52, 1.42, 780, &[0.0, 1.0, -0.25]);
         assert_eq!(
-            FieldSampler::new(&field, &lons, &lats).has_tables(),
+            FieldSampler::new(
+                &field,
+                TexelAxes {
+                    lats: &lats,
+                    lons: &lons
+                }
+            )
+            .has_tables(),
             (true, true)
         );
         let weighted = assert_matches_reference(&field, &lats, &lons);
@@ -806,13 +840,49 @@ mod tests {
     }
 
     #[test]
+    fn reads_outside_a_table_give_the_bits_of_the_field() {
+        // Tables cut short (negative slack) so reads at the edge of the
+        // texels' reach miss them and go to the field: the same bits.
+        let field = mixed_field();
+        let lats = axis(-0.3, 0.1, 100, &[0.0]);
+        let lons = axis(-0.2, 0.6, 200, &[0.0]);
+        let axes = TexelAxes {
+            lats: &lats,
+            lons: &lons,
+        };
+        let mut full = FieldSampler::new(&field, axes);
+        assert_sampler_matches_reference(&mut full, &field, &lats, &lons);
+        assert_eq!(full.table_misses(), 0);
+        for slack in [-1, -2] {
+            let mut tight = FieldSampler::with_slack(&field, axes, slack);
+            assert_eq!(tight.has_tables(), (true, true), "slack {slack}");
+            let weighted = assert_sampler_matches_reference(&mut tight, &field, &lats, &lons);
+            assert!(
+                weighted > lats.len() * lons.len() / 3,
+                "{weighted} weighted"
+            );
+            assert!(
+                tight.table_misses() > 0,
+                "slack {slack}: reads miss the tables"
+            );
+        }
+    }
+
+    #[test]
     fn sampling_without_tables_matches_the_code_before_437() {
         // Texels much coarser than the grid: the sampler reads the field.
         let field = mixed_field();
         let lats = axis(-0.62, 0.42, 30, &[0.0]);
         let lons = axis(-0.52, 1.42, 30, &[0.0, 1.0]);
         assert_eq!(
-            FieldSampler::new(&field, &lons, &lats).has_tables(),
+            FieldSampler::new(
+                &field,
+                TexelAxes {
+                    lats: &lats,
+                    lons: &lons
+                }
+            )
+            .has_tables(),
             (false, true),
             "no class table; the 8 cell brightness grid still fits"
         );

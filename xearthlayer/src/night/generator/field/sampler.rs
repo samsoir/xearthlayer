@@ -15,8 +15,10 @@ use super::{
 use crate::night::generator::noise::NoisePair;
 use crate::night::math::floor_i64;
 
-/// Cells of slack around those a table must hold. Reads outside a table
-/// are still answered (from the field), so this only keeps them rare.
+/// Cells of slack around those a table must hold. The tables hold every
+/// cell a texel can read with no slack at all (see `FieldSampler::build`);
+/// the slack absorbs rounding. A read outside a table is still answered,
+/// from the field, with the same bits.
 const TABLE_SLACK_CELLS: i64 = 2;
 
 /// The most table cells per texel. A texture coarser than the recipe grid
@@ -92,11 +94,18 @@ impl<T: Copy> CellTable<T> {
         let (Some((r0, r1)), Some((c0, c1))) = (rows, cols) else {
             return empty;
         };
-        let (nr, nc) = ((r1 - r0 + 1) as u64, (c1 - c0 + 1) as u64);
-        if nr.saturating_mul(nc) > budget as u64 {
+        if r1 < r0 || c1 < c0 {
             return empty;
         }
-        let mut cells = Vec::with_capacity((nr * nc) as usize);
+        let (nr, nc) = (
+            r1.abs_diff(r0).saturating_add(1),
+            c1.abs_diff(c0).saturating_add(1),
+        );
+        let n = match nr.checked_mul(nc) {
+            Some(n) if n <= budget as u64 => n as usize,
+            _ => return empty,
+        };
+        let mut cells = Vec::with_capacity(n);
         for r in r0..=r1 {
             cells.extend((c0..=c1).map(|c| cell(r, c)));
         }
@@ -126,11 +135,22 @@ fn span(values: impl Iterator<Item = i64>) -> Option<(i64, i64)> {
     })
 }
 
+/// `span` grown by `below` cells down and `above` cells up (either may be
+/// negative, in tests), saturating at the ends of `i64`: a texel at an
+/// extreme position gets no table rather than an overflow.
+fn widen(span: Option<(i64, i64)>, below: i64, above: i64) -> Option<(i64, i64)> {
+    span.map(|(lo, hi)| (lo.saturating_sub(below), hi.saturating_add(above)))
+}
+
 /// A class cell as one word: `slot << 8 | index`, 0 for no weight (no
-/// recipe, another grid, or class 0, which carries no weight).
+/// recipe, another grid, or class 0, which carries no weight). A slot is
+/// below 2^24: a field holds a few tiles each way.
 fn pack(cell: Option<(usize, u8)>) -> u32 {
     match cell {
-        Some((slot, index)) if index != 0 => (slot as u32) << 8 | u32::from(index),
+        Some((slot, index)) if index != 0 => {
+            debug_assert!(slot < 1 << 24, "slot {slot} does not fit a class word");
+            (slot as u32) << 8 | u32::from(index)
+        }
         _ => 0,
     }
 }
@@ -152,10 +172,20 @@ struct BrightnessLayer {
     cells: CellTable<u8>,
 }
 
-/// A [`RecipeField`] sampled at the texel centres of one texture: columns
-/// at `lons` and rows at `lats`. Gives the bits of the field's per-point
-/// `RecipeField::class_weights` and `RecipeField::radiance` (test only) at
-/// texel `(row, col)`, which are this sampler over one point.
+/// Where a [`FieldSampler`] samples: the latitude of each texel row (north
+/// first) and the longitude of each texel column (west first). Named
+/// fields rather than two slices, so a call cannot swap them unseen; the
+/// sampler's methods take `(row, col)`.
+#[derive(Debug, Clone, Copy)]
+pub struct TexelAxes<'a> {
+    pub lats: &'a [f64],
+    pub lons: &'a [f64],
+}
+
+/// A [`RecipeField`] sampled at the texel centres of one texture: rows at
+/// `axes.lats` and columns at `axes.lons`. Gives the bits of the field's
+/// per-point `RecipeField::class_weights` and `RecipeField::radiance` (test
+/// only) at texel `(row, col)`, which are this sampler over one point.
 ///
 /// The warp noise keeps the corner values of the last lattice cell it
 /// read, so texels sampled in raster order hash once per cell (about 20 to
@@ -165,10 +195,20 @@ pub struct FieldSampler<'f> {
     class: Option<ClassLayer>,
     brightness: Option<BrightnessLayer>,
     warp: NoisePair,
+    /// Reads that fell outside a built table and went to the field.
+    #[cfg(test)]
+    misses: std::cell::Cell<u64>,
 }
 
 impl<'f> FieldSampler<'f> {
-    pub fn new(field: &'f RecipeField, lons: &[f64], lats: &[f64]) -> Self {
+    pub fn new(field: &'f RecipeField, axes: TexelAxes<'_>) -> Self {
+        Self::build(field, axes, TABLE_SLACK_CELLS)
+    }
+
+    /// The sampler with `slack` cells around the cells its tables must
+    /// hold; tests pass a negative slack to make reads miss the tables.
+    fn build(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64) -> Self {
+        let TexelAxes { lats, lons } = axes;
         let budget = lons.len() * lats.len() * MAX_TABLE_CELLS_PER_TEXEL;
         let class = field.dims(Layer::Class).map(|(ny, nx)| {
             let cols: Vec<ClassAxis> = lons
@@ -183,8 +223,11 @@ impl<'f> FieldSampler<'f> {
             // [-1, 1], floors to within one cell below `floor(g)`, and the
             // bilinear corners reach one cell above that.
             let reach = |axes: &[ClassAxis]| {
-                span(axes.iter().map(|a| floor_i64(a.g)))
-                    .map(|(lo, hi)| (lo - 1 - TABLE_SLACK_CELLS, hi + 1 + TABLE_SLACK_CELLS))
+                widen(
+                    span(axes.iter().map(|a| floor_i64(a.g))),
+                    1 + slack,
+                    1 + slack,
+                )
             };
             let cells = CellTable::build(reach(&rows), reach(&cols), budget, |r, c| {
                 pack(field.layer_cell(Layer::Class, r, c))
@@ -200,10 +243,8 @@ impl<'f> FieldSampler<'f> {
                 .iter()
                 .map(|&lat| BrightnessAxis::of((90.0 - lat) * ny as f64 - 0.5))
                 .collect();
-            let reach = |axes: &[BrightnessAxis]| {
-                span(axes.iter().map(|a| a.c0))
-                    .map(|(lo, hi)| (lo - TABLE_SLACK_CELLS, hi + 1 + TABLE_SLACK_CELLS))
-            };
+            let reach =
+                |axes: &[BrightnessAxis]| widen(span(axes.iter().map(|a| a.c0)), slack, 1 + slack);
             let cells = CellTable::build(reach(&rows), reach(&cols), budget, |r, c| {
                 field
                     .layer_cell(Layer::Brightness, r, c)
@@ -216,7 +257,18 @@ impl<'f> FieldSampler<'f> {
             class,
             brightness,
             warp: NoisePair::new(WARP_SEED_X, WARP_SEED_Y),
+            #[cfg(test)]
+            misses: std::cell::Cell::new(0),
         }
+    }
+
+    /// Counts a read outside a built table (tests only).
+    #[inline]
+    fn missed(&self, table_built: bool) {
+        #[cfg(test)]
+        self.misses.set(self.misses.get() + u64::from(table_built));
+        #[cfg(not(test))]
+        let _ = table_built;
     }
 
     /// The class weights at texel `(row, col)`, into `out`: the bilinear
@@ -244,10 +296,10 @@ impl<'f> FieldSampler<'f> {
                 continue;
             }
             let (r, c) = (r0 + dr, c0 + dc);
-            let word = class
-                .cells
-                .get(r, c)
-                .unwrap_or_else(|| pack(self.field.layer_cell(Layer::Class, r, c)));
+            let word = class.cells.get(r, c).unwrap_or_else(|| {
+                self.missed(!class.cells.cells.is_empty());
+                pack(self.field.layer_cell(Layer::Class, r, c))
+            });
             let Some((slot, index)) = unpack(word) else {
                 continue;
             };
@@ -273,6 +325,7 @@ impl<'f> FieldSampler<'f> {
         let (x, y) = (b.cols[col], b.rows[row]);
         let at = |r: i64, c: i64| {
             f64::from(b.cells.get(r, c).unwrap_or_else(|| {
+                self.missed(!b.cells.cells.is_empty());
                 self.field
                     .layer_cell(Layer::Brightness, r, c)
                     .map_or(0, |(_, v)| v)
@@ -281,6 +334,19 @@ impl<'f> FieldSampler<'f> {
         let top = at(y.c0, x.c0) * x.rest + at(y.c0, x.c0 + 1) * x.f;
         let bottom = at(y.c0 + 1, x.c0) * x.rest + at(y.c0 + 1, x.c0 + 1) * x.f;
         self.field.radiance_of(top * y.rest + bottom * y.f)
+    }
+
+    /// A sampler whose tables hold `slack` cells around the cells it must
+    /// read (negative: fewer), for tests of reads outside a table.
+    #[cfg(test)]
+    pub(crate) fn with_slack(field: &'f RecipeField, axes: TexelAxes<'_>, slack: i64) -> Self {
+        Self::build(field, axes, slack)
+    }
+
+    /// Reads so far that fell outside a built table and went to the field.
+    #[cfg(test)]
+    pub(crate) fn table_misses(&self) -> u64 {
+        self.misses.get()
     }
 
     /// Whether the class and brightness tables were built: for tests of
@@ -334,5 +400,27 @@ mod tests {
         assert_eq!(over.get(-2, 6), None, "past the budget: no table");
         let none = CellTable::build(None, Some((5, 8)), 100, |r, c| r * 100 + c);
         assert_eq!(none.get(0, 5), None);
+        let inverted = CellTable::build(Some((2, 1)), Some((5, 8)), 100, |r, c| r * 100 + c);
+        assert!(inverted.cells.is_empty(), "an empty range: no table");
+    }
+
+    #[test]
+    fn extreme_ranges_neither_overflow_nor_build() {
+        let all = Some((i64::MIN, i64::MAX));
+        let t = CellTable::build(all, all, usize::MAX, |_, _| 0u8);
+        assert!(t.cells.is_empty());
+        assert_eq!(t.get(0, 0), None);
+        assert_eq!(widen(Some((i64::MIN, i64::MAX)), 3, 3), all);
+        assert_eq!(widen(Some((i64::MIN + 1, i64::MAX - 1)), 3, 3), all);
+        assert_eq!(widen(Some((10, 20)), 3, 4), Some((7, 24)));
+        assert_eq!(widen(Some((10, 20)), -3, -4), Some((13, 16)));
+        assert_eq!(widen(None, 3, 3), None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "does not fit")]
+    fn a_slot_past_24_bits_is_caught() {
+        pack(Some((1 << 24, 1)));
     }
 }

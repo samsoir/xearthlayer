@@ -18,7 +18,7 @@ use std::sync::Arc;
 use image::{Rgba, RgbaImage};
 use tracing::debug;
 
-use super::field::{FieldSampler, RecipeField};
+use super::field::{FieldSampler, RecipeField, TexelAxes};
 use super::led::{self, LedRegion, TonePath};
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
@@ -50,7 +50,13 @@ impl CpuLitGenerator {
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
 
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
-        let mut sampler = FieldSampler::new(&field, &lons, &lats);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
         // Patterns by (tile slot, palette index), resolved on first use.
         let mut patterns: Vec<Option<Option<Arc<LitPattern>>>> =
             vec![None; field.slot_count() * PALETTE_SLOTS];
@@ -435,7 +441,13 @@ mod tests {
         let n = name_at(37.20, -122.725);
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(&n, 128);
         let field = RecipeField::new(&Footprint::from_name(&n), &golden);
-        let mut sampler = FieldSampler::new(&field, &lons, &lats);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
         assert_eq!(
             sampler.has_tables(),
             (true, true),
@@ -467,6 +479,51 @@ mod tests {
             }
         }
         assert!(weighted > 128 * 128 / 4, "{weighted} weighted texels");
+        assert_eq!(sampler.table_misses(), 0, "every read is in the tables");
+    }
+
+    /// The pinned generations' sampling never leaves the sampler's tables
+    /// (at their size and at larger ones), so the fallback to the field
+    /// stays a fallback: a table reach that stopped covering the warp
+    /// (`WARP_AMPLITUDE_CELLS` raised past it) fails here.
+    #[test]
+    fn pinned_generations_read_only_their_tables() {
+        // The road pin's recipe.
+        let varied = synthetic(
+            46,
+            6,
+            120,
+            |r, c| u8::from((r / 3 + c / 5) % 3 != 0),
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        );
+        let road_recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| varied.clone());
+        let inputs: [(DdsFilename, crate::night::generator::RecipeLookup<'_>); 2] = [
+            (name_at(37.20, -122.725), &golden),
+            (name_at(46.5, 6.5), &road_recipes),
+        ];
+        for (n, recipes) in &inputs {
+            for size in [128, 512] {
+                let TexelCentres { lons, lats, .. } = TexelCentres::of(n, size);
+                let field = RecipeField::new(&Footprint::from_name(n), *recipes);
+                let mut sampler = FieldSampler::new(
+                    &field,
+                    TexelAxes {
+                        lats: &lats,
+                        lons: &lons,
+                    },
+                );
+                assert_eq!(sampler.has_tables(), (true, true), "{n:?} at {size}");
+                let mut weights = Vec::new();
+                for i in 0..lats.len() {
+                    for j in 0..lons.len() {
+                        sampler.class_weights(i, j, &mut weights);
+                        sampler.radiance(i, j);
+                    }
+                }
+                assert_eq!(sampler.table_misses(), 0, "{n:?} at {size}");
+            }
+        }
     }
 
     /// The generator's tone path is byte for byte the `powf` path it

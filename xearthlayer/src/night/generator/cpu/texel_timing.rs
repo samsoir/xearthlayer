@@ -76,7 +76,13 @@ fn time_parts(request: &LitRequest<'_>, runs: usize) -> Parts {
         }
     });
     parts.weights[1] = least_ms(runs, || {
-        let mut sampler = FieldSampler::new(&field, &lons, &lats);
+        let mut sampler = FieldSampler::new(
+            &field,
+            TexelAxes {
+                lats: &lats,
+                lons: &lons,
+            },
+        );
         for i in 0..lats.len() {
             for j in 0..lons.len() {
                 sampler.class_weights(i, j, &mut out);
@@ -84,7 +90,13 @@ fn time_parts(request: &LitRequest<'_>, runs: usize) -> Parts {
             }
         }
     });
-    let mut sampler = FieldSampler::new(&field, &lons, &lats);
+    let mut sampler = FieldSampler::new(
+        &field,
+        TexelAxes {
+            lats: &lats,
+            lons: &lons,
+        },
+    );
     let mut want = Vec::with_capacity(4);
     for (i, &lat) in lats.iter().enumerate() {
         for (j, &lon) in lons.iter().enumerate() {
