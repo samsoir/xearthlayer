@@ -21,7 +21,7 @@ mod inner {
     use tokio_util::sync::CancellationToken;
 
     use crate::dds::compressor::MipmapCompressor;
-    use crate::dds::gpu_stats::{start_sample_log, GpuEncodeStats};
+    use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::layout;
     use crate::dds::{DdsError, DdsFormat};
 
@@ -42,10 +42,12 @@ mod inner {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct GpuTileTiming {
         /// From the caller starting its send (time blocked on a full channel
-        /// included) to the worker taking the request.
+        /// included) to the worker taking the request. For a lone tile this
+        /// is mostly the idle worker's poll: up to `IDLE_POLL` (10 ms).
         pub queue_wait: Duration,
         /// CPU mip generation ([`MipmapStream`](crate::dds::MipmapStream))
-        /// and the padding of the sub-block tail.
+        /// and the padding of the sub-block tail. The stream works one level
+        /// ahead: taking level `i` computes level `i + 1`.
         pub downsample: Duration,
         /// Creating the tile's output and readback buffers and each level's
         /// texture, and `queue.write_texture`, which copies the level into a
@@ -53,7 +55,8 @@ mod inner {
         pub upload: Duration,
         /// Command recording, submit and the blocking poll: GPU and driver.
         pub gpu: Duration,
-        /// Waiting for the buffer map, and copying the mapped range out.
+        /// Waiting for the buffer map, and copying the mapped range out into
+        /// the tile's result `Vec`, its growth (reallocation) included.
         pub readback: Duration,
         /// The processor's whole call, as the loop timed it.
         pub process: Duration,
@@ -128,7 +131,9 @@ mod inner {
         }
 
         /// The stage timings of the tiles answered through this channel,
-        /// and its queue depth.
+        /// the requests that failed, and its queue depth. Someone must take
+        /// its samples ([`GpuEncodeStats::take_sample`]); in the service the
+        /// per-minute log does.
         pub fn stats(&self) -> &Arc<GpuEncodeStats> {
             &self.stats
         }
@@ -143,8 +148,9 @@ mod inner {
 
         /// Shut down the GPU pipeline by closing the channel.
         ///
-        /// This causes the worker's `blocking_recv()` to return `None`,
-        /// triggering clean GPU resource release. Required because
+        /// Once the requests already buffered are served, the worker's
+        /// `try_recv()` reports the channel disconnected and the loop ends,
+        /// releasing the GPU resources. Required because
         /// `spawn_blocking` threads are not cancelled by tokio runtime
         /// shutdown — the channel must be explicitly closed.
         pub fn shutdown(&mut self) {
@@ -161,9 +167,12 @@ mod inner {
         ) -> Result<Vec<u8>, DdsError> {
             // Refused on the caller's side: the worker never sees it.
             format.ensure_supported()?;
-            let sender = self.sender.as_ref().ok_or_else(|| {
-                DdsError::CompressionFailed("GPU worker has been shut down".to_string())
-            })?;
+            let Some(sender) = self.sender.as_ref() else {
+                self.stats.record_failed();
+                return Err(DdsError::CompressionFailed(
+                    "GPU worker has been shut down".to_string(),
+                ));
+            };
 
             let (width, height) = image.dimensions();
             let _span = tracing::debug_span!(
@@ -188,19 +197,33 @@ mod inner {
                 response: resp_tx,
             };
 
-            sender.blocking_send(request).map_err(|_| {
-                DdsError::CompressionFailed("GPU worker is not running".to_string())
-            })?;
-
-            let reply = resp_rx.blocking_recv().map_err(|_| {
-                DdsError::CompressionFailed("GPU worker dropped response channel".to_string())
-            })?;
+            let reply = sender
+                .blocking_send(request)
+                .map_err(|_| DdsError::CompressionFailed("GPU worker is not running".to_string()))
+                .and_then(|()| {
+                    resp_rx.blocking_recv().map_err(|_| {
+                        DdsError::CompressionFailed(
+                            "GPU worker dropped response channel".to_string(),
+                        )
+                    })
+                });
             let total = sent_at.elapsed();
             drop(in_channel);
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(e) => {
+                    self.stats.record_failed();
+                    return Err(e);
+                }
+            };
 
             let t = &reply.timing;
             let encoded = reply.result.is_ok();
-            self.stats.record(t, total, encoded);
+            if encoded {
+                self.stats.record_encoded(t, total);
+            } else {
+                self.stats.record_failed();
+            }
             let us = |d: Duration| d.as_micros() as u64;
             tracing::debug!(
                 width,
@@ -303,13 +326,17 @@ mod inner {
         let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
         let mut result = Vec::new();
 
-        for level_idx in 0.. {
-            // Taking a level from the stream computes the next one: this is
-            // where the CPU downsample happens.
+        // At most `mipmap_count` takes, so a full chain makes no extra call
+        // that only finds the stream's end (one is made, and spanned, only
+        // when the count asks for more levels than the image has).
+        for level_idx in 0..mipmap_count {
+            // The stream works one level ahead: taking level `i` computes
+            // level `i + 1`, which this span names as `computes_level`. The
+            // last take computes nothing, and its span is near zero.
             let downsample = tracing::debug_span!(
                 target: "profiling",
                 "gpu_downsample",
-                level = level_idx
+                computes_level = level_idx + 1
             )
             .entered();
             let started = Instant::now();
@@ -644,10 +671,12 @@ mod inner {
     /// Initializes GPU resources and spawns the worker thread. Returns the
     /// channel handle, the worker `JoinHandle`, and the selection: the
     /// adapter chosen (for display; the worker owns the device) with the
-    /// host's other adapters for the encoder policy. Also starts the
-    /// per-minute `GPU encode sample` line of the channel's
-    /// [`stats`](GpuEncoderChannel::stats), which ends with `shutdown` or
-    /// the channel.
+    /// host's other adapters for the encoder policy.
+    ///
+    /// Nothing else is started: the per-minute `GPU encode sample` line of
+    /// the channel's [`stats`](GpuEncoderChannel::stats) is started by the
+    /// service wiring (`service::builder::create_encoder`), so a test that
+    /// samples the stats itself loses nothing to it.
     ///
     /// # Errors
     ///
@@ -668,10 +697,8 @@ mod inner {
         tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown.clone());
-        let channel = GpuEncoderChannel::new(tx);
-        start_sample_log(Arc::downgrade(channel.stats()), shutdown);
-        Ok((channel, handle, selection))
+        let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
+        Ok((GpuEncoderChannel::new(tx), handle, selection))
     }
 }
 
@@ -1276,6 +1303,13 @@ mod tests {
             .collect();
 
         depth_reaches(&stats, 5).await;
+        // The counter is raised before the send: wait for the buffered
+        // request to reach the channel's one slot too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while raw.capacity() != 0 {
+            assert!(Instant::now() < deadline, "the slot was never filled");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         assert_eq!(
             raw.max_capacity() - raw.capacity(),
             1,
@@ -1309,6 +1343,31 @@ mod tests {
             .take_sample()
             .expect("the request was counted");
         assert_eq!((s.depth_now, s.depth_max), (0, 1));
+        assert_eq!((s.tiles(), s.failed), (0, 1), "the failed send is counted");
+    }
+
+    /// Every request that comes back without a tile is a failure in the
+    /// sample: a worker gone before replying, and a handle shut down.
+    #[tokio::test]
+    async fn dropped_replies_and_a_shut_down_handle_count_as_failures() {
+        // A worker that takes one request and drops it unanswered.
+        let (tx, mut rx) = mpsc::channel::<GpuEncodeRequest>(CHANNEL_CAPACITY);
+        let worker = tokio::task::spawn_blocking(move || drop(rx.blocking_recv()));
+        let channel = Arc::new(GpuEncoderChannel::new(tx));
+        let stats = Arc::clone(channel.stats());
+
+        let err = encode_one(&channel).await.expect_err("reply dropped");
+        assert!(err.to_string().contains("dropped response channel"));
+        worker.await.unwrap();
+
+        let mut handle = Arc::try_unwrap(channel).ok().expect("sole owner");
+        handle.shutdown();
+        let handle = Arc::new(handle);
+        let err = encode_one(&handle).await.expect_err("shut down");
+        assert!(err.to_string().contains("shut down"));
+
+        let s = stats.take_sample().expect("two failures");
+        assert_eq!((s.tiles(), s.failed, s.depth_now), (0, 2, 0));
     }
 
     #[tokio::test]

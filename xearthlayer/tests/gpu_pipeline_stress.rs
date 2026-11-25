@@ -105,8 +105,9 @@ mod gpu_stress {
 
     fn print_sample(title: &str, s: &GpuSample) {
         eprintln!(
-            "{title}: tiles={} failed={} depth_now={} depth_max={}",
+            "{title}: tiles={} (unsampled {}) failed={} depth_now={} depth_max={}",
             s.tiles(),
+            s.unsampled,
             s.failed,
             s.depth_now,
             s.depth_max
@@ -201,6 +202,7 @@ mod gpu_stress {
         let mut all_latencies_ms: Vec<f64> = Vec::new();
         let mut burst_tiles = 0usize;
         let mut burst_wall = Duration::ZERO;
+        let mut depth_left_after_bursts = 0u64;
 
         while start.elapsed() < duration {
             burst_count += 1;
@@ -271,7 +273,13 @@ mod gpu_stress {
                 );
                 all_latencies_ms.extend_from_slice(&burst_latencies);
             }
-            assert_eq!(stats.depth(), 0, "the channel is empty after the burst");
+            // A burst whose callers all returned leaves the channel empty.
+            // Checked at the end, after the failure summary: a caller that
+            // timed out is still counted in the depth.
+            if burst_latencies.len() == burst_size && stats.depth() != 0 {
+                eprintln!("  Depth {} after a complete burst", stats.depth());
+                depth_left_after_bursts += 1;
+            }
 
             // Check worker is still alive
             if !channel.is_connected() {
@@ -325,6 +333,10 @@ mod gpu_stress {
         assert!(
             channel.is_connected(),
             "GPU worker should still be alive after stress test"
+        );
+        assert_eq!(
+            depth_left_after_bursts, 0,
+            "every complete burst must leave the queue depth at zero"
         );
     }
 

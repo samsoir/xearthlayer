@@ -2,10 +2,15 @@
 //! tile, and how many requests are in the channel.
 //!
 //! [`GpuEncoderChannel`](super::gpu_channel::GpuEncoderChannel) records
-//! every tile it is answered for. Every [`MEMORY_SAMPLE_INTERVAL`] a task
-//! closes the window and logs one `GPU encode sample` line, the memory
-//! sample's cadence. The numbers go to the log and, as spans, to the
-//! profile trace only: no metric events, telemetry or dashboard.
+//! every request it sends: the stages of each encoded tile, and a count of
+//! the requests that came back without one. In the service, a task started
+//! by `service::builder::create_encoder` closes the window every
+//! `metrics::MEMORY_SAMPLE_INTERVAL` (the memory sample's cadence) and
+//! logs one `GPU encode sample` line. Anything else holding a channel must
+//! call [`GpuEncodeStats::take_sample`] itself; until it does, each window
+//! keeps at most [`WINDOW_CAP`] tiles. The numbers go to the log and, as
+//! spans, to the profile trace only: no metric events, telemetry or
+//! dashboard.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, Weak};
@@ -16,9 +21,18 @@ use tokio_util::sync::CancellationToken;
 use super::gpu_channel::GpuTileTiming;
 use crate::metrics::{LatencySummary, LatencyWindow, MEMORY_SAMPLE_INTERVAL};
 
+/// Tiles one window summarises at most. Past it a tile is only counted
+/// ([`GpuSample::unsampled`]), so a channel nobody samples stays bounded.
+/// A 60 s sample at 50 tiles/s holds 3,000.
+pub const WINDOW_CAP: usize = 10_000;
+
 /// The stage windows of one sample, each in microseconds.
 #[derive(Default)]
 struct StageWindows {
+    /// Tiles in the windows below, at most [`WINDOW_CAP`].
+    recorded: usize,
+    /// Encoded tiles past the cap.
+    unsampled: u64,
     queue_wait: LatencyWindow,
     downsample: LatencyWindow,
     upload: LatencyWindow,
@@ -28,8 +42,9 @@ struct StageWindows {
     total: LatencyWindow,
 }
 
-/// One closed sample. Stage summaries cover the tiles encoded in it; a
-/// failed tile counts in [`failed`](Self::failed) only.
+/// One closed sample. Stage summaries cover the tiles encoded in it (the
+/// first [`WINDOW_CAP`]); a request that came back without a tile counts in
+/// [`failed`](Self::failed) only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuSample {
     pub queue_wait: Option<LatencySummary>,
@@ -41,6 +56,11 @@ pub struct GpuSample {
     pub process: Option<LatencySummary>,
     /// The caller's round trip, from starting its send to the reply.
     pub total: Option<LatencySummary>,
+    /// Encoded tiles past [`WINDOW_CAP`], in no summary.
+    pub unsampled: u64,
+    /// Requests that came back without a tile: an error from the worker,
+    /// a worker not running or gone before replying, or a handle already
+    /// shut down.
     pub failed: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).
@@ -51,8 +71,8 @@ pub struct GpuSample {
 
 impl GpuSample {
     /// Tiles encoded in the sample.
-    pub fn tiles(&self) -> usize {
-        self.total.map_or(0, |s| s.count)
+    pub fn tiles(&self) -> u64 {
+        self.total.map_or(0, |s| s.count as u64) + self.unsampled
     }
 
     /// Nothing was encoded, failed or waiting during the sample.
@@ -76,16 +96,16 @@ fn micros(d: Duration) -> u64 {
 }
 
 impl GpuEncodeStats {
-    /// Records one tile the worker answered: its stages and the caller's
-    /// round trip when it was encoded, a failure otherwise.
-    pub fn record(&self, timing: &GpuTileTiming, total: Duration, encoded: bool) {
-        if !encoded {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+    /// Records one encoded tile: its stages and the caller's round trip.
+    pub fn record_encoded(&self, timing: &GpuTileTiming, total: Duration) {
         let Ok(mut w) = self.window.lock() else {
             return;
         };
+        if w.recorded >= WINDOW_CAP {
+            w.unsampled += 1;
+            return;
+        }
+        w.recorded += 1;
         w.queue_wait.record(micros(timing.queue_wait));
         w.downsample.record(micros(timing.downsample));
         w.upload.record(micros(timing.upload));
@@ -93,6 +113,11 @@ impl GpuEncodeStats {
         w.readback.record(micros(timing.readback));
         w.process.record(micros(timing.process));
         w.total.record(micros(total));
+    }
+
+    /// Records one request that came back without a tile.
+    pub fn record_failed(&self) {
+        self.failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Requests in the channel now: buffered, blocked in `blocking_send` on
@@ -118,6 +143,7 @@ impl GpuEncodeStats {
         let depth_max = self.depth_peak.swap(depth_now, Ordering::Relaxed);
         let failed = self.failed.swap(0, Ordering::Relaxed);
         let mut w = self.window.lock().ok()?;
+        w.recorded = 0;
         let sample = GpuSample {
             queue_wait: w.queue_wait.take(),
             downsample: w.downsample.take(),
@@ -126,6 +152,7 @@ impl GpuEncodeStats {
             readback: w.readback.take(),
             process: w.process.take(),
             total: w.total.take(),
+            unsampled: std::mem::take(&mut w.unsampled),
             failed,
             depth_now,
             depth_max: depth_max.max(depth_now),
@@ -154,6 +181,7 @@ impl GpuEncodeStats {
         let (process_p50_ms, process_p95_ms, process_max_ms) = fig(s.process);
         tracing::info!(
             tiles = s.tiles(),
+            unsampled = s.unsampled,
             failed = s.failed,
             depth_now = s.depth_now,
             depth_max = s.depth_max,
@@ -253,9 +281,9 @@ mod tests {
     #[test]
     fn a_sample_summarises_each_stage_and_counts_failures_apart() {
         let stats = GpuEncodeStats::default();
-        stats.record(&timing(1), ms(16), true);
-        stats.record(&timing(2), ms(31), true);
-        stats.record(&timing(9), ms(99), false);
+        stats.record_encoded(&timing(1), ms(16));
+        stats.record_encoded(&timing(2), ms(31));
+        stats.record_failed();
 
         let s = stats.take_sample().expect("a busy sample");
         assert_eq!(s.tiles(), 2);
@@ -271,6 +299,32 @@ mod tests {
         assert_eq!(s.total.unwrap().median_us, 16_000);
 
         assert!(stats.take_sample().is_none(), "taking starts a new sample");
+    }
+
+    /// A channel nobody samples stays bounded: past the cap a tile is only
+    /// counted, and the next window starts empty.
+    #[test]
+    fn a_window_summarises_at_most_its_cap_and_counts_the_rest() {
+        let stats = GpuEncodeStats::default();
+        for _ in 0..WINDOW_CAP + 3 {
+            stats.record_encoded(&timing(1), ms(16));
+        }
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!(s.total.unwrap().count, WINDOW_CAP);
+        assert_eq!(s.unsampled, 3);
+        assert_eq!(s.tiles(), WINDOW_CAP as u64 + 3);
+
+        stats.record_encoded(&timing(1), ms(16));
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!((s.total.unwrap().count, s.unsampled), (1, 0));
+    }
+
+    #[test]
+    fn a_sample_of_failures_only_is_not_idle() {
+        let stats = GpuEncodeStats::default();
+        stats.record_failed();
+        let s = stats.take_sample().expect("a failure is not idle");
+        assert_eq!((s.tiles(), s.failed), (0, 1));
     }
 
     #[test]
@@ -327,7 +381,7 @@ mod tests {
     #[test]
     fn the_sample_line_carries_every_stage_in_milliseconds() {
         let stats = GpuEncodeStats::default();
-        stats.record(&timing(1), Duration::from_micros(16_234), true);
+        stats.record_encoded(&timing(1), Duration::from_micros(16_234));
 
         let events = capture_events(|| stats.log_sample());
         let line = events
@@ -336,6 +390,7 @@ mod tests {
             .expect("a sample line");
         for (field, value) in [
             ("tiles", "1"),
+            ("unsampled", "0"),
             ("failed", "0"),
             ("depth_now", "0"),
             ("depth_max", "0"),
