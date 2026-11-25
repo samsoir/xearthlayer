@@ -226,19 +226,29 @@ type PayloadCache = moka::future::Cache<(u32, u32, u8), Bytes>;
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
-/// The lit probe's answer for `footprint`: lit by its recipes (read
-/// through `lookup`, `is_lit` naming the lit terrains) first, else by a
-/// road of `road_tiles` within `reach` degrees of it, across the
-/// antimeridian too ([`crosses_footprint`], over the raster's own box),
-/// else dark.
-fn probe_answer(
+/// The lit probe's first step (#428): whether `footprint`'s recipes, read
+/// through `lookup` (`is_lit` naming the lit terrains), light it. A
+/// footprint they light is answered without waiting for its roads.
+fn recipe_lights(
     footprint: &Footprint,
     lookup: RecipeLookup<'_>,
     is_lit: impl Fn(&str) -> bool,
+) -> bool {
+    RecipeField::new(footprint, lookup).has_light(is_lit)
+}
+
+/// The lit probe's answer for `footprint`, given its recipe step: lit by
+/// its recipes when `recipe_lit`, the roads not consulted (#428); else by
+/// a road of `road_tiles` (those ready when the probe's road wait ended)
+/// within `reach` degrees of it, across the antimeridian too
+/// ([`crosses_footprint`], over the raster's own box); else dark.
+fn probe_answer(
+    recipe_lit: bool,
+    footprint: &Footprint,
     road_tiles: &[Arc<MergedRoads>],
     reach: f64,
 ) -> ProbeAnswer {
-    if RecipeField::new(footprint, lookup).has_light(is_lit) {
+    if recipe_lit {
         ProbeAnswer::Recipe
     } else if road_tiles
         .iter()
@@ -748,6 +758,11 @@ impl NightLitSource {
         })
     }
 
+    /// Whether `name` is lit, answered once per footprint for the session.
+    /// The recipe is read first, under a probe permit; only a footprint it
+    /// leaves dark waits for its road tiles (holding no permit, #428), whose
+    /// builds were started before the recipe read so they start as early as
+    /// they would for a wait.
     async fn has_light(&self, name: &DdsFilename) -> bool {
         if !SUPPORTED_LIT_ZOOMS.contains(&name.zoom) {
             return false;
@@ -756,26 +771,23 @@ impl NightLitSource {
         if let Some(hit) = self.lit.get(&key) {
             return *hit;
         }
-        // Roads before the permit: a lit task never waits for roads while
-        // holding one.
-        let road_started = Instant::now();
-        let FootprintRoads {
-            tiles: road_tiles,
-            complete: roads_complete,
-            timed_out: roads_timed_out,
-        } = self
-            .footprint_roads(name, self.layout(name).first_visible, Purpose::Probe)
-            .await;
-        let road_wait = self.roads.is_some().then(|| road_started.elapsed());
+        let size = self.layout(name).first_visible;
+        let road_tiles = self.roads.as_ref().map(|roads| {
+            let tiles = self.road_tiles(name, size);
+            for &tile in &tiles {
+                roads.ensure(tile, Trigger::Probe);
+            }
+            (roads, tiles)
+        });
         let started = Instant::now();
-        let Ok(_permit) = self.probes.acquire().await else {
+        let Ok(permit) = self.probes.acquire().await else {
             return false;
         };
         let permit_wait = started.elapsed();
         if let Some(hit) = self.lit.get(&key).map(|hit| *hit) {
-            // Another probe answered while we waited: its waits count too.
+            // Another probe answered while we waited: its wait counts too.
             self.stats.record_probe(&ProbeRecord {
-                road_wait,
+                road_wait: None,
                 permit_wait,
                 committed: None,
             });
@@ -784,30 +796,39 @@ impl NightLitSource {
         let probe_started = Instant::now();
         let (recipes, art) = (Arc::clone(&self.recipes), Arc::clone(&self.art));
         let footprint = Footprint::from_name(name);
-        // How far outside the footprint a road can light it: the raster's
-        // reach at the size generation uses, so the two agree.
-        let reach = if road_tiles.is_empty() {
-            0.0
-        } else {
-            reach_deg(name, self.layout(name).first_visible, &self.road_model)
-        };
-        let answer = match tokio::task::spawn_blocking(move || {
+        let recipe_lit = tokio::task::spawn_blocking(move || {
             // The field reads every tile the generator could read for this
             // footprint, once each; an unreadable one counts as dark.
             let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
             // `lit_terrain` records no doubt, which is safe here: the probe
             // decides a size, and a size is never persisted.
-            probe_answer(
-                &footprint,
-                &lookup,
-                |n| art.lit_terrain(n).is_some(),
-                &road_tiles,
-                reach,
-            )
+            recipe_lights(&footprint, &lookup, |n| art.lit_terrain(n).is_some())
         })
-        .await
-        {
-            Ok(answer) => answer,
+        .await;
+        let probe_time = probe_started.elapsed();
+        drop(permit);
+        let mut roads_seen = None;
+        let mut road_wait = None;
+        let answer = match recipe_lit {
+            Ok(recipe_lit) => {
+                let mut ready = Vec::new();
+                let mut reach = 0.0;
+                if let (false, Some((roads, tiles))) = (recipe_lit, road_tiles) {
+                    // Roads after the permit, and only for a footprint its
+                    // recipe leaves dark: a lit task never waits for roads
+                    // while holding one.
+                    let road_started = Instant::now();
+                    let found = roads.footprint(&tiles, Purpose::Probe).await;
+                    road_wait = Some(road_started.elapsed());
+                    roads_seen = Some((found.complete, found.timed_out));
+                    // How far outside the footprint a road can light it:
+                    // the raster's reach at the size generation uses, so the
+                    // two agree. About 20 ns a tile: no blocking hop.
+                    reach = reach_deg(name, size, &self.road_model);
+                    ready = found.tiles;
+                }
+                probe_answer(recipe_lit, &footprint, &ready, reach)
+            }
             Err(_) => {
                 // The probe is meant to be panic-free. This arm is a last
                 // resort, and it remembers the dark answer so size and read
@@ -822,7 +843,8 @@ impl NightLitSource {
             permit_wait,
             committed: committed.then_some(answer),
         });
-        if committed && !lit && roads_timed_out {
+        let roads_timed_out = roads_seen.map(|(_, timed_out)| timed_out);
+        if committed && !lit && roads_timed_out == Some(true) {
             // A road still building could have lit it; the answer stands
             // for the session (R7).
             if let Some(roads) = &self.roads {
@@ -837,8 +859,8 @@ impl NightLitSource {
             answer = answer.label(),
             wait_ms = permit_wait.as_millis() as u64,
             road_wait_ms = road_wait.map(|w| w.as_millis() as u64),
-            probe_ms = probe_started.elapsed().as_millis() as u64,
-            roads_complete,
+            probe_ms = probe_time.as_millis() as u64,
+            roads_complete = roads_seen.map(|(complete, _)| complete),
             roads_timed_out,
             "Night lighting: lit probe"
         );
@@ -2275,13 +2297,13 @@ mod tests {
                 Some(gate.clone()),
             );
             let source = source_in(&temp).with_roads(roads.clone());
-            // The gate is shut: both probes time out before the build runs.
-            // Lit by its recipe: a timeout cannot have changed the answer.
+            // The gate is shut: the dark probe times out before the build
+            // runs. Lit by its recipe, the other never waits (#428).
             let lit = lit_name();
             assert_eq!(source.size(&lit).await, source.layout(&lit).total_len);
             assert_eq!(source.size(&name).await, 152, "committed without roads");
             let s = roads.stats_snapshot();
-            assert_eq!((s.probe_timeouts, s.answered_before_roads), (2, 1));
+            assert_eq!((s.probe_timeouts, s.answered_before_roads), (1, 1));
             // The committed answer holds once the roads are ready (R7).
             gate.add_permits(1);
             until_ready(&roads, TILE).await;
@@ -2370,6 +2392,53 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some());
+        }
+
+        #[tokio::test]
+        async fn a_recipe_lit_footprint_answers_without_waiting_for_its_roads() {
+            // #428: the recipe alone lights it, so the probe does not wait
+            // for the build the gate holds, which it has started.
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                FOREVER,
+                FOREVER,
+                Some(shut()),
+            );
+            let source = source_in(&temp).with_roads(roads.clone());
+            assert_eq!(road_tiles(&name, 1024, &RoadModel::DEFAULT), [TILE]);
+            // A road wait would last FOREVER: the bound is far below it.
+            let size = tokio::time::timeout(Duration::from_secs(5), source.size(&name)).await;
+            assert_eq!(size.ok(), Some(source.layout(&name).total_len));
+            assert_eq!(roads.builds_pending(), 1, "the build was started");
+            let s = roads.stats_snapshot();
+            assert_eq!((s.probe_waits, s.probe_timeouts), (0, 0));
+            assert_eq!(source.stats.snapshot().probes(ProbeAnswer::Recipe), 1);
+        }
+
+        #[tokio::test]
+        async fn a_recipe_dark_footprint_waits_for_its_roads() {
+            let temp = TempDir::new().unwrap();
+            let name = dark_name();
+            let gate = shut();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                LONG,
+                LONG,
+                Some(gate.clone()),
+            );
+            let source = source_in(&temp).with_roads(roads.clone());
+            // The gate opens while the probe waits, before its deadline.
+            let (size, ()) = tokio::join!(source.size(&name), async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                gate.add_permits(1);
+            });
+            assert_eq!(size, source.layout(&name).total_len, "lit by the road");
+            let s = roads.stats_snapshot();
+            assert_eq!((s.probe_waits, s.probe_timeouts), (1, 0));
+            assert_eq!(s.answered_before_roads, 0);
+            assert_eq!(source.stats.snapshot().probes(ProbeAnswer::Road), 1);
         }
 
         #[tokio::test]
@@ -2466,14 +2535,39 @@ mod tests {
             let no_recipe = |_: i32, _: i32| None;
             let across_east = [road_past((-17, -180), &east, -179.999_7)];
             assert_eq!(
-                probe_answer(&east, &no_recipe, |_| true, &across_east, east_reach),
+                probe_answer(
+                    recipe_lights(&east, &no_recipe, |_| true),
+                    &east,
+                    &across_east,
+                    east_reach
+                ),
                 ProbeAnswer::Road
             );
             let across_west = [road_past((-17, 179), &west, 179.999_7)];
             assert_eq!(
-                probe_answer(&west, &no_recipe, |_| true, &across_west, west_reach),
+                probe_answer(
+                    recipe_lights(&west, &no_recipe, |_| true),
+                    &west,
+                    &across_west,
+                    west_reach
+                ),
                 ProbeAnswer::Road
             );
+        }
+
+        #[test]
+        fn given_a_recipe_that_lights_the_footprint_the_roads_are_not_consulted() {
+            // #428: lit by its recipe, with a road across it, with a road
+            // that alone would not light it, or with no roads waited for.
+            let [(east, east_reach), _] = textures_at_the_antimeridian();
+            let across = road_past((-17, -180), &east, -179.999_7);
+            let beyond = road_past((-17, -180), &east, -179.5);
+            for road_tiles in [vec![across], vec![beyond], vec![]] {
+                assert_eq!(
+                    probe_answer(true, &east, &road_tiles, east_reach),
+                    ProbeAnswer::Recipe
+                );
+            }
         }
 
         #[test]
@@ -2487,7 +2581,12 @@ mod tests {
                 road_past((-17, -180), &east, -179.5),
             ] {
                 assert_eq!(
-                    probe_answer(&east, &no_recipe, |_| true, &[across], east_reach),
+                    probe_answer(
+                        recipe_lights(&east, &no_recipe, |_| true),
+                        &east,
+                        &[across],
+                        east_reach
+                    ),
                     ProbeAnswer::Dark
                 );
             }
@@ -2496,7 +2595,12 @@ mod tests {
                 road_past((-17, 179), &west, 179.5),
             ] {
                 assert_eq!(
-                    probe_answer(&west, &no_recipe, |_| true, &[across], west_reach),
+                    probe_answer(
+                        recipe_lights(&west, &no_recipe, |_| true),
+                        &west,
+                        &[across],
+                        west_reach
+                    ),
                     ProbeAnswer::Dark
                 );
             }
@@ -3018,7 +3122,11 @@ mod tests {
             assert_eq!(snap.probes(ProbeAnswer::Recipe), 1, "the recipe first");
             assert_eq!(snap.probes(ProbeAnswer::Dark), 0);
             let w = source.stats.take_window().unwrap();
-            assert_eq!(w.probe_road_wait.unwrap().count, 2);
+            assert_eq!(
+                w.probe_road_wait.unwrap().count,
+                1,
+                "the recipe-lit probe waits for no roads"
+            );
             assert_eq!(w.probe_permit_wait.unwrap().count, 2);
         }
 

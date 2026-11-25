@@ -207,8 +207,9 @@ pub struct RoadService {
     /// When callers stop waiting for a tile's current build, per purpose;
     /// set by the first of them, cleared when a new build starts.
     deadlines: DashMap<(Tile, Purpose), Instant>,
-    /// Tiles a probe has asked for, for the lead time.
-    probed: DashSet<Tile>,
+    /// Tiles a probe has asked for, for the lead time: the first probe's
+    /// instant while the tile is not ready yet, `None` once noted.
+    probed: DashMap<Tile, Option<Instant>>,
     /// Every source's identity, taken once per tile; concurrent first
     /// callers share one pass. A failed pass is not kept.
     identities: DashMap<Tile, Arc<OnceCell<Arc<[DsfIdentity]>>>>,
@@ -355,7 +356,7 @@ impl RoadService {
             pending: DashMap::new(),
             failed: DashSet::new(),
             deadlines: DashMap::new(),
-            probed: DashSet::new(),
+            probed: DashMap::new(),
             identities: DashMap::new(),
             ready_at: DashMap::new(),
             extract: Arc::new(Semaphore::new(permits)),
@@ -368,8 +369,13 @@ impl RoadService {
 
     /// Starts building `tile` unless it is ready, failed or building.
     /// Returns at once; the build runs in its own task. A DSF-open hint is
-    /// ignored while [`ROAD_HINT_BACKLOG`] builds are pending.
+    /// ignored while [`ROAD_HINT_BACKLOG`] builds are pending. A probe's
+    /// call counts as the tile's first probe for the lead time, as a probe's
+    /// `footprint` does.
     pub fn ensure(self: &Arc<Self>, tile: Tile, trigger: Trigger) {
+        if trigger == Trigger::Probe {
+            self.note_probe(tile, Instant::now());
+        }
         if self.tiles.contains_key(&tile) {
             return;
         }
@@ -394,6 +400,11 @@ impl RoadService {
     /// of each tile this call is the first probe of.
     pub async fn footprint(self: &Arc<Self>, tiles: &[Tile], purpose: Purpose) -> FootprintRoads {
         let started = Instant::now();
+        if purpose == Purpose::Probe {
+            for &tile in tiles {
+                self.note_probe(tile, started);
+            }
+        }
         let found = join_all(tiles.iter().map(|&tile| async move {
             let (state, waited) = self.tile_by(tile, purpose, started).await;
             (tile, state, waited)
@@ -406,11 +417,8 @@ impl RoadService {
             timed_out: false,
         };
         let mut waited = false;
-        for (tile, state, tile_waited) in found {
+        for (_, state, tile_waited) in found {
             waited |= tile_waited;
-            if purpose == Purpose::Probe && self.probed.insert(tile) {
-                self.note_lead(tile, started, now);
-            }
             match state {
                 TileWait::Ready(roads) => out.tiles.push(roads),
                 TileWait::Failed => out.complete = false,
@@ -491,16 +499,51 @@ impl RoadService {
         }
     }
 
-    /// Logs how long before (positive) or after (negative) its first probe
-    /// at `first_probe` the tile was ready.
-    fn note_lead(&self, tile: Tile, first_probe: Instant, now: Instant) {
+    /// A probe asked for `tile` at `at`. The tile's first probe notes its
+    /// lead time: at once when the tile has been ready, else when its build
+    /// makes it ready ([`Self::note_ready`]), so a negative lead is how long
+    /// after the probe the roads came, whoever waited for them. A tile that
+    /// never becomes ready notes none.
+    fn note_probe(&self, tile: Tile, at: Instant) {
+        // The entry's lock is held while `ready_at` is read: a build that
+        // makes the tile ready meanwhile sets `ready_at` first, then waits
+        // for this lock in `note_ready`, so the lead is noted exactly once.
+        let Entry::Vacant(e) = self.probed.entry(tile) else {
+            return;
+        };
         let ready = self.ready_at.get(&tile).map(|r| *r);
+        match ready {
+            Some(ready) => {
+                e.insert(None);
+                self.note_lead(tile, at, ready);
+            }
+            None => {
+                e.insert(Some(at));
+            }
+        }
+    }
+
+    /// The tile was ready at `ready` (its first time): notes the lead time
+    /// of a probe that asked before.
+    fn note_ready(&self, tile: Tile, ready: Instant) {
+        let probed = match self.probed.get_mut(&tile) {
+            Some(mut first) => first.take(),
+            None => None,
+        };
+        if let Some(first_probe) = probed {
+            self.note_lead(tile, first_probe, ready);
+        }
+    }
+
+    /// Logs how long before (positive) or after (negative) its first probe
+    /// at `first_probe` the tile was ready at `ready`.
+    fn note_lead(&self, tile: Tile, first_probe: Instant, ready: Instant) {
         #[cfg(test)]
         self.test.leads_noted.fetch_add(1, Ordering::SeqCst);
         debug!(
             lat = tile.0,
             lon = tile.1,
-            ms = lead_ms(first_probe, ready, now),
+            ms = lead_ms(first_probe, ready),
             "Night roads: lead time"
         );
     }
@@ -619,7 +662,19 @@ impl RoadService {
         self.stats.record_build(&record);
         match merged {
             Ok(m) => {
-                self.ready_at.entry(tile).or_insert_with(Instant::now);
+                let now = Instant::now();
+                // `ready_at` before `probed` (see `note_probe`); its guard
+                // is dropped first.
+                let first = match self.ready_at.entry(tile) {
+                    Entry::Vacant(e) => {
+                        e.insert(now);
+                        true
+                    }
+                    Entry::Occupied(_) => false,
+                };
+                if first {
+                    self.note_ready(tile, now);
+                }
                 debug!(
                     lat = tile.0,
                     lon = tile.1,
@@ -1038,14 +1093,12 @@ fn wait_until(deadline: Instant, now: Instant) -> Option<Instant> {
 }
 
 /// Milliseconds from the tile being ready to its first probe: positive when
-/// the roads came first, negative when the probe did (still not ready
-/// counts up to `now`).
-fn lead_ms(first_probe: Instant, ready_at: Option<Instant>, now: Instant) -> i64 {
-    let signed = |a: Instant, b: Instant| match a.checked_duration_since(b) {
+/// the roads came first, negative when the probe did.
+fn lead_ms(first_probe: Instant, ready_at: Instant) -> i64 {
+    match first_probe.checked_duration_since(ready_at) {
         Some(d) => d.as_millis() as i64,
-        None => -(b.duration_since(a).as_millis() as i64),
-    };
-    signed(first_probe, ready_at.unwrap_or(now))
+        None => -(ready_at.duration_since(first_probe).as_millis() as i64),
+    }
 }
 
 #[cfg(test)]
@@ -1304,9 +1357,8 @@ pub(crate) mod tests {
     fn lead_time_is_positive_when_the_roads_came_first() {
         let t0 = Instant::now();
         let ms = |n| Duration::from_millis(n);
-        assert_eq!(lead_ms(t0 + ms(300), Some(t0), t0 + ms(900)), 300);
-        assert_eq!(lead_ms(t0, Some(t0 + ms(250)), t0 + ms(900)), -250);
-        assert_eq!(lead_ms(t0, None, t0 + ms(900)), -900, "still not ready");
+        assert_eq!(lead_ms(t0 + ms(300), t0), 300);
+        assert_eq!(lead_ms(t0, t0 + ms(250)), -250);
     }
 
     #[test]
@@ -2044,6 +2096,43 @@ pub(crate) mod tests {
         assert_eq!(noted(), 2);
         svc.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(noted(), 2, "once per tile");
+    }
+
+    /// Waits until `tile` is in the tile cache.
+    async fn until_ready(svc: &RoadService, tile: Tile) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !svc.is_ready(tile) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(svc.is_ready(tile), "never ready");
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_only_starts_a_build_notes_the_lead_once_the_tile_is_ready() {
+        // #428: a probe the recipe answers starts its tiles' builds and
+        // waits for none; its tiles' lead times are still noted.
+        let t = install(None);
+        let (c, gate) = gated(LONG, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        let noted = || svc.test.leads_noted.load(Ordering::SeqCst);
+        svc.ensure(TILE, Trigger::Probe);
+        assert_eq!(svc.builds_pending(), 1, "the probe started the build");
+        assert_eq!(noted(), 0, "not ready yet");
+        gate.add_permits(1);
+        until_ready(&svc, TILE).await;
+        assert_eq!(noted(), 1, "noted when the build made it ready");
+        svc.ensure(TILE, Trigger::Probe);
+        svc.footprint(&[TILE], Purpose::Probe).await;
+        assert_eq!(noted(), 1, "once per tile");
+
+        // A tile ready before its first probe notes it at that probe.
+        let other = (10, 10);
+        gate.add_permits(1);
+        svc.ensure(other, Trigger::DsfOpen);
+        until_ready(&svc, other).await;
+        assert_eq!(noted(), 1, "a hint is no probe");
+        svc.ensure(other, Trigger::Probe);
+        assert_eq!(noted(), 2);
     }
 
     #[tokio::test]

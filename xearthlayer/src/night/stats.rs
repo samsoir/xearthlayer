@@ -159,7 +159,10 @@ pub struct GenerationRecord {
 /// probe's answer after its permit wait.
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeRecord {
-    /// Waiting for the footprint's road tiles; `None` without road lights.
+    /// Waiting for the footprint's road tiles; `None` when it did not wait:
+    /// without road lights, or when its recipe lit it or another probe's
+    /// answer was found first (only a footprint the recipe leaves dark
+    /// waits for roads, #428).
     pub road_wait: Option<Duration>,
     /// From asking for a probe permit to holding one.
     pub permit_wait: Duration,
@@ -275,7 +278,8 @@ pub struct LitWindow {
     pub reads: [Option<LatencySummary>; 7],
     pub generation_permit_wait: Option<LatencySummary>,
     pub generation: Option<LatencySummary>,
-    /// Probe waits for road tiles, with road lights only.
+    /// Probe waits for road tiles: probes of footprints their recipe left
+    /// dark, with road lights only.
     pub probe_road_wait: Option<LatencySummary>,
     pub probe_permit_wait: Option<LatencySummary>,
     /// Waits for the disk permit of a lookup (write-backs are not timed).
