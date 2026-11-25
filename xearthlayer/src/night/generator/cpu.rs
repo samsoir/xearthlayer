@@ -13,13 +13,13 @@
 //! Road glow (`LitRequest::roads`) is added last, in linear light, only on
 //! the texels it reaches: an empty road field leaves every byte as it was.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use image::{Rgba, RgbaImage};
 use tracing::debug;
 
 use super::field::RecipeField;
-use super::led::{self, LedRegion};
+use super::led::{self, LedRegion, TonePath};
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TexelCentres};
@@ -35,6 +35,15 @@ pub struct CpuLitGenerator;
 
 impl LitGenerator for CpuLitGenerator {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage {
+        self.generate_with(request, &led::Toner::new(request.led))
+    }
+}
+
+impl CpuLitGenerator {
+    /// The generator with the tone path `tone`: the request's
+    /// [`led::Toner`] in production; tests pass the reference path, or one
+    /// that records what reaches it, to compare with it.
+    fn generate_with<T: TonePath>(&self, request: &LitRequest<'_>, tone: &T) -> RgbaImage {
         let name = request.name;
         let size = request.size;
         let TexelCentres { lons, lats, xs, ys } = TexelCentres::of(name, size);
@@ -125,19 +134,15 @@ impl LitGenerator for CpuLitGenerator {
                     share += w.weight * tone.share;
                     kelvin += w.weight * tone.kelvin;
                 }
-                let sodium = rgb;
-                let toned = (request.led.sodium.mix > 0.0)
-                    .then(|| led::desaturate(sodium, &request.led.sodium));
-                let (mut led_rgb, mut patch_here) = (None, None);
+                let (mut led_kelvin, mut patch_here) = (None, None);
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
                     patch_here = Some(patch);
                     if patch.u < share / wsum {
-                        let k = led::patch_kelvin(kelvin / wsum, &patch);
-                        led_rgb = Some(led::recolour(sodium, k, request.led.energy));
+                        led_kelvin = Some(led::patch_kelvin(kelvin / wsum, &patch));
                     }
                 }
-                let mut bytes = led::texel_bytes(sodium, toned, led_rgb, g as f32);
+                let mut bytes = tone.bytes(rgb, led_kelvin, g as f32);
                 if road > 0.0 {
                     let texel = RoadTexel {
                         at: (lat, lon),
@@ -157,13 +162,6 @@ impl LitGenerator for CpuLitGenerator {
 
 fn opaque([r, g, b]: [u8; 3]) -> Rgba<u8> {
     Rgba([r, g, b, 255])
-}
-
-/// Stored values (0..255) to linear light, exactly as `led::decode` gives
-/// them, built once: a road texel decodes its pattern bytes by lookup.
-pub(super) fn linear_table() -> &'static [f32; 256] {
-    static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| std::array::from_fn(|v| led::decode([v as f32; 3])[0]))
 }
 
 /// Road glow added over a texel's pattern bytes, in linear light. The level
@@ -209,7 +207,7 @@ impl<'r> RoadLight<'r> {
         ));
         Self {
             request,
-            linear: linear_table(),
+            linear: led::linear_table(),
             encoder: led::ByteEncoder::get(),
             sodium: unit_luminance(sodium),
             region: None,
@@ -359,6 +357,46 @@ mod tests {
             );
             assert!(img.pixels().any(is_led), "the pin covers LED texels");
             assert_eq!(digest(&img), want, "digest {:#018x}", digest(&img));
+        }
+    }
+
+    /// The generator's tone path is byte for byte the `powf` path it
+    /// replaced (#436), at several models, brightnesses and regions.
+    #[test]
+    fn the_generator_gives_the_powf_tone_path_bytes() {
+        let strong_tone = LedModel {
+            sodium: led::SodiumTone {
+                mix: 1.0,
+                kelvin: 5000.0,
+                energy: 1.3,
+            },
+            ..full_share_model()
+        };
+        let n = name_at(37.20, -122.725);
+        for model in [
+            LedModel::DEFAULT,
+            LedModel::OFF,
+            full_share_model(),
+            strong_tone,
+        ] {
+            for (brightness, region) in [(1.0, LedRegion::Na), (0.5, LedRegion::Af)] {
+                let request = LitRequest {
+                    name: &n,
+                    size: 128,
+                    brightness,
+                    recipes: &golden,
+                    patterns: &speckled,
+                    regions: &move |_, _| region,
+                    led: &model,
+                    roads: &RoadField::empty(128),
+                    road_model: &RoadModel::DEFAULT,
+                };
+                let img = CpuLitGenerator.generate(&request);
+                let reference = CpuLitGenerator
+                    .generate_with(&request, &led::powf_reference::PowfToner(&model));
+                assert!(lit_texels(&img) > 0);
+                assert!(img == reference, "{model:?} at {brightness} in {region:?}");
+            }
         }
     }
 
@@ -537,18 +575,6 @@ mod tests {
             }
         }
         assert!(compared > 0, "the road is lit");
-    }
-
-    #[test]
-    fn the_linear_table_is_the_led_decode() {
-        let table = linear_table();
-        for v in 0..=255u8 {
-            assert_eq!(
-                table[usize::from(v)].to_bits(),
-                led::decode([f32::from(v); 3])[0].to_bits(),
-                "stored {v}"
-            );
-        }
     }
 
     /// The composition rule written out plainly, with no table or memo.
