@@ -114,7 +114,7 @@ mod inner {
 
     /// What one of the worker's channels holds when it looks (#421).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum QueueState {
+    pub(super) enum QueueState {
         /// At least one request is buffered.
         Ready,
         /// Nothing buffered, and a sender may still send.
@@ -125,7 +125,7 @@ mod inner {
 
     /// What the worker does next, by [`next_take`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum NextTake {
+    pub(super) enum NextTake {
         /// Take the next request of this lane.
         Take(GpuLane),
         /// Wait for a request.
@@ -137,7 +137,7 @@ mod inner {
     /// The lane rule (#421): a demand request whenever one is buffered, a
     /// prefetch request only while the demand channel holds none, and the
     /// end once both channels are closed and empty.
-    pub fn next_take(demand: QueueState, prefetch: QueueState) -> NextTake {
+    pub(super) fn next_take(demand: QueueState, prefetch: QueueState) -> NextTake {
         match (demand, prefetch) {
             (QueueState::Ready, _) => NextTake::Take(GpuLane::Demand),
             (_, QueueState::Ready) => NextTake::Take(GpuLane::Prefetch),
@@ -148,7 +148,7 @@ mod inner {
 
     /// What the worker does with a request it took, by [`admit`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Admission {
+    pub(super) enum Admission {
         /// Its job was cancelled before the tile started: answer
         /// [`GpuEncodeReply::Cancelled`], encode nothing (#422).
         Skip,
@@ -165,7 +165,7 @@ mod inner {
     /// `queue_wait`, whose job is `job_cancelled`, under `rule`. A request
     /// still queued in `claim` is claimed for the worker when the answer is
     /// [`Admission::Start`]; none of the others is a miss.
-    pub fn admit(
+    pub(super) fn admit(
         lane: GpuLane,
         job_cancelled: bool,
         queue_wait: Duration,
@@ -254,6 +254,10 @@ mod inner {
         }
     }
 
+    /// Not test-only: the loop's integration tests (`tests/gpu_*.rs`,
+    /// `tests/panic_hook.rs`) build their workers this way, and they cannot
+    /// see `#[cfg(test)]` items. Production builds both lanes
+    /// ([`gpu_lanes`]).
     impl From<mpsc::Receiver<GpuEncodeRequest>> for WorkerQueues {
         /// One demand channel and no prefetch: the prefetch queue is closed
         /// from the start. For tests of the loop that need one lane only.
@@ -496,7 +500,8 @@ mod inner {
         }
 
         /// Whether the worker started the tile.
-        pub fn is_started(&self) -> bool {
+        #[cfg(test)]
+        pub(super) fn is_started(&self) -> bool {
             self.0.load(Ordering::Acquire) == Self::STARTED
         }
 
@@ -1247,8 +1252,8 @@ mod inner {
     }
 
     impl TileProcessor for WgpuTileProcessor {
-        /// [`process_tile`](Self::process_tile), then the kept resources are
-        /// dropped if the tile failed ([`AfterTile::of`]).
+        /// `process_tile`, then the kept resources are dropped if the tile
+        /// failed (`AfterTile::of`).
         ///
         /// Dropping them while the late tile's work may still be on the GPU
         /// is safe: wgpu-core holds every buffer and texture a submission
@@ -3578,7 +3583,6 @@ mod tests {
     #[test]
     fn an_encode_waiting_on_the_gpu_occupies_no_blocking_thread() {
         use crate::executor::{TextureEncoderAdapter, TextureEncoderAsync, TokioExecutor};
-        use crate::texture::DdsTextureEncoder;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -3601,7 +3605,6 @@ mod tests {
                 .with_mipmap_count(1)
                 .with_mipmap_compressor(Arc::new(channel)),
         )));
-        let _: &DdsTextureEncoder = adapter.encoder();
 
         let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
         runtime.block_on(async {

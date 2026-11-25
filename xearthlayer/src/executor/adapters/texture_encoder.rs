@@ -37,11 +37,6 @@ impl<E> TextureEncoderAdapter<E> {
     pub fn new(encoder: E) -> Self {
         Self { encoder }
     }
-
-    /// The encoder adapted.
-    pub fn encoder(&self) -> &E {
-        &self.encoder
-    }
 }
 
 impl<E: TextureEncoder + 'static> TextureEncoderAsync for TextureEncoderAdapter<E> {

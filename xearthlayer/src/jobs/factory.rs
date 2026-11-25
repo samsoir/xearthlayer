@@ -198,9 +198,10 @@ where
 
     /// The encoder these jobs encode with.
     ///
-    /// Exposed so each lane's encoder is assertable: with the GPU, the
-    /// prefetch lane's sends on the prefetch channel (#421).
-    pub fn encoder(&self) -> &Arc<E> {
+    /// Exposed to tests so each lane's encoder is assertable: with the GPU,
+    /// the prefetch lane's sends on the prefetch channel (#421).
+    #[cfg(test)]
+    pub(crate) fn encoder(&self) -> &Arc<E> {
         &self.encoder
     }
 }
