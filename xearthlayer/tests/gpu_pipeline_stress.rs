@@ -412,4 +412,148 @@ mod gpu_stress {
             std::thread::available_parallelism().map_or(0, |n| n.get())
         );
     }
+
+    /// Device loss in the middle of a burst (#420): the device is destroyed
+    /// with `Device::destroy` once two tiles have come back. Reports how
+    /// every tile of the burst ended (GPU, fallback, failed), the health,
+    /// and how the tiles after the burst are encoded, and asserts the run
+    /// ends in fallback encodes byte for byte the ISPC encode rather than
+    /// failed tiles.
+    ///
+    /// `Destroyed` is the one device-lost reason that does not fail the
+    /// health (it follows only an explicit `destroy`, which XEarthLayer never
+    /// calls), so what turns the encoder over here is what the destroyed
+    /// device does to the worker. Measured on Vulkan (wgpu 30): every
+    /// submission is refused and `poll` fails at once with
+    /// `WrongSubmissionIndex`, no panic and no hang, so the tiles after the
+    /// destroy fail in time and `MISSES_BEFORE_FAILED` of them fail the GPU.
+    /// Those tiles are lost; every tile after them is a fallback encode.
+    #[tokio::test]
+    #[ignore]
+    async fn device_destroyed_mid_burst_ends_in_fallback_encodes() {
+        use xearthlayer::dds::gpu_health::SharedGpuHealth;
+
+        let burst_size: usize = env_or("GPU_STRESS_BURST_SIZE", 15);
+        let image_size = image_size();
+        let levels = levels(image_size);
+        let health = SharedGpuHealth::new();
+        let (device, queue, compressor, selection) =
+            match xearthlayer::dds::create_gpu_resources(&gpu_device(), &health) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Skipping: no usable GPU ({e})");
+                    return;
+                }
+            };
+        let killer = device.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let worker = spawn_gpu_worker(
+            device,
+            queue,
+            compressor,
+            rx,
+            tokio_util::sync::CancellationToken::new(),
+            health.clone(),
+        );
+        let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+        let encoder = Arc::new(
+            DdsEncoder::new(DdsFormat::BC1)
+                .with_mipmap_compressor(
+                    Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
+                    Arc::new(IspcCompressor),
+                )
+                .with_mipmap_count(levels),
+        );
+        let source = Arc::new(test_image(image_size));
+        let expected = DdsEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(IspcCompressor))
+            .with_mipmap_count(levels)
+            .encode((*source).clone())
+            .unwrap();
+        eprintln!(
+            "Device loss: adapter={}, burst={burst_size}, {image_size}x{image_size}, {levels} levels",
+            selection.adapter
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let start = Instant::now();
+        let handles: Vec<_> = (0..burst_size)
+            .map(|_| {
+                let enc = Arc::clone(&encoder);
+                let img = (*source).clone();
+                let done = done_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let r = enc.encode(img);
+                    let _ = done.send(());
+                    r
+                })
+            })
+            .collect();
+        let destroyed_at = tokio::task::spawn_blocking(move || {
+            for _ in 0..2 {
+                let _ = done_rx.recv();
+            }
+            killer.destroy();
+            Instant::now()
+        })
+        .await
+        .unwrap();
+        eprintln!(
+            "  destroyed the device at {:.1} ms",
+            (destroyed_at - start).as_secs_f64() * 1000.0
+        );
+
+        let (mut ok, mut same, mut failed) = (0, 0, 0);
+        for h in handles {
+            match tokio::time::timeout(Duration::from_secs(60), h).await {
+                Ok(Ok(Ok(dds))) => {
+                    ok += 1;
+                    same += usize::from(dds == expected);
+                }
+                Ok(Ok(Err(e))) => {
+                    failed += 1;
+                    eprintln!("  failed: {e}");
+                }
+                other => panic!("a caller hung or panicked: {other:?}"),
+            }
+        }
+        let burst = channel.stats().take_sample().unwrap_or_default();
+        eprintln!(
+            "  burst: ok={ok} (ISPC-identical {same}) failed={failed}; GPU tiles={} \
+             fallback={} failed={}; health={:?}; worker ended={}",
+            burst.tiles(),
+            burst.fallback,
+            burst.failed,
+            health.health(),
+            worker.is_finished()
+        );
+
+        // After the burst: every tile must be encoded, on the fallback.
+        let mut after_failed = 0;
+        for i in 0..5 {
+            let enc = Arc::clone(&encoder);
+            let img = (*source).clone();
+            match tokio::task::spawn_blocking(move || enc.encode(img))
+                .await
+                .unwrap()
+            {
+                Ok(dds) => assert!(dds == expected, "tile {i} after the burst: bytes"),
+                Err(e) => {
+                    after_failed += 1;
+                    eprintln!("  after the burst, tile {i} failed: {e}");
+                }
+            }
+        }
+        let after = channel.stats().take_sample().unwrap_or_default();
+        eprintln!(
+            "  after: GPU tiles={} fallback={} failed={}; health={:?}",
+            after.tiles(),
+            after.fallback,
+            after.failed,
+            health.health()
+        );
+        assert!(health.is_failed(), "the GPU is failed for the session");
+        assert_eq!(after_failed, 0, "the run ends in fallback encodes");
+        assert_eq!(after.fallback, 5, "every later tile is a fallback encode");
+    }
 }
