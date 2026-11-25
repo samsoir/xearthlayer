@@ -83,6 +83,7 @@ mod compressor;
 mod conversion;
 mod encoder;
 pub mod gpu_channel;
+pub mod gpu_health;
 pub mod gpu_stats;
 mod header;
 pub mod layout;
