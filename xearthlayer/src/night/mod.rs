@@ -19,6 +19,8 @@ pub mod roads;
 pub mod service;
 pub(crate) mod stats;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_log;
 
 pub use disk::{
     check_entry, decode_entry_unsized, encode_entry, footprint_fingerprint, lit_cache_key,
@@ -28,7 +30,7 @@ pub use footprint::Footprint;
 pub use generator::{
     CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, LIT_GENERATOR_VERSION,
 };
-pub use laminar::{LaminarArt, LitPattern, LitTerrain};
+pub use laminar::{ArtFiles, ArtRecord, DiskArtFiles, LaminarArt, LitPattern, LitTerrain};
 pub use layout::{minimal_black_dds, LitLayout};
 pub use prefs::{
     FixedTextureSetting, StartupTextureSetting, TextureSettingSource, FULL_TEXTURE_SETTING,

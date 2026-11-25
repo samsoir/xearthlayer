@@ -133,7 +133,8 @@ pub enum WriteBackSkip {
     NoFingerprint,
     /// A road tile failed: kept in memory only.
     RoadFailed,
-    /// An art file failed to read this session: kept in memory only.
+    /// A pattern lookup for the payload met a Laminar art file given up on
+    /// after I/O errors this session: kept in memory only.
     ArtFailed,
 }
 
