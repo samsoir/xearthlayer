@@ -27,10 +27,12 @@
 //! Blocking work is bounded by [`ROAD_EXTRACT_PERMITS`]: a build holds one
 //! permit for its whole tile and no other lit permit, and releases it before
 //! the detached write of its cache entries, so a queued build never waits
-//! for another tile's disk writes. A write takes one of the lit disk tier's
-//! permits, shared with the lit source, and at most [`ROAD_WRITE_BACKLOG`]
-//! tiles' entries are ever waiting in memory: past it a tile's entries are
-//! dropped, and the next session extracts them again.
+//! for another tile's disk writes. Each entry's write takes one of the lit
+//! disk tier's permits, shared with the lit source, and gives it back before
+//! the next, so a lit disk lookup waits for one entry's write, never a whole
+//! tile's. At most [`ROAD_WRITE_BACKLOG`] tiles' entries are ever waiting in
+//! memory: past it a tile's entries are dropped, and the next session
+//! extracts them again.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -382,6 +384,8 @@ pub struct RoadService {
 struct TestProbes {
     writes_peak: std::sync::atomic::AtomicUsize,
     writes_dropped: std::sync::atomic::AtomicUsize,
+    /// Road entry writes waiting for a lit disk permit.
+    writes_awaiting_permit: std::sync::atomic::AtomicUsize,
     index_builds: std::sync::atomic::AtomicUsize,
     identity_passes: std::sync::atomic::AtomicUsize,
     leads_noted: std::sync::atomic::AtomicUsize,
@@ -1201,9 +1205,11 @@ impl RoadService {
         build.clone().await
     }
 
-    /// Writes a built tile's cache entries in one detached task, under a
-    /// lit disk permit, once the build's extract permit is released: a
-    /// queued build never waits for a write. At most
+    /// Writes a built tile's cache entries in one detached task, once the
+    /// build's extract permit is released: a queued build never waits for a
+    /// write. Each entry takes a lit disk permit of its own and gives it back
+    /// before the next, so a lit disk lookup queued meanwhile waits for one
+    /// entry's write, never for the rest of the tile's. At most
     /// `config.write_backlog` tiles' entries wait at once; past it the
     /// tile's entries are dropped, and the next session extracts them again.
     fn write_back(&self, tile: Tile, entries: Vec<(String, Bytes)>) {
@@ -1237,12 +1243,19 @@ impl RoadService {
         // Counted until the task ends, however it ends.
         let slot = WriteSlot(Arc::clone(&self.writes_pending));
         let disk_io = self.disk_io.clone();
+        #[cfg(test)]
+        let test = Arc::clone(&self.test);
         tokio::spawn(async move {
             let _slot = slot;
-            let Some(_permit) = disk_io.acquire().await else {
-                return;
-            };
             for (key, entry) in entries {
+                #[cfg(test)]
+                test.writes_awaiting_permit.fetch_add(1, Ordering::SeqCst);
+                let permit = disk_io.acquire().await;
+                #[cfg(test)]
+                test.writes_awaiting_permit.fetch_sub(1, Ordering::SeqCst);
+                let Some(_permit) = permit else {
+                    return;
+                };
                 if let Err(e) = disk.set(&key, entry).await {
                     debug!(error = %e, key, "Night roads: road cache write failed");
                 }
@@ -1495,6 +1508,7 @@ pub(crate) mod tests {
         loaded: std::sync::Mutex<Vec<String>>,
         set_gate: Option<Arc<Semaphore>>,
         sets_waiting: std::sync::atomic::AtomicUsize,
+        sets_done: std::sync::atomic::AtomicUsize,
     }
 
     impl Loads {
@@ -1504,6 +1518,7 @@ pub(crate) mod tests {
                 loaded: std::sync::Mutex::default(),
                 set_gate: None,
                 sets_waiting: Default::default(),
+                sets_done: Default::default(),
             }
         }
 
@@ -1523,6 +1538,11 @@ pub(crate) mod tests {
         fn sets_waiting(&self) -> usize {
             self.sets_waiting.load(Ordering::SeqCst)
         }
+
+        /// `set`s that have returned.
+        fn sets_done(&self) -> usize {
+            self.sets_done.load(Ordering::SeqCst)
+        }
     }
 
     impl Cache for Loads {
@@ -1536,7 +1556,9 @@ pub(crate) mod tests {
                     }
                     self.sets_waiting.fetch_sub(1, Ordering::SeqCst);
                 }
-                self.inner.set(&key, value).await
+                let set = self.inner.set(&key, value).await;
+                self.sets_done.fetch_add(1, Ordering::SeqCst);
+                set
             }
             .boxed()
         }
@@ -2379,11 +2401,70 @@ pub(crate) mod tests {
         assert_eq!(all as usize, crate::night::service::LIT_DISK_PERMITS);
         let held = disk_io.acquire_many(all).await.unwrap();
         assert!(svc.footprint(&tiles, Purpose::Generate).await.complete);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(d.sets_waiting(), 0, "no write without a disk permit");
+        until("both tiles' writes wait for a disk permit", || {
+            svc.test.writes_awaiting_permit.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(d.sets_waiting() + d.sets_done(), 0, "no write without one");
         gate.add_permits(tiles.len());
         drop(held);
         assert_eq!(entries(&svc, &(d.clone() as _)).await, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lit_disk_lookup_waits_for_one_road_entry_not_a_whole_tile() {
+        // Three 7z overlays: the tile's write has three entries.
+        let t = tempfile::tempdir().unwrap();
+        let mut third = overlay(46, 6);
+        third.road(46, 6, 100, &[(6.8, 46.8), (6.9, 46.9)]);
+        write_install(
+            t.path(),
+            TILE,
+            &[
+                ("High", Some(sevenz(&high(None).bytes()))),
+                ("Low", Some(sevenz(&low().bytes()))),
+                ("Third", Some(sevenz(&third.bytes()))),
+            ],
+        );
+        let gate = Arc::new(Semaphore::new(0));
+        let d = Arc::new(Loads::with_set_gate(disk(), Arc::clone(&gate)));
+        let permits = LitDiskPermits::new();
+        let svc = RoadService::with_config(
+            t.path().into(),
+            vec![],
+            Some(d.clone() as _),
+            permits.clone(),
+            config(LONG, LONG),
+        );
+        // Other lit disk work holds every permit but one.
+        let others = permits
+            .semaphore()
+            .acquire_many(crate::night::service::LIT_DISK_PERMITS as u32 - 1)
+            .await
+            .unwrap();
+        assert!(svc.footprint(&[TILE], Purpose::Generate).await.complete);
+        until("the tile's first entry is being written", || {
+            d.sets_waiting() == 1
+        })
+        .await;
+        assert_eq!(
+            permits.semaphore().available_permits(),
+            0,
+            "it holds the last"
+        );
+        // A lit disk lookup queues for a permit behind the entry's write.
+        let mut lookup = Box::pin(permits.acquire());
+        assert!((&mut lookup).now_or_never().is_none(), "queued");
+        gate.add_permits(1);
+        let permit = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .expect("the lookup waits for one entry's write, not the tile's")
+            .expect("a permit");
+        assert_eq!(d.sets_done(), 1, "the tile's other entries wait for it");
+        assert_eq!(d.sets_waiting(), 0);
+        drop((permit, others));
+        gate.add_permits(2);
+        assert_eq!(entries(&svc, &(d.clone() as _)).await, 3);
     }
 
     #[tokio::test]
@@ -2710,6 +2791,16 @@ pub(crate) mod tests {
         assert_eq!(noted(), 2);
         svc.footprint(&[TILE], Purpose::Probe).await;
         assert_eq!(noted(), 2, "once per tile");
+    }
+
+    /// Waits until `done` holds, failing the test (naming `what`) if it does
+    /// not within a generous bound.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
     }
 
     /// Waits until `tile` is in the tile cache.
