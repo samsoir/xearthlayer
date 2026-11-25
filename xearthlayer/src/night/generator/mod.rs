@@ -123,16 +123,41 @@ pub const BC1_FLOOR: u8 = 8;
 /// and every level is floored at [`BC1_FLOOR`] after its dimming, then
 /// repaired where BC1 tints it ([`bc1_repair`]).
 ///
+/// An opaque black image (the probe answered lit, the generator lit
+/// nothing) is not encoded: its payload is all zeros, which the full path
+/// gives too (pinned at the first visible sizes from 4 to 2048 px), so it is
+/// returned at the layout's length without building, dimming or compressing
+/// the chain.
+///
 /// An empty image is an error ([`DdsError::InvalidDimensions`]), which the
 /// service serves as black.
 ///
 /// [`DdsError::InvalidDimensions`]: crate::dds::DdsError::InvalidDimensions
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let mut chain = lit_chain(&image);
+    if let Some(len) = black_payload_len(&image) {
+        return Ok(bytes::Bytes::from(vec![0; len]));
+    }
+    encode_chain(&image).map(bytes::Bytes::from)
+}
+
+/// The full path of [`encode_visible`]: the chain, its dimming and BC1.
+fn encode_chain(image: &RgbaImage) -> Result<Vec<u8>, crate::dds::DdsError> {
+    let mut chain = lit_chain(image);
     for (n, level) in chain.iter_mut().enumerate() {
         dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
     }
-    bc1_levels(&chain).map(bytes::Bytes::from)
+    bc1_levels(&chain)
+}
+
+/// The payload length of `image`'s chain when every texel of it is opaque
+/// black, else `None` (an empty image included, so its error stays the full
+/// path's). Its whole chain is then opaque black, and ISPC encodes an opaque
+/// black block as eight zero bytes, which the repair leaves alone.
+fn black_payload_len(image: &RgbaImage) -> Option<usize> {
+    const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
+    let (w, h) = image.dimensions();
+    let black = w > 0 && h > 0 && image.as_raw().chunks_exact(4).all(|t| t == OPAQUE_BLACK);
+    black.then(|| layout::chain_len(w, h, layout::full_chain_levels(w, h), DdsFormat::BC1))
 }
 
 /// The BC1 blocks of `levels`, in order, without a DDS header, each level
@@ -676,9 +701,9 @@ mod tests {
         assert!((light[1] - 1.0 / 2.0).abs() < 1e-3, "{light:?}");
     }
 
-    // The encoder before #439, kept as the reference its tables are held
-    // to: its own decode table, `powf` and `round` per channel, and a
-    // multiply and `round` per channel when dimming.
+    // The encoder before #439, kept as the reference the tables and the
+    // black shortcut are held to: its own decode table, `powf` and `round`
+    // per channel, and a multiply and `round` per channel when dimming.
 
     /// The byte `lit_chain` gave a linear value before #439.
     fn chain_encode_reference(c: f32) -> u8 {
@@ -907,5 +932,41 @@ mod tests {
             let want = encode_visible_reference(&img);
             assert_eq!(&encode_visible(img).unwrap()[..], &want[..]);
         }
+    }
+
+    /// First visible sizes: 2048 to 256 px at ZL15 to ZL18, and the smaller
+    /// ones of higher zooms, down to the layout's least, 4 px.
+    const FIRST_VISIBLE_SIZES: [u32; 10] = [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+    #[test]
+    fn opaque_black_encodes_to_zeros_by_the_full_path_and_the_shortcut() {
+        // Pinned: ISPC encodes an opaque black block as eight zero bytes and
+        // the repair leaves it, so the full path gives a payload of zeros,
+        // which the shortcut returns without running it.
+        for size in FIRST_VISIBLE_SIZES {
+            let black = solid(size, [0; 3]);
+            let full = encode_chain(&black).unwrap();
+            let levels = layout::full_chain_levels(size, size);
+            assert_eq!(
+                full.len(),
+                layout::chain_len(size, size, levels, DdsFormat::BC1),
+                "{size} px"
+            );
+            assert!(full.iter().all(|&b| b == 0), "{size} px full path");
+            assert_eq!(black_payload_len(&black), Some(full.len()), "{size} px");
+            assert_eq!(&encode_visible(black).unwrap()[..], &full[..], "{size} px");
+        }
+    }
+
+    #[test]
+    fn only_opaque_black_takes_the_black_shortcut() {
+        let mut one_lit = solid(64, [0; 3]);
+        one_lit.put_pixel(63, 63, image::Rgba([1, 0, 0, 255]));
+        let mut one_translucent = solid(64, [0; 3]);
+        one_translucent.put_pixel(0, 0, image::Rgba([0, 0, 0, 254]));
+        assert_eq!(black_payload_len(&one_lit), None);
+        assert_eq!(black_payload_len(&one_translucent), None);
+        // An empty image is still the full path's error.
+        assert_eq!(black_payload_len(&RgbaImage::new(0, 0)), None);
     }
 }
