@@ -1172,7 +1172,7 @@ mod tests {
         eprintln!(
             "pattern {} ({} px): cold {cold:?} (read and decode), warm {warm:?} per call",
             lit.texture.display(),
-            pattern.size
+            pattern.size()
         );
     }
 }
