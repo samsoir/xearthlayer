@@ -5,25 +5,49 @@
 //! package under it is used), and `XEL_LAMINAR_ART`, Laminar's `1000 world
 //! terrain` directory. Without them the test says so and times nothing.
 //! `XEL_NIGHT_PACKAGES=... XEL_LAMINAR_ART=... cargo test --release -p
-//! xearthlayer --lib time_the_lit_encode -- --ignored --nocapture`.
+//! xearthlayer --test lit_encode_timing -- --ignored --nocapture`.
 //!
-//! "Before" is the encoder before #439 (`encode_visible_reference`), whose
-//! memory is also #439's: the whole chain at once, a copy of the first
-//! level and a linear copy of it with four channels. Peak memory is
-//! measured by [`CountingAllocator`], which this module makes the global
-//! allocator of the library's unit tests; it counts per thread, so tests
-//! running beside a measurement do not disturb it.
+//! "Before" is the encoder before #439 (`support/lit_encode_before.rs`),
+//! whose memory is also #439's: the whole chain at once, a copy of the
+//! first level and a linear copy of it with four channels. Peak memory is
+//! measured by [`CountingAllocator`], which this binary, and no other but
+//! `lit_encode_memory`, makes its global allocator; it counts per thread.
+
+#[path = "support/counting_alloc.rs"]
+mod counting_alloc;
+#[path = "support/lit_encode_before.rs"]
+mod lit_encode_before;
 
 use image::RgbaImage;
 
-use super::counting_alloc::{held_at_peak, CountingAllocator};
-use super::tests::{encode_visible_reference, name_at, solid};
-use super::*;
-use crate::night::roads::field::RoadField;
-use crate::night::roads::RoadModel;
+use counting_alloc::{held_at_peak, CountingAllocator};
+use lit_encode_before::encode_visible_before;
+use xearthlayer::fuse::{DdsFilename, TextureKind};
+use xearthlayer::night::generator::encode_visible;
+use xearthlayer::night::roads::field::RoadField;
+use xearthlayer::night::roads::RoadModel;
+use xearthlayer::night::{
+    CpuLitGenerator, LaminarArt, LedModel, LedRegion, LitGenerator, LitRequest, RecipeStore,
+};
 
 #[global_allocator]
 static COUNTING: CountingAllocator = CountingAllocator;
+
+/// The ZL16 lit texture whose footprint holds `(lat, lon)`.
+fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    let n = f64::from(1u32 << 16);
+    let x = ((lon + 180.0) / 360.0 * n) as u32;
+    let lat_r = lat.to_radians();
+    let y =
+        ((1.0 - (lat_r.tan() + 1.0 / lat_r.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+    DdsFilename {
+        row: y / 16 * 16,
+        col: x / 16 * 16,
+        zoom: 16,
+        map_type: "BI".into(),
+        kind: TextureKind::Lit,
+    }
+}
 
 /// The ZL16 textures of the recipe tiles under `roots`, sampled evenly
 /// to at most `tiles` tiles, three positions in each.
@@ -91,7 +115,7 @@ fn encode_costs(img: &RgbaImage, runs: usize) -> (Cost, Cost) {
         costs[which].peak = costs[which].peak.max(peak);
     };
     for _ in 0..runs {
-        let (ms, (old, peak)) = timed(|| held_at_peak(|| encode_visible_reference(img)));
+        let (ms, (old, peak)) = timed(|| held_at_peak(|| encode_visible_before(img)));
         record(0, ms, peak);
         let owned = img.clone();
         let (ms, (new, peak)) = timed(|| held_at_peak(|| encode_visible(owned).unwrap()));
@@ -135,9 +159,9 @@ fn time_the_lit_encode() {
         })
         .collect();
     roots.sort_by(|a, b| a.0.cmp(&b.0));
-    let store = crate::night::RecipeStore::with_regions(roots.clone());
+    let store = RecipeStore::with_regions(roots.clone());
     let roots: Vec<std::path::PathBuf> = roots.into_iter().map(|(r, _)| r).collect();
-    let art = crate::night::LaminarArt::new(art.into());
+    let art = LaminarArt::new(art.into());
     let regions = |a: i32, b: i32| {
         store
             .get_with_region(a, b)
@@ -191,6 +215,10 @@ fn time_the_lit_encode() {
     );
     report(
         &format!("black at {SIZE} px (the shortcut after)"),
-        &[solid(SIZE, [0; 3])],
+        &[RgbaImage::from_pixel(
+            SIZE,
+            SIZE,
+            image::Rgba([0, 0, 0, 255]),
+        )],
     );
 }

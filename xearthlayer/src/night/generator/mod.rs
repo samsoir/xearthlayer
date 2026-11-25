@@ -12,11 +12,6 @@ pub mod led;
 pub mod noise;
 pub mod tiling;
 
-#[cfg(test)]
-mod counting_alloc;
-#[cfg(test)]
-mod encode_timing;
-
 use std::sync::Arc;
 
 use image::RgbaImage;
@@ -368,7 +363,7 @@ mod tests {
         assert_eq!(LIT_GENERATOR_VERSION, 10);
     }
 
-    pub(super) fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    fn name_at(lat: f64, lon: f64) -> DdsFilename {
         let n = f64::from(1u32 << 16);
         let x = ((lon + 180.0) / 360.0 * n) as u32;
         let lat_r = lat.to_radians();
@@ -459,7 +454,7 @@ mod tests {
         rgbs
     }
 
-    pub(super) fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
+    fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
         RgbaImage::from_pixel(size, size, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
     }
 
@@ -565,7 +560,7 @@ mod tests {
 
     /// Every level of `image`'s chain, collected: what [`lit_chain`] hands
     /// its visitor, kept.
-    pub(super) fn lit_chain_levels(image: RgbaImage) -> Vec<RgbaImage> {
+    fn lit_chain_levels(image: RgbaImage) -> Vec<RgbaImage> {
         let mut levels = Vec::new();
         lit_chain(image, |_, level| {
             levels.push(level.clone());
@@ -577,7 +572,7 @@ mod tests {
 
     /// The payload of `levels`, each compressed and repaired by
     /// [`bc1_level_into`] into its slice of one buffer, in order.
-    pub(super) fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
+    fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
         let level_len =
             |level: &RgbaImage| layout::level_len(level.width(), level.height(), DdsFormat::BC1);
         let mut payload = vec![0; levels.iter().map(level_len).sum()];
@@ -812,7 +807,7 @@ mod tests {
     }
 
     /// `lit_chain` before #439.
-    pub(super) fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
+    fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
         let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
         let (mut w, mut h) = image.dimensions();
         let mut linear: Vec<[f32; 4]> = image
@@ -850,7 +845,7 @@ mod tests {
     }
 
     /// `dim` before #439.
-    pub(super) fn dim_reference(level: &mut RgbaImage, gain: f32) {
+    fn dim_reference(level: &mut RgbaImage, gain: f32) {
         for px in level.pixels_mut() {
             let rgb = &mut px.0[..3];
             for c in rgb.iter_mut() {
@@ -864,8 +859,10 @@ mod tests {
 
     /// `encode_visible` before #439: the full path, with no shortcut. Its
     /// memory is also that of #439's: the whole chain, with a copy of the
-    /// first level and a linear copy of it, four channels (#440).
-    pub(super) fn encode_visible_reference(image: &RgbaImage) -> Vec<u8> {
+    /// first level and a linear copy of it, four channels (#440). The
+    /// integration tests, which cannot reach this module, measure that
+    /// memory with a copy of it (`tests/support/lit_encode_before.rs`).
+    fn encode_visible_reference(image: &RgbaImage) -> Vec<u8> {
         let mut chain = lit_chain_reference(image);
         for (n, level) in chain.iter_mut().enumerate() {
             dim_reference(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
@@ -883,7 +880,7 @@ mod tests {
     /// [0, 1.25]. A superset of the inputs `led`'s
     /// `the_byte_encoder_is_encode_rounded_for_every_kind_of_input` builds
     /// inline, for its tests to share.
-    pub(super) fn encode_probe_inputs() -> Vec<f32> {
+    fn encode_probe_inputs() -> Vec<f32> {
         let mut inputs = vec![
             0.0,
             -0.0,
