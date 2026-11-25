@@ -47,6 +47,9 @@ mod inner {
     /// Bounded channel capacity for GPU encode requests.
     pub const CHANNEL_CAPACITY: usize = 32;
 
+    /// The failure every request still queued at shutdown is answered with.
+    const SHUT_DOWN: &str = "GPU worker shut down";
+
     /// How long an idle worker sleeps between looks at its channel, its
     /// shutdown token and its health.
     const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -693,6 +696,14 @@ mod inner {
         loop {
             if shutdown.is_cancelled() {
                 tracing::info!("GPU pipeline worker: shutdown signal received");
+                let failed = drain(&mut rx, |request| {
+                    let _ = request
+                        .response
+                        .send(GpuEncodeReply::failed(SHUT_DOWN, GpuTileTiming::default()));
+                });
+                if failed > 0 {
+                    tracing::debug!(failed, "GPU worker failed its queue at shutdown");
+                }
                 break;
             }
             // Failed from outside the loop: the device was lost.
@@ -862,22 +873,38 @@ mod inner {
         }
     }
 
-    /// Closes the channel and hands back every request in it, until it is
-    /// empty: buffered ones, and those whose senders were already past the
-    /// capacity check when it closed (`blocking_recv` waits for them, where
-    /// `try_recv` would report the closed channel empty). A send that comes
-    /// later fails and returns the request to its caller with the error, so
-    /// no image is left behind with the receiver.
+    /// Closes the channel and hands back every request in it ([`drain`]),
+    /// so no image is left behind with the receiver.
     ///
     /// Must be called on a blocking thread, as the worker is.
     fn hand_back_all(rx: &mut mpsc::Receiver<GpuEncodeRequest>, reason: &str) {
-        rx.close();
-        let mut handed = 0;
-        while let Some(request) = rx.blocking_recv() {
-            hand_back(request, reason);
-            handed += 1;
-        }
+        let handed = drain(rx, |request| hand_back(request, reason));
         tracing::debug!(handed, reason, "GPU worker handed its queue back");
+    }
+
+    /// Closes the channel and gives every request in it to `answer`, until
+    /// no sender holds a slot (#464): the buffered requests, and those whose
+    /// senders reserved a slot before the close and send after it.
+    /// `blocking_recv` returns `None` only then, where `try_recv` reports
+    /// the queue empty while a reserved slot is still to be filled, and a
+    /// request sent into it after the loop ended would never be answered
+    /// (`GpuEncoderChannel` keeps its sender for the session, so the reply
+    /// channel is never dropped either). A send that comes after the close
+    /// fails and returns the request to its caller with the error. Returns
+    /// how many requests were answered.
+    ///
+    /// Must be called on a blocking thread, as the worker is.
+    fn drain(
+        rx: &mut mpsc::Receiver<GpuEncodeRequest>,
+        mut answer: impl FnMut(GpuEncodeRequest),
+    ) -> usize {
+        rx.close();
+        let mut answered = 0;
+        while let Some(request) = rx.blocking_recv() {
+            answer(request);
+            answered += 1;
+        }
+        answered
     }
 
     /// Spawn the worker loop around `processor` on a dedicated blocking
@@ -886,8 +913,9 @@ mod inner {
     /// take it. The loop ends:
     ///
     /// - when the shutdown token is cancelled, between tiles: a tile in
-    ///   progress is finished and answered, queued requests are dropped and
-    ///   their callers see the response channel closed;
+    ///   progress is finished and answered; every queued request, and every
+    ///   one whose sender already holds a slot, fails with "GPU worker shut
+    ///   down" (#464);
     /// - when every sender is dropped, after the buffered requests;
     /// - when the GPU fails (#420): the processor panics (the request in
     ///   progress fails with the panic's message), `health` is failed from
@@ -1237,8 +1265,7 @@ mod tests {
     }
 
     /// Shutdown is seen between tiles: the tile in progress is finished and
-    /// answered, the queued one is never started and its caller sees the
-    /// response channel closed.
+    /// answered, the queued one is never started and fails (#464).
     #[tokio::test]
     async fn shutdown_stops_a_busy_loop_after_its_tile() {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -1272,12 +1299,84 @@ mod tests {
 
         let (first, _) = processed(reply_of(replies.next().unwrap()).await);
         assert_eq!(first.unwrap().len(), 8, "the busy tile is answered");
-        let queued = replies.next().unwrap().await;
-        assert!(queued.is_err(), "the queued request is dropped unanswered");
+        let (queued, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(
+            error_text(&queued),
+            "Compression failed: GPU worker shut down"
+        );
         assert!(
             started_rx.try_recv().is_err(),
             "the queued request was never started"
         );
+    }
+
+    /// A request sent while the shutdown drains the queue is answered
+    /// (#464, reported in #459). Its sender reserved its slot before the
+    /// drain began and sends after the queue looked empty: a drain that
+    /// stopped there, dropping the receiver, left the request in a channel
+    /// nobody reads, and `GpuEncoderChannel` keeps its sender for the
+    /// session, so the caller waited forever.
+    #[tokio::test]
+    async fn shutdown_answers_a_request_sent_while_the_queue_drains() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let permit = tx.clone().reserve_owned().await.expect("a free slot");
+        let shutdown = CancellationToken::new();
+        let handle = spawn(SoftwareProcessor, rx, shutdown.clone());
+
+        shutdown.cancel();
+        // Several idle polls: the worker has seen the shutdown and found
+        // the queue empty.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (late, reply) = request(4);
+        permit.send(late);
+
+        let (result, _) = processed(reply_of(reply).await);
+        assert_eq!(
+            error_text(&result),
+            "Compression failed: GPU worker shut down"
+        );
+        loop_ends(handle, Duration::from_secs(1)).await;
+        drop(tx);
+    }
+
+    /// The same after a panic (#464): a request sent while the failed
+    /// worker drains its queue comes back with its image (#420).
+    #[tokio::test]
+    async fn a_panic_answers_a_request_sent_while_the_queue_drains() {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let permit = tx.clone().reserve_owned().await.expect("a free slot");
+        let in_progress = queue(&tx, &[4]).pop().unwrap();
+        let health = SharedGpuHealth::new();
+        let handle = spawn_tile_worker(
+            FnProcessor(
+                |_: RgbaImage, _: &mut GpuTileTiming| -> Result<Vec<u8>, DdsError> {
+                    panic!("device lost")
+                },
+            ),
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            HangRule::default(),
+        );
+
+        // The health turns Failed just before the drain begins.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !health.is_failed() {
+            assert!(Instant::now() < deadline, "the worker never failed");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (late, reply) = request(8);
+        permit.send(late);
+
+        let (image, reason) = returned(reply_of(reply).await);
+        assert_eq!(
+            (image.width(), reason.as_str()),
+            (8, "GPU worker panicked: device lost")
+        );
+        assert!(processed(reply_of(in_progress).await).0.is_err());
+        loop_ends(handle, Duration::from_secs(1)).await;
+        drop(tx);
     }
 
     /// Requests already buffered are still served after the last sender is
