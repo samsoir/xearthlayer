@@ -91,9 +91,19 @@ struct GpuEncodeRequest {
     image: RgbaImage,       // source image, moved (not cloned)
     format: DdsFormat,
     mipmap_count: usize,
-    response: oneshot::Sender<Result<Vec<u8>, DdsError>>,
+    sent_at: Instant,       // the caller starting its send: start of the queue wait
+    response: oneshot::Sender<GpuEncodeReply>, // the result and the tile's GpuTileTiming
 }
 ```
+
+**The loop and the tile work are apart (#419).** `spawn_tile_worker` runs the
+loop (receive, shutdown, `catch_unwind`, drain, reply, timing) around any
+`TileProcessor`, whose one method encodes one tile and fills the tile's
+stage times. `WgpuTileProcessor` (device, queue, `GpuBlockCompressor`) is the
+production processor, and `spawn_gpu_worker` starts the loop with it. Tests
+drive the real loop with processors that panic, sleep, fail or record their
+order, so the loop's failure handling, shutdown and drain are tested without
+a GPU.
 
 **Worker loop:**
 1. Receive `GpuEncodeRequest` with owned source image
@@ -122,6 +132,28 @@ VRAM budget: pipeline depth 2 with 4096x4096 tiles ~ 160MB peak.
 - Worker panic recovery via `catch_unwind` (logs error, sends failure, drains queue, breaks loop)
 - `device.on_uncaptured_error()` registered for device loss logging
 - Structured tracing on buffer lifecycle and error paths
+
+### Stage Timing and Queue Depth (#419)
+
+Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
+
+| Stage | What it covers |
+|---|---|
+| `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. A lone tile waits mostly for the idle worker's poll, up to 10 ms |
+| `downsample` | CPU mip generation (`MipmapStream`, which works one level ahead) and the padding of the sub-block tail |
+| `upload` | The tile's output and readback buffers, each level's texture and `queue.write_texture` |
+| `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included (no timestamp queries) |
+| `readback` | Receiving the map, copying out of the mapped range and growing the result `Vec` |
+| `process` | The processor's whole call, on the worker |
+| total | On the caller, from its send to the reply |
+
+They appear in three places:
+
+- **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker), and per level `gpu_downsample` (`computes_level`), `gpu_buffers`, `gpu_upload`, `gpu_submit_poll` and `gpu_readback`, plus `dds_header_assembly` in `DdsEncoder`.
+- **The debug log**: one `GPU encode: tile stages` line per tile. Header assembly, which copies the payload behind the header, is in the encoder's own debug line (`assemble_us`), not in this one or the sample: removing that copy belongs with #423.
+- **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
+
+The queue depth (`GpuEncodeStats`, `dds/gpu_stats.rs`) is raised before `blocking_send` and lowered when the reply or the failure is back, by a guard that drops on every path. It counts callers blocked on a full channel, which the channel's own capacity (32 buffered requests) does not show.
 
 ## Memory Optimization
 
@@ -177,14 +209,30 @@ The `MipmapCompressor` trait accepts an owned `RgbaImage`, which is moved (not c
 
 ## Performance
 
-| Metric | ISPC (CPU) | wgpu iGPU |
-|--------|-----------|-----------|
-| 4096x4096 BC1 encode | ~20-50ms | ~2-5ms |
-| 4096x4096 + 5 mipmaps | ~25-60ms | ~7-12ms |
-| CPU utilisation | 100% on encoding threads | ~0% (GPU-offloaded) |
-| Memory overhead | Negligible | ~50-100MB (pipelines, buffers) |
+Measured on 2026-11-24 with `tests/gpu_pipeline_stress.rs` (#419), on a quiet Framework 16 (Ryzen AI 9 HX 370, 24 threads, on AC power). The tile is a textured 4096×4096 image with its full 13-level chain, encoded to BC1 in a release build. "Lone" is 10 tiles, one at a time, after a warm-up. "Burst" is 15 tiles submitted at once, then 1 s idle, for 40 s. Times are p50 per tile in ms.
 
-On integrated GPUs with shared memory, texture upload and readback are near-free (no PCIe transfer).
+| Stage | Radeon 890M (integrated, RADV) lone | burst | RTX 5070 Laptop (discrete) lone | burst, first bursts |
+|---|---|---|---|---|
+| queue wait | 5.5 | 131 | 5.6 | 175 |
+| CPU downsample | 6.9 | 6.4 | 7.1 | 6.4 |
+| upload (buffers, textures, `write_texture`) | 4.3 | 4.3 | 8.2 | 8.2 |
+| GPU (submit to poll, 13 levels) | 5.9 | 5.8 | 4.0 | 4.5 |
+| readback (map, copy, `Vec` growth) | 1.3 | 0.9 | 1.4 | 1.0 |
+| worker total | 18.5 | 17.9 | 20.7 | 20.6 |
+| caller total | 24.3 | 149 | 26.5 | 199 |
+| throughput | | 54 tiles/s | | 48–50 tiles/s |
+
+ISPC on the same machine and tile, through `DdsEncoder` (`ispc_reference_on_the_same_tile`): 32 ms for a lone tile on one thread, and 167 tiles/s for a burst of 15 across 24 threads.
+
+What the numbers show:
+
+- **The single worker sets the GPU path's throughput.** Throughput is about 1 / worker total, about 55 tiles/s at best, a third of ISPC across all cores. Under a burst, a tile's latency is almost all queue wait, growing with its place in the queue.
+- **A lone tile is only a little faster than ISPC on one thread:** about 25 ms against 32 ms. Of that, 5 to 6 ms is the idle worker's 10 ms poll (`try_recv` and sleep).
+- **The CPU downsample, which runs on the worker thread, is its largest stage on the integrated GPU.** Upload is not free there either (4.3 ms, shared memory); on the discrete GPU it is the largest stage (8.2 ms over PCIe).
+- **The NVIDIA driver's power management cuts the discrete GPU's rate by two thirds under bursty work.** After about 7 bursts with 1 s idle gaps, the driver moved the GPU from P0 (12,001 MHz memory, PCIe gen 4) to P5 and P8 (810 and 405 MHz memory, PCIe gen 1 to 2) at 38 °C. Upload rose to 31 ms and submit-to-poll to 21 ms, and throughput fell to 14 tiles/s, in two runs out of two. Bursts back to back stayed at about 45 tiles/s. A discrete GPU that renders nothing else between tiles sees this load pattern in flight.
+- **Memory:** process RSS grew about 200 MB on the NVIDIA driver over a run, and between 3 and 110 MB on RADV.
+
+The GPU figure is wall time from submit to poll, driver included: timestamp queries are not used. Header assembly in `DdsEncoder` is not in the table.
 
 ## Diagnostics
 
@@ -203,7 +251,7 @@ GPU Adapters:
 
 - `"software"` -> `SoftwareCompressor`
 - `"ispc"` -> `IspcCompressor` (default)
-- `"gpu"` -> `GpuEncoderChannel` via `create_gpu_resources()`; hard error on failure
+- `"gpu"` -> `GpuEncoderChannel` via `create_gpu_resources()`; hard error on failure. The builder also starts the channel's 60 s `GPU encode sample` logger, which ends with the service's shutdown token or the channel
 
 No changes to task, executor, or job code. The compressor is injected via the existing `DdsEncoder` API.
 
@@ -212,7 +260,9 @@ No changes to task, executor, or job code. The compressor is injected via the ex
 | File | Purpose |
 |------|---------|
 | `dds/compressor.rs` | `ImageCompressor` and `MipmapCompressor` traits, `SoftwareCompressor`, `IspcCompressor`, `create_gpu_resources` |
-| `dds/gpu_channel.rs` | `GpuEncoderChannel` (implements `MipmapCompressor`), GPU worker task |
+| `dds/gpu_channel.rs` | `GpuEncoderChannel` (implements `MipmapCompressor`), the worker loop (`spawn_tile_worker`), `TileProcessor` and `WgpuTileProcessor`, `GpuTileTiming` |
+| `dds/gpu_stats.rs` | `GpuEncodeStats`: stage windows, failures, queue depth, the `GPU encode sample` line |
+| `tests/gpu_pipeline_stress.rs` | Ignored GPU benchmark: lone tiles and bursts on the production chain, with the ISPC reference |
 | `dds/mipmap.rs` | `MipmapStream` iterator |
 | `dds/encoder.rs` | `DdsEncoder`, `CompressorBackend` dispatch |
 | `service/builder.rs` | Compressor construction and wiring |
