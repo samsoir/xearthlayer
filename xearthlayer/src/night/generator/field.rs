@@ -10,7 +10,7 @@ use super::gain::gain;
 use super::noise::value_noise;
 use super::RecipeLookup;
 use crate::night::footprint::Footprint;
-use crate::night::recipe::{BrightnessScale, Grid, Recipe};
+use crate::night::recipe::{Grid, RadianceCurve, Recipe};
 
 /// How far beyond a footprint sampling can reach, in degrees: bilinear
 /// neighbours and the class warp stay well inside it.
@@ -53,7 +53,8 @@ pub struct RecipeField {
     slots: Vec<Option<Arc<Recipe>>>,
     class_dims: Option<(usize, usize)>,
     brightness_dims: Option<(usize, usize)>,
-    scale: BrightnessScale,
+    /// The brightness scale's curve, its logarithm taken once.
+    curve: RadianceCurve,
 }
 
 impl RecipeField {
@@ -83,7 +84,7 @@ impl RecipeField {
             footprint: *footprint,
             class_dims: first.map(|r| dims(&r.class)),
             brightness_dims: first.map(|r| dims(&r.brightness)),
-            scale: first.map(|r| r.scale).unwrap_or_default(),
+            curve: first.map(|r| r.scale.curve()).unwrap_or_default(),
             south0,
             west0,
             lats,
@@ -190,7 +191,7 @@ impl RecipeField {
         if b <= 0.0 {
             return 0.0;
         }
-        self.scale.radiance_at(b)
+        self.curve.radiance_at(b)
     }
 
     /// Radiance (nW/cm2/sr) at a point; 0 where no recipe contributes.
@@ -404,6 +405,7 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::synthetic;
     use super::*;
+    use crate::night::recipe::BrightnessScale;
 
     fn footprint(north: f64, south: f64, west: f64, east: f64) -> Footprint {
         Footprint {

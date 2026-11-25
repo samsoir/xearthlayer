@@ -66,8 +66,42 @@ impl BrightnessScale {
 
     /// `radiance` for a fractional byte, as bilinear sampling produces.
     pub fn radiance_at(&self, b: f64) -> f64 {
-        let span = (1.0 + self.rmax_nw / self.r0_nw).ln();
-        self.r0_nw * ((b / 255.0 * span).exp() - 1.0)
+        self.curve().radiance_at(b)
+    }
+
+    /// The scale with its logarithm taken once, for sampling it many times.
+    pub fn curve(&self) -> RadianceCurve {
+        RadianceCurve {
+            scale: *self,
+            span: (1.0 + self.rmax_nw / self.r0_nw).ln(),
+        }
+    }
+}
+
+/// A [`BrightnessScale`] with `ln(1 + rmax / r0)` computed once: the lit
+/// generator reads a radiance per texel, and the logarithm depends on the
+/// scale alone. Gives the bits `BrightnessScale::radiance_at` gives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadianceCurve {
+    scale: BrightnessScale,
+    span: f64,
+}
+
+impl Default for RadianceCurve {
+    fn default() -> Self {
+        BrightnessScale::default().curve()
+    }
+}
+
+impl RadianceCurve {
+    /// The scale the curve was made from.
+    pub fn scale(&self) -> BrightnessScale {
+        self.scale
+    }
+
+    /// `BrightnessScale::radiance_at` without the logarithm.
+    pub fn radiance_at(&self, b: f64) -> f64 {
+        self.scale.r0_nw * ((b / 255.0 * self.span).exp() - 1.0)
     }
 }
 
@@ -362,6 +396,26 @@ mod tests {
         let s = BrightnessScale::default();
         for b in [0u8, 1, 97, 230, 255] {
             assert!((s.radiance_at(f64::from(b)) - s.radiance(b)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_curve_gives_the_scale_bits() {
+        for scale in [
+            BrightnessScale::default(),
+            BrightnessScale {
+                r0_nw: 0.37,
+                rmax_nw: 912.5,
+            },
+        ] {
+            let curve = scale.curve();
+            assert_eq!(curve.scale(), scale);
+            for k in 0..=2550 {
+                let b = f64::from(k) * 0.1;
+                let span = (1.0 + scale.rmax_nw / scale.r0_nw).ln();
+                let inline = scale.r0_nw * ((b / 255.0 * span).exp() - 1.0);
+                assert_eq!(curve.radiance_at(b).to_bits(), inline.to_bits(), "{b}");
+            }
         }
     }
 

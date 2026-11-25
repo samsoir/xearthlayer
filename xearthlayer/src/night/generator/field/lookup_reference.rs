@@ -72,7 +72,7 @@ pub(crate) fn radiance(field: &RecipeField, lat: f64, lon: f64) -> f64 {
     if b <= 0.0 {
         return 0.0;
     }
-    let scale = field.scale;
+    let scale = field.curve.scale();
     let span = (1.0 + scale.rmax_nw / scale.r0_nw).ln();
     scale.r0_nw * ((b / 255.0 * span).exp() - 1.0)
 }
