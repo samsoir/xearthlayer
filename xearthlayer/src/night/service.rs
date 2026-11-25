@@ -278,7 +278,7 @@ struct Generated {
 
 /// Whether a generation had every road tile it could draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoadsState {
+pub enum RoadsState {
     Complete,
     /// A tile was still building at the deadline: a later generation may
     /// have it, so the payload is kept nowhere.
