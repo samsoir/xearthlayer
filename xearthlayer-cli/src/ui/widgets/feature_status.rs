@@ -188,17 +188,16 @@ impl<'a> FeatureStatusWidget<'a> {
 
     fn encoder_line(&self) -> Line<'static> {
         let mut spans = vec![styled("Tile Processing Engine, ", TEXT)];
-        if let EncoderStatus::GpuFailed { reason, .. } = &self.status.encoder {
-            spans.push(styled(
-                format!(
-                    "GPU encoder failed ({}), encoding on CPU (ISPC)",
-                    shortened(reason)
-                ),
-                WARN,
-            ));
-            return line(Mark::WARNING, spans);
-        }
         let (mark, adapter) = match &self.status.encoder {
+            // What is being done before why: a narrow pane cuts the
+            // reason, never the fallback.
+            EncoderStatus::GpuFailed { reason, .. } => {
+                spans.push(styled(
+                    format!("GPU failed, encoding on CPU (ISPC): {}", shortened(reason)),
+                    WARN,
+                ));
+                (Mark::WARNING, None)
+            }
             EncoderStatus::Software => {
                 spans.push(styled("Software", Color::Red));
                 (self.feature_mark(symbols::ENGINE, Mark::CHECK), None)
@@ -213,7 +212,6 @@ impl<'a> FeatureStatusWidget<'a> {
             ),
             // The warning outranks the emoji: it is the one thing to see.
             EncoderStatus::GpuSharedWithSim(adapter) => (Mark::WARNING, Some(adapter)),
-            EncoderStatus::GpuFailed { .. } => unreachable!("drawn above"),
         };
         if let Some(adapter) = adapter {
             spans.push(styled(
@@ -276,8 +274,8 @@ impl<'a> FeatureStatusWidget<'a> {
 }
 
 /// Characters of a GPU failure's reason the encoder line shows: a panic's
-/// message can run long, and what is being done about it must stay on the
-/// pane. The whole reason is in the log's WARN.
+/// message can run long. The reason comes after the fallback, so a narrow
+/// pane cuts it further; the whole reason is in the log's WARN.
 const REASON_CHARS: usize = 40;
 
 /// `reason`, cut to [`REASON_CHARS`] with an ellipsis when longer.
@@ -445,10 +443,9 @@ mod tests {
     }
 
     /// Each row as text, skipping the cell a wide symbol covers so an emoji
-    /// reads as written. 120 columns, as the Status pane on a typical
-    /// terminal.
+    /// reads as written. 100 columns: a narrow terminal's Status pane.
     fn render_with(widget: FeatureStatusWidget<'_>) -> (Buffer, Vec<String>) {
-        let area = Rect::new(0, 0, 120, 4);
+        let area = Rect::new(0, 0, 100, 4);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         let rows = (0..area.height)
@@ -739,8 +736,8 @@ mod tests {
             let (buf, rows) = render(&status, symbols);
             assert_eq!(
                 rows[1],
-                "  !  Tile Processing Engine, GPU encoder failed (GPU device lost: driver reset), \
-                 encoding on CPU (ISPC)"
+                "  !  Tile Processing Engine, GPU failed, encoding on CPU (ISPC): \
+                 GPU device lost: driver reset"
             );
             assert_eq!(marker(&buf, 1), Color::Yellow, "{symbols:?}");
             assert_eq!(text(&buf, 1), Color::Gray, "the label stays grey");
@@ -748,10 +745,11 @@ mod tests {
         }
     }
 
-    /// A long reason (a panic's message) is cut, so what is being done about
-    /// it stays on the line.
+    /// What is being done comes before why, so a narrow pane cuts the
+    /// reason, never the fallback; a long reason (a panic's message) is cut
+    /// to [`REASON_CHARS`] whatever the width.
     #[test]
-    fn a_long_failure_reason_is_cut_before_the_fallback() {
+    fn a_long_failure_reason_is_cut_after_the_fallback() {
         let reason = "GPU worker panicked: assertion failed: width % 4 == 0 && height % 4 == 0";
         let status = FeatureStatus {
             encoder: EncoderStatus::GpuFailed {
@@ -763,8 +761,16 @@ mod tests {
         let (_, rows) = render(&status, SymbolSet::Plain);
         assert_eq!(
             rows[1],
-            "  !  Tile Processing Engine, GPU encoder failed \
-             (GPU worker panicked: assertion failed: …), encoding on CPU (ISPC)"
+            "  !  Tile Processing Engine, GPU failed, encoding on CPU (ISPC): \
+             GPU worker panicked: assertion fail"
+        );
+        let full = FeatureStatusWidget::new(&status)
+            .with_symbols(SymbolSet::Plain)
+            .encoder_line();
+        assert_eq!(
+            full.to_string(),
+            "  !  Tile Processing Engine, GPU failed, encoding on CPU (ISPC): \
+             GPU worker panicked: assertion failed: …"
         );
         assert_eq!(shortened("short"), "short");
         assert_eq!(shortened(reason).chars().count(), REASON_CHARS);
