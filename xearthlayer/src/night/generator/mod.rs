@@ -12,6 +12,9 @@ pub mod led;
 pub mod noise;
 pub mod tiling;
 
+#[cfg(test)]
+mod encode_timing;
+
 use std::sync::Arc;
 
 use image::RgbaImage;
@@ -151,8 +154,9 @@ fn encode_chain(image: &RgbaImage) -> Result<Vec<u8>, crate::dds::DdsError> {
 
 /// The payload length of `image`'s chain when every texel of it is opaque
 /// black, else `None` (an empty image included, so its error stays the full
-/// path's). Its whole chain is then opaque black, and ISPC encodes an opaque
-/// black block as eight zero bytes, which the repair leaves alone.
+/// path's). Its whole chain is then opaque black. ISPC's BC1 kernels encode
+/// an opaque black block as eight zero bytes, which the repair leaves alone:
+/// measured, and pinned by test on the x86 and aarch64 kernels CI runs.
 fn black_payload_len(image: &RgbaImage) -> Option<usize> {
     const OPAQUE_BLACK: [u8; 4] = [0, 0, 0, 255];
     let (w, h) = image.dimensions();
@@ -236,6 +240,8 @@ fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
     let decode = cpu::linear_table();
     let encoder = led::ByteEncoder::get();
     let encode = |c: f32| encoder.byte(c);
+    // Every texel the generator makes is opaque, so nearly every alpha is
+    // exactly 1.0 and skips the rounding.
     let alpha = |a: f32| {
         if a == 1.0 {
             255
@@ -293,7 +299,7 @@ mod tests {
         assert_eq!(LIT_GENERATOR_VERSION, 10);
     }
 
-    fn name_at(lat: f64, lon: f64) -> DdsFilename {
+    pub(super) fn name_at(lat: f64, lon: f64) -> DdsFilename {
         let n = f64::from(1u32 << 16);
         let x = ((lon + 180.0) / 360.0 * n) as u32;
         let lat_r = lat.to_radians();
@@ -384,7 +390,7 @@ mod tests {
         rgbs
     }
 
-    fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
+    pub(super) fn solid(size: u32, rgb: [u8; 3]) -> RgbaImage {
         RgbaImage::from_pixel(size, size, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
     }
 
@@ -711,7 +717,7 @@ mod tests {
     }
 
     /// `lit_chain` before #439.
-    fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
+    pub(super) fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
         let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
         let (mut w, mut h) = image.dimensions();
         let mut linear: Vec<[f32; 4]> = image
@@ -749,7 +755,7 @@ mod tests {
     }
 
     /// `dim` before #439.
-    fn dim_reference(level: &mut RgbaImage, gain: f32) {
+    pub(super) fn dim_reference(level: &mut RgbaImage, gain: f32) {
         for px in level.pixels_mut() {
             let rgb = &mut px.0[..3];
             for c in rgb.iter_mut() {
@@ -777,8 +783,10 @@ mod tests {
 
     /// Floats on which an encode is most likely to differ: specials, the
     /// float steps either side of every byte boundary, and a dense sweep of
-    /// [0, 1.25].
-    fn encode_probe_inputs() -> Vec<f32> {
+    /// [0, 1.25]. A superset of the inputs `led`'s
+    /// `the_byte_encoder_is_encode_rounded_for_every_kind_of_input` builds
+    /// inline, for its tests to share.
+    pub(super) fn encode_probe_inputs() -> Vec<f32> {
         let mut inputs = vec![
             0.0,
             -0.0,
@@ -822,8 +830,10 @@ mod tests {
 
     #[test]
     fn the_chain_encode_is_led_encode_rounded() {
-        // With `the_byte_encoder_exhaustive` (every float from 0 to 1 against
-        // the same rounding), this makes `ByteEncoder` the chain's encode.
+        // With `led`'s tests of `ByteEncoder` against the same rounding (on
+        // these inputs, and on every float from 0 to 1 in
+        // `the_byte_encoder_exhaustive`), this makes `ByteEncoder` the
+        // chain's encode.
         for x in encode_probe_inputs() {
             assert_eq!(
                 chain_encode_reference(x),
@@ -832,34 +842,6 @@ mod tests {
                 x.to_bits()
             );
         }
-    }
-
-    #[test]
-    fn the_byte_encoder_is_the_chain_encode() {
-        let encoder = led::ByteEncoder::get();
-        for x in encode_probe_inputs() {
-            assert_eq!(
-                encoder.byte(x),
-                chain_encode_reference(x),
-                "linear {x:e} ({:#x})",
-                x.to_bits()
-            );
-        }
-    }
-
-    /// Every float from 0 to 1, the inputs of `the_byte_encoder_exhaustive`.
-    /// Release only (about two billion `powf`): `cargo test --release -p
-    /// xearthlayer --lib the_chain_encode_is_led_encode_rounded_exhaustive --
-    /// --ignored`.
-    #[test]
-    #[ignore]
-    fn the_chain_encode_is_led_encode_rounded_exhaustive() {
-        let mut mismatches = 0u64;
-        for bits in 0..=1.0f32.to_bits() {
-            let x = f32::from_bits(bits);
-            mismatches += u64::from(chain_encode_reference(x) != led_encode_round(x));
-        }
-        assert_eq!(mismatches, 0);
     }
 
     /// Every (R, G) pair, with B their XOR, at the given alpha.
@@ -942,19 +924,21 @@ mod tests {
     fn opaque_black_encodes_to_zeros_by_the_full_path_and_the_shortcut() {
         // Pinned: ISPC encodes an opaque black block as eight zero bytes and
         // the repair leaves it, so the full path gives a payload of zeros,
-        // which the shortcut returns without running it.
-        for size in FIRST_VISIBLE_SIZES {
-            let black = solid(size, [0; 3]);
+        // which the shortcut returns without running it. Non-square sizes
+        // keep the shortcut's length tied to the chain the full path builds.
+        let square = FIRST_VISIBLE_SIZES.map(|s| (s, s));
+        for (w, h) in square.into_iter().chain([(64, 16), (13, 7), (1024, 512)]) {
+            let black = RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
             let full = encode_chain(&black).unwrap();
-            let levels = layout::full_chain_levels(size, size);
+            let levels = layout::full_chain_levels(w, h);
             assert_eq!(
                 full.len(),
-                layout::chain_len(size, size, levels, DdsFormat::BC1),
-                "{size} px"
+                layout::chain_len(w, h, levels, DdsFormat::BC1),
+                "{w}x{h}"
             );
-            assert!(full.iter().all(|&b| b == 0), "{size} px full path");
-            assert_eq!(black_payload_len(&black), Some(full.len()), "{size} px");
-            assert_eq!(&encode_visible(black).unwrap()[..], &full[..], "{size} px");
+            assert!(full.iter().all(|&b| b == 0), "{w}x{h} full path");
+            assert_eq!(black_payload_len(&black), Some(full.len()), "{w}x{h}");
+            assert_eq!(&encode_visible(black).unwrap()[..], &full[..], "{w}x{h}");
         }
     }
 
@@ -968,188 +952,5 @@ mod tests {
         assert_eq!(black_payload_len(&one_translucent), None);
         // An empty image is still the full path's error.
         assert_eq!(black_payload_len(&RgbaImage::new(0, 0)), None);
-    }
-
-    /// The ZL16 textures of the recipe tiles under `roots`, sampled evenly
-    /// to at most `tiles` tiles, three positions in each.
-    fn real_texture_names(roots: &[std::path::PathBuf], tiles: usize) -> Vec<DdsFilename> {
-        let mut found: Vec<(i32, i32)> = Vec::new();
-        for root in roots {
-            let Ok(blocks) = std::fs::read_dir(root.join("night")) else {
-                continue;
-            };
-            for block in blocks.flatten() {
-                let Ok(files) = std::fs::read_dir(block.path()) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let name = file.file_name();
-                    let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".oxn")) else {
-                        continue;
-                    };
-                    if stem.len() == 7 {
-                        if let (Ok(lat), Ok(lon)) = (stem[..3].parse(), stem[3..].parse()) {
-                            found.push((lat, lon));
-                        }
-                    }
-                }
-            }
-        }
-        found.sort_unstable();
-        found.dedup();
-        let step = found.len().div_ceil(tiles.max(1)).max(1);
-        found
-            .iter()
-            .step_by(step)
-            .flat_map(|&(lat, lon)| {
-                [(0.5, 0.5), (0.25, 0.25), (0.75, 0.75)]
-                    .map(|(a, b)| name_at(f64::from(lat) + a, f64::from(lon) + b))
-            })
-            .collect()
-    }
-
-    /// Milliseconds `f` took, and its result.
-    fn timed<T>(f: impl FnOnce() -> T) -> (f64, T) {
-        let started = std::time::Instant::now();
-        let out = f();
-        (started.elapsed().as_secs_f64() * 1e3, out)
-    }
-
-    /// `lit_chain`, `dim` and `bc1_levels` of `img`, in ms, by the encoder
-    /// before #439 and by today's, each the least of `runs`; asserts both
-    /// payloads and `encode_visible`'s are the same bytes.
-    fn stage_times(img: &RgbaImage, runs: usize) -> ([f64; 3], [f64; 3], f64) {
-        let (mut before, mut after, mut visible) = ([f64::MAX; 3], [f64::MAX; 3], f64::MAX);
-        let least = |acc: &mut [f64; 3], t: [f64; 3]| {
-            for (a, t) in acc.iter_mut().zip(t) {
-                *a = a.min(t);
-            }
-        };
-        for _ in 0..runs {
-            let (t0, mut chain) = timed(|| lit_chain_reference(img));
-            let (t1, ()) = timed(|| {
-                for (n, level) in chain.iter_mut().enumerate() {
-                    dim_reference(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
-                }
-            });
-            let (t2, old) = timed(|| bc1_levels(&chain).unwrap());
-            least(&mut before, [t0, t1, t2]);
-
-            let (t0, mut chain) = timed(|| lit_chain(img));
-            let (t1, ()) = timed(|| {
-                for (n, level) in chain.iter_mut().enumerate() {
-                    dim(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
-                }
-            });
-            let (t2, new) = timed(|| bc1_levels(&chain).unwrap());
-            least(&mut after, [t0, t1, t2]);
-            assert!(new == old, "the stages changed a byte");
-
-            let owned = img.clone();
-            let (t, payload) = timed(|| encode_visible(owned).unwrap());
-            visible = visible.min(t);
-            assert!(payload[..] == old[..], "encode_visible changed a byte");
-        }
-        (before, after, visible)
-    }
-
-    /// Release-build timing of the encode stages before and after #439, on
-    /// real ZL16 textures at 1024 px and on a black one, one thread. Every
-    /// payload is also checked byte for byte against the encoder before
-    /// #439. The inputs are the installation's, named by environment
-    /// variables read here only: `XEL_NIGHT_PACKAGE`, one or more ortho
-    /// package directories holding `night/` recipes (separated as `PATH`
-    /// is), and `XEL_LAMINAR_ART`, Laminar's `1000 world terrain`
-    /// directory. Without them it says so and does nothing. Run with
-    /// `XEL_NIGHT_PACKAGE=... XEL_LAMINAR_ART=... cargo test --release -p
-    /// xearthlayer --lib time_the_lit_encode_stages -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn time_the_lit_encode_stages() {
-        let (Some(packages), Some(art)) = (
-            std::env::var_os("XEL_NIGHT_PACKAGE"),
-            std::env::var_os("XEL_LAMINAR_ART"),
-        ) else {
-            eprintln!(
-                "time_the_lit_encode_stages: set XEL_NIGHT_PACKAGE (ortho package \
-                 directories with night/ recipes) and XEL_LAMINAR_ART (Laminar's \
-                 `1000 world terrain`); nothing timed"
-            );
-            return;
-        };
-        const SIZE: u32 = 1024;
-        const RUNS: usize = 3;
-        let roots: Vec<std::path::PathBuf> = std::env::split_paths(&packages).collect();
-        let region = |root: &std::path::Path| {
-            let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let code = name.trim_start_matches("zzXEL_").trim_end_matches("_ortho");
-            LedRegion::from_code(code)
-        };
-        let store = crate::night::RecipeStore::with_regions(
-            roots.iter().map(|r| (r.clone(), region(r))).collect(),
-        );
-        let art = crate::night::LaminarArt::new(art.into());
-        let regions = |a: i32, b: i32| {
-            store
-                .get_with_region(a, b)
-                .map_or(LedRegion::Unknown, |(_, r)| r)
-        };
-        let model = RoadModel::DEFAULT;
-        let roads = RoadField::empty(SIZE);
-        let mut textures = Vec::new();
-        for name in real_texture_names(&roots, 40) {
-            let img = CpuLitGenerator.generate(&LitRequest {
-                name: &name,
-                size: SIZE,
-                brightness: 1.0,
-                recipes: &|a, b| store.get(a, b),
-                patterns: &|c| art.pattern(c),
-                regions: &regions,
-                led: &LedModel::DEFAULT,
-                roads: &roads,
-                road_model: &model,
-            });
-            if img.pixels().any(|p| p.0[..3] != [0; 3]) {
-                textures.push(img);
-            }
-        }
-        if textures.is_empty() {
-            eprintln!("time_the_lit_encode_stages: no lit texture under {roots:?}; nothing timed");
-            return;
-        }
-        let report = |label: &str, images: &[RgbaImage]| {
-            let (mut before, mut after, mut visible) = ([0.0; 3], [0.0; 3], 0.0);
-            for img in images {
-                let (b, a, v) = stage_times(img, RUNS);
-                for c in 0..3 {
-                    before[c] += b[c] / images.len() as f64;
-                    after[c] += a[c] / images.len() as f64;
-                }
-                visible += v / images.len() as f64;
-            }
-            let total = |t: [f64; 3]| t.iter().sum::<f64>();
-            println!(
-                "{label}: ms per texture, before -> after: lit_chain {:.2} -> {:.2}, \
-                 dim {:.2} -> {:.2}, bc1_levels {:.2} -> {:.2}, total {:.2} -> {:.2}; \
-                 encode_visible {:.2}",
-                before[0],
-                after[0],
-                before[1],
-                after[1],
-                before[2],
-                after[2],
-                total(before),
-                total(after),
-                visible
-            );
-        };
-        report(
-            &format!("{} real ZL16 textures at {SIZE} px", textures.len()),
-            &textures,
-        );
-        report(
-            &format!("black at {SIZE} px (stages without the shortcut)"),
-            &[solid(SIZE, [0; 3])],
-        );
     }
 }
