@@ -658,9 +658,9 @@ impl NightLitSource {
         {
             Ok(answer) => answer,
             Err(_) => {
-                // The probe is meant to be panic-free: XEL's panic hook
-                // unmounts on any panic. This arm is a last resort, and it
-                // remembers the dark answer so size and read keep agreeing.
+                // The probe is meant to be panic-free. This arm is a last
+                // resort, and it remembers the dark answer so size and read
+                // keep agreeing.
                 warn!("Night lighting: lit probe failed; footprint stays dark this session");
                 false
             }

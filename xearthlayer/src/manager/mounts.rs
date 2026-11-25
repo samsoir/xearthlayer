@@ -19,7 +19,6 @@ use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
 };
-use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
@@ -658,9 +657,6 @@ impl MountManager {
                     mountpoint: mountpoint.clone(),
                 };
 
-                // Register mount point with panic handler for cleanup on crash
-                panic_handler::register_mount(mountpoint.clone());
-
                 // Store service to keep runtime alive, then store session and mount info
                 self.consolidated_service = Some(service);
                 self.consolidated_session = Some(session);
@@ -740,11 +736,6 @@ impl MountManager {
             });
         }
 
-        // Unregister from panic handler before unmounting
-        if let Some(mount) = self.mounts.get(&key) {
-            panic_handler::unregister_mount(&mount.mountpoint);
-        }
-
         // Remove session first - Drop will trigger unmount via fusermount
         self.sessions.remove(&key);
         // Then remove service - this shuts down the runtime
@@ -763,11 +754,6 @@ impl MountManager {
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
         for key in keys.into_iter().rev() {
-            // Unregister from panic handler before unmounting
-            if let Some(mount) = self.mounts.get(&key) {
-                panic_handler::unregister_mount(&mount.mountpoint);
-            }
-
             // Remove session first - Drop will trigger unmount via fusermount
             self.sessions.remove(&key);
             // Then remove service - this shuts down the runtime
@@ -776,17 +762,11 @@ impl MountManager {
         }
 
         // Unmount patches (if mounted separately)
-        if let Some(ref mount) = self.patches_mount {
-            panic_handler::unregister_mount(&mount.mountpoint);
-        }
         self.patches_session = None;
         self.patches_mount = None;
         self.patches_service = None;
 
         // Unmount consolidated ortho (if mounted)
-        if let Some(ref mount) = self.consolidated_mount {
-            panic_handler::unregister_mount(&mount.mountpoint);
-        }
         self.consolidated_session = None;
         self.consolidated_mount = None;
         self.consolidated_service = None;
@@ -1016,9 +996,14 @@ impl Default for MountManager {
     }
 }
 
+/// Unmounts everything still mounted.
+///
+/// This is how a panic on the main thread during `run` removes the mount: it
+/// unwinds through `run`, which drops the orchestrator owning this manager.
+/// The panic hook leaves mounts alone, because it cannot tell a panic that
+/// will be caught from one that ends the process (#418, `crate::panic`).
 impl Drop for MountManager {
     fn drop(&mut self) {
-        // Ensure all mounts are cleaned up
         self.unmount_all();
     }
 }
@@ -1182,6 +1167,51 @@ mod tests {
     fn test_is_mounted_empty() {
         let manager = MountManager::new();
         assert!(!manager.is_mounted("na"));
+    }
+
+    #[test]
+    fn a_panic_unwinding_through_the_manager_unmounts_the_ortho_session() {
+        // #418: the panic hook no longer unmounts, so a panic on the main
+        // thread during `run` relies on this drop. A stand-in for the FUSE
+        // task records whether it was told to unmount; the mountpoint is a
+        // temporary folder that is not in the mount table, so no unmount
+        // command runs.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        let mountpoint = folder.path().join(ORTHO_MOUNT_FOLDER);
+        let told_to_unmount = Arc::new(AtomicBool::new(false));
+
+        let (unmount_tx, unmount_rx) = tokio::sync::oneshot::channel::<()>();
+        let recorded = Arc::clone(&told_to_unmount);
+        let fuse_task = runtime.spawn(async move {
+            // Ok only when the handle sent the signal, not when it was
+            // dropped unsent.
+            recorded.store(unmount_rx.await.is_ok(), Ordering::SeqCst);
+            Ok(())
+        });
+        let session = SpawnedMountHandle::new(fuse_task, unmount_tx, mountpoint.clone());
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut manager = MountManager::new();
+            manager.consolidated_session = Some(session);
+            manager.consolidated_mount = Some(ActiveMount {
+                region: "consolidated".to_string(),
+                package_type: PackageType::Ortho,
+                mountpoint,
+            });
+            panic!("main thread panic during run");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(
+            told_to_unmount.load(Ordering::SeqCst),
+            "dropping the manager while unwinding must unmount its session"
+        );
     }
 
     // Note: Integration tests requiring actual FUSE mounts are in integration tests

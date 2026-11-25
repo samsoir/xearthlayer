@@ -4,8 +4,9 @@
 //! the mount table as `/proc/mounts`, while macOS (macFUSE) uses the BSD
 //! `umount(8)` and `mount(8)`. Everything that needs to unmount a mount or ask
 //! "is this path mounted?" shares the same platform logic, so it lives here
-//! once: the panic handler, the spawned-mount Drop fallback, and the package
-//! manager's status display.
+//! once: the spawned-mount Drop fallback (which also serves a panic on the
+//! main thread, #418), stale-mount recovery, and the package manager's status
+//! display.
 
 use std::path::Path;
 use std::process::Command;
@@ -26,7 +27,7 @@ pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
     #[cfg(target_os = "macos")]
     {
         // macFUSE unmounts via BSD umount(8). This helper is only reached as a
-        // fallback from the panic handler and the Drop path, where the daemon
+        // fallback from the Drop path and stale-mount recovery, where the daemon
         // may be wedged and we just want the mount gone — so we always force
         // (`-f`) to detach immediately rather than risk blocking. The normal,
         // clean teardown goes through the async `MountHandle::unmount`, not

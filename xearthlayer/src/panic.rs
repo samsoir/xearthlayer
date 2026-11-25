@@ -1,245 +1,273 @@
-//! Panic handler for graceful cleanup and state logging.
+//! Panic report for `xearthlayer run`.
 //!
-//! This module provides a custom panic hook that:
-//! - Logs useful state information (telemetry, mount points)
-//! - Attempts to unmount FUSE filesystems to prevent X-Plane SIGBUS
-//! - Preserves the original panic behavior after cleanup
+//! [`init`] installs a process-wide panic hook that writes a report of every
+//! panic to stderr: a banner, the panic's location and message, and a
+//! telemetry snapshot when a source was registered with
+//! [`set_telemetry_callback`]. It then chains to the hook it replaced. While
+//! the dashboard runs, stderr is the flight log (#358), so that is where the
+//! report lands.
 //!
-//! The panic handler uses a global mount registry since panic hooks must be
-//! `'static`. Mount points are registered when created and unregistered on
-//! normal unmount.
+//! # When the mount is removed
+//!
+//! The hook never unmounts (#418). It runs at the point of every panic, on the
+//! panicking thread, before the stack unwinds and before any `catch_unwind`
+//! (or tokio's catching of task panics) sees it, so it cannot know whether the
+//! panic will be caught. When it unmounted, one recoverable panic anywhere in
+//! the service took all of XEarthLayer's scenery away from X-Plane for the
+//! rest of the session.
+//!
+//! - **A panic on the main thread** during `run` unwinds through `run`, which
+//!   drops its `ServiceOrchestrator`. That drops the `MountManager`, whose
+//!   `Drop` calls `unmount_all`; dropping the ortho session
+//!   (`SpawnedMountHandle`) unmounts it, escalating through
+//!   [`crate::system::unmount_fuse`] (`fusermount3`/`fusermount` on Linux,
+//!   `umount -f` on macOS) if the volume is still in the mount table. The
+//!   session is dropped before the service that owns its Tokio runtime, so the
+//!   FUSE task can still answer while it is unmounted.
+//! - **A panic on any other thread** is caught or ends only that thread: a
+//!   tokio task or `spawn_blocking` closure becomes a `JoinError`, the GPU
+//!   worker catches its own. The mount stays and keeps serving.
+//! - **Not covered**: a panic raised while another unwinds (a `Drop` that
+//!   panics) aborts the process before the drop path runs, as does
+//!   `SIGKILL`. The stale mount is then left for the next `run` to clear
+//!   ([`crate::system::recover_stale_fuse_mount`], before it mounts).
 
-use std::io::Write;
-use std::panic::{self, PanicHookInfo};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::any::Any;
+use std::io::{self, Write};
+use std::panic::{self, Location, PanicHookInfo};
+use std::sync::{Mutex, Once};
 
 use crate::metrics::TelemetrySnapshot;
 
-/// Global mount point registry for panic cleanup.
-static MOUNT_REGISTRY: OnceLock<Mutex<MountRegistry>> = OnceLock::new();
+/// A source of the telemetry snapshot written with every panic report.
+type TelemetrySource = Box<dyn Fn() -> TelemetrySnapshot + Send + Sync>;
 
-/// Registry of active mount points for panic cleanup.
-#[derive(Default)]
-struct MountRegistry {
-    /// Active mount points that need cleanup on panic.
-    mount_points: Vec<PathBuf>,
-    /// Callback to capture telemetry snapshot.
-    telemetry_callback: Option<Box<dyn Fn() -> TelemetrySnapshot + Send + Sync>>,
-}
+/// The registered telemetry source, if any. A `static` because a panic hook
+/// must be `'static`.
+static TELEMETRY_SOURCE: Mutex<Option<TelemetrySource>> = Mutex::new(None);
 
-/// Initialize the panic handler.
+/// Guards [`init`], so a second call does not stack a second hook.
+static INIT: Once = Once::new();
+
+/// Install the panic hook.
 ///
-/// This should be called once early in the application startup. It sets up
-/// a custom panic hook that will:
-///
-/// 1. Log the panic location and message
-/// 2. Capture and log telemetry state
-/// 3. Attempt to unmount all registered FUSE mount points
-/// 4. Chain to the default panic handler
-///
-/// # Safety
-///
-/// This function should only be called once. Subsequent calls will be ignored.
+/// Call once, early in `run`. For every panic, on any thread, the hook writes
+/// the report described in the module docs to stderr, then calls the hook
+/// it replaced. It does not unmount anything: see "When the mount is removed"
+/// in the module docs. Later calls do nothing.
 pub fn init() {
-    // Initialize the global registry
-    let _ = MOUNT_REGISTRY.get_or_init(|| Mutex::new(MountRegistry::default()));
-
-    // Store the original panic hook
-    let original_hook = panic::take_hook();
-
-    // Set our custom panic hook
-    panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
-        // First, run our cleanup
-        handle_panic(info);
-
-        // Then chain to the original hook
-        original_hook(info);
-    }));
+    INIT.call_once(|| {
+        let original_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
+            report(info);
+            original_hook(info);
+        }));
+    });
 }
 
-/// Register a mount point for panic cleanup.
+/// Register the source of the telemetry snapshot written with every panic
+/// report, replacing any earlier one.
 ///
-/// When a panic occurs, registered mount points will be unmounted using
-/// `fusermount -u` to prevent the FUSE filesystem from becoming stuck
-/// and causing SIGBUS in X-Plane.
-pub fn register_mount(path: PathBuf) {
-    if let Some(registry) = MOUNT_REGISTRY.get() {
-        if let Ok(mut guard) = registry.lock() {
-            guard.mount_points.push(path);
-        }
-    }
-}
-
-/// Unregister a mount point after normal unmount.
-///
-/// This removes the mount point from the registry so it won't be
-/// attempted during panic cleanup.
-pub fn unregister_mount(path: &PathBuf) {
-    if let Some(registry) = MOUNT_REGISTRY.get() {
-        if let Ok(mut guard) = registry.lock() {
-            guard.mount_points.retain(|p| p != path);
-        }
-    }
-}
-
-/// Set the telemetry callback for state capture on panic.
-///
-/// This callback will be invoked during panic handling to capture
-/// the current telemetry state for logging.
+/// The source runs on the panicking thread, inside the panic hook, so it must
+/// not panic or block: a panic there aborts the process.
 pub fn set_telemetry_callback<F>(callback: F)
 where
     F: Fn() -> TelemetrySnapshot + Send + Sync + 'static,
 {
-    if let Some(registry) = MOUNT_REGISTRY.get() {
-        if let Ok(mut guard) = registry.lock() {
-            guard.telemetry_callback = Some(Box::new(callback));
-        }
+    if let Ok(mut source) = TELEMETRY_SOURCE.lock() {
+        *source = Some(Box::new(callback));
     }
 }
 
-/// Handle a panic by logging state and cleaning up mounts.
-fn handle_panic(info: &PanicHookInfo<'_>) {
-    // Try to write to stderr directly since logging may be broken
-    let mut stderr = std::io::stderr().lock();
+/// The hook's body: take a snapshot and write the report to stderr.
+fn report(info: &PanicHookInfo<'_>) {
+    // `try_lock`, not `lock`: a panic hook never waits, on another thread
+    // registering a source or on a lock this thread already holds.
+    let telemetry = TELEMETRY_SOURCE
+        .try_lock()
+        .ok()
+        .and_then(|source| source.as_ref().map(|snapshot| snapshot()));
 
-    // Write panic header
-    let _ = writeln!(stderr, "\n");
-    let _ = writeln!(
-        stderr,
+    // Straight to stderr, since logging may be what panicked.
+    let mut stderr = io::stderr().lock();
+    let _ = write_report(
+        &mut stderr,
+        info.location(),
+        info.payload(),
+        telemetry.as_ref(),
+    );
+    let _ = stderr.flush();
+}
+
+/// Write the panic report: banner, location, message, the telemetry snapshot
+/// when there is one, and what becomes of the scenery mount.
+fn write_report<W: Write>(
+    out: &mut W,
+    location: Option<&Location<'_>>,
+    payload: &(dyn Any + Send),
+    telemetry: Option<&TelemetrySnapshot>,
+) -> io::Result<()> {
+    writeln!(out, "\n")?;
+    writeln!(
+        out,
         "╔══════════════════════════════════════════════════════════════════╗"
-    );
-    let _ = writeln!(
-        stderr,
+    )?;
+    writeln!(
+        out,
         "║                    XEARTHLAYER PANIC HANDLER                     ║"
-    );
-    let _ = writeln!(
-        stderr,
+    )?;
+    writeln!(
+        out,
         "╚══════════════════════════════════════════════════════════════════╝"
-    );
-    let _ = writeln!(stderr);
+    )?;
+    writeln!(out)?;
 
-    // Write panic location and message
-    let _ = writeln!(stderr, "━━━ Panic Information ━━━");
-    if let Some(location) = info.location() {
-        let _ = writeln!(
-            stderr,
+    writeln!(out, "━━━ Panic Information ━━━")?;
+    if let Some(location) = location {
+        writeln!(
+            out,
             "Location: {}:{}:{}",
             location.file(),
             location.line(),
             location.column()
-        );
+        )?;
     }
-    if let Some(message) = info.payload().downcast_ref::<&str>() {
-        let _ = writeln!(stderr, "Message: {}", message);
-    } else if let Some(message) = info.payload().downcast_ref::<String>() {
-        let _ = writeln!(stderr, "Message: {}", message);
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        writeln!(out, "Message: {}", message)?;
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        writeln!(out, "Message: {}", message)?;
     }
-    let _ = writeln!(stderr);
+    writeln!(out)?;
 
-    // Try to capture telemetry
-    if let Some(registry) = MOUNT_REGISTRY.get() {
-        if let Ok(guard) = registry.lock() {
-            if let Some(ref callback) = guard.telemetry_callback {
-                let _ = writeln!(stderr, "━━━ Telemetry State ━━━");
-                let snapshot = callback();
-                let _ = writeln!(stderr, "Uptime:           {:?}", snapshot.uptime);
-                let _ = writeln!(stderr, "Jobs running:     {}", snapshot.jobs_active);
-                let _ = writeln!(stderr, "Jobs completed:   {}", snapshot.jobs_completed);
-                let _ = writeln!(stderr, "Jobs failed:      {}", snapshot.jobs_failed);
-                let _ = writeln!(stderr, "Jobs timed out:   {}", snapshot.jobs_timed_out);
-                let _ = writeln!(stderr, "Downloads active: {}", snapshot.downloads_active);
-                let _ = writeln!(stderr, "Encodes active:   {}", snapshot.encodes_active);
-                let _ = writeln!(
-                    stderr,
-                    "Memory cache:     {} bytes",
-                    snapshot.memory_cache_size_bytes
-                );
-                let _ = writeln!(
-                    stderr,
-                    "DDS disk cache:   {} bytes",
-                    snapshot.dds_disk_cache_size_bytes
-                );
-                let _ = writeln!(
-                    stderr,
-                    "Chunk disk cache: {} bytes",
-                    snapshot.chunk_disk_cache_size_bytes
-                );
-                let _ = writeln!(stderr);
-            }
-        }
+    if let Some(snapshot) = telemetry {
+        writeln!(out, "━━━ Telemetry State ━━━")?;
+        writeln!(out, "Uptime:           {:?}", snapshot.uptime)?;
+        writeln!(out, "Jobs running:     {}", snapshot.jobs_active)?;
+        writeln!(out, "Jobs completed:   {}", snapshot.jobs_completed)?;
+        writeln!(out, "Jobs failed:      {}", snapshot.jobs_failed)?;
+        writeln!(out, "Jobs timed out:   {}", snapshot.jobs_timed_out)?;
+        writeln!(out, "Downloads active: {}", snapshot.downloads_active)?;
+        writeln!(out, "Encodes active:   {}", snapshot.encodes_active)?;
+        writeln!(
+            out,
+            "Memory cache:     {} bytes",
+            snapshot.memory_cache_size_bytes
+        )?;
+        writeln!(
+            out,
+            "DDS disk cache:   {} bytes",
+            snapshot.dds_disk_cache_size_bytes
+        )?;
+        writeln!(
+            out,
+            "Chunk disk cache: {} bytes",
+            snapshot.chunk_disk_cache_size_bytes
+        )?;
+        writeln!(out)?;
     }
 
-    // Attempt mount cleanup
-    let _ = writeln!(stderr, "━━━ Mount Cleanup ━━━");
-    if let Some(registry) = MOUNT_REGISTRY.get() {
-        if let Ok(guard) = registry.lock() {
-            if guard.mount_points.is_empty() {
-                let _ = writeln!(stderr, "No mount points registered for cleanup.");
-            } else {
-                let _ = writeln!(
-                    stderr,
-                    "Attempting to unmount {} FUSE mount(s)...",
-                    guard.mount_points.len()
-                );
-
-                for mount_point in &guard.mount_points {
-                    let _ = write!(stderr, "  Unmounting {}... ", mount_point.display());
-
-                    // Graceful first, then escalate to the platform's forced
-                    // unmount if the mount is still busy. unmount_fuse picks
-                    // fusermount (Linux) or umount (macOS).
-                    if crate::system::unmount_fuse(mount_point, false) {
-                        let _ = writeln!(stderr, "OK");
-                    } else if crate::system::unmount_fuse(mount_point, true) {
-                        let _ = writeln!(stderr, "OK (forced)");
-                    } else {
-                        let _ = writeln!(stderr, "FAILED");
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = writeln!(stderr);
-    let _ = writeln!(stderr, "━━━ End of XEarthLayer Panic Handler ━━━");
-    let _ = writeln!(stderr);
-
-    // Ensure output is flushed
-    let _ = stderr.flush();
+    writeln!(out, "━━━ Scenery Mount ━━━")?;
+    writeln!(out, "{}", MOUNT_NOTE)?;
+    writeln!(out)?;
+    writeln!(out, "━━━ End of XEarthLayer Panic Handler ━━━")?;
+    writeln!(out)
 }
+
+/// What the report says about the mount: the handler leaves it alone (#418).
+const MOUNT_NOTE: &str = "Left mounted by this handler. A panic on the main thread unmounts \
+as `run` unwinds; on any other thread it is caught or ends only that thread, \
+and the scenery keeps being served.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// The payload a `panic!` with this message carries, as the hook gets it.
+    fn payload_of(panic: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn Any + Send> {
+        // Unit tests never install this module's hook (it is process-wide);
+        // the default hook prints the expected panic into captured output.
+        std::panic::catch_unwind(panic).expect_err("the closure panics")
+    }
+
+    fn report_text(
+        location: Option<&Location<'_>>,
+        payload: &(dyn Any + Send),
+        telemetry: Option<&TelemetrySnapshot>,
+    ) -> String {
+        let mut out = Vec::new();
+        write_report(&mut out, location, payload, telemetry).unwrap();
+        String::from_utf8(out).unwrap()
+    }
 
     #[test]
-    fn test_mount_registry_register_unregister() {
-        // Initialize registry
-        init();
+    fn the_report_has_the_banner_location_and_message() {
+        let payload = payload_of(|| panic!("tile decode failed"));
+        let location = Location::caller();
 
-        let path1 = PathBuf::from("/tmp/test_mount_1");
-        let path2 = PathBuf::from("/tmp/test_mount_2");
+        let text = report_text(Some(location), payload.as_ref(), None);
 
-        // Register mounts
-        register_mount(path1.clone());
-        register_mount(path2.clone());
+        assert!(text.contains("XEARTHLAYER PANIC HANDLER"));
+        assert!(text.contains(&format!(
+            "Location: {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        )));
+        assert!(text.contains("Message: tile decode failed"));
+        assert!(text.contains("End of XEarthLayer Panic Handler"));
+    }
 
-        // Verify they're registered
-        if let Some(registry) = MOUNT_REGISTRY.get() {
-            let guard = registry.lock().unwrap();
-            assert!(guard.mount_points.contains(&path1));
-            assert!(guard.mount_points.contains(&path2));
-        }
+    #[test]
+    fn a_formatted_message_is_reported() {
+        let tile = 42;
+        let payload = payload_of(move || panic!("tile {tile} failed"));
 
-        // Unregister one
-        unregister_mount(&path1);
+        let text = report_text(None, payload.as_ref(), None);
 
-        // Verify it's removed
-        if let Some(registry) = MOUNT_REGISTRY.get() {
-            let guard = registry.lock().unwrap();
-            assert!(!guard.mount_points.contains(&path1));
-            assert!(guard.mount_points.contains(&path2));
-        }
+        assert!(text.contains("Message: tile 42 failed"));
+    }
+
+    #[test]
+    fn the_telemetry_snapshot_is_reported_when_there_is_one() {
+        let payload = payload_of(|| panic!("boom"));
+        let snapshot = TelemetrySnapshot {
+            uptime: Duration::from_secs(90),
+            jobs_active: 7,
+            jobs_failed: 3,
+            memory_cache_size_bytes: 1234,
+            ..TelemetrySnapshot::default()
+        };
+
+        let text = report_text(None, payload.as_ref(), Some(&snapshot));
+
+        assert!(text.contains("Telemetry State"));
+        assert!(text.contains("Uptime:           90s"));
+        assert!(text.contains("Jobs running:     7"));
+        assert!(text.contains("Jobs failed:      3"));
+        assert!(text.contains("Memory cache:     1234 bytes"));
+    }
+
+    #[test]
+    fn without_a_telemetry_source_the_section_is_left_out() {
+        let payload = payload_of(|| panic!("boom"));
+
+        let text = report_text(None, payload.as_ref(), None);
+
+        assert!(!text.contains("Telemetry State"));
+    }
+
+    #[test]
+    fn the_report_says_the_mount_is_left_in_place() {
+        // #418: the hook runs before anyone knows whether the panic will be
+        // caught, so it must not unmount, and says so rather than claiming a
+        // cleanup it no longer does.
+        let payload = payload_of(|| panic!("boom"));
+
+        let text = report_text(None, payload.as_ref(), None);
+
+        assert!(text.contains("Scenery Mount"));
+        assert!(text.contains(MOUNT_NOTE));
+        assert!(!text.contains("Unmounting"));
     }
 }
