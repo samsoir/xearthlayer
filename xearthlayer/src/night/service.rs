@@ -31,6 +31,7 @@ use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRe
 use super::layout::minimal_black_dds;
 use super::roads::field::{reach_deg, RoadField};
 use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
+use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::RoadModel;
 use super::stats::{
     DiskMiss, GenerationRecord, LitStats, PayloadLookup, ProbeAnswer, ProbeRecord, ReadOutcome,
@@ -122,29 +123,6 @@ pub fn lit_generation_permits(cores: usize) -> usize {
     (cores / 8).clamp(MIN_LIT_GENERATION_PERMITS, MAX_LIT_GENERATION_PERMITS)
 }
 
-/// Extra attempts at a recipe read that failed with an I/O error before the
-/// tile is given up on for the session.
-const RECIPE_RETRIES: u32 = 2;
-const RECIPE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Calls `attempt` until it succeeds, at most `retries + 1` times.
-fn with_retries<T, E>(
-    retries: u32,
-    delay: std::time::Duration,
-    mut attempt: impl FnMut() -> Result<T, E>,
-) -> Result<T, E> {
-    let mut left = retries;
-    loop {
-        match attempt() {
-            Err(_) if left > 0 => {
-                left -= 1;
-                std::thread::sleep(delay);
-            }
-            result => return result,
-        }
-    }
-}
-
 /// A recipe that could not be read, even after retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unreadable;
@@ -175,7 +153,7 @@ impl SessionRecipes {
         if self.given_up.contains(&(lat, lon)) {
             return Err(Unreadable);
         }
-        with_retries(RECIPE_RETRIES, RECIPE_RETRY_DELAY, || {
+        with_retries(READ_RETRIES, READ_RETRY_DELAY, || {
             self.store.get_with_region(lat, lon)
         })
         .map_err(|e| {
@@ -1049,30 +1027,6 @@ mod tests {
             "the least recently read payload makes room"
         );
         assert_eq!(cache.entry_count(), u64::from(HELD));
-    }
-
-    #[test]
-    fn retries_stop_at_the_first_success() {
-        let mut calls = 0;
-        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
-            calls += 1;
-            if calls < 2 {
-                Err("transient")
-            } else {
-                Ok(7)
-            }
-        });
-        assert_eq!((r, calls), (Ok(7), 2));
-    }
-
-    #[test]
-    fn retries_give_up_after_the_limit() {
-        let mut calls = 0;
-        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
-            calls += 1;
-            Err("down")
-        });
-        assert_eq!((r, calls), (Err("down"), 3));
     }
 
     #[test]
