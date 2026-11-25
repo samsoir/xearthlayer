@@ -385,12 +385,26 @@ struct TestProbes {
     writes_peak: std::sync::atomic::AtomicUsize,
     /// Road entry writes waiting for a lit disk permit.
     writes_awaiting_permit: std::sync::atomic::AtomicUsize,
+    /// Times a caller started waiting for a build, and the instant the
+    /// latest of them waited until.
+    waits_entered: std::sync::atomic::AtomicUsize,
+    last_wait_until: std::sync::Mutex<Option<Instant>>,
     index_builds: std::sync::atomic::AtomicUsize,
     identity_passes: std::sync::atomic::AtomicUsize,
     leads_noted: std::sync::atomic::AtomicUsize,
     /// `start` marks its tile failed between its two checks, as a build
     /// failing on another thread at that moment would.
     fail_between_checks: AtomicBool,
+}
+
+#[cfg(test)]
+impl TestProbes {
+    fn note_wait(&self, until: Instant) {
+        self.waits_entered.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut last) = self.last_wait_until.lock() {
+            *last = Some(until);
+        }
+    }
 }
 
 /// A source that stopped a tile build.
@@ -792,6 +806,8 @@ impl RoadService {
                 return (settled(&build.roads), waited);
             };
             waited = true;
+            #[cfg(test)]
+            self.test.note_wait(until);
             tokio::select! {
                 biased;
                 roads = build.roads.clone() => {
@@ -1282,6 +1298,41 @@ impl RoadService {
         });
     }
 
+    /// Makes the first caller of `purpose` for `tile`'s current build one
+    /// that asked `ago`: a caller that asks later takes that build's
+    /// deadline. Start the build first: a new build clears its deadlines.
+    #[cfg(test)]
+    pub(crate) fn asked_ago(&self, tile: Tile, purpose: Purpose, ago: Duration) {
+        let asked = Instant::now().checked_sub(ago).unwrap();
+        self.first_asked.insert((tile, purpose), asked);
+    }
+
+    /// Makes the deadline of `tile`'s build for `purpose` already past, as
+    /// if its first caller had asked a whole cap ago.
+    #[cfg(test)]
+    pub(crate) fn deadline_passed(&self, tile: Tile, purpose: Purpose) {
+        self.asked_ago(tile, purpose, self.config.cap(purpose));
+    }
+
+    /// Whether a caller of `purpose` has asked for `tile`'s current build:
+    /// it is waiting for it, or has.
+    #[cfg(test)]
+    pub(crate) fn is_asked(&self, tile: Tile, purpose: Purpose) -> bool {
+        self.first_asked.contains_key(&(tile, purpose))
+    }
+
+    /// Times a caller started waiting for a build.
+    #[cfg(test)]
+    pub(crate) fn waits_entered(&self) -> usize {
+        self.test.waits_entered.load(Ordering::SeqCst)
+    }
+
+    /// The instant the latest caller to wait for a build waited until.
+    #[cfg(test)]
+    fn last_wait_until(&self) -> Option<Instant> {
+        *self.test.last_wait_until.lock().unwrap()
+    }
+
     /// Builds in flight.
     #[cfg(test)]
     pub(crate) fn builds_pending(&self) -> usize {
@@ -1621,13 +1672,6 @@ pub(crate) mod tests {
             generate_cap: generate,
             ..RoadServiceConfig::default()
         }
-    }
-
-    /// Makes the deadline of `tile`'s build for `purpose` already past, as
-    /// if its first caller had asked a whole cap ago.
-    fn deadline_passed(svc: &RoadService, tile: Tile, purpose: Purpose) {
-        let asked = Instant::now().checked_sub(svc.config.cap(purpose)).unwrap();
-        svc.first_asked.insert((tile, purpose), asked);
     }
 
     /// `config` whose builds wait for the returned gate: each
@@ -2289,17 +2333,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn pending_cache_writes_never_exceed_the_backlog() {
-        // A burst of 7z tiles queues on one permit; a finished tile's entry
-        // must not wait in memory behind the rest of the burst.
-        let t = tempfile::tempdir().unwrap();
+        // A burst of 7z tiles queues on one permit while no write can end:
+        // the backlog's tiles wait to be written, the rest are dropped
+        // rather than wait in memory behind them.
         let tiles = [(46, 6), (47, 6), (48, 6), (49, 6), (50, 6)];
-        for &(lat, lon) in &tiles {
-            let mut b = overlay(lat, lon);
-            let (x, y) = (f64::from(lon), f64::from(lat));
-            b.road(lat, lon, 100, &[(x + 0.1, y + 0.1), (x + 0.2, y + 0.2)]);
-            write_install(t.path(), (lat, lon), &[("High", Some(sevenz(&b.bytes())))]);
-        }
-        let d = disk();
+        let t = sevenz_install(&tiles);
+        let gate = Arc::new(Semaphore::new(0));
+        let d = Arc::new(Loads::with_set_gate(disk(), Arc::clone(&gate)));
         let c = RoadServiceConfig {
             extract_permits: 1,
             ..config(LONG, LONG)
@@ -2307,7 +2347,7 @@ pub(crate) mod tests {
         let svc = RoadService::with_config(
             t.path().into(),
             vec![],
-            Some(d.clone()),
+            Some(d.clone() as _),
             LitDiskPermits::new(),
             c,
         );
@@ -2316,8 +2356,18 @@ pub(crate) mod tests {
         }
         let r = svc.footprint(&tiles, Purpose::Generate).await;
         assert!(r.complete);
-        assert_eq!(entries(&svc, &d).await, tiles.len() as u64, "all written");
-        assert!(svc.test.writes_peak.load(Ordering::SeqCst) <= ROAD_WRITE_BACKLOG);
+        let dropped = tiles.len() - ROAD_WRITE_BACKLOG;
+        assert_eq!(
+            svc.test.writes_peak.load(Ordering::SeqCst),
+            ROAD_WRITE_BACKLOG
+        );
+        assert_eq!(svc.stats_snapshot().road_writes_dropped, dropped as u64);
+        gate.add_permits(tiles.len());
+        assert_eq!(
+            entries(&svc, &(d.clone() as _)).await,
+            ROAD_WRITE_BACKLOG as u64,
+            "the backlog's tiles are written"
+        );
     }
 
     /// A 7z overlay with one motorway for each of `tiles`, as road packs
@@ -2554,18 +2604,21 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_probe_after_the_first_probes_deadline_does_not_wait() {
         let t = install(None);
-        let wait = Duration::from_millis(500);
-        let (c, _gate) = gated(500, LONG);
+        let (c, _gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
-        // The gate stays shut: the build outlasts every deadline.
-        let first = svc.footprint(&[TILE], Purpose::Probe).await;
-        assert!(!first.complete && first.timed_out);
+        // The gate stays shut: the build outlasts every deadline. Its first
+        // probe asked a whole wait ago.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.deadline_passed(TILE, Purpose::Probe);
         let deadline = svc.deadline(TILE, Purpose::Probe).unwrap();
-        let started = Instant::now();
-        let second = svc.footprint(&[TILE], Purpose::Probe).await;
-        // A wait of its own would last the whole probe wait; the margin is
-        // that wait, far above any scheduling delay.
-        assert!(started.elapsed() < wait);
+        // A wait of its own would last LONG: the bound is far below it.
+        let second = tokio::time::timeout(
+            Duration::from_secs(5),
+            svc.footprint(&[TILE], Purpose::Probe),
+        )
+        .await
+        .expect("no wait of its own");
+        assert_eq!(svc.waits_entered(), 0, "did not wait");
         assert_eq!(
             svc.deadline(TILE, Purpose::Probe).unwrap(),
             deadline,
@@ -2574,28 +2627,32 @@ pub(crate) mod tests {
         assert!(!second.complete);
         assert!(second.timed_out, "still building past its deadline");
         assert!(second.tiles.is_empty());
-        assert_eq!(svc.stats_snapshot().probe_timeouts, 2);
+        assert_eq!(svc.stats_snapshot().probe_timeouts, 1);
     }
 
     #[tokio::test]
     async fn a_probe_during_the_build_waits_only_the_remaining_time() {
         let t = install(None);
-        let wait = Duration::from_millis(1_000);
-        let (c, _gate) = gated(1_000, LONG);
+        let (c, gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
-        let s = Arc::clone(&svc);
-        let first = tokio::spawn(async move { s.footprint(&[TILE], Purpose::Probe).await });
-        // The second probe asks 400 ms after the first: had it a wait of its
-        // own, it would end 400 ms after the build's deadline.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let started = Instant::now();
-        let second = svc.footprint(&[TILE], Purpose::Probe).await;
-        let ended = Instant::now();
+        // The build's first probe asked half a wait ago.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.asked_ago(TILE, Purpose::Probe, Duration::from_millis(LONG / 2));
         let deadline = svc.deadline(TILE, Purpose::Probe).unwrap();
-        assert!(!second.complete && second.timed_out);
-        assert!(ended >= deadline, "waited until the build's deadline");
-        assert!(ended < started + wait, "not a wait of its own");
-        assert!(!first.await.unwrap().complete);
+        let s = Arc::clone(&svc);
+        let second = tokio::spawn(async move { s.footprint(&[TILE], Purpose::Probe).await });
+        until("the second probe waits", || svc.waits_entered() == 1).await;
+        assert_eq!(
+            svc.last_wait_until(),
+            Some(deadline),
+            "until the build's deadline, half a wait away, not a wait of its own"
+        );
+        gate.add_permits(1);
+        let second = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the build ends its wait")
+            .unwrap();
+        assert!(second.complete && !second.timed_out);
     }
 
     #[tokio::test]
@@ -2624,7 +2681,7 @@ pub(crate) mod tests {
         });
         assert!(first.complete);
         // Its first build's deadline has passed, and the tile is evicted.
-        deadline_passed(&svc, TILE, Purpose::Probe);
+        svc.deadline_passed(TILE, Purpose::Probe);
         svc.tiles.invalidate(&TILE).await;
         assert!(!svc.is_ready(TILE));
         let (again, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Probe), async {
@@ -2648,7 +2705,7 @@ pub(crate) mod tests {
         // A finished build whose tile is not (or no longer) in the cache,
         // its deadline already past.
         svc.pending.insert(tile, Build::finished(done));
-        deadline_passed(&svc, tile, Purpose::Probe);
+        svc.deadline_passed(tile, Purpose::Probe);
         let r = svc.footprint(&[tile], Purpose::Probe).await;
         assert!(r.complete && !r.timed_out);
         assert!(Arc::ptr_eq(&r.tiles[0], &roads));
