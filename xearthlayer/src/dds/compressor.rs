@@ -16,9 +16,11 @@
 
 use super::layout::{self, BLOCK_DIM};
 use super::types::{DdsError, DdsFormat};
+use futures::future::BoxFuture;
 use image::RgbaImage;
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Pad an image up to a whole number of 4×4 compression blocks.
 ///
@@ -236,9 +238,26 @@ pub trait ImageCompressor: Send + Sync {
 /// (without DDS header), level 0 (full resolution) first, then each
 /// successively halved level. Or [`ChainOutcome::Returned`]: the backend did
 /// not take the image, and hands it back for the caller to encode another way
-/// (#420).
+/// (#420). Or, from [`submit_mipmap_chain`](Self::submit_mipmap_chain) only,
+/// [`ChainOutcome::Cancelled`] (#422).
+///
+/// # Two forms
+///
+/// A backend that waits rather than computes (the GPU channel waits on its
+/// worker) is used through [`submit_mipmap_chain`](Self::submit_mipmap_chain),
+/// which is awaited, so no thread is parked while it waits (#422). The
+/// synchronous [`compress_mipmap_chain`](Self::compress_mipmap_chain) blocks
+/// the calling thread until the backend answers: it is for callers where
+/// nothing is async (tests, a blocking thread), never a task on a runtime
+/// worker thread.
 pub trait MipmapCompressor: Send + Sync {
-    /// Compress a full mipmap chain from the source image.
+    /// Compress a full mipmap chain from the source image, on the calling
+    /// thread.
+    ///
+    /// Blocks until the backend answers. Call it only where nothing is
+    /// async: from a test or a blocking thread, never from a task on a
+    /// runtime worker thread, which it would stall. Production encodes
+    /// through [`submit_mipmap_chain`](Self::submit_mipmap_chain).
     ///
     /// # Arguments
     ///
@@ -253,6 +272,31 @@ pub trait MipmapCompressor: Send + Sync {
         format: DdsFormat,
         mipmap_count: usize,
     ) -> Result<ChainOutcome, DdsError>;
+
+    /// Compress a full mipmap chain from the source image, awaited (#422).
+    ///
+    /// `cancel` is the job's token: a backend that queues work skips an
+    /// image whose job is cancelled before the work starts and answers
+    /// [`ChainOutcome::Cancelled`]; work already started is finished and
+    /// answered. The default answers at once from
+    /// [`compress_mipmap_chain`](Self::compress_mipmap_chain), on the
+    /// awaiting thread, ignoring `cancel`: it suits backends that compute in
+    /// place and at once (test doubles). A backend that waits, or computes
+    /// for long, must override it, as the GPU channel does.
+    fn submit_mipmap_chain(
+        &self,
+        image: RgbaImage,
+        format: DdsFormat,
+        mipmap_count: usize,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ChainOutcome, DdsError>> {
+        let _ = cancel;
+        Box::pin(std::future::ready(self.compress_mipmap_chain(
+            image,
+            format,
+            mipmap_count,
+        )))
+    }
 
     /// Human-readable name for logging and diagnostics.
     fn name(&self) -> &str;
@@ -274,6 +318,10 @@ pub enum ChainOutcome {
         /// Why the backend did not take it.
         reason: String,
     },
+    /// The job was cancelled before the backend started on the image, so it
+    /// was not encoded: it is not paid for yet (#422). Only
+    /// [`MipmapCompressor::submit_mipmap_chain`] answers it.
+    Cancelled,
 }
 
 impl std::fmt::Debug for ChainOutcome {
@@ -292,6 +340,7 @@ impl std::fmt::Debug for ChainOutcome {
                 )
                 .field("reason", reason)
                 .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
         }
     }
 }

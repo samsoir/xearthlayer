@@ -11,6 +11,15 @@
 //!   ([`ChainOutcome::Returned`], a failed GPU, #420) is encoded with it
 //!   through the same in-place loop, so the file is byte for byte the
 //!   fallback's.
+//!
+//! # Waiting without a thread (#422)
+//!
+//! [`DdsEncoder::encode`] does the whole encode on the calling thread.
+//! A job encodes in two steps instead: [`DdsEncoder::encode_awaiting`] awaits
+//! a mipmap backend (the GPU channel), so no thread waits for it, and
+//! answers [`AwaitedEncode::Cpu`] for what is left to compute on the CPU
+//! (everything, with an image backend; an image the backend handed back),
+//! which [`DdsEncoder::encode_on_cpu`] encodes on a blocking thread.
 
 use crate::dds::compressor::{
     compress_level_into, default_compressor, ChainOutcome, ImageCompressor, MipmapCompressor,
@@ -20,7 +29,39 @@ use crate::dds::mipmap::MipmapStream;
 use crate::dds::types::{DdsError, DdsFormat, DdsHeader};
 use image::RgbaImage;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
+
+/// What [`DdsEncoder::encode_awaiting`] came to (#422).
+pub enum AwaitedEncode {
+    /// The DDS file: the mipmap backend encoded the chain.
+    Encoded(Vec<u8>),
+    /// CPU work is left: [`DdsEncoder::encode_on_cpu`] encodes this image,
+    /// on a blocking thread. The whole encode, with an image backend; with a
+    /// mipmap backend, an image it handed back (#420).
+    Cpu(RgbaImage),
+    /// The job was cancelled before the backend started on the image, or
+    /// before the CPU took over an image it handed back: nothing was
+    /// encoded, as nothing is paid for yet.
+    Cancelled,
+}
+
+impl std::fmt::Debug for AwaitedEncode {
+    /// An image by its size: its pixels would fill the screen.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encoded(data) => f
+                .debug_tuple("Encoded")
+                .field(&format_args!("{} bytes", data.len()))
+                .finish(),
+            Self::Cpu(image) => f
+                .debug_tuple("Cpu")
+                .field(&format_args!("{}x{}", image.width(), image.height()))
+                .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
+        }
+    }
+}
 
 /// Backend for compressing image data.
 enum CompressorBackend {
@@ -128,20 +169,8 @@ impl DdsEncoder {
     ///
     /// Returns error if image dimensions are invalid or compression fails.
     pub fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, DdsError> {
-        // Before any downsampling or hand-off to a backend (#395).
-        self.format.ensure_supported()?;
-        let width = image.width();
-        let height = image.height();
-
-        if width == 0 || height == 0 {
-            return Err(DdsError::InvalidDimensions(width, height));
-        }
-
-        let count = if self.generate_mipmaps {
-            self.resolve_mipmap_count(width, height)
-        } else {
-            1
-        };
+        let (width, height) = image.dimensions();
+        let count = self.levels_for(width, height)?;
         match &self.backend {
             CompressorBackend::Mipmap {
                 compressor,
@@ -158,6 +187,98 @@ impl DdsEncoder {
                 self.encode_mipmap_stream(compressor.as_ref(), image, width, height, count)
             }
         }
+    }
+
+    /// The first step of a job's encode (#422): with a mipmap backend, its
+    /// chain, awaited ([`MipmapCompressor::submit_mipmap_chain`]) so that no
+    /// thread waits for it, with `cancel` the job's token. Answers the file,
+    /// the CPU work left ([`AwaitedEncode::Cpu`]: the whole encode with an
+    /// image backend, or an image the backend handed back), or
+    /// [`AwaitedEncode::Cancelled`]: the backend skipped the image for a
+    /// cancelled job, or handed it back after the job was cancelled, when
+    /// the CPU encode it would need is not paid for either.
+    ///
+    /// With an image backend nothing is checked here: [`encode_on_cpu`]
+    /// checks as [`encode`](Self::encode) does.
+    ///
+    /// [`encode_on_cpu`]: Self::encode_on_cpu
+    pub async fn encode_awaiting(
+        &self,
+        image: RgbaImage,
+        cancel: &CancellationToken,
+    ) -> Result<AwaitedEncode, DdsError> {
+        let CompressorBackend::Mipmap { compressor, .. } = &self.backend else {
+            return Ok(AwaitedEncode::Cpu(image));
+        };
+        let (width, height) = image.dimensions();
+        let count = self.levels_for(width, height)?;
+        debug!(
+            width,
+            height,
+            mipmap_count = count,
+            format = ?self.format,
+            backend = compressor.name(),
+            "Awaiting the mipmap chain from MipmapCompressor"
+        );
+        match compressor
+            .submit_mipmap_chain(image, self.format, count, cancel.clone())
+            .await?
+        {
+            ChainOutcome::Compressed(compressed) => Ok(AwaitedEncode::Encoded(self.assemble(
+                compressor.name(),
+                width,
+                height,
+                count,
+                compressed,
+            ))),
+            ChainOutcome::Returned { image, reason } => {
+                debug!(
+                    backend = compressor.name(),
+                    reason = %reason,
+                    cancelled = cancel.is_cancelled(),
+                    "MipmapCompressor handed the image back"
+                );
+                // Handed back unencoded: for a cancelled job the CPU encode
+                // is not paid for yet either.
+                Ok(if cancel.is_cancelled() {
+                    AwaitedEncode::Cancelled
+                } else {
+                    AwaitedEncode::Cpu(image)
+                })
+            }
+            ChainOutcome::Cancelled => Ok(AwaitedEncode::Cancelled),
+        }
+    }
+
+    /// The CPU step of a job's encode (#422), for an image
+    /// [`encode_awaiting`](Self::encode_awaiting) answered
+    /// [`AwaitedEncode::Cpu`]: with an image backend, [`encode`](Self::encode);
+    /// with a mipmap backend, its fallback's encode, byte for byte what
+    /// that compressor alone makes. CPU work: run it on a blocking thread.
+    pub fn encode_on_cpu(&self, image: RgbaImage) -> Result<Vec<u8>, DdsError> {
+        match &self.backend {
+            CompressorBackend::Image(_) => self.encode(image),
+            CompressorBackend::Mipmap { fallback, .. } => {
+                let (width, height) = image.dimensions();
+                let count = self.levels_for(width, height)?;
+                self.encode_mipmap_stream(fallback.as_ref(), image, width, height, count)
+            }
+        }
+    }
+
+    /// The level count of a `width` x `height` encode, after the checks
+    /// every encode makes before any downsampling or hand-off to a backend:
+    /// a supported format (#395) and a non-empty image.
+    fn levels_for(&self, width: u32, height: u32) -> Result<usize, DdsError> {
+        self.format.ensure_supported()?;
+        if width == 0 || height == 0 {
+            return Err(DdsError::InvalidDimensions(width, height));
+        }
+        Ok(if self.generate_mipmaps {
+            self.resolve_mipmap_count(width, height)
+        } else {
+            1
+        })
     }
 
     /// Compress an image with its first `count` mipmap levels (1 without
@@ -262,8 +383,27 @@ impl DdsEncoder {
                 );
                 return self.encode_mipmap_stream(fallback, image, width, height, count);
             }
+            // No job token reaches the synchronous form.
+            ChainOutcome::Cancelled => {
+                return Err(DdsError::CompressionFailed(format!(
+                    "{} cancelled a synchronous encode",
+                    compressor.name()
+                )))
+            }
         };
+        Ok(self.assemble(compressor.name(), width, height, count, compressed))
+    }
 
+    /// The DDS file of a mipmap backend's `compressed` chain: the header,
+    /// then the chain.
+    fn assemble(
+        &self,
+        backend: &str,
+        width: u32,
+        height: u32,
+        count: usize,
+        compressed: Vec<u8>,
+    ) -> Vec<u8> {
         // Timed for the GPU path's stages (#419): the copy behind the header
         // is the whole payload.
         let assembly = tracing::debug_span!(target: "profiling", "dds_header_assembly").entered();
@@ -275,13 +415,14 @@ impl DdsEncoder {
         drop(assembly);
 
         debug!(
+            backend,
             total_dds_bytes = output.len(),
             compressed_bytes = compressed.len(),
             assemble_us,
             "MipmapCompressor encode complete"
         );
 
-        Ok(output)
+        output
     }
 }
 

@@ -3,10 +3,14 @@
 //! Provides a `TextureEncoder` implementation that encodes RGBA images
 //! to DirectDraw Surface (DDS) format with BC1 compression.
 
-use crate::dds::{default_compressor, layout, DdsEncoder, DdsFormat, ImageCompressor};
+use crate::dds::{
+    default_compressor, layout, AwaitedEncode, DdsEncoder, DdsFormat, ImageCompressor,
+};
 use crate::texture::{TextureEncoder, TextureError};
+use futures::future::BoxFuture;
 use image::RgbaImage;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// DDS texture encoder.
 ///
@@ -158,8 +162,9 @@ impl DdsTextureEncoder {
     }
 }
 
-impl TextureEncoder for DdsTextureEncoder {
-    fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
+impl DdsTextureEncoder {
+    /// The DDS encoder for one encode, on this encoder's backends.
+    fn dds_encoder(&self) -> DdsEncoder {
         let mut encoder = DdsEncoder::new(self.format);
 
         if let Some(count) = self.mipmap_count {
@@ -167,12 +172,39 @@ impl TextureEncoder for DdsTextureEncoder {
         }
 
         if let Some(ref mc) = self.mipmap_compressor {
-            encoder = encoder.with_mipmap_compressor(Arc::clone(mc), Arc::clone(&self.compressor));
+            encoder.with_mipmap_compressor(Arc::clone(mc), Arc::clone(&self.compressor))
         } else {
-            encoder = encoder.with_compressor(Arc::clone(&self.compressor));
+            encoder.with_compressor(Arc::clone(&self.compressor))
         }
+    }
+}
 
-        encoder.encode(image).map_err(TextureError::from)
+impl TextureEncoder for DdsTextureEncoder {
+    fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
+        self.dds_encoder().encode(image).map_err(TextureError::from)
+    }
+
+    /// With a mipmap backend (the GPU channel), its chain, awaited; with an
+    /// image backend, the whole encode left to the CPU (#422).
+    fn encode_awaiting<'a>(
+        &'a self,
+        image: RgbaImage,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<AwaitedEncode, TextureError>> {
+        Box::pin(async move {
+            self.dds_encoder()
+                .encode_awaiting(image, cancel)
+                .await
+                .map_err(TextureError::from)
+        })
+    }
+
+    /// The image backend's encode, or the mipmap backend's fallback's for
+    /// an image it handed back (#422).
+    fn encode_on_cpu(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
+        self.dds_encoder()
+            .encode_on_cpu(image)
+            .map_err(TextureError::from)
     }
 
     fn expected_size(&self, width: u32, height: u32) -> usize {

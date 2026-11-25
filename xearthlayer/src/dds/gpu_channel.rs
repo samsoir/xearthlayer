@@ -59,8 +59,12 @@
 //! either is answered.
 
 mod inner {
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use futures::future::BoxFuture;
+    use tracing::Instrument;
 
     use block_compression::{CompressionVariant, GpuBlockCompressor};
     use image::RgbaImage;
@@ -139,6 +143,43 @@ mod inner {
             (_, QueueState::Ready) => NextTake::Take(GpuLane::Prefetch),
             (QueueState::Closed, QueueState::Closed) => NextTake::End,
             _ => NextTake::Wait,
+        }
+    }
+
+    /// What the worker does with a request it took, by [`admit`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Admission {
+        /// Its job was cancelled before the tile started: answer
+        /// [`GpuEncodeReply::Cancelled`], encode nothing (#422).
+        Skip,
+        /// It waited past the deadline on a lane that has one: hand its
+        /// image back for the CPU (#420, #421).
+        HandBack,
+        /// Its caller left on a cancel: nobody is waiting, drop it (#422).
+        CallerLeft,
+        /// Encode it: the worker has claimed it ([`RequestClaim::start`]).
+        Start,
+    }
+
+    /// The worker's decision on a request taken from `lane` after waiting
+    /// `queue_wait`, whose job is `job_cancelled`, under `rule`. A request
+    /// still queued in `claim` is claimed for the worker when the answer is
+    /// [`Admission::Start`]; none of the others is a miss.
+    pub fn admit(
+        lane: GpuLane,
+        job_cancelled: bool,
+        queue_wait: Duration,
+        rule: &HangRule,
+        claim: &RequestClaim,
+    ) -> Admission {
+        if job_cancelled {
+            Admission::Skip
+        } else if lane.has_deadline() && rule.waited_out(queue_wait) {
+            Admission::HandBack
+        } else if claim.start() {
+            Admission::Start
+        } else {
+            Admission::CallerLeft
         }
     }
 
@@ -386,8 +427,76 @@ mod inner {
         /// When the caller started to send: the start of the queue wait, on
         /// the worker's [`Clock`].
         pub sent_at: Instant,
+        /// The job's cancellation token (#422): the worker skips a request
+        /// whose job is cancelled before it starts the tile, answering
+        /// [`GpuEncodeReply::Cancelled`].
+        pub cancel: CancellationToken,
+        /// Whether the worker started the tile or its caller left (#422).
+        pub claim: RequestClaim,
         /// One-shot channel for returning the compressed data (or error).
         pub response: oneshot::Sender<GpuEncodeReply>,
+    }
+
+    impl GpuEncodeRequest {
+        /// A request for `image`, sent at `sent_at` on the worker's
+        /// [`Clock`], for a job whose token is `cancel`, and the receiver of
+        /// its reply.
+        pub fn new(
+            image: RgbaImage,
+            format: DdsFormat,
+            mipmap_count: usize,
+            sent_at: Instant,
+            cancel: CancellationToken,
+        ) -> (Self, oneshot::Receiver<GpuEncodeReply>) {
+            let (response, reply) = oneshot::channel();
+            let request = Self {
+                image,
+                format,
+                mipmap_count,
+                sent_at,
+                cancel,
+                claim: RequestClaim::default(),
+                response,
+            };
+            (request, reply)
+        }
+    }
+
+    /// Who has a queued request (#422): the worker, once it starts the tile,
+    /// or its caller, once it leaves on a cancel. Whichever claims it first
+    /// has it, so a tile is never encoded after its caller left, and a
+    /// caller never leaves a tile the GPU is already encoding: that tile is
+    /// paid for, and its caller waits for it and caches it (#385).
+    #[derive(Clone, Debug, Default)]
+    pub struct RequestClaim(Arc<AtomicU8>);
+
+    impl RequestClaim {
+        const QUEUED: u8 = 0;
+        const STARTED: u8 = 1;
+        const ABANDONED: u8 = 2;
+
+        /// The worker's claim: `true` if it may start the tile, `false` if
+        /// the caller left.
+        pub fn start(&self) -> bool {
+            self.claim(Self::STARTED)
+        }
+
+        /// The caller's claim: `true` if it may leave, `false` if the worker
+        /// already started the tile.
+        pub fn abandon(&self) -> bool {
+            self.claim(Self::ABANDONED)
+        }
+
+        /// Whether the worker started the tile.
+        pub fn is_started(&self) -> bool {
+            self.0.load(Ordering::Acquire) == Self::STARTED
+        }
+
+        fn claim(&self, by: u8) -> bool {
+            self.0
+                .compare_exchange(Self::QUEUED, by, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
     }
 
     /// The worker's answer to one [`GpuEncodeRequest`].
@@ -408,6 +517,9 @@ mod inner {
             /// its own wait in the queue past the deadline.
             reason: String,
         },
+        /// The request's job was cancelled before the worker took it, so the
+        /// tile was not encoded (#422).
+        Cancelled,
     }
 
     impl GpuEncodeReply {
@@ -436,6 +548,7 @@ mod inner {
                     )
                     .field("reason", reason)
                     .finish(),
+                Self::Cancelled => f.write_str("Cancelled"),
             }
         }
     }
@@ -473,6 +586,13 @@ mod inner {
     /// returns compressed data for all mipmap levels. The GPU worker owns
     /// the mipmap iteration internally, eliminating per-level channel round-trips.
     ///
+    /// The caller awaits the worker (#422,
+    /// [`submit_mipmap_chain`](MipmapCompressor::submit_mipmap_chain)): no
+    /// thread is parked while its tile waits. A caller whose job is
+    /// cancelled leaves at once, unless the worker already started its tile
+    /// ([`RequestClaim`]), which it then waits for; the worker skips a
+    /// request whose job was cancelled before it took it.
+    ///
     /// An image the GPU does not take comes back as
     /// [`ChainOutcome::Returned`]: while the worker's `health` is Failed
     /// (never sent), when the channel is closed (the request comes back with
@@ -497,6 +617,9 @@ mod inner {
         Refused(RgbaImage),
         /// The worker dropped the reply unanswered.
         Dropped,
+        /// The job was cancelled before the worker started the tile, and
+        /// the caller left.
+        Left,
         Replied(GpuEncodeReply),
     }
 
@@ -534,9 +657,10 @@ mod inner {
         }
 
         /// The stage timings of the tiles answered through this channel,
-        /// the requests that failed or were handed back, and its queue depth. Someone must take
-        /// its samples ([`GpuEncodeStats::take_sample`]); in the service the
-        /// per-minute log does.
+        /// the requests that failed, were handed back or were cancelled,
+        /// and its queue depth. Someone must take its samples
+        /// ([`GpuEncodeStats::take_sample`]); in the service the per-minute
+        /// log does.
         pub fn stats(&self) -> &Arc<GpuEncodeStats> {
             &self.stats
         }
@@ -563,14 +687,15 @@ mod inner {
         pub fn shutdown(&mut self) {
             self.sender.take();
         }
-    }
 
-    impl MipmapCompressor for GpuEncoderChannel {
-        fn compress_mipmap_chain(
+        /// Sends one tile to the worker and awaits its answer (#422): the
+        /// one implementation behind both forms of [`MipmapCompressor`].
+        async fn encode_chain(
             &self,
             image: RgbaImage,
             format: DdsFormat,
             mipmap_count: usize,
+            cancel: CancellationToken,
         ) -> Result<ChainOutcome, DdsError> {
             // Refused on the caller's side: the worker never sees it.
             format.ensure_supported()?;
@@ -590,34 +715,34 @@ mod inner {
             };
 
             let (width, height) = image.dimensions();
-            let _span = tracing::debug_span!(
-                target: "profiling",
-                "gpu_encode",
-                width,
-                height,
-                levels = mipmap_count,
-            )
-            .entered();
 
-            // Counted from before the send (which blocks on a full channel)
-            // until the reply or the failure is back.
+            // Counted from before the send (which waits on a full channel)
+            // until the reply, the failure or the caller's leaving.
             let in_channel = self.stats.enter();
             let sent_at = self.clock.now();
-            let (resp_tx, resp_rx) = oneshot::channel();
-            let request = GpuEncodeRequest {
-                image, // moved, zero clones
-                format,
-                mipmap_count,
-                sent_at,
-                response: resp_tx,
-            };
+            let (request, mut resp_rx) =
+                GpuEncodeRequest::new(image, format, mipmap_count, sent_at, cancel.clone());
+            let claim = request.claim.clone();
 
-            let sent = match sender.blocking_send(request) {
-                // The send error hands the request back, image and all.
-                Err(mpsc::error::SendError(request)) => Sent::Refused(request.image),
-                Ok(()) => match resp_rx.blocking_recv() {
-                    Ok(reply) => Sent::Replied(reply),
-                    Err(_) => Sent::Dropped,
+            // A cancel while the channel is full leaves without sending: the
+            // request, image and all, is dropped with the send.
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Sent::Left,
+                sent = sender.send(request) => match sent {
+                    // The send error hands the request back, image and all.
+                    Err(mpsc::error::SendError(request)) => Sent::Refused(request.image),
+                    Ok(()) => tokio::select! {
+                        biased;
+                        reply = &mut resp_rx => reply.map_or(Sent::Dropped, Sent::Replied),
+                        // Left only if the worker has not started the tile:
+                        // a tile already being encoded is paid for (#385).
+                        _ = cancel.cancelled() => if claim.abandon() {
+                            Sent::Left
+                        } else {
+                            (&mut resp_rx).await.map_or(Sent::Dropped, Sent::Replied)
+                        },
+                    },
                 },
             };
             let total = self.clock.now().saturating_duration_since(sent_at);
@@ -644,6 +769,15 @@ mod inner {
                     return Err(DdsError::CompressionFailed(
                         "GPU worker dropped response channel".to_string(),
                     ));
+                }
+                Sent::Left | Sent::Replied(GpuEncodeReply::Cancelled) => {
+                    self.stats.record_cancelled();
+                    tracing::debug!(
+                        width,
+                        height,
+                        "GPU encode: job cancelled before its tile started"
+                    );
+                    return Ok(ChainOutcome::Cancelled);
                 }
                 Sent::Replied(GpuEncodeReply::Returned { image, reason }) => {
                     self.stats.record_fallback();
@@ -676,6 +810,48 @@ mod inner {
                 "GPU encode: tile stages"
             );
             result.map(ChainOutcome::Compressed)
+        }
+    }
+
+    impl MipmapCompressor for GpuEncoderChannel {
+        /// Blocks the calling thread on [`submit_mipmap_chain`] with a token
+        /// never cancelled. Call it only where nothing is async (a test or a
+        /// blocking thread): on a runtime worker thread it stalls the
+        /// runtime. Production awaits [`submit_mipmap_chain`] (#422).
+        ///
+        /// [`submit_mipmap_chain`]: MipmapCompressor::submit_mipmap_chain
+        fn compress_mipmap_chain(
+            &self,
+            image: RgbaImage,
+            format: DdsFormat,
+            mipmap_count: usize,
+        ) -> Result<ChainOutcome, DdsError> {
+            pollster::block_on(self.submit_mipmap_chain(
+                image,
+                format,
+                mipmap_count,
+                CancellationToken::new(),
+            ))
+        }
+
+        fn submit_mipmap_chain(
+            &self,
+            image: RgbaImage,
+            format: DdsFormat,
+            mipmap_count: usize,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<ChainOutcome, DdsError>> {
+            let span = tracing::debug_span!(
+                target: "profiling",
+                "gpu_encode",
+                width = image.width(),
+                height = image.height(),
+                levels = mipmap_count,
+            );
+            Box::pin(
+                self.encode_chain(image, format, mipmap_count, cancel)
+                    .instrument(span),
+            )
         }
 
         fn name(&self) -> &str {
@@ -1105,23 +1281,49 @@ mod inner {
 
             let taken = clock.now();
             let queue_wait = taken.saturating_duration_since(request.sent_at);
-            // The valve exists for the FUSE timeout: a prefetch request has
-            // no deadline and waits for the GPU (#421).
-            if lane.has_deadline() && rule.waited_out(queue_wait) {
-                // Not a miss: the GPU never saw it.
-                let waited_ms = queue_wait.as_millis() as u64;
-                tracing::debug!(
-                    waited_ms,
-                    "GPU worker handed back a tile that waited too long"
-                );
-                hand_back(
-                    request,
-                    &format!(
-                        "waited {waited_ms} ms in the queue, past the GPU's {} ms deadline",
-                        rule.deadline.as_millis()
-                    ),
-                );
-                continue;
+            match admit(
+                lane,
+                request.cancel.is_cancelled(),
+                queue_wait,
+                &rule,
+                &request.claim,
+            ) {
+                Admission::Start => {}
+                // A cancelled job's tile is not paid for yet: skipped, not
+                // encoded (#422).
+                Admission::Skip => {
+                    tracing::debug!(
+                        lane = lane.name(),
+                        "GPU worker skipped a tile whose job was cancelled"
+                    );
+                    let _ = request.response.send(GpuEncodeReply::Cancelled);
+                    continue;
+                }
+                Admission::CallerLeft => {
+                    tracing::debug!(
+                        lane = lane.name(),
+                        "GPU worker skipped a tile whose caller left"
+                    );
+                    continue;
+                }
+                // The valve exists for the FUSE timeout: a prefetch request
+                // has no deadline and waits for the GPU (#421). Not a miss:
+                // the GPU never saw it.
+                Admission::HandBack => {
+                    let waited_ms = queue_wait.as_millis() as u64;
+                    tracing::debug!(
+                        waited_ms,
+                        "GPU worker handed back a tile that waited too long"
+                    );
+                    hand_back(
+                        request,
+                        &format!(
+                            "waited {waited_ms} ms in the queue, past the GPU's {} ms deadline",
+                            rule.deadline.as_millis()
+                        ),
+                    );
+                    continue;
+                }
             }
 
             let GpuEncodeRequest {
@@ -1129,6 +1331,8 @@ mod inner {
                 format,
                 mipmap_count,
                 sent_at: _,
+                cancel: _,
+                claim: _,
                 response,
             } = request;
 
@@ -1914,15 +2118,13 @@ mod tests {
         clock: &FakeClock,
         width: u32,
     ) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) {
-        let (response, reply) = oneshot::channel();
-        let request = GpuEncodeRequest {
-            image: RgbaImage::new(width, 4),
-            format: DdsFormat::BC1,
-            mipmap_count: 1,
-            sent_at: clock.now(),
-            response,
-        };
-        (request, reply)
+        GpuEncodeRequest::new(
+            RgbaImage::new(width, 4),
+            DdsFormat::BC1,
+            1,
+            clock.now(),
+            CancellationToken::new(),
+        )
     }
 
     /// Queues requests of the given widths, stamped now on `clock`.
@@ -1979,6 +2181,7 @@ mod tests {
             GpuEncodeReply::Returned { reason, .. } => {
                 panic!("expected a processed tile, it was handed back: {reason}")
             }
+            GpuEncodeReply::Cancelled => panic!("expected a processed tile, it was cancelled"),
         }
     }
 
@@ -2019,6 +2222,7 @@ mod tests {
             ChainOutcome::Returned { reason, .. } => {
                 panic!("expected the GPU's chain, the image was handed back: {reason}")
             }
+            ChainOutcome::Cancelled => panic!("expected the GPU's chain, it was cancelled"),
         })
     }
 
@@ -2661,6 +2865,321 @@ mod tests {
         assert_eq!(GpuLane::Prefetch.name(), "prefetch");
     }
 
+    // =========================================================================
+    // Awaited, and cancelled before the tile starts (#422)
+    // =========================================================================
+
+    /// The worker's decision on a request it took, given its lane, its
+    /// job's cancel, its wait in the queue and who has claimed it.
+    #[test]
+    fn a_taken_request_is_admitted_by_lane_cancel_wait_and_claim() {
+        let fresh = RequestClaim::default;
+        let left = || {
+            let claim = RequestClaim::default();
+            assert!(claim.abandon());
+            claim
+        };
+        use Admission::{CallerLeft, HandBack, Skip, Start};
+        use GpuLane::{Demand, Prefetch};
+        for (lane, cancelled, wait, claim, admission) in [
+            (Demand, false, IN_TIME, fresh(), Start),
+            (Prefetch, false, IN_TIME, fresh(), Start),
+            // The valve: demand only (#421).
+            (Demand, false, LATE, fresh(), HandBack),
+            (Prefetch, false, LATE, fresh(), Start),
+            // A cancelled job is skipped on either lane, waited out or not.
+            (Demand, true, IN_TIME, fresh(), Skip),
+            (Prefetch, true, LATE, fresh(), Skip),
+            (Demand, true, LATE, fresh(), Skip),
+            // Its caller left first.
+            (Demand, false, IN_TIME, left(), CallerLeft),
+            (Prefetch, false, LATE, left(), CallerLeft),
+        ] {
+            assert_eq!(
+                admit(lane, cancelled, wait, &RULE, &claim),
+                admission,
+                "{lane:?}, cancelled {cancelled}, waited {wait:?}"
+            );
+            assert_eq!(claim.is_started(), admission == Start, "{lane:?}");
+        }
+    }
+
+    /// Whoever claims a queued request first has it: the worker starting
+    /// the tile, or the caller leaving on a cancel.
+    #[test]
+    fn a_request_is_claimed_once_by_the_worker_or_its_caller() {
+        let claim = RequestClaim::default();
+        assert!(!claim.is_started());
+        assert!(claim.start(), "the worker starts a queued tile");
+        assert!(claim.is_started());
+        assert!(!claim.abandon(), "its caller cannot leave a started tile");
+        assert!(!claim.start());
+
+        let claim = RequestClaim::default();
+        assert!(claim.abandon(), "a caller leaves a queued tile");
+        assert!(!claim.start(), "the worker cannot start a tile left");
+        assert!(!claim.is_started());
+    }
+
+    /// A channel handle on `clock`, its raw sender (to queue tiles the
+    /// handle did not send) and the worker's side.
+    fn handle_and_raw(
+        clock: &FakeClock,
+    ) -> (
+        Arc<GpuEncoderChannel>,
+        mpsc::Sender<GpuEncodeRequest>,
+        mpsc::Receiver<GpuEncodeRequest>,
+    ) {
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let channel = handle(tx.clone()).with_clock(clock.shared());
+        (Arc::new(channel), tx, rx)
+    }
+
+    /// Yields until `raw`'s channel holds `n` requests: the futures that
+    /// send them run on this thread, and each sends on its first poll.
+    async fn queued(raw: &mpsc::Sender<GpuEncodeRequest>, n: usize) {
+        for _ in 0..10_000 {
+            if raw.max_capacity() - raw.capacity() == n {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{n} requests were never queued");
+    }
+
+    /// A job cancelled while its tile waits in the queue: its caller
+    /// returns `Cancelled` at once, without waiting for the worker (still
+    /// held on a tile), and the worker never starts that tile. It is
+    /// counted as cancelled, not as a tile, failure or fallback.
+    #[tokio::test]
+    async fn a_caller_cancelled_while_queued_leaves_and_the_tile_is_never_started() {
+        let clock = FakeClock::new();
+        let (channel, raw, rx) = handle_and_raw(&clock);
+        let (inner, started) = recording();
+        let (processor, open) = gated(inner);
+        let busy = one(&raw, &clock, 4);
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        waits_for("the busy tile is taken", || all_taken(&raw)).await;
+
+        let cancel = CancellationToken::new();
+        let caller = {
+            let (channel, cancel) = (Arc::clone(&channel), cancel.clone());
+            tokio::spawn(async move {
+                channel
+                    .submit_mipmap_chain(RgbaImage::new(8, 4), DdsFormat::BC1, 1, cancel)
+                    .await
+            })
+        };
+        queued(&raw, 1).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(GUARD, caller)
+            .await
+            .expect("the caller leaves while the worker is held")
+            .unwrap();
+        assert!(
+            matches!(outcome, Ok(ChainOutcome::Cancelled)),
+            "{outcome:?}"
+        );
+
+        drop(open);
+        processed(reply_of(busy).await).0.unwrap();
+        // A tile behind it shows the worker went past the cancelled one.
+        processed(reply_of(one(&raw, &clock, 12)).await).0.unwrap();
+        assert_eq!(
+            *started.lock().unwrap(),
+            [4, 12],
+            "the cancelled tile never started"
+        );
+
+        let s = channel.stats().take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.failed, s.fallback, s.cancelled), (0, 0, 0, 1));
+        assert_eq!(s.depth_now, 0, "the caller that left is not counted");
+    }
+
+    /// A job cancelled while the GPU encodes its tile: the tile is paid
+    /// for, so its caller waits for it and gets it (#385 then caches it).
+    #[tokio::test]
+    async fn a_caller_cancelled_while_its_tile_is_encoded_waits_for_it() {
+        let clock = FakeClock::new();
+        let (channel, raw, rx) = handle_and_raw(&clock);
+        let (inner, _) = recording();
+        let (processor, open) = gated(inner);
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+
+        let cancel = CancellationToken::new();
+        let mut caller = Box::pin(channel.submit_mipmap_chain(
+            RgbaImage::new(8, 4),
+            DdsFormat::BC1,
+            1,
+            cancel.clone(),
+        ));
+        assert!(futures::poll!(&mut caller).is_pending());
+        waits_for("the tile is taken", || all_taken(&raw)).await;
+        // Taken, held at the gate: claimed by the worker.
+        cancel.cancel();
+        assert!(
+            futures::poll!(&mut caller).is_pending(),
+            "a started tile is waited for"
+        );
+
+        drop(open);
+        let outcome = tokio::time::timeout(GUARD, caller)
+            .await
+            .expect("the tile is answered");
+        assert_eq!(compressed(outcome).unwrap().len(), 8);
+    }
+
+    /// A job already cancelled is never sent; one cancelled while the
+    /// channel is full leaves its send, and the request goes with it.
+    #[tokio::test]
+    async fn a_cancelled_caller_sends_nothing() {
+        let clock = FakeClock::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let channel = handle(tx.clone()).with_clock(clock.shared());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = channel
+            .submit_mipmap_chain(RgbaImage::new(4, 4), DdsFormat::BC1, 1, cancel)
+            .await;
+        assert!(
+            matches!(outcome, Ok(ChainOutcome::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+
+        let _full = one(&tx, &clock, 4);
+        let cancel = CancellationToken::new();
+        let mut caller = Box::pin(channel.submit_mipmap_chain(
+            RgbaImage::new(8, 4),
+            DdsFormat::BC1,
+            1,
+            cancel.clone(),
+        ));
+        assert!(
+            futures::poll!(&mut caller).is_pending(),
+            "waiting for a slot"
+        );
+        cancel.cancel();
+        assert!(matches!(caller.await, Ok(ChainOutcome::Cancelled)));
+        assert_eq!(rx.try_recv().unwrap().image.width(), 4);
+        assert!(
+            rx.try_recv().is_err(),
+            "the cancelled request never arrived"
+        );
+        assert_eq!(channel.stats().take_sample().unwrap().cancelled, 2);
+    }
+
+    /// The worker skips a request whose job was cancelled before it took
+    /// it, answering `Cancelled` without starting the tile, and goes on.
+    #[tokio::test]
+    async fn the_worker_skips_a_request_whose_job_was_cancelled() {
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let cancel = CancellationToken::new();
+        let (skipped, skipped_reply) = GpuEncodeRequest::new(
+            RgbaImage::new(4, 4),
+            DdsFormat::BC1,
+            1,
+            clock.now(),
+            cancel.clone(),
+        );
+        cancel.cancel();
+        tx.try_send(skipped).unwrap();
+        let next = one(&tx, &clock, 8);
+        let (processor, started) = recording();
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+
+        assert!(matches!(
+            reply_of(skipped_reply).await,
+            GpuEncodeReply::Cancelled
+        ));
+        processed(reply_of(next).await).0.unwrap();
+        assert_eq!(*started.lock().unwrap(), [8]);
+    }
+
+    /// The acceptance test of #422: an encode waiting on the worker
+    /// occupies no blocking-pool thread. The runtime's one blocking thread
+    /// is held for the whole test, the worker runs on a thread of its own,
+    /// and a burst of encodes through the executor's adapter, the
+    /// production path, is answered all the same. Waited for on blocking
+    /// threads, as before #422, none of them could start.
+    #[test]
+    fn an_encode_waiting_on_the_gpu_occupies_no_blocking_thread() {
+        use crate::executor::{TextureEncoderAdapter, TextureEncoderAsync, TokioExecutor};
+        use crate::texture::DdsTextureEncoder;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let health = SharedGpuHealth::new();
+        let (processor, started) = recording();
+        let worker = {
+            let (health, clock) = (health.clone(), clock.clone());
+            std::thread::spawn(move || run_worker_loop_here(processor, rx, health, &clock))
+        };
+        let channel =
+            GpuEncoderChannel::new(tx, health, CancellationToken::new()).with_clock(clock.shared());
+        let adapter = Arc::new(TextureEncoderAdapter::new(Arc::new(
+            crate::texture::DdsTextureEncoder::new(DdsFormat::BC1)
+                .with_mipmap_count(1)
+                .with_mipmap_compressor(Arc::new(channel)),
+        )));
+        let _: &DdsTextureEncoder = adapter.encoder();
+
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        runtime.block_on(async {
+            let held = tokio::task::spawn_blocking(move || hold_rx.recv());
+            let burst: Vec<_> = (1..=6)
+                .map(|i| {
+                    let adapter = Arc::clone(&adapter);
+                    tokio::spawn(async move {
+                        let cancel = CancellationToken::new();
+                        adapter
+                            .encode(RgbaImage::new(4 * i, 4), &cancel, &TokioExecutor::new())
+                            .await
+                    })
+                })
+                .collect();
+            for encode in burst {
+                let dds = tokio::time::timeout(GUARD, encode)
+                    .await
+                    .expect("answered with no blocking thread free")
+                    .unwrap()
+                    .expect("the blocking executor was not needed")
+                    .expect("the tile is encoded");
+                assert_eq!(dds.len(), crate::dds::layout::HEADER_LEN + 8);
+            }
+            hold_tx.send(()).unwrap();
+            held.await.unwrap().unwrap();
+        });
+        assert_eq!(started.lock().unwrap().len(), 6);
+        drop(adapter);
+        worker.join().unwrap();
+    }
+
     /// The processor is given the deadline: the rule's deadline from when
     /// the worker took the tile, whatever the tile waited in the queue.
     #[tokio::test]
@@ -2887,6 +3406,7 @@ mod tests {
                     assert_eq!(image.width(), width, "each caller gets its own image");
                     back.push(reason);
                 }
+                GpuEncodeReply::Cancelled => panic!("nothing was cancelled"),
             }
         }
         assert_eq!(

@@ -93,6 +93,7 @@ mod gpu_stress {
             ChainOutcome::Returned { reason, .. } => {
                 panic!("the GPU handed the tile back: {reason}")
             }
+            ChainOutcome::Cancelled => panic!("nothing cancels these tiles"),
         }
     }
 
@@ -264,6 +265,10 @@ mod gpu_stress {
                         total_handed_back += 1;
                         answered += 1;
                         eprintln!("  Handed back to the CPU: {reason}");
+                    }
+                    Ok(Ok((Ok(ChainOutcome::Cancelled), _))) => {
+                        total_failures += 1;
+                        eprintln!("  Cancelled, though nothing cancels these tiles");
                     }
                     Ok(Ok((Err(e), _))) => {
                         total_failures += 1;

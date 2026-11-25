@@ -70,6 +70,10 @@ pub struct GpuSample {
     /// the deadline in the queue (`HangRule::waited_out`). Neither tiles
     /// nor failures.
     pub fallback: u64,
+    /// Requests whose job was cancelled before the worker started the tile
+    /// (#422): the caller left, or the worker skipped it. Not encoded, and
+    /// neither tiles, failures nor fallbacks.
+    pub cancelled: u64,
     /// Requests in the channel when the sample closed (see
     /// [`GpuEncodeStats::depth`]).
     pub depth_now: usize,
@@ -88,6 +92,7 @@ impl GpuSample {
         self.tiles() == 0
             && self.failed == 0
             && self.fallback == 0
+            && self.cancelled == 0
             && self.depth_max == 0
             && self.depth_now == 0
     }
@@ -100,6 +105,7 @@ pub struct GpuEncodeStats {
     window: Mutex<StageWindows>,
     failed: AtomicU64,
     fallback: AtomicU64,
+    cancelled: AtomicU64,
     depth: AtomicUsize,
     depth_peak: AtomicUsize,
 }
@@ -138,8 +144,14 @@ impl GpuEncodeStats {
         self.fallback.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Requests in the channel now: buffered, blocked in `blocking_send` on
-    /// a full channel, and in progress. The channel's own
+    /// Records one request whose job was cancelled before its tile started
+    /// (#422).
+    pub fn record_cancelled(&self) {
+        self.cancelled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Requests in the channel now: buffered, waiting in their send on a
+    /// full channel, and in progress. The channel's own
     /// `max_capacity() - capacity()` sees only the buffered ones.
     pub fn depth(&self) -> usize {
         self.depth.load(Ordering::Relaxed)
@@ -161,6 +173,7 @@ impl GpuEncodeStats {
         let depth_max = self.depth_peak.swap(depth_now, Ordering::Relaxed);
         let failed = self.failed.swap(0, Ordering::Relaxed);
         let fallback = self.fallback.swap(0, Ordering::Relaxed);
+        let cancelled = self.cancelled.swap(0, Ordering::Relaxed);
         let mut w = self.window.lock().ok()?;
         w.recorded = 0;
         let sample = GpuSample {
@@ -174,6 +187,7 @@ impl GpuEncodeStats {
             unsampled: std::mem::take(&mut w.unsampled),
             failed,
             fallback,
+            cancelled,
             depth_now,
             depth_max: depth_max.max(depth_now),
         };
@@ -206,6 +220,7 @@ impl GpuEncodeStats {
             unsampled = s.unsampled,
             failed = s.failed,
             fallback = s.fallback,
+            cancelled = s.cancelled,
             health = if health.is_failed() {
                 "failed"
             } else {
@@ -437,6 +452,7 @@ mod tests {
             ("unsampled", "0"),
             ("failed", "0"),
             ("fallback", "0"),
+            ("cancelled", "0"),
             ("health", "\"healthy\""),
             ("depth_now", "0"),
             ("depth_max", "0"),

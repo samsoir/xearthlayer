@@ -90,15 +90,13 @@ impl TileProcessor for Overruns {
 }
 
 fn request(clock: &FakeClock, width: u32) -> (GpuEncodeRequest, oneshot::Receiver<GpuEncodeReply>) {
-    let (response, reply) = oneshot::channel();
-    let request = GpuEncodeRequest {
-        image: RgbaImage::new(width, 4),
-        format: DdsFormat::BC1,
-        mipmap_count: 1,
-        sent_at: clock.now(),
-        response,
-    };
-    (request, reply)
+    GpuEncodeRequest::new(
+        RgbaImage::new(width, 4),
+        DdsFormat::BC1,
+        1,
+        clock.now(),
+        CancellationToken::new(),
+    )
 }
 
 #[tokio::test]

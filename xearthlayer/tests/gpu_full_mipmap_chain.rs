@@ -26,6 +26,7 @@ fn gpu_bytes(outcome: ChainOutcome) -> Vec<u8> {
     match outcome {
         ChainOutcome::Compressed(data) => data,
         ChainOutcome::Returned { reason, .. } => panic!("the GPU handed the tile back: {reason}"),
+        ChainOutcome::Cancelled => panic!("nothing cancels these tiles"),
     }
 }
 

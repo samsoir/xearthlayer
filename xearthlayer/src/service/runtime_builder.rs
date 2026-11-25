@@ -695,7 +695,7 @@ mod tests {
     async fn each_lane_factory_encodes_on_its_own_gpu_channel() {
         use crate::dds::gpu_channel::{gpu_lanes, GpuEncodeReply, GpuTileTiming};
         use crate::dds::gpu_health::SharedGpuHealth;
-        use crate::texture::TextureEncoder;
+        use crate::executor::TextureEncoderAsync;
 
         let (channels, mut queues) = gpu_lanes(
             4,
@@ -725,9 +725,15 @@ mod tests {
         );
 
         for (factory, lane) in [(&demand, "demand"), (&prefetch, "prefetch")] {
-            let encoder = Arc::clone(factory.encoder().encoder());
-            let caller =
-                tokio::task::spawn_blocking(move || encoder.encode(image::RgbaImage::new(4, 4)));
+            // The production path: the job's awaited encode (#422).
+            let encoder = Arc::clone(factory.encoder());
+            let caller = tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                encoder
+                    .encode(image::RgbaImage::new(4, 4), &cancel, &TokioExecutor::new())
+                    .await
+                    .expect("no blocking work")
+            });
             let (ours, other) = match lane {
                 "demand" => (&mut queues.demand, &mut queues.prefetch),
                 _ => (&mut queues.prefetch, &mut queues.demand),

@@ -35,6 +35,8 @@ use crate::cache::DiskTier;
 use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Chunk Provider Trait
@@ -120,14 +122,38 @@ impl std::error::Error for ChunkDownloadError {}
 
 /// Trait for async texture encoding.
 ///
-/// Wraps texture encoders for use with `spawn_blocking`. The actual encoding
-/// is CPU-intensive and should not block the async runtime.
+/// A job encodes through [`encode`](Self::encode), which is awaited and
+/// takes the job's cancellation token (#422). CPU work runs on the blocking
+/// executor the task hands it, under the task's CPU permit, as it always
+/// has; an encoder whose backend waits rather than computes (the GPU) is
+/// awaited instead, so no blocking thread is parked while it waits.
 pub trait TextureEncoderAsync: Send + Sync + 'static {
-    /// Encodes an RGBA image to DDS format.
+    /// The whole encode of an RGBA image to DDS, on the calling thread.
     ///
-    /// This is expected to be CPU-intensive and should be called via
-    /// `BlockingExecutor::execute_blocking`.
-    fn encode(&self, image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError>;
+    /// CPU-intensive: call it through `BlockingExecutor::execute_blocking`
+    /// (the default [`encode`](Self::encode) does).
+    fn encode_blocking(&self, image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError>;
+
+    /// Encodes an RGBA image to DDS for a job whose token is `cancel`,
+    /// running CPU work on `blocking` (#422).
+    ///
+    /// The outer error is the blocking executor's (a panic, a shutdown);
+    /// the inner one the encode's. An encode skipped because the job was
+    /// cancelled before it started is an inner error, and the job is then
+    /// cancelled. The default runs [`encode_blocking`](Self::encode_blocking)
+    /// on `blocking`, whatever `cancel` says: an encode that has started is
+    /// finished, as the CPU encoders always have.
+    fn encode<X: BlockingExecutor>(
+        self: &Arc<Self>,
+        image: image::RgbaImage,
+        cancel: &CancellationToken,
+        blocking: &X,
+    ) -> impl Future<Output = Result<Result<Vec<u8>, TextureEncodeError>, ExecutorError>> + Send
+    {
+        let _ = cancel;
+        let encoder = Arc::clone(self);
+        blocking.execute_blocking(move || encoder.encode_blocking(image))
+    }
 
     /// Returns the expected DDS file size for given dimensions.
     ///

@@ -22,9 +22,12 @@
 //! assert!(encoder.expected_size(4096, 4096) > 0);
 //! ```
 
+use crate::dds::AwaitedEncode;
 use crate::texture::TextureError;
+use futures::future::BoxFuture;
 use image::RgbaImage;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Trait for texture encoding strategies.
 ///
@@ -57,6 +60,28 @@ pub trait TextureEncoder: Send + Sync {
     /// - Image dimensions are invalid for the format
     /// - Encoding/compression fails
     fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError>;
+
+    /// The first step of a job's encode (#422): what can be awaited rather
+    /// than waited for on a thread, with `cancel` the job's token. The
+    /// default leaves the whole encode to the CPU ([`AwaitedEncode::Cpu`]);
+    /// an encoder whose backend waits (the GPU channel) awaits it here, so
+    /// no thread is parked while it waits.
+    fn encode_awaiting<'a>(
+        &'a self,
+        image: RgbaImage,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<AwaitedEncode, TextureError>> {
+        let _ = cancel;
+        Box::pin(std::future::ready(Ok(AwaitedEncode::Cpu(image))))
+    }
+
+    /// The CPU step of a job's encode (#422), for an image
+    /// [`encode_awaiting`](Self::encode_awaiting) answered
+    /// [`AwaitedEncode::Cpu`]. CPU work: run it on a blocking thread. The
+    /// default is [`encode`](Self::encode).
+    fn encode_on_cpu(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
+        self.encode(image)
+    }
 
     /// Return the expected file size for a given image dimension.
     ///
@@ -97,6 +122,18 @@ pub trait TextureEncoder: Send + Sync {
 impl<T: TextureEncoder + ?Sized> TextureEncoder for Arc<T> {
     fn encode(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
         (**self).encode(image)
+    }
+
+    fn encode_awaiting<'a>(
+        &'a self,
+        image: RgbaImage,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<AwaitedEncode, TextureError>> {
+        (**self).encode_awaiting(image, cancel)
+    }
+
+    fn encode_on_cpu(&self, image: RgbaImage) -> Result<Vec<u8>, TextureError> {
+        (**self).encode_on_cpu(image)
     }
 
     fn expected_size(&self, width: u32, height: u32) -> usize {
