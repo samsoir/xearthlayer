@@ -58,7 +58,8 @@ impl std::fmt::Debug for DdsTextureEncoder {
             .field("mipmap_count", &self.mipmap_count);
 
         if let Some(ref mc) = self.mipmap_compressor {
-            s.field("compressor", &mc.name());
+            s.field("compressor", &mc.name())
+                .field("fallback", &self.compressor.name());
         } else {
             s.field("compressor", &self.compressor.name());
         }
@@ -436,5 +437,36 @@ mod tests {
         let debug_str = format!("{:?}", encoder);
         assert!(debug_str.contains("DdsTextureEncoder"));
         assert!(debug_str.contains("software"));
+    }
+
+    /// With a mipmap backend, the debug output names its fallback too.
+    #[test]
+    fn debug_names_the_fallback_of_a_mipmap_backend() {
+        use crate::dds::{ChainOutcome, DdsError, MipmapCompressor, SoftwareCompressor};
+
+        struct Backend;
+        impl MipmapCompressor for Backend {
+            fn compress_mipmap_chain(
+                &self,
+                _image: RgbaImage,
+                _format: DdsFormat,
+                _mipmap_count: usize,
+            ) -> Result<ChainOutcome, DdsError> {
+                Ok(ChainOutcome::Compressed(Vec::new()))
+            }
+            fn name(&self) -> &str {
+                "backend"
+            }
+        }
+
+        let encoder = DdsTextureEncoder::new(DdsFormat::BC1)
+            .with_compressor(Arc::new(SoftwareCompressor))
+            .with_mipmap_compressor(Arc::new(Backend));
+        let debug_str = format!("{encoder:?}");
+        assert!(
+            debug_str.contains(r#"compressor: "backend""#),
+            "{debug_str}"
+        );
+        assert!(debug_str.contains(r#"fallback: "software""#), "{debug_str}");
     }
 }

@@ -166,6 +166,10 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                         DdsTextureEncoder::new(config.texture().format()),
                         config.texture().mipmap_count(),
                     )
+                    // Named, not left to the encoder's default: the WARN
+                    // and the Status pane say a failed GPU's tiles are
+                    // encoded on ISPC (#420).
+                    .with_compressor(Arc::new(IspcCompressor))
                     .with_mipmap_compressor(Arc::new(channel)),
                 ),
                 gpu_worker_handle: Some(worker_handle),
@@ -253,6 +257,10 @@ mod tests {
                     .gpu_health
                     .expect("a GPU encoder reports its health");
                 assert!(!health.is_failed(), "a new GPU is healthy");
+                // The WARN and the Status pane say a failed GPU falls back
+                // to ISPC: the encoder must name it.
+                let debug = format!("{:?}", components.encoder);
+                assert!(debug.contains(r#"fallback: "ispc""#), "{debug}");
                 // The policy's verdict must match the host: a lone GPU is the
                 // one X-Plane renders with and warns, two or more do not (#203).
                 let host = crate::system::HardwareProfile::new(crate::system::enumerate_gpus());
