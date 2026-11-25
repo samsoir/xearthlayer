@@ -1,6 +1,5 @@
 //! The queue's shared state, and the transitions every thread uses.
 
-use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -13,6 +12,7 @@ use super::lock::QueueLock;
 use super::stages::Stages;
 use crate::manager::cancel::CancelToken;
 use crate::manager::error::ManagerError;
+use crate::panic::panic_message;
 
 /// Where a job is. The phase decides what cancelling it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,16 +295,5 @@ pub(super) fn outcome_of(error: ManagerError) -> JobOutcome {
     match error {
         ManagerError::Cancelled => JobOutcome::Cancelled,
         e => JobOutcome::Failed(e),
-    }
-}
-
-/// The text of a panic payload, for logs and `ManagerError::Panicked`.
-pub(super) fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
     }
 }

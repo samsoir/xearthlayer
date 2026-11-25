@@ -509,17 +509,6 @@ mod inner {
         }
     }
 
-    /// The text of a caught panic's payload.
-    pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-        if let Some(s) = payload.downcast_ref::<&str>() {
-            s.to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown panic".to_string()
-        }
-    }
-
     /// The worker loop, on the worker's thread; [`spawn_tile_worker`] says
     /// what ends it and how each request is answered.
     fn run_worker_loop<P: TileProcessor>(
@@ -583,7 +572,7 @@ mod inner {
                     let _ = response.send(GpuEncodeReply { result, timing });
                 }
                 Err(panic_info) => {
-                    let msg = panic_message(panic_info.as_ref());
+                    let msg = crate::panic::panic_message(panic_info.as_ref());
 
                     tracing::error!(
                         error = %msg,
@@ -832,14 +821,6 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one tile was started");
         assert!(tx.is_closed(), "the receiver is gone with the loop");
-    }
-
-    #[test]
-    fn panic_message_reads_str_string_and_other_payloads() {
-        let caught = |f: fn()| panic_message(std::panic::catch_unwind(f).unwrap_err().as_ref());
-        assert_eq!(caught(|| panic!("plain")), "plain");
-        assert_eq!(caught(|| panic!("formatted {}", 7)), "formatted 7");
-        assert_eq!(caught(|| std::panic::panic_any(42_u32)), "unknown panic");
     }
 
     #[tokio::test]

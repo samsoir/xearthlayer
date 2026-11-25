@@ -8,11 +8,12 @@ use xearthlayer_package::PackageMetadata;
 use super::job::{Job, JobEvent, JobId, JobOutcome};
 use super::ledger::{Admission, Filesystem};
 use super::stages::{InstallContext, Stages};
-use super::state::{outcome_of, panic_message, Phase, Ready, Shared};
+use super::state::{outcome_of, Phase, Ready, Shared};
 use crate::manager::cancel::CancelToken;
 use crate::manager::download::DownloadProgressCallback;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::InstallStage;
+use crate::panic::panic_message;
 
 /// Run one `Stages` call. A panic becomes `ManagerError::Panicked`, so it
 /// fails that job and the thread goes on to the next one; whatever payload
