@@ -1216,7 +1216,46 @@ mod inner {
         }
     }
 
+    /// What [`WgpuTileProcessor`] does with its kept [`TileResources`] once
+    /// a tile is over ([`AfterTile::of`]).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AfterTile {
+        /// Keep them for the next tile of the size (#423).
+        Keep,
+        /// Drop them: the next tile makes fresh ones.
+        Discard,
+    }
+
+    impl AfterTile {
+        /// Keep after a tile that succeeded, discard after any error.
+        ///
+        /// A failed tile can leave the readback buffer mapped or with a map
+        /// still pending: a poll that timed out returns before the map
+        /// completes, and a failed map or mapped range returns before
+        /// `unmap`. Every later submit that copies into that buffer then
+        /// fails (`BufferStillMapped`), so one late tile became three misses
+        /// in a row and turned the GPU off for the session, where fresh
+        /// buffers per tile let it recover (#420). Which errors leave it so
+        /// is the driver's business: any error discards, and the next tile
+        /// pays one allocation, as every tile did before #423.
+        pub(super) fn of(outcome: &Result<(), DdsError>) -> Self {
+            match outcome {
+                Ok(()) => Self::Keep,
+                Err(_) => Self::Discard,
+            }
+        }
+    }
+
     impl TileProcessor for WgpuTileProcessor {
+        /// [`process_tile`](Self::process_tile), then the kept resources are
+        /// dropped if the tile failed ([`AfterTile::of`]).
+        ///
+        /// Dropping them while the late tile's work may still be on the GPU
+        /// is safe: wgpu-core holds every buffer and texture a submission
+        /// uses until that submission completes (its trackers keep a
+        /// reference) and destroys the raw resource only when the last
+        /// reference goes; dropping a buffer whose map is pending aborts the
+        /// map, whose callback then sends into a channel nobody reads.
         fn process(
             &mut self,
             image: RgbaImage,
@@ -1226,7 +1265,11 @@ mod inner {
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError> {
-            self.process_tile(image, format, levels, deadline, timing, payload)
+            let outcome = self.process_tile(image, format, levels, deadline, timing, payload);
+            if AfterTile::of(&outcome) == AfterTile::Discard && self.resources.take().is_some() {
+                tracing::debug!("GPU worker dropped its kept resources after a failed tile");
+            }
+            outcome
         }
     }
 
@@ -1985,7 +2028,7 @@ pub use inner::*;
 
 #[cfg(test)]
 mod tests {
-    use super::inner::{Ending, LoopEnd, Misses, Verdict};
+    use super::inner::{AfterTile, Ending, LoopEnd, Misses, Verdict};
     use super::*;
     use crate::dds::compressor::tests::varied;
     use crate::dds::compressor::{ChainOutcome, MipmapCompressor};
@@ -2278,6 +2321,55 @@ mod tests {
             (LoopEnd::Panicked, Ending::Abandon),
         ] {
             assert_eq!(end.ending(), ending, "{end:?}");
+        }
+    }
+
+    /// Given how a tile ended, whether the GPU processor keeps its
+    /// resources for the next (#423 review): only after a success. A tile
+    /// that timed out, failed its map or failed in any other way leaves
+    /// the next tile to fresh ones.
+    #[test]
+    fn the_kept_resources_survive_a_good_tile_only() {
+        let failed = |message: &str| Err(DdsError::CompressionFailed(message.to_string()));
+        for (case, outcome, after) in [
+            ("encoded", Ok(()), AfterTile::Keep),
+            (
+                "poll timed out",
+                failed("GPU poll timed out at the tile's deadline, level 0"),
+                AfterTile::Discard,
+            ),
+            (
+                "map failed",
+                failed("buffer mapping failed: Buffer is still mapped"),
+                AfterTile::Discard,
+            ),
+            (
+                "mapped range",
+                failed("mapped range unavailable: out of range"),
+                AfterTile::Discard,
+            ),
+            (
+                "poll failed",
+                failed("GPU poll failed: lost"),
+                AfterTile::Discard,
+            ),
+            (
+                "chain short of its slots",
+                failed("the chain does not fill the file"),
+                AfterTile::Discard,
+            ),
+            (
+                "unsupported format",
+                Err(DdsError::UnsupportedFormat("BC3".to_string())),
+                AfterTile::Discard,
+            ),
+            (
+                "bad dimensions",
+                Err(DdsError::InvalidDimensions(0, 4)),
+                AfterTile::Discard,
+            ),
+        ] {
+            assert_eq!(AfterTile::of(&outcome), after, "{case}");
         }
     }
 
@@ -4953,5 +5045,59 @@ mod tests {
         let data = compressed(result).expect("GPU compression should succeed");
         // BC1: 1024×1024 blocks × 8 bytes = 8388608 bytes
         assert_eq!(data.len(), crate::dds::layout::HEADER_LEN + 8_388_608);
+    }
+
+    /// A tile that fails on the GPU leaves nothing behind for the next
+    /// (#423 review): one good tile, one whose deadline has already passed
+    /// (its poll times out with the readback buffer's map still pending),
+    /// then five good tiles, every one encoded and byte for byte a fresh
+    /// processor's. With the kept resources reused after the failure, each
+    /// of the five failed (`BufferStillMapped`, then a submission index
+    /// that was never returned), and the GPU was off for the session.
+    #[test]
+    #[ignore] // Requires GPU hardware
+    fn a_failed_tile_leaves_the_next_tiles_to_fresh_resources() {
+        const SIZE: u32 = 4096;
+        let levels = crate::dds::layout::full_chain_levels(SIZE, SIZE);
+        let Some((device, queue, compressor)) = gpu_resources_or_skip() else {
+            return;
+        };
+        let Some((fresh_device, fresh_queue, fresh_compressor)) = gpu_resources_or_skip() else {
+            return;
+        };
+        let mut worker = WgpuTileProcessor::new(device, queue, compressor);
+        let mut fresh = WgpuTileProcessor::new(fresh_device, fresh_queue, fresh_compressor);
+        let encode = |processor: &mut WgpuTileProcessor, deadline: Instant| {
+            let mut payload =
+                vec![0; crate::dds::layout::chain_len(SIZE, SIZE, levels, DdsFormat::BC1)];
+            processor
+                .process(
+                    varied(SIZE, SIZE),
+                    DdsFormat::BC1,
+                    levels as usize,
+                    deadline,
+                    &mut GpuTileTiming::default(),
+                    &mut payload,
+                )
+                .map(|()| payload)
+        };
+        // Generous: only a guard against a hung GPU.
+        let in_time = || Instant::now() + Duration::from_secs(60);
+
+        let expected = encode(&mut fresh, in_time()).expect("the fresh processor's tile");
+        let first = encode(&mut worker, in_time()).expect("the first tile");
+        assert!(first == expected, "the first tile is the fresh one's");
+        let late = encode(&mut worker, Instant::now());
+        assert!(
+            late.as_ref()
+                .is_err_and(|e| e.to_string().contains("timed out")),
+            "the tile past its deadline times out: {:?}",
+            late.map(|p| p.len())
+        );
+        for tile in 1..=5 {
+            let payload = encode(&mut worker, in_time())
+                .unwrap_or_else(|e| panic!("tile {tile} after the late one: {e}"));
+            assert!(payload == expected, "tile {tile} is the fresh one's");
+        }
     }
 }
