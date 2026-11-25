@@ -2041,7 +2041,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn dsf_hints_are_ignored_past_the_backlog_but_probes_are_not() {
         let t = install(None);
-        let (c, _gate) = gated(30, LONG);
+        let (c, gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
         // The gate stays shut, so every build stays pending.
         let tiles: Vec<Tile> = (0..ROAD_HINT_BACKLOG as i32 + 1).map(|k| (10, k)).collect();
@@ -2060,9 +2060,19 @@ pub(crate) mod tests {
             ROAD_HINT_BACKLOG,
             "a pending tile is no new build"
         );
-        let r = svc.footprint(&[last], Purpose::Probe).await;
-        assert!(r.timed_out, "the probe started its build and waited");
-        assert!(svc.pending.contains_key(&last));
+        let s = Arc::clone(&svc);
+        let probe = tokio::spawn(async move { s.footprint(&[last], Purpose::Probe).await });
+        until("the probe waits for the tile", || svc.waits_entered() == 1).await;
+        assert!(
+            svc.pending.contains_key(&last),
+            "the probe started its build"
+        );
+        gate.add_permits(tiles.len());
+        let r = tokio::time::timeout(Duration::from_secs(5), probe)
+            .await
+            .expect("the build ends the wait")
+            .unwrap();
+        assert!(r.complete && !r.timed_out, "and got its roads");
     }
 
     // Failure.
@@ -2086,10 +2096,10 @@ pub(crate) mod tests {
         let t = install_with(high(None).bytes(), b"garbage".to_vec());
         let svc = patient(t.path(), None);
         assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
-        let started = Instant::now();
+        let waits = svc.waits_entered();
         let r = svc.footprint(&[TILE], Purpose::Generate).await;
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert!(!r.complete);
+        assert_eq!(svc.waits_entered(), waits, "no wait for a failed tile");
+        assert!(!r.complete && !r.timed_out);
         assert!(r.tiles.is_empty());
         assert_eq!(svc.stats_snapshot().tiles_failed, 1, "not rebuilt");
     }
@@ -2311,11 +2321,15 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn callers_that_stop_waiting_share_one_build_and_never_cancel_it() {
         let t = install(None);
-        let (c, gate) = gated(30, 30);
+        let (c, gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
-        // The gate is shut: both callers give up on a build still waiting.
-        assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
-        assert!(!svc.footprint(&[TILE], Purpose::Generate).await.complete);
+        // The gate is shut: both callers give up on a build still waiting,
+        // their deadlines past.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.deadline_passed(TILE, Purpose::Probe);
+        svc.deadline_passed(TILE, Purpose::Generate);
+        assert!(svc.footprint(&[TILE], Purpose::Probe).await.timed_out);
+        assert!(svc.footprint(&[TILE], Purpose::Generate).await.timed_out);
         svc.ensure(TILE, Trigger::DsfOpen);
         let a = svc.start(TILE, Trigger::Probe).unwrap();
         assert!(a
@@ -2660,9 +2674,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn probe_and_generate_deadlines_are_independent() {
         let t = install(None);
-        let (c, gate) = gated(30, LONG);
+        let (c, gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
-        assert!(!svc.footprint(&[TILE], Purpose::Probe).await.complete);
+        // The build's probe deadline has passed; no generation has asked.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.deadline_passed(TILE, Purpose::Probe);
+        assert!(svc.footprint(&[TILE], Purpose::Probe).await.timed_out);
+        assert!(!svc.is_asked(TILE, Purpose::Generate));
         let (r, ()) = tokio::join!(svc.footprint(&[TILE], Purpose::Generate), async {
             gate.add_permits(1)
         });
@@ -2772,8 +2790,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_footprint_past_a_building_tiles_deadline_times_out() {
         let t = install(None);
-        let (c, _gate) = gated(30, LONG);
+        let (c, _gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
+        // The gate stays shut and the build's probe deadline has passed.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.deadline_passed(TILE, Purpose::Probe);
         let r = svc.footprint(&[TILE], Purpose::Probe).await;
         assert!(!r.complete && r.timed_out);
         let s = svc.stats_snapshot();
@@ -2785,8 +2806,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn generate_waits_and_timeouts_are_counted_apart() {
         let t = install(None);
-        let (c, _gate) = gated(LONG, 30);
+        let (c, _gate) = gated(LONG, LONG);
         let svc = RoadService::with_config(t.path().into(), vec![], None, LitDiskPermits::new(), c);
+        // The gate stays shut and the build's generate deadline has passed.
+        svc.ensure(TILE, Trigger::DsfOpen);
+        svc.deadline_passed(TILE, Purpose::Generate);
         assert!(svc.footprint(&[TILE], Purpose::Generate).await.timed_out);
         let s = svc.stats_snapshot();
         assert_eq!((s.generate_waits, s.generate_timeouts), (1, 1));

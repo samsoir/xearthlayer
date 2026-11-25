@@ -2719,7 +2719,7 @@ mod tests {
             let roads = roads(
                 xp_install(&temp, Some(road_across(&name))),
                 LONG,
-                30,
+                LONG,
                 Some(gate.clone()),
             );
             let white = Arc::new(White::default());
@@ -2728,11 +2728,15 @@ mod tests {
                 .with_disk_cache(d.clone())
                 .with_roads(roads.clone());
             let layout = LitLayout::new(16, 4);
-            // The gate is shut: the generation times out on its roads.
+            // The gate is shut and the roads' generate deadline has passed:
+            // each generation times out on its roads, without a wait.
+            let tiles = tiles_of(&source, &name);
+            deadlines_passed(&roads, &tiles, Purpose::Generate);
             assert!(
                 source.served_payload(&name, &layout).await.0.is_some(),
                 "served"
             );
+            assert_eq!(roads.waits_entered(), 0, "no wait past the deadline");
             assert_eq!(roads.stats_snapshot().generate_timeouts, 1);
             source.payloads.run_pending_tasks().await;
             assert_eq!(source.payloads.entry_count(), 0, "not in memory");
@@ -2745,8 +2749,10 @@ mod tests {
                 .unwrap()
                 .is_none());
             // Once the roads are ready the payload is complete and kept.
-            gate.add_permits(1);
-            until_ready(&roads, TILE).await;
+            gate.add_permits(tiles.len());
+            for &tile in &tiles {
+                until_ready(&roads, tile).await;
+            }
             assert!(source.served_payload(&name, &layout).await.0.is_some());
             assert!(source.served_payload(&name, &layout).await.0.is_some());
             assert_eq!(calls(&white), 3, "kept once complete");
@@ -2903,16 +2909,24 @@ mod tests {
             let roads = roads(
                 xp_install(&temp, Some(road_across(&name))),
                 LONG,
-                30,
+                LONG,
                 Some(gate.clone()),
             );
             let source = source_sharing(&temp, &roads).with_roads(roads.clone());
             let layout = source.layout(&name);
-            let (size, ()) = tokio::join!(source.size(&name), async { gate.add_permits(1) });
+            let tiles = tiles_of(&source, &name);
+            let (size, ()) =
+                tokio::join!(source.size(&name), async { gate.add_permits(tiles.len()) });
             assert_eq!(size, layout.total_len, "lit by the road");
-            // The tile is evicted and its rebuild is held: generation times out.
-            roads.evict(TILE).await;
+            // The tiles are evicted and their rebuilds held, past their
+            // generate deadline: generation times out.
+            for &tile in &tiles {
+                roads.evict(tile).await;
+            }
+            deadlines_passed(&roads, &tiles, Purpose::Generate);
+            let waits = roads.waits_entered();
             let file = source.read(&name, 0, u32::MAX).await;
+            assert_eq!(roads.waits_entered(), waits, "the generation did not wait");
             assert_eq!(file.len() as u64, size, "size and read agree");
             let lit = &file[layout.payload_start() as usize..];
             assert!(lit.iter().all(|&b| b == 0), "the payload black");
@@ -3744,13 +3758,15 @@ mod tests {
             let roads = roads(
                 xp_install(&temp, Some(road_across(&name))),
                 LONG,
-                30,
+                LONG,
                 Some(gate.clone()),
             );
             let source = source_sharing(&temp, &roads)
                 .with_generator(Arc::new(White::default()))
                 .with_roads(roads.clone());
-            let tiles = road_tiles(&name, 1024, &RoadModel::DEFAULT);
+            // The roads are still building past their generate deadline.
+            let tiles = tiles_of(&source, &name);
+            deadlines_passed(&roads, &tiles, Purpose::Generate);
             let all = source.generations.available_permits() as u32;
             let held = source.generations.acquire_many(all).await.unwrap();
             let layout = LitLayout::new(16, 4);
