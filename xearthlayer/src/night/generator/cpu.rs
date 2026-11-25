@@ -161,7 +161,7 @@ fn opaque([r, g, b]: [u8; 3]) -> Rgba<u8> {
 
 /// Stored values (0..255) to linear light, exactly as `led::decode` gives
 /// them, built once: a road texel decodes its pattern bytes by lookup.
-fn linear_table() -> &'static [f32; 256] {
+pub(super) fn linear_table() -> &'static [f32; 256] {
     static TABLE: OnceLock<[f32; 256]> = OnceLock::new();
     TABLE.get_or_init(|| std::array::from_fn(|v| led::decode([v as f32; 3])[0]))
 }

@@ -158,13 +158,35 @@ fn bc1_levels(levels: &[RgbaImage]) -> Result<Vec<u8>, crate::dds::DdsError> {
     Ok(payload)
 }
 
-/// Scales a level's stored R, G and B by `gain`, then turns black every
-/// texel whose largest of them is below [`BC1_FLOOR`]. Alpha is untouched.
+/// Scales a level's stored R, G and B by `gain`, each rounded to nearest,
+/// then turns black every texel whose largest of them is below
+/// [`BC1_FLOOR`]. Alpha is untouched.
+///
+/// The scaling goes through [`dim_table`], 256 values computed once per
+/// call; at a gain of 1.0 it is skipped, since `(v * 1.0).round()` is `v`,
+/// and only the floor is applied.
 fn dim(level: &mut RgbaImage, gain: f32) {
+    if gain == 1.0 {
+        map_and_floor(level, |c| c);
+    } else {
+        let table = dim_table(gain);
+        map_and_floor(level, |c| table[usize::from(c)]);
+    }
+}
+
+/// `(v * gain).round()` for every stored value `v`: what [`dim`] gives a
+/// channel.
+fn dim_table(gain: f32) -> [u8; 256] {
+    std::array::from_fn(|v| (v as f32 * gain).round() as u8)
+}
+
+/// Maps each of a level's R, G and B through `scale`, then turns black every
+/// texel whose largest of them is below [`BC1_FLOOR`].
+fn map_and_floor(level: &mut RgbaImage, scale: impl Fn(u8) -> u8) {
     for px in level.pixels_mut() {
         let rgb = &mut px.0[..3];
         for c in rgb.iter_mut() {
-            *c = (f32::from(*c) * gain).round() as u8;
+            *c = scale(*c);
         }
         if rgb.iter().all(|&c| c < BC1_FLOOR) {
             rgb.fill(0);
@@ -179,9 +201,23 @@ fn dim(level: &mut RgbaImage, gain: f32) {
 /// channel of warm light, lost the most, so distance made every town dimmer
 /// and more orange (#363). Each level is averaged from the linear values of
 /// the level above, never from its rounded bytes. Alpha is linear already.
+///
+/// Stored values decode through the process-wide table of
+/// `cpu::linear_table` and linear values encode through
+/// [`led::ByteEncoder`], which gives exactly the byte `led::encode` rounded
+/// to nearest gives, with no `powf` or `round` per channel. An alpha of
+/// exactly 1.0 (every opaque texel) is 255 without rounding.
 fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
-    let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
-    let encode = |c: f32| (c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0).round() as u8;
+    let decode = cpu::linear_table();
+    let encoder = led::ByteEncoder::get();
+    let encode = |c: f32| encoder.byte(c);
+    let alpha = |a: f32| {
+        if a == 1.0 {
+            255
+        } else {
+            (a * 255.0).round() as u8
+        }
+    };
     let (mut w, mut h) = image.dimensions();
     let mut linear: Vec<[f32; 4]> = image
         .pixels()
@@ -210,7 +246,7 @@ fn lit_chain(image: &RgbaImage) -> Vec<RgbaImage> {
         (linear, w, h) = (next, nw, nh);
         chain.push(RgbaImage::from_fn(w, h, |x, y| {
             let [r, g, b, a] = linear[(y * w + x) as usize];
-            image::Rgba([encode(r), encode(g), encode(b), (a * 255.0).round() as u8])
+            image::Rgba([encode(r), encode(g), encode(b), alpha(a)])
         }));
     }
     chain
@@ -638,5 +674,238 @@ mod tests {
         let light = FADE_RAMP.map(|v| v.powf(SRGB_GAMMA));
         assert!((light[0] - 1.0 / 4.0).abs() < 1e-3, "{light:?}");
         assert!((light[1] - 1.0 / 2.0).abs() < 1e-3, "{light:?}");
+    }
+
+    // The encoder before #439, kept as the reference its tables are held
+    // to: its own decode table, `powf` and `round` per channel, and a
+    // multiply and `round` per channel when dimming.
+
+    /// The byte `lit_chain` gave a linear value before #439.
+    fn chain_encode_reference(c: f32) -> u8 {
+        (c.clamp(0.0, 1.0).powf(1.0 / SRGB_GAMMA) * 255.0).round() as u8
+    }
+
+    /// `lit_chain` before #439.
+    fn lit_chain_reference(image: &RgbaImage) -> Vec<RgbaImage> {
+        let decode: [f32; 256] = std::array::from_fn(|v| (v as f32 / 255.0).powf(SRGB_GAMMA));
+        let (mut w, mut h) = image.dimensions();
+        let mut linear: Vec<[f32; 4]> = image
+            .pixels()
+            .map(|p| {
+                let [r, g, b, a] = p.0;
+                [
+                    decode[usize::from(r)],
+                    decode[usize::from(g)],
+                    decode[usize::from(b)],
+                    f32::from(a) / 255.0,
+                ]
+            })
+            .collect();
+        let mut chain = vec![image.clone()];
+        while w > 1 && h > 1 {
+            let (nw, nh) = (w / 2, h / 2);
+            let above = &linear;
+            let at = |x: u32, y: u32| above[(y * w + x) as usize];
+            let next: Vec<[f32; 4]> = (0..nh)
+                .flat_map(|y| (0..nw).map(move |x| (x * 2, y * 2)))
+                .map(|(x, y)| {
+                    let q = [at(x, y), at(x + 1, y), at(x, y + 1), at(x + 1, y + 1)];
+                    std::array::from_fn(|c| (q[0][c] + q[1][c] + q[2][c] + q[3][c]) / 4.0)
+                })
+                .collect();
+            (linear, w, h) = (next, nw, nh);
+            chain.push(RgbaImage::from_fn(w, h, |x, y| {
+                let [r, g, b, a] = linear[(y * w + x) as usize];
+                let e = chain_encode_reference;
+                image::Rgba([e(r), e(g), e(b), (a * 255.0).round() as u8])
+            }));
+        }
+        chain
+    }
+
+    /// `dim` before #439.
+    fn dim_reference(level: &mut RgbaImage, gain: f32) {
+        for px in level.pixels_mut() {
+            let rgb = &mut px.0[..3];
+            for c in rgb.iter_mut() {
+                *c = (f32::from(*c) * gain).round() as u8;
+            }
+            if rgb.iter().all(|&c| c < BC1_FLOOR) {
+                rgb.fill(0);
+            }
+        }
+    }
+
+    /// `encode_visible` before #439: the full path, with no shortcut.
+    fn encode_visible_reference(image: &RgbaImage) -> Vec<u8> {
+        let mut chain = lit_chain_reference(image);
+        for (n, level) in chain.iter_mut().enumerate() {
+            dim_reference(level, FADE_RAMP.get(n).copied().unwrap_or(1.0));
+        }
+        bc1_levels(&chain).unwrap()
+    }
+
+    /// `encode` of `led`, rounded and clamped: what `ByteEncoder` gives.
+    fn led_encode_round(c: f32) -> u8 {
+        led::encode([c; 3])[0].round().clamp(0.0, 255.0) as u8
+    }
+
+    /// Floats on which an encode is most likely to differ: specials, the
+    /// float steps either side of every byte boundary, and a dense sweep of
+    /// [0, 1.25].
+    fn encode_probe_inputs() -> Vec<f32> {
+        let mut inputs = vec![
+            0.0,
+            -0.0,
+            -1.0,
+            1.0,
+            1.5,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MAX,
+            f32::MIN,
+        ];
+        for b in 0..256 {
+            let t = ((b as f64 + 0.5) / 255.0).powf(f64::from(SRGB_GAMMA)) as f32;
+            let mut x = t;
+            for _ in 0..64 {
+                x = f32::from_bits(x.to_bits().saturating_sub(1));
+            }
+            for _ in 0..128 {
+                inputs.push(x);
+                x = f32::from_bits(x.to_bits() + 1);
+            }
+        }
+        inputs.extend((0..=2_000_000).map(|i| i as f32 / 1_600_000.0));
+        inputs
+    }
+
+    #[test]
+    fn the_shared_decode_table_is_the_one_lit_chain_built() {
+        let table = cpu::linear_table();
+        for v in 0..=255u8 {
+            assert_eq!(
+                table[usize::from(v)].to_bits(),
+                (f32::from(v) / 255.0).powf(SRGB_GAMMA).to_bits(),
+                "stored {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chain_encode_is_led_encode_rounded() {
+        // With `the_byte_encoder_exhaustive` (every float from 0 to 1 against
+        // the same rounding), this makes `ByteEncoder` the chain's encode.
+        for x in encode_probe_inputs() {
+            assert_eq!(
+                chain_encode_reference(x),
+                led_encode_round(x),
+                "linear {x:e} ({:#x})",
+                x.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn the_byte_encoder_is_the_chain_encode() {
+        let encoder = led::ByteEncoder::get();
+        for x in encode_probe_inputs() {
+            assert_eq!(
+                encoder.byte(x),
+                chain_encode_reference(x),
+                "linear {x:e} ({:#x})",
+                x.to_bits()
+            );
+        }
+    }
+
+    /// Every float from 0 to 1, the inputs of `the_byte_encoder_exhaustive`.
+    /// Release only (about two billion `powf`): `cargo test --release -p
+    /// xearthlayer --lib the_chain_encode_is_led_encode_rounded_exhaustive --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn the_chain_encode_is_led_encode_rounded_exhaustive() {
+        let mut mismatches = 0u64;
+        for bits in 0..=1.0f32.to_bits() {
+            let x = f32::from_bits(bits);
+            mismatches += u64::from(chain_encode_reference(x) != led_encode_round(x));
+        }
+        assert_eq!(mismatches, 0);
+    }
+
+    /// Every (R, G) pair, with B their XOR, at the given alpha.
+    fn every_byte(alpha: impl Fn(u32, u32) -> u8) -> RgbaImage {
+        RgbaImage::from_fn(256, 256, |x, y| {
+            image::Rgba([x as u8, y as u8, (x ^ y) as u8, alpha(x, y)])
+        })
+    }
+
+    /// Every R, G and B from 0 to 15: each combination around the floor.
+    fn around_the_floor() -> RgbaImage {
+        RgbaImage::from_fn(64, 64, |x, y| {
+            let i = y * 64 + x;
+            image::Rgba([(i % 16) as u8, (i / 16 % 16) as u8, (i / 256) as u8, 255])
+        })
+    }
+
+    #[test]
+    fn lit_chain_equals_the_reference() {
+        let images = [
+            golden_level(),
+            checker(64, [200, 120, 50]),
+            lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]),
+            every_byte(|_, _| 255),
+            every_byte(|x, y| (x * 7 + y * 3) as u8),
+            around_the_floor(),
+            RgbaImage::from_fn(64, 16, |x, y| {
+                image::Rgba([x as u8 * 4, y as u8 * 16, 9, 255])
+            }),
+            RgbaImage::from_fn(13, 7, |x, y| {
+                image::Rgba([x as u8 * 19, y as u8 * 37, 200, 77])
+            }),
+            RgbaImage::from_pixel(1, 1, image::Rgba([90, 60, 30, 255])),
+        ];
+        for (i, img) in images.iter().enumerate() {
+            assert!(lit_chain(img) == lit_chain_reference(img), "image {i}");
+        }
+    }
+
+    #[test]
+    fn dim_through_a_table_equals_the_reference_for_every_byte() {
+        for gain in FADE_RAMP.into_iter().chain([1.0, 0.32319]) {
+            let table = dim_table(gain);
+            for v in 0..=255u8 {
+                assert_eq!(
+                    table[usize::from(v)],
+                    (f32::from(v) * gain).round() as u8,
+                    "gain {gain} stored {v}"
+                );
+            }
+            for source in [every_byte(|x, y| (x + y) as u8), around_the_floor()] {
+                let (mut got, mut want) = (source.clone(), source);
+                dim(&mut got, gain);
+                dim_reference(&mut want, gain);
+                assert!(got == want, "gain {gain}");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_visible_equals_the_reference() {
+        for img in [
+            golden_level(),
+            checker(64, [240; 3]),
+            lamps(64, [17, 13, 9], [15, 11, 9], [15, 13, 9]),
+            every_byte(|_, _| 255),
+            around_the_floor(),
+            solid(64, [14; 3]),
+        ] {
+            let want = encode_visible_reference(&img);
+            assert_eq!(&encode_visible(img).unwrap()[..], &want[..]);
+        }
     }
 }
