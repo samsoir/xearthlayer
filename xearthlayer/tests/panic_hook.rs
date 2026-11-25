@@ -7,7 +7,8 @@
 //! a tokio task or a `spawn_blocking` closure left XEarthLayer running with
 //! nothing mounted. These tests install the real hook with a writer they read
 //! back, panic where the service catches panics, and check that the report
-//! was written for each and that the runtime carries on. What the report says
+//! was written for each and that the runtime carries on; for the GPU worker
+//! (#420), that tiles go on being encoded, on the CPU. What the report says
 //! is tested in `xearthlayer::panic`, the unmount on a main-thread panic in
 //! `manager::mounts`.
 
@@ -86,4 +87,93 @@ fn a_panic_caught_on_a_plain_thread_is_reported_and_the_thread_carries_on() {
 
     assert_eq!(worker.join().unwrap(), "worker carried on");
     assert!(reported("panic in one tile"));
+}
+
+/// The GPU worker's own panic (#420), under the installed hook: a processor
+/// that panics as `Device::poll` does on a lost device. The hook reports it
+/// and unmounts nothing; the real worker loop catches it, fails the health
+/// and ends; the runtime carries on and the tile after it is encoded on the
+/// fallback.
+#[test]
+fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use image::RgbaImage;
+    use tokio_util::sync::CancellationToken;
+    use xearthlayer::dds::gpu_channel::{
+        spawn_tile_worker, GpuEncoderChannel, GpuTileTiming, HangRule, TileProcessor,
+        CHANNEL_CAPACITY,
+    };
+    use xearthlayer::dds::gpu_health::SharedGpuHealth;
+    use xearthlayer::dds::{DdsEncoder, DdsError, DdsFormat, IspcCompressor, MipmapCompressor};
+
+    struct LosesTheDevice;
+
+    impl TileProcessor for LosesTheDevice {
+        fn process(
+            &mut self,
+            _image: RgbaImage,
+            _format: DdsFormat,
+            _levels: usize,
+            _deadline: Instant,
+            _timing: &mut GpuTileTiming,
+        ) -> Result<Vec<u8>, DdsError> {
+            panic!("panic in the GPU worker: Device::poll: device lost")
+        }
+    }
+
+    install();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("runtime builds");
+
+    let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+    let health = SharedGpuHealth::new();
+    let channel = Arc::new(GpuEncoderChannel::new(tx, health.clone()));
+    let encoder = Arc::new(DdsEncoder::new(DdsFormat::BC1).with_mipmap_compressor(
+        Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
+        Arc::new(IspcCompressor),
+    ));
+    let worker = {
+        let _guard = runtime.enter();
+        spawn_tile_worker(
+            LosesTheDevice,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            HangRule::default(),
+        )
+    };
+
+    let encode = |encoder: &Arc<DdsEncoder>| {
+        let encoder = Arc::clone(encoder);
+        runtime
+            .block_on(runtime.spawn_blocking(move || encoder.encode(RgbaImage::new(64, 64))))
+            .expect("the encode itself never panics")
+    };
+    assert!(
+        encode(&encoder).is_err(),
+        "the tile in the processor is lost"
+    );
+    runtime
+        .block_on(worker)
+        .expect("the loop caught the panic and ended");
+
+    assert!(reported(
+        "panic in the GPU worker: Device::poll: device lost"
+    ));
+    assert_eq!(
+        health.failure(),
+        Some("GPU worker panicked: panic in the GPU worker: Device::poll: device lost")
+    );
+    let expected = DdsEncoder::new(DdsFormat::BC1)
+        .with_compressor(Arc::new(IspcCompressor))
+        .encode(RgbaImage::new(64, 64))
+        .unwrap();
+    assert_eq!(
+        encode(&encoder).expect("the next tile is encoded on the fallback"),
+        expected
+    );
 }
