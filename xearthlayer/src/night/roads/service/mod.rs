@@ -231,6 +231,18 @@ pub struct FootprintRoads {
     pub timed_out: bool,
 }
 
+/// Where a tile is at one instant, as [`RoadService::tiles_now`] finds it.
+#[derive(Debug, Clone)]
+pub enum TileNow {
+    Ready(Arc<MergedRoads>),
+    /// A build is in flight.
+    Building,
+    /// No roads this session.
+    Failed,
+    /// Neither ready nor building: evicted, or never asked for.
+    Absent,
+}
+
 /// How one tile of a footprint ended.
 enum TileWait {
     Ready(Arc<MergedRoads>),
@@ -556,6 +568,32 @@ impl RoadService {
                 None
             }
         }
+    }
+
+    /// How each of `tiles` is now, in the order asked, from the tile cache,
+    /// the builds in flight and the failed tiles. Starts no build, never
+    /// waits and records no wait: a generation holding its permit looks
+    /// once more at the tiles its wait left out (#427), and must not wait
+    /// for roads while holding it.
+    pub async fn tiles_now(&self, tiles: &[Tile]) -> Vec<TileNow> {
+        let mut out = Vec::with_capacity(tiles.len());
+        for &tile in tiles {
+            let now = if let Some(roads) = self.tiles.get(&tile).await {
+                TileNow::Ready(roads)
+            } else if let Some(build) = self.pending.get(&tile).map(|b| b.roads.clone()) {
+                match settled(&build) {
+                    TileWait::Ready(roads) => TileNow::Ready(roads),
+                    TileWait::Failed => TileNow::Failed,
+                    TileWait::TimedOut => TileNow::Building,
+                }
+            } else if self.failed.contains(&tile) {
+                TileNow::Failed
+            } else {
+                TileNow::Absent
+            };
+            out.push(now);
+        }
+        out
     }
 
     /// The lit source committed a dark answer for a footprint whose probe
@@ -2332,6 +2370,48 @@ pub(crate) mod tests {
         assert!(r.complete && !r.timed_out);
         assert!(Arc::ptr_eq(&r.tiles[0], &roads));
         assert_eq!(svc.stats_snapshot().probe_timeouts, 0);
+    }
+
+    #[tokio::test]
+    async fn a_look_at_the_tiles_now_never_waits_and_starts_nothing() {
+        let t = install_with(high(None).bytes(), low().bytes());
+        let failing = (47, 6);
+        write_install(t.path(), failing, &[("High", Some(b"garbage".to_vec()))]);
+        let (c, gate) = gated(LONG, LONG);
+        let svc = RoadService::with_config(t.path().into(), vec![], None, c);
+        svc.ensure(TILE, Trigger::DsfOpen);
+        assert_eq!(svc.builds_pending(), 1);
+        let absent = (10, 10);
+        // The gate is shut: a wait for TILE would last LONG.
+        let now = tokio::time::timeout(Duration::from_secs(5), svc.tiles_now(&[TILE, absent]))
+            .await
+            .expect("no wait");
+        assert!(
+            matches!(now[..], [TileNow::Building, TileNow::Absent]),
+            "{now:?}"
+        );
+        assert_eq!(
+            svc.builds_pending(),
+            1,
+            "no build started for the absent tile"
+        );
+        assert_eq!(
+            svc.stats_snapshot(),
+            StatsSnapshot::default(),
+            "no wait recorded"
+        );
+
+        gate.add_permits(2);
+        until_ready(&svc, TILE).await;
+        assert!(!svc.footprint(&[failing], Purpose::Generate).await.complete);
+        let now = svc.tiles_now(&[TILE, failing, absent]).await;
+        assert!(
+            matches!(
+                now[..],
+                [TileNow::Ready(_), TileNow::Failed, TileNow::Absent]
+            ),
+            "{now:?}"
+        );
     }
 
     #[test]

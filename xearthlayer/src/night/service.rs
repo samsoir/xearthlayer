@@ -34,7 +34,7 @@ use super::layout::minimal_black_dds;
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{crosses_footprint, reach_deg, RoadField};
 use super::roads::merge::MergedRoads;
-use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
+use super::roads::service::{FootprintRoads, Purpose, RoadService, TileNow, Trigger};
 use super::roads::RoadModel;
 use super::stats::{
     DiskMiss, GenerationRecord, LitStats, PayloadLookup, ProbeAnswer, ProbeRecord, ReadOutcome,
@@ -638,20 +638,31 @@ impl NightLitSource {
 
     /// The generated visible levels of the footprint. Waits for its roads
     /// first, holding no permit, then generates under a generation permit;
-    /// the road raster is generation work and runs under it.
+    /// the road raster is generation work and runs under it. Holding the
+    /// permit, it looks once more, without waiting, at the road tiles its
+    /// wait left out, so roads that came while it queued are drawn (#427).
     async fn generate(&self, name: DdsFilename, layout: &LitLayout) -> Option<Generated> {
         let size = layout.first_visible;
         let found = self.footprint_roads(&name, size, Purpose::Generate).await;
-        let roads_state = RoadsState::of(&found);
-        let road_tiles = found.tiles;
+        let asked_roads = RoadsState::of(&found);
         let asked = Instant::now();
         let _permit = {
             let _waiting = self.stats.generations_waiting.enter();
             self.generations.acquire().await.ok()?
         };
         let permit_wait = asked.elapsed();
+        let found = match &self.roads {
+            Some(roads) if asked_roads != RoadsState::Complete => {
+                let tiles = self.road_tiles(&name, size);
+                let now = roads.tiles_now(&tiles).await;
+                recheck(&tiles, found, now)
+            }
+            _ => found,
+        };
+        let roads_state = RoadsState::of(&found);
         let roads_ready_at_permit =
-            roads_state == RoadsState::TimedOut && self.road_tiles_ready(&name, size);
+            asked_roads == RoadsState::TimedOut && roads_state == RoadsState::Complete;
+        let road_tiles = found.tiles;
         let started = Instant::now();
         let (recipes, art, generator, owned, size, brightness, road_model) = (
             Arc::clone(&self.recipes),
@@ -728,6 +739,7 @@ impl NightLitSource {
                     size,
                     roads_complete = roads_state == RoadsState::Complete,
                     roads_timed_out = roads_state == RoadsState::TimedOut,
+                    roads_ready_at_permit,
                     "Night lighting: lit texture generated"
                 );
                 Some(Generated {
@@ -748,21 +760,11 @@ impl NightLitSource {
         self.stats.record_generation(&GenerationRecord {
             permit_wait,
             generation: started.elapsed(),
-            roads: roads_state,
+            roads: asked_roads,
             roads_ready_at_permit,
             payload: result.is_some(),
         });
         result
-    }
-
-    /// Whether every road tile that can light `name` at `size` texels is in
-    /// the road service's tile cache now (without touching its LRU order).
-    fn road_tiles_ready(&self, name: &DdsFilename, size: u32) -> bool {
-        self.roads.as_ref().is_some_and(|roads| {
-            self.road_tiles(name, size)
-                .into_iter()
-                .all(|tile| roads.is_ready(tile))
-        })
     }
 
     /// Whether `name` is lit, answered once per footprint for the session.
@@ -968,6 +970,30 @@ fn read_part(reached: bool, payload: bool) -> &'static str {
         (true, true) => "lit",
         (true, false) => "black",
     }
+}
+
+/// The roads of `asked` (a footprint's road tiles, in order) once more:
+/// each tile `held` from the wait, else as it is `now`. A tile still
+/// building or absent (evicted since) counts as late, a failed one as
+/// failed, as in the wait.
+fn recheck(asked: &[(i32, i32)], held: FootprintRoads, now: Vec<TileNow>) -> FootprintRoads {
+    let mut out = FootprintRoads {
+        tiles: Vec::with_capacity(asked.len()),
+        complete: true,
+        timed_out: false,
+    };
+    for (&tile, now) in asked.iter().zip(now) {
+        let held = held.tiles.iter().find(|r| r.tile == tile).cloned();
+        match (held, now) {
+            (Some(roads), _) | (None, TileNow::Ready(roads)) => out.tiles.push(roads),
+            (None, TileNow::Failed) => out.complete = false,
+            (None, TileNow::Building | TileNow::Absent) => {
+                out.complete = false;
+                out.timed_out = true;
+            }
+        }
+    }
+    out
 }
 
 /// A generated part for the memory cache: kept unless its roads were
@@ -2398,8 +2424,109 @@ mod tests {
             assert_eq!(calls(&white), 1, "the failed tile is final: from memory");
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_generation_takes_the_roads_that_came_while_it_waited_for_its_permit() {
+            // #427: the generation times out on its roads, which are ready
+            // by the time it holds its permit: it draws them and is kept.
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = lit_name();
+            let gate = shut();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                LONG,
+                30,
+                Some(gate.clone()),
+            );
+            let seen = Arc::new(SeesRoads::default());
+            let source = source_in(&temp)
+                .with_generator(seen.clone())
+                .with_disk_cache(d.clone())
+                .with_roads(roads.clone());
+            let tiles = road_tiles(&name, 1024, &RoadModel::DEFAULT);
+            let all = source.generations.available_permits() as u32;
+            let held = source.generations.acquire_many(all).await.unwrap();
+            let layout = LitLayout::new(16, 4);
+            let ((payload, outcome), ()) =
+                tokio::join!(source.served_payload(&name, &layout), async {
+                    // Past its road wait: it now waits for a permit.
+                    counted(&source, |_| source.stats.generations_waiting.now() == 1).await;
+                    assert_eq!(roads.stats_snapshot().generate_timeouts, 1);
+                    gate.add_permits(tiles.len());
+                    for tile in &tiles {
+                        until_ready(&roads, *tile).await;
+                    }
+                    drop(held);
+                });
+            assert!(payload.is_some());
+            assert_eq!(outcome, ReadOutcome::Generated);
+            assert!(seen.0.load(Ordering::SeqCst), "the road field was drawn");
+            assert_eq!(seen.1.load(Ordering::SeqCst), 1, "generated once");
+            source.payloads.run_pending_tasks().await;
+            assert!(
+                source
+                    .payloads
+                    .contains_key(&(name.row, name.col, name.zoom)),
+                "kept in memory"
+            );
+            let snap = counted(&source, |s| s.disk_writes == 1).await;
+            assert!(on_disk(&d, &name).await, "written to the disk tier");
+            assert_eq!(snap.write_backs_skipped, [0; 4]);
+            assert_eq!(snap.generation_roads(RoadsState::TimedOut), 1, "at its ask");
+            assert_eq!(snap.roads_ready_at_permit, 1);
+            assert_eq!(
+                source.served_payload(&name, &layout).await.1,
+                ReadOutcome::MemoryHit
+            );
+            assert_eq!(seen.1.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_recheck_keeps_what_the_wait_had_and_adds_what_came_since() {
+            let (a, b, c, d) = ((1, 1), (1, 2), (1, 3), (1, 4));
+            let merged = |t| Arc::new(crate::night::roads::merge::MergedRoads::empty(t));
+            let held_a = merged(a);
+            let held = FootprintRoads {
+                tiles: vec![Arc::clone(&held_a)],
+                complete: false,
+                timed_out: true,
+            };
+            let late = recheck(
+                &[a, b, c, d],
+                held.clone(),
+                vec![
+                    TileNow::Absent, // evicted since: the wait's copy is kept
+                    TileNow::Ready(merged(b)),
+                    TileNow::Building,
+                    TileNow::Failed,
+                ],
+            );
+            let tiles: Vec<_> = late.tiles.iter().map(|r| r.tile).collect();
+            assert_eq!(tiles, [a, b], "in the order asked");
+            assert!(Arc::ptr_eq(&late.tiles[0], &held_a));
+            assert_eq!(RoadsState::of(&late), RoadsState::TimedOut);
+
+            let failed = recheck(
+                &[a, d],
+                held.clone(),
+                vec![TileNow::Absent, TileNow::Failed],
+            );
+            assert_eq!(RoadsState::of(&failed), RoadsState::Failed);
+
+            let healed = recheck(
+                &[a, b],
+                held,
+                vec![TileNow::Absent, TileNow::Ready(merged(b))],
+            );
+            assert_eq!(RoadsState::of(&healed), RoadsState::Complete);
+            assert_eq!(healed.tiles.len(), 2);
+        }
+
         #[tokio::test]
         async fn a_generation_past_its_road_wait_is_kept_nowhere_and_heals() {
+            // #427 keeps the rule (its optional hold of such payloads is not
+            // taken): a payload whose roads are still building when it holds
+            // its generation permit is served and kept nowhere.
             let temp = TempDir::new().unwrap();
             let d = disk();
             let name = lit_name();
@@ -2757,12 +2884,17 @@ mod tests {
                 .is_some());
         }
 
-        /// Records whether its request carried road light.
+        /// Records whether its request carried road light, and counts its
+        /// calls.
         #[derive(Default)]
-        struct SeesRoads(std::sync::atomic::AtomicBool);
+        struct SeesRoads(
+            std::sync::atomic::AtomicBool,
+            std::sync::atomic::AtomicUsize,
+        );
 
         impl crate::night::LitGenerator for SeesRoads {
             fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.0
                     .store(!r.roads.is_empty(), std::sync::atomic::Ordering::SeqCst);
                 image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
