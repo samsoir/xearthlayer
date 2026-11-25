@@ -8,7 +8,7 @@
 //! a function of world position, so textures never disagree on shared
 //! ground and the pattern never visibly repeats.
 
-use super::noise::{hash2, mix, unit};
+use super::noise::{floor_i64, hash2, mix, unit};
 use crate::night::laminar::LitPattern;
 
 pub(crate) const EARTH_RADIUS_M: f64 = 6_378_137.0;
@@ -115,7 +115,7 @@ pub fn sample_cached(pattern: &LitPattern, x: f64, y: f64, cache: &mut CornerCac
     let cell = pattern.ground_scale_m;
     let (a, b) = (x / cell, y / cell);
     let s = (a + b) * SKEW;
-    let (i, j) = ((a + s).floor(), (b + s).floor());
+    let (i, j) = (floor_i64(a + s) as f64, floor_i64(b + s) as f64);
     let t = (i + j) * UNSKEW;
     let (x0, y0) = (a - (i - t), b - (j - t));
     let (i1, j1) = if x0 > y0 { (1.0, 0.0) } else { (0.0, 1.0) };

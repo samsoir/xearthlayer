@@ -20,6 +20,7 @@ use tracing::debug;
 
 use super::field::RecipeField;
 use super::led::{self, LedRegion, TonePath};
+use super::noise::floor_i64;
 use super::tiling::{sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TexelCentres};
@@ -254,7 +255,7 @@ impl<'r> RoadLight<'r> {
         let m = r.road_model;
         let density = (radiance / m.full_nw).clamp(0.0, 1.0) as f32;
         let level = m.peak * road * (m.country + (1.0 - m.country) * density) * r.brightness as f32;
-        let region = self.region((led::floor_i64(lat) as i32, led::floor_i64(lon) as i32));
+        let region = self.region((floor_i64(lat) as i32, floor_i64(lon) as i32));
         let tone = r.led.tone(false, bright, region);
         // `patch.u` is below 1, so no share means sodium without a patch.
         let patch = (tone.share > 0.0)

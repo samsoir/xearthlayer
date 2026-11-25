@@ -2,6 +2,7 @@
 
 use crate::dds::layout::level_len;
 use crate::dds::DdsFormat;
+use crate::night::generator::noise::floor_i64;
 
 /// One lit pattern: the top level of a Laminar `*_LIT.dds`, as RGB.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,13 +18,33 @@ pub struct LitPattern {
 impl LitPattern {
     /// Bilinear sample at pattern coordinates `(u, v)` in repeats; the
     /// pattern wraps, so any real `u`, `v` is valid.
+    ///
+    /// A tap wraps with a mask when the size is a power of two (every stock
+    /// Laminar lit texture is 1024 px), which gives the index `rem_euclid`
+    /// gives for every `i64`, and with `rem_euclid` otherwise.
     pub fn sample(&self, u: f64, v: f64) -> [f32; 3] {
         let n = self.size as f64;
         let (x, y) = (u * n - 0.5, v * n - 0.5);
-        let (x0, y0) = (x.floor(), y.floor());
-        let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
-        let wrap = |i: f64| (i as i64).rem_euclid(self.size as i64) as usize;
-        let (xa, xb, ya, yb) = (wrap(x0), wrap(x0 + 1.0), wrap(y0), wrap(y0 + 1.0));
+        let (x0, y0) = (floor_i64(x), floor_i64(y));
+        let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+        let size = i64::from(self.size);
+        let (xa, xb, ya, yb) = if self.size.is_power_of_two() {
+            let wrap = |i: i64| (i & (size - 1)) as usize;
+            (
+                wrap(x0),
+                wrap(x0.wrapping_add(1)),
+                wrap(y0),
+                wrap(y0.wrapping_add(1)),
+            )
+        } else {
+            let wrap = |i: i64| i.rem_euclid(size) as usize;
+            (
+                wrap(x0),
+                wrap(x0.wrapping_add(1)),
+                wrap(y0),
+                wrap(y0.wrapping_add(1)),
+            )
+        };
         let at = |x: usize, y: usize| self.rgb[y * self.size as usize + x];
         let mut out = [0.0f32; 3];
         for (ch, o) in out.iter_mut().enumerate() {
