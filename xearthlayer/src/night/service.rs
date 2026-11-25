@@ -27,10 +27,13 @@ use moka::policy::EvictionPolicy;
 use tracing::{debug, warn};
 
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
-use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest};
+use super::generator::{
+    CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, RecipeLookup,
+};
 use super::layout::minimal_black_dds;
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
-use super::roads::field::{reach_deg, RoadField};
+use super::roads::field::{crosses_footprint, reach_deg, RoadField};
+use super::roads::merge::MergedRoads;
 use super::roads::service::{FootprintRoads, Purpose, RoadService, Trigger};
 use super::roads::RoadModel;
 use super::stats::{
@@ -222,6 +225,30 @@ type PayloadCache = moka::future::Cache<(u32, u32, u8), Bytes>;
 
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
+
+/// The lit probe's answer for `footprint`: lit by its recipes (read
+/// through `lookup`, `is_lit` naming the lit terrains) first, else by a
+/// road of `road_tiles` within `reach` degrees of it, across the
+/// antimeridian too ([`crosses_footprint`], over the raster's own box),
+/// else dark.
+fn probe_answer(
+    footprint: &Footprint,
+    lookup: RecipeLookup<'_>,
+    is_lit: impl Fn(&str) -> bool,
+    road_tiles: &[Arc<MergedRoads>],
+    reach: f64,
+) -> ProbeAnswer {
+    if RecipeField::new(footprint, lookup).has_light(is_lit) {
+        ProbeAnswer::Recipe
+    } else if road_tiles
+        .iter()
+        .any(|roads| crosses_footprint(roads, footprint, reach))
+    {
+        ProbeAnswer::Road
+    } else {
+        ProbeAnswer::Dark
+    }
+}
 
 /// The night lit source: full-size, correctly laid out textures where the
 /// recipe and the user's art say there is light (the visible levels
@@ -770,20 +797,13 @@ impl NightLitSource {
             let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
             // `lit_terrain` records no doubt, which is safe here: the probe
             // decides a size, and a size is never persisted.
-            if RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some()) {
-                ProbeAnswer::Recipe
-            } else if road_tiles.iter().any(|roads| {
-                roads.crosses(
-                    footprint.south - reach,
-                    footprint.west - reach,
-                    footprint.north + reach,
-                    footprint.east + reach,
-                )
-            }) {
-                ProbeAnswer::Road
-            } else {
-                ProbeAnswer::Dark
-            }
+            probe_answer(
+                &footprint,
+                &lookup,
+                |n| art.lit_terrain(n).is_some(),
+                &road_tiles,
+                reach,
+            )
         })
         .await
         {
@@ -2415,6 +2435,71 @@ mod tests {
             name.col = 0;
             assert!(field_tiles(&name).contains(&(-17, 179)));
             assert!(road_tiles(&name, size, &RoadModel::DEFAULT).contains(&(-17, 179)));
+        }
+
+        /// The ZL16 textures by the line at Taveuni, east edge on the line
+        /// and west edge on it, with their footprints and the probe's reach.
+        fn textures_at_the_antimeridian() -> [(Footprint, f64); 2] {
+            let mut name = name_at(-16.8, 179.95);
+            [(1 << 16) - 16, 0].map(|col| {
+                name.col = col;
+                let size = LitLayout::new(name.zoom, 4).first_visible;
+                let reach = reach_deg(&name, size, &RoadModel::DEFAULT);
+                (Footprint::from_name(&name), reach)
+            })
+        }
+
+        /// A north-south road at `lon` in `tile`, past `fp`'s north and south.
+        fn road_past(tile: (i32, i32), fp: &Footprint, lon: f64) -> Arc<MergedRoads> {
+            crate::night::roads::field::tests::merged(
+                tile,
+                &[(100, vec![(lon, fp.north + 0.01), (lon, fp.south - 0.01)])],
+            )
+        }
+
+        #[test]
+        fn given_a_road_just_across_the_antimeridian_the_probe_answers_lit() {
+            // No recipe anywhere: only the road, 30 m across the line, can
+            // light the texture.
+            let [(east, east_reach), (west, west_reach)] = textures_at_the_antimeridian();
+            assert_eq!((east.east, west.west), (180.0, -180.0));
+            let no_recipe = |_: i32, _: i32| None;
+            let across_east = [road_past((-17, -180), &east, -179.999_7)];
+            assert_eq!(
+                probe_answer(&east, &no_recipe, |_| true, &across_east, east_reach),
+                ProbeAnswer::Road
+            );
+            let across_west = [road_past((-17, 179), &west, 179.999_7)];
+            assert_eq!(
+                probe_answer(&west, &no_recipe, |_| true, &across_west, west_reach),
+                ProbeAnswer::Road
+            );
+        }
+
+        #[test]
+        fn given_no_road_across_the_antimeridian_the_probe_answers_dark() {
+            let [(east, east_reach), (west, west_reach)] = textures_at_the_antimeridian();
+            let no_recipe = |_: i32, _: i32| None;
+            // The tiles across the line, with no road in them, or with one
+            // well beyond the reach.
+            for across in [
+                Arc::new(crate::night::roads::merge::MergedRoads::empty((-17, -180))),
+                road_past((-17, -180), &east, -179.5),
+            ] {
+                assert_eq!(
+                    probe_answer(&east, &no_recipe, |_| true, &[across], east_reach),
+                    ProbeAnswer::Dark
+                );
+            }
+            for across in [
+                Arc::new(crate::night::roads::merge::MergedRoads::empty((-17, 179))),
+                road_past((-17, 179), &west, 179.5),
+            ] {
+                assert_eq!(
+                    probe_answer(&west, &no_recipe, |_| true, &[across], west_reach),
+                    ProbeAnswer::Dark
+                );
+            }
         }
 
         #[test]
