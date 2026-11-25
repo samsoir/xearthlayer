@@ -345,6 +345,8 @@ pub struct NightLitSource {
     /// write-backs; the summary task holds it weakly.
     stats: Arc<LitStats>,
     summary_started: AtomicBool,
+    /// Road tiles whose changed DSFs have been logged: once each.
+    road_sources_logged: DashSet<(i32, i32)>,
 }
 
 /// A generated part of a footprint, how complete its roads were, and the
@@ -411,16 +413,24 @@ fn write_back_skip(
     }
 }
 
-/// Whether every road tile the fingerprint names (`fingerprinted`, from the
-/// session's identity pass) was read from the DSFs it names, by the build
-/// whose roads were drawn (`read_from`). A tile drawn from no build is not.
-fn roads_agree(fingerprinted: &[TileDsfs], read_from: &[Arc<ReadFrom>]) -> bool {
-    fingerprinted.iter().all(|(tile, identities)| {
-        read_from
-            .iter()
-            .find(|r| r.tile == *tile)
-            .is_some_and(|r| r.agrees_with(identities))
-    })
+/// The first road tile the fingerprint names (`fingerprinted`, from the
+/// session's identity pass) that was not read from the DSFs it names by the
+/// build whose roads were drawn (`read_from`), or `None` when every one was:
+/// the roads agree with the fingerprint. A tile drawn from no build has not
+/// been read from them.
+fn road_sources_changed(
+    fingerprinted: &[TileDsfs],
+    read_from: &[Arc<ReadFrom>],
+) -> Option<(i32, i32)> {
+    fingerprinted
+        .iter()
+        .find(|(tile, identities)| {
+            !read_from
+                .iter()
+                .find(|r| r.tile == *tile)
+                .is_some_and(|r| r.agrees_with(identities))
+        })
+        .map(|(tile, _)| *tile)
 }
 
 /// A payload served but not kept in the memory cache, or `None` (black):
@@ -459,6 +469,7 @@ impl NightLitSource {
             road_model: RoadModel::DEFAULT,
             stats,
             summary_started: AtomicBool::new(false),
+            road_sources_logged: DashSet::new(),
         }
     }
 
@@ -561,10 +572,12 @@ impl NightLitSource {
     /// without waiting, unless [`write_back_skip`] gives a reason not to (a
     /// road tile missing, no fingerprint, a doubt among its art lookups).
     /// When the reason is the art, a debug line names the file and why; a
-    /// payload skipped for an earlier reason logs none. `Err` is a payload
-    /// not to keep in memory: black, or generated while a road tile was late. Without a disk tier
-    /// this is `generate`. Sets `from_disk` when the payload is read from
-    /// the disk tier.
+    /// payload skipped for an earlier reason logs none. When the reason is a
+    /// changed road DSF, a debug line names the road tile, once per tile for
+    /// the session. `Err` is a payload not to keep in memory: black, or
+    /// generated while a road tile was late. Without a disk tier this is
+    /// `generate`. Sets `from_disk` when the payload is read from the disk
+    /// tier.
     async fn load_or_generate(
         &self,
         name: DdsFilename,
@@ -609,24 +622,33 @@ impl NightLitSource {
         }
         let (row, col, zoom) = (name.row, name.col, name.zoom);
         let generated = self.generate(name, &layout).await;
+        let changed = generated
+            .as_ref()
+            .and_then(|g| road_sources_changed(&road_dsfs, &g.read_from));
         let skip = generated.as_ref().and_then(|g| {
             write_back_skip(
                 g.roads,
                 fp.is_some(),
-                roads_agree(&road_dsfs, &g.read_from),
+                changed.is_none(),
                 g.art_doubt.is_some(),
             )
         });
         if let Some(skip) = skip {
             self.stats.record_write_back_skipped(skip);
         }
-        if skip == Some(WriteBackSkip::RoadSourcesChanged) {
-            debug!(
-                row,
-                col,
-                zoom,
-                "Night lighting: lit texture kept off disk; a road DSF changed since its roads were read"
-            );
+        if let (Some(WriteBackSkip::RoadSourcesChanged), Some(tile)) = (skip, changed) {
+            // Every footprint over the tile skips its write-back for the
+            // rest of the session (the counter says how many): logged once.
+            if self.road_sources_logged.insert(tile) {
+                debug!(
+                    row,
+                    col,
+                    zoom,
+                    lat = tile.0,
+                    lon = tile.1,
+                    "Night lighting: lit textures over a road tile kept off disk; its DSFs changed since its roads were read"
+                );
+            }
         }
         if let (
             Some(WriteBackSkip::ArtFailed),
@@ -3271,6 +3293,20 @@ mod tests {
                 ReadOutcome::MemoryHit,
                 "kept in memory"
             );
+            // Another footprint over the tile is kept off disk too; the tile
+            // is noted for its log line once.
+            assert_eq!(a.road_sources_logged.len(), 1);
+            let other = dark_name();
+            assert_eq!(tiles_of(&a, &other), tiles_of(&a, &name));
+            assert!(a.served_payload(&other, &layout).await.0.is_some());
+            assert_eq!(
+                a.stats
+                    .snapshot()
+                    .write_backs_skipped(WriteBackSkip::RoadSourcesChanged),
+                2
+            );
+            assert_eq!(a.road_sources_logged.len(), 1, "logged once per tile");
+            assert!(a.road_sources_logged.contains(&TILE));
 
             // The next session reads the second DSF and generates with it.
             let (b, _, seen) = road_session(&temp, &d);
@@ -3490,7 +3526,7 @@ mod tests {
         }
 
         #[test]
-        fn roads_agree_only_when_every_fingerprinted_tile_was_read_from_its_dsfs() {
+        fn road_sources_changed_names_the_first_tile_not_read_from_its_dsfs() {
             use crate::night::roads::service::DsfIdentity;
             let id = |path: &str| DsfIdentity {
                 path: path.into(),
@@ -3510,20 +3546,30 @@ mod tests {
                 (b, Arc::from(vec![id("/b.dsf")])),
             ];
             let both = [read(a, "/a.dsf"), read(b, "/b.dsf")];
-            assert!(roads_agree(&fingerprinted, &both));
-            assert!(
-                roads_agree(&fingerprinted, &[both[1].clone(), both[0].clone()]),
+            assert_eq!(road_sources_changed(&fingerprinted, &both), None, "agree");
+            assert_eq!(
+                road_sources_changed(&fingerprinted, &[both[1].clone(), both[0].clone()]),
+                None,
                 "matched by tile, not by position"
             );
-            assert!(
-                !roads_agree(&fingerprinted, &both[..1]),
+            assert_eq!(
+                road_sources_changed(&fingerprinted, &both[..1]),
+                Some(b),
                 "a fingerprinted tile missing from what was read"
             );
-            assert!(
-                !roads_agree(&fingerprinted, &[read(a, "/a.dsf"), read(b, "/other.dsf")]),
-                "a tile read from other DSFs"
+            assert_eq!(
+                road_sources_changed(
+                    &fingerprinted,
+                    &[read(a, "/old.dsf"), read(b, "/other.dsf")]
+                ),
+                Some(a),
+                "tiles read from other DSFs: the first"
             );
-            assert!(roads_agree(&[], &both), "no road tile in the fingerprint");
+            assert_eq!(
+                road_sources_changed(&[], &both),
+                None,
+                "no road tile in the fingerprint"
+            );
         }
 
         #[test]

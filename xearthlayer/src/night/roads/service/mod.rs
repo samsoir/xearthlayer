@@ -644,9 +644,9 @@ impl RoadService {
     /// runs (a pack updated between flights, an overlay link rebuilt), so
     /// these need not be the DSFs a tile's roads were read from: the lit
     /// source writes a payload under them only when they agree with the
-    /// build's [`ReadFrom`] (#430). `None` when the pass failed: a source whose `stat` failed for
-    /// another reason, or a panic. A failed pass is not kept, so a later
-    /// call tries again. The `stat`s run on the blocking pool under the
+    /// build's [`ReadFrom`] (#430). `None` when the pass failed: a source
+    /// whose `stat` failed for another reason, or a panic. A failed pass is
+    /// not kept, so a later call tries again. The `stat`s run on the blocking pool under the
     /// caller's permit, if any: this takes none.
     pub async fn identities(self: &Arc<Self>, tile: Tile) -> Option<Arc<[DsfIdentity]>> {
         let cell = Arc::clone(&self.identities.entry(tile).or_default());
@@ -680,7 +680,9 @@ impl RoadService {
     /// the builds in flight and the failed tiles. Starts no build, never
     /// waits and records no wait: a generation holding its permit looks
     /// once more at the tiles its wait left out (#427), and must not wait
-    /// for roads while holding it.
+    /// for roads while holding it. A ready tile found here is read from the
+    /// tile cache as `footprint` reads it, so it counts as a use and moves
+    /// up the LRU order.
     pub async fn tiles_now(&self, tiles: &[Tile]) -> Vec<TileNow> {
         let mut out = Vec::with_capacity(tiles.len());
         for &tile in tiles {

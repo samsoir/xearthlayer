@@ -9,7 +9,7 @@
 //! pools, rasters and any other atom are read past without buffering, a
 //! DSF without a network stops after HEAD and DEFN, one with a network
 //! stops once GEOD and CMDS are read, and a base mesh read for overlays
-//! only ([`ReadMode::OverlaysOnly`]) stops after HEAD. [`read_dsf_file`] streams a raw file
+//! only ([`ReadMode::OverlaysOnly`]) stops after HEAD. [`read_dsf_open`] streams a raw file
 //! or the single entry of a 7z, so decompression stops where reading does.
 //!
 //! Layout: `XPLNEDSF`, `u32 1`, atoms (`u32 id, u32 size` with the size
@@ -28,9 +28,9 @@ mod walk;
 #[cfg(test)]
 pub(crate) mod test_dsf;
 
+pub use stream::read_dsf_open;
 #[cfg(test)]
-pub use stream::read_dsf_stream;
-pub use stream::{read_dsf_file, read_dsf_open};
+pub use stream::{read_dsf_file, read_dsf_stream};
 
 pub const MAX_DSF_BYTES: usize = 512 * 1024 * 1024;
 /// Ceiling on any one atom body the reader keeps (HEAD, DEFN, a PO32, an
