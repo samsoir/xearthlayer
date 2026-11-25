@@ -360,6 +360,63 @@ mod tests {
         }
     }
 
+    /// Road-lit output: the `crossing_field` road over a varied synthetic
+    /// recipe in its tile (classes in irregular bands, brightness from 0 up
+    /// across the cells) with the speckled pattern for every class, under
+    /// `LedModel::DEFAULT` in region Na. Captured at 2a51a20, before #437
+    /// hoisted per-texel work: the road pass reads radiance and LED patches
+    /// too, and must not move.
+    const ROAD_LED_DIGEST: u64 = 0xb267_c12f_e5c9_e022;
+
+    #[test]
+    fn the_road_lit_output_is_pinned() {
+        let n = name_at(46.5, 6.5);
+        let roads = crossing_field(&n, 128);
+        let varied = synthetic(
+            46,
+            6,
+            120,
+            |r, c| u8::from((r / 3 + c / 5) % 3 != 0),
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        );
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| varied.clone());
+        let any_speckled = |_: &str| speckled("lib/g10/terrain10/urban_tmp_sdry3.ter");
+        let request = |roads| LitRequest {
+            name: &n,
+            size: 128,
+            brightness: 1.0,
+            recipes: &recipes,
+            patterns: &any_speckled,
+            regions: &|_, _| LedRegion::Na,
+            led: &LedModel::DEFAULT,
+            roads,
+            road_model: &RoadModel::DEFAULT,
+        };
+        let img = CpuLitGenerator.generate(&request(&roads));
+        let without = CpuLitGenerator.generate(&request(&RoadField::empty(128)));
+        // The pin covers road glow over lit pattern texels and over black
+        // ground (where the road pass draws its own patch), and LED texels.
+        let (mut over_lit, mut over_black) = (0, 0);
+        for (a, b) in without.pixels().zip(img.pixels()) {
+            if a != b {
+                if a.0[..3] == [0; 3] {
+                    over_black += 1;
+                } else {
+                    over_lit += 1;
+                }
+            }
+        }
+        assert!(over_lit > 0 && over_black > 0, "{over_lit} {over_black}");
+        assert!(img.pixels().any(is_led), "the pin covers LED texels");
+        assert_eq!(
+            digest(&img),
+            ROAD_LED_DIGEST,
+            "digest {:#018x}",
+            digest(&img)
+        );
+    }
+
     /// The generator's tone path is byte for byte the `powf` path it
     /// replaced (#436), at several models, brightnesses and regions.
     #[test]
