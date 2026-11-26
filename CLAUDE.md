@@ -658,6 +658,8 @@ the two `[package.metadata.deb]` `copyright` fields: bump them together.
 - **Job Executor Framework**: `docs/dev/job-executor-design.md` (daemon architecture, job/task traits)
 - **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
 - **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
+- **Prefetch V4 (proposed)**: `docs/dev/prefetch-v4-streaming-design.md` (speclet: a streaming, proximity-ranked prefetch feeder that succeeds the adaptive coordinator's cycles; companion to GPU JPEG decode; #475)
+- **GPU JPEG decode (proposed)**: `docs/dev/gpu-jpeg-decode-design.md` (speclet: chunk decode on the GPU, three passes, supported profile and CPU fallback, spike findings; companion to Prefetch V4; #475)
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - **World rebuild runbook**: `docs/dev/world-rebuild-runbook.md` (the campaign to rebuild every regional package: naming, staging channel, promotion, retirement)
 - Zoom level overlap management: `docs/dev/zoom-level-overlap-design.md` (dedupe, gap analysis)
