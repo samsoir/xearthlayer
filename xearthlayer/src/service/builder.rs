@@ -57,11 +57,19 @@ pub async fn create_async_provider(
 
 /// Result of [`create_encoder`], including optional GPU worker handle.
 pub struct EncoderComponents {
-    /// The texture encoder.
+    /// The demand lane's texture encoder (and the service's, for sizes).
     pub encoder: Arc<DdsTextureEncoder>,
-    /// GPU worker handle (present when `texture.compressor = gpu`).
-    /// Must be awaited during shutdown to ensure GPU resources are released.
-    pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The prefetch lane's texture encoder (#421). With a CPU backend it is
+    /// [`encoder`](Self::encoder) itself; with the GPU it sends on the
+    /// prefetch channel, which the worker reads only while the demand
+    /// channel is empty.
+    pub prefetch_encoder: Arc<DdsTextureEncoder>,
+    /// The GPU worker (present when `texture.compressor = gpu`): its
+    /// thread and shutdown token. Stop it at shutdown
+    /// ([`GpuWorkerHandle::stop`](crate::dds::gpu_channel::GpuWorkerHandle::stop))
+    /// so the GPU's resources are released: the channels stay open while
+    /// anything holds an encoder, so the worker does not end by itself.
+    pub gpu_worker_handle: Option<crate::dds::gpu_channel::GpuWorkerHandle>,
     /// The GPU the encoder selected (present when `texture.compressor = gpu`).
     pub gpu_adapter: Option<crate::system::GpuAdapter>,
     /// The GPU encoder's health (present when `texture.compressor = gpu`):
@@ -72,11 +80,6 @@ pub struct EncoderComponents {
     /// only GPU is the one X-Plane renders with (#203). Logged at creation
     /// and shown on the dashboard's Status pane.
     pub gpu_warning: Option<String>,
-    /// Shutdown token for the GPU worker (present when `texture.compressor = gpu`).
-    /// Cancelling this token causes the worker to exit its loop regardless of
-    /// the channel state. Required because `spawn_blocking` threads are not
-    /// cancelled by tokio runtime shutdown.
-    pub gpu_shutdown: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Apply an explicit mipmap level override, if the config carries one.
@@ -88,6 +91,33 @@ fn apply_mipmap_count(encoder: DdsTextureEncoder, count: Option<usize>) -> DdsTe
         Some(count) => encoder.with_mipmap_count(count),
         None => encoder,
     }
+}
+
+/// The prefetch lane's GPU channel capacity (#421): its CPU pool, as no
+/// more of its encode tasks can run at once.
+fn prefetch_gpu_capacity(config: &ServiceConfig) -> usize {
+    crate::executor::LaneSizing::from_configured_share(config.prefetch_capacity_share())
+        .prefetch
+        .cpu
+}
+
+/// The demand and prefetch lanes' encoders on the two GPU channels (#421),
+/// each with ISPC as the fallback for the images the GPU hands back. Named,
+/// not left to the encoder's default: the WARN and the Status pane say a
+/// failed GPU's tiles are encoded on ISPC (#420).
+pub(crate) fn gpu_lane_encoders(
+    channels: crate::dds::gpu_channel::GpuEncoderChannels,
+    format: crate::dds::DdsFormat,
+    mipmap_count: Option<usize>,
+) -> (Arc<DdsTextureEncoder>, Arc<DdsTextureEncoder>) {
+    let on = |channel: crate::dds::gpu_channel::GpuEncoderChannel| {
+        Arc::new(
+            apply_mipmap_count(DdsTextureEncoder::new(format), mipmap_count)
+                .with_compressor(Arc::new(crate::dds::IspcCompressor))
+                .with_mipmap_compressor(Arc::new(channel)),
+        )
+    };
+    (on(channels.demand), on(channels.prefetch))
 }
 
 /// Create texture encoder from configuration.
@@ -102,6 +132,7 @@ fn apply_mipmap_count(encoder: DdsTextureEncoder, count: Option<usize>) -> DdsTe
 /// one X-Plane renders with gets its contention warning without a second
 /// enumeration (#203).
 pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, ServiceError> {
+    use crate::dds::gpu_channel::GpuLane;
     use crate::dds::{IspcCompressor, SoftwareCompressor};
     use crate::system::{CompressorKind, DefaultEncoderPolicy, EncoderPolicy};
 
@@ -120,63 +151,72 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
         ))
     })?;
 
-    let cpu_components = |compressor: Arc<dyn crate::dds::ImageCompressor>| EncoderComponents {
-        encoder: Arc::new(
+    let cpu_components = |compressor: Arc<dyn crate::dds::ImageCompressor>| {
+        let encoder = Arc::new(
             apply_mipmap_count(
                 DdsTextureEncoder::new(config.texture().format()),
                 config.texture().mipmap_count(),
             )
             .with_compressor(compressor),
-        ),
-        gpu_worker_handle: None,
-        gpu_adapter: None,
-        gpu_health: None,
-        gpu_warning: None,
-        gpu_shutdown: None,
+        );
+        EncoderComponents {
+            // Both lanes encode on their own CPU pools: one encoder.
+            prefetch_encoder: Arc::clone(&encoder),
+            encoder,
+            gpu_worker_handle: None,
+            gpu_adapter: None,
+            gpu_health: None,
+            gpu_warning: None,
+        }
     };
 
     match backend {
         CompressorKind::Gpu => {
-            use crate::dds::gpu_channel::create_gpu_encoder_channel;
+            use crate::dds::gpu_channel::create_gpu_encoder_channels;
 
             let shutdown_token = tokio_util::sync::CancellationToken::new();
-            let (channel, worker_handle, selection) =
-                create_gpu_encoder_channel(config.texture().gpu_device(), shutdown_token.clone())
-                    .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
+            let (channels, worker_handle, selection) = create_gpu_encoder_channels(
+                config.texture().gpu_device(),
+                prefetch_gpu_capacity(config),
+                shutdown_token.clone(),
+            )
+            .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
 
             let decision = DefaultEncoderPolicy.select(&selection.host, Some(CompressorKind::Gpu));
             if let Some(warning) = &decision.warning {
                 tracing::warn!(adapter = %selection.adapter, "{warning}");
             }
 
-            // The per-minute `GPU encode sample` line, ended with the worker
-            // by the shutdown token or when the channel is dropped (#419).
-            crate::dds::gpu_stats::start_sample_log(
-                Arc::downgrade(channel.stats()),
-                channel.health().clone(),
-                shutdown_token.clone(),
-            );
-            let gpu_health = channel.health().clone();
+            // The per-minute `GPU encode sample` line of each lane, ended
+            // with the worker by the shutdown token or when its channel is
+            // dropped (#419, #421).
+            for (lane, channel) in [
+                (GpuLane::Demand, &channels.demand),
+                (GpuLane::Prefetch, &channels.prefetch),
+            ] {
+                crate::dds::gpu_stats::start_sample_log(
+                    lane,
+                    Arc::downgrade(channel.stats()),
+                    channel.health().clone(),
+                    shutdown_token.clone(),
+                );
+            }
+            let gpu_health = channels.demand.health().clone();
 
             tracing::info!("GPU pipeline encoder created with dedicated worker");
 
+            let (encoder, prefetch_encoder) = gpu_lane_encoders(
+                channels,
+                config.texture().format(),
+                config.texture().mipmap_count(),
+            );
             Ok(EncoderComponents {
-                encoder: Arc::new(
-                    apply_mipmap_count(
-                        DdsTextureEncoder::new(config.texture().format()),
-                        config.texture().mipmap_count(),
-                    )
-                    // Named, not left to the encoder's default: the WARN
-                    // and the Status pane say a failed GPU's tiles are
-                    // encoded on ISPC (#420).
-                    .with_compressor(Arc::new(IspcCompressor))
-                    .with_mipmap_compressor(Arc::new(channel)),
-                ),
+                encoder,
+                prefetch_encoder,
                 gpu_worker_handle: Some(worker_handle),
                 gpu_adapter: Some(selection.adapter),
                 gpu_health: Some(gpu_health),
                 gpu_warning: decision.warning,
-                gpu_shutdown: Some(shutdown_token),
             })
         }
         CompressorKind::Software => Ok(cpu_components(Arc::new(SoftwareCompressor))),
@@ -293,25 +333,52 @@ mod tests {
             Err(_) => return, // No GPU available
         };
 
-        let worker_handle = components
+        let mut worker_handle = components
             .gpu_worker_handle
             .expect("GPU compressor should return a worker handle");
 
-        // Drop the encoder — this drops the GpuEncoderChannel (sender),
-        // closing the mpsc channel and causing the worker to exit.
+        // Drop both lanes' encoders: this drops both GpuEncoderChannels
+        // (senders), closing the channels and causing the worker to exit.
         drop(components.encoder);
+        drop(components.prefetch_encoder);
 
-        // The worker handle must complete within a reasonable timeout.
-        // If it doesn't, GPU resources are leaked and the process will hang.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), worker_handle).await;
+        // The worker must end within a reasonable bound. If it doesn't, GPU
+        // resources are leaked and the process will hang.
+        let ended = worker_handle
+            .wait(std::time::Duration::from_secs(5))
+            .await
+            .expect("GPU worker should complete within 5s after channel close");
+        assert!(ended.is_ok(), "GPU worker should not panic during shutdown");
+    }
 
-        assert!(
-            result.is_ok(),
-            "GPU worker should complete within 5s after channel close"
-        );
-        assert!(
-            result.unwrap().is_ok(),
-            "GPU worker should not panic during shutdown"
+    /// With a CPU encoder both lanes encode on their own CPU pools, so they
+    /// share one encoder (#421).
+    #[test]
+    fn a_cpu_encoder_is_shared_by_both_lanes() {
+        for compressor in ["software", "ispc"] {
+            let config = ServiceConfig::builder()
+                .texture(TextureConfig::default().with_compressor(compressor.to_string()))
+                .build();
+            let components = create_encoder(&config).unwrap();
+            assert!(
+                Arc::ptr_eq(&components.encoder, &components.prefetch_encoder),
+                "{compressor}"
+            );
+        }
+    }
+
+    /// The prefetch lane's GPU channel holds its CPU pool's worth of
+    /// requests (#421).
+    #[test]
+    fn the_prefetch_gpu_channel_is_sized_by_the_prefetch_cpu_pool() {
+        let config = ServiceConfig::builder()
+            .prefetch_capacity_share(0.2)
+            .build();
+        assert_eq!(
+            prefetch_gpu_capacity(&config),
+            crate::executor::LaneSizing::from_configured_share(0.2)
+                .prefetch
+                .cpu
         );
     }
 

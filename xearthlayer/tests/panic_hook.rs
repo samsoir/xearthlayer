@@ -128,7 +128,8 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
             _levels: usize,
             _deadline: Instant,
             _timing: &mut GpuTileTiming,
-        ) -> Result<Vec<u8>, DdsError> {
+            _payload: &mut [u8],
+        ) -> Result<(), DdsError> {
             panic!("panic in the GPU worker: Device::poll: device lost")
         }
     }
@@ -150,7 +151,7 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),
     ));
-    let worker = {
+    let mut worker = {
         let _guard = runtime.enter();
         spawn_tile_worker_with_clock(
             LosesTheDevice,
@@ -172,8 +173,9 @@ fn a_gpu_worker_panic_is_reported_and_tiles_fall_back_to_the_cpu() {
         encode(&encoder).is_err(),
         "the tile in the processor is lost"
     );
-    runtime
-        .block_on(worker)
+    worker
+        .wait_blocking(std::time::Duration::from_secs(5))
+        .expect("the loop ended")
         .expect("the loop caught the panic and ended");
 
     assert!(reported(

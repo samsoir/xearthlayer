@@ -12,6 +12,7 @@
 //! CPU (`DdsEncoder`'s fallback compressor, ISPC in the service).
 
 use std::sync::{Arc, OnceLock};
+use tokio_util::sync::CancellationToken;
 
 /// What the GPU encoder is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,9 +31,15 @@ pub enum GpuHealth {
 /// The GPU encoder's health, shared by the worker, the device-lost callback,
 /// the channel's callers and the dashboard. Cloning shares it.
 ///
-/// Reads take no lock: the reason is set once, in a [`OnceLock`].
+/// Reads take no lock: the reason is set once, in a [`OnceLock`]. The
+/// failure can also be awaited ([`failed`](Self::failed)), as the idle GPU
+/// worker does (#423).
 #[derive(Clone, Debug, Default)]
-pub struct SharedGpuHealth(Arc<OnceLock<String>>);
+pub struct SharedGpuHealth {
+    reason: Arc<OnceLock<String>>,
+    /// Cancelled once the reason is set.
+    failed: CancellationToken,
+}
 
 impl SharedGpuHealth {
     /// A healthy GPU.
@@ -52,12 +59,18 @@ impl SharedGpuHealth {
 
     /// Why the GPU failed, or `None` while it is healthy.
     pub fn failure(&self) -> Option<&str> {
-        self.0.get().map(String::as_str)
+        self.reason.get().map(String::as_str)
     }
 
     /// Whether the GPU has failed.
     pub fn is_failed(&self) -> bool {
-        self.0.get().is_some()
+        self.reason.get().is_some()
+    }
+
+    /// Resolves once the GPU has failed, at once if it already has. Needs
+    /// no runtime: the idle worker awaits it on its own thread (#423).
+    pub async fn failed(&self) {
+        self.failed.cancelled().await
     }
 
     /// Records that the GPU failed for `reason`. The first call turns the
@@ -70,11 +83,12 @@ impl SharedGpuHealth {
     /// [`fail`](Self::fail), not generic, so the WARN has one callsite.
     fn fail_with(&self, reason: String) -> bool {
         let mut first = false;
-        let reason = self.0.get_or_init(|| {
+        let reason = self.reason.get_or_init(|| {
             first = true;
             reason
         });
         if first {
+            self.failed.cancel();
             tracing::warn!(
                 reason = %reason,
                 "GPU encoder failed, encoding on CPU (ISPC) for the rest of the session"
@@ -197,6 +211,21 @@ pub(crate) mod tests {
             }
         );
         assert!(dashboard.is_failed());
+    }
+
+    /// The failure can be awaited by a clone, from a thread with no
+    /// runtime, as the idle worker awaits it.
+    #[test]
+    fn a_failure_wakes_whoever_awaits_it() {
+        use std::future::Future;
+        let health = SharedGpuHealth::new();
+        let mut waiting = Box::pin(health.failed());
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut cx).is_pending(), "healthy");
+        health.clone().fail("device lost");
+        assert!(waiting.as_mut().poll(&mut cx).is_ready());
+        pollster::block_on(health.failed());
     }
 
     #[test]

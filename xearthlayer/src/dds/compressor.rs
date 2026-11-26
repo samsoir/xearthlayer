@@ -16,9 +16,11 @@
 
 use super::layout::{self, BLOCK_DIM};
 use super::types::{DdsError, DdsFormat};
+use futures::future::BoxFuture;
 use image::RgbaImage;
 use std::borrow::Cow;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Pad an image up to a whole number of 4×4 compression blocks.
 ///
@@ -232,13 +234,31 @@ pub trait ImageCompressor: Send + Sync {
 ///
 /// # Returns
 ///
-/// [`ChainOutcome::Compressed`]: the compressed data of every mipmap level
-/// (without DDS header), level 0 (full resolution) first, then each
-/// successively halved level. Or [`ChainOutcome::Returned`]: the backend did
+/// [`ChainOutcome::Compressed`]: the DDS file it was given, with the
+/// compressed data of every mipmap level written after the header, level 0
+/// (full resolution) first, then each successively halved level, in place
+/// (#423). Or [`ChainOutcome::Returned`]: the backend did
 /// not take the image, and hands it back for the caller to encode another way
-/// (#420).
+/// (#420). Or, from [`submit_mipmap_chain`](Self::submit_mipmap_chain) only,
+/// [`ChainOutcome::Cancelled`] (#422).
+///
+/// # Two forms
+///
+/// A backend that waits rather than computes (the GPU channel waits on its
+/// worker) is used through [`submit_mipmap_chain`](Self::submit_mipmap_chain),
+/// which is awaited, so no thread is parked while it waits (#422). The
+/// synchronous [`compress_mipmap_chain`](Self::compress_mipmap_chain) blocks
+/// the calling thread until the backend answers: it is for callers where
+/// nothing is async (tests, a blocking thread), never a task on a runtime
+/// worker thread.
 pub trait MipmapCompressor: Send + Sync {
-    /// Compress a full mipmap chain from the source image.
+    /// Compress a full mipmap chain from the source image, on the calling
+    /// thread.
+    ///
+    /// Blocks until the backend answers. Call it only where nothing is
+    /// async: from a test or a blocking thread, never from a task on a
+    /// runtime worker thread, which it would stall. Production encodes
+    /// through [`submit_mipmap_chain`](Self::submit_mipmap_chain).
     ///
     /// # Arguments
     ///
@@ -247,12 +267,45 @@ pub trait MipmapCompressor: Send + Sync {
     ///   other format must be rejected with [`DdsError::UnsupportedFormat`]
     ///   before any work is done (see [`DdsFormat`]).
     /// * `mipmap_count` - Number of mipmap levels to generate (including original)
+    /// * `output` - The DDS file, allocated once at its exact size
+    ///   ([`layout::file_len`]) with the header written: the backend writes
+    ///   the chain into `output[layout::HEADER_LEN..]`, each level in its
+    ///   slot, and returns the same buffer as [`ChainOutcome::Compressed`]
+    ///   (#423). A chain that does not fill it exactly is an error.
     fn compress_mipmap_chain(
         &self,
         image: RgbaImage,
         format: DdsFormat,
         mipmap_count: usize,
+        output: Vec<u8>,
     ) -> Result<ChainOutcome, DdsError>;
+
+    /// Compress a full mipmap chain from the source image, awaited (#422).
+    ///
+    /// `cancel` is the job's token: a backend that queues work skips an
+    /// image whose job is cancelled before the work starts and answers
+    /// [`ChainOutcome::Cancelled`]; work already started is finished and
+    /// answered. The default answers at once from
+    /// [`compress_mipmap_chain`](Self::compress_mipmap_chain), on the
+    /// awaiting thread, ignoring `cancel`: it suits backends that compute in
+    /// place and at once (test doubles). A backend that waits, or computes
+    /// for long, must override it, as the GPU channel does.
+    fn submit_mipmap_chain(
+        &self,
+        image: RgbaImage,
+        format: DdsFormat,
+        mipmap_count: usize,
+        output: Vec<u8>,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'_, Result<ChainOutcome, DdsError>> {
+        let _ = cancel;
+        Box::pin(std::future::ready(self.compress_mipmap_chain(
+            image,
+            format,
+            mipmap_count,
+            output,
+        )))
+    }
 
     /// Human-readable name for logging and diagnostics.
     fn name(&self) -> &str;
@@ -260,7 +313,8 @@ pub trait MipmapCompressor: Send + Sync {
 
 /// What a [`MipmapCompressor`] did with an image.
 pub enum ChainOutcome {
-    /// Every level, compressed back to back, largest first.
+    /// The DDS file the backend was given, every level compressed back to
+    /// back after the header, largest first.
     Compressed(Vec<u8>),
     /// The backend did not take the image, so it comes back unchanged for
     /// the caller to encode another way: [`DdsEncoder`] encodes it with its
@@ -274,6 +328,12 @@ pub enum ChainOutcome {
         /// Why the backend did not take it.
         reason: String,
     },
+    /// The job was cancelled before the backend started on the image, so it
+    /// was not encoded: it is not paid for yet (#422). That includes an
+    /// image the backend would otherwise hand back, as the CPU encode is not
+    /// paid for either. Only [`MipmapCompressor::submit_mipmap_chain`]
+    /// answers it.
+    Cancelled,
 }
 
 impl std::fmt::Debug for ChainOutcome {
@@ -292,6 +352,7 @@ impl std::fmt::Debug for ChainOutcome {
                 )
                 .field("reason", reason)
                 .finish(),
+            Self::Cancelled => f.write_str("Cancelled"),
         }
     }
 }
@@ -1054,8 +1115,10 @@ mod gpu_tests {
             _image: RgbaImage,
             _format: DdsFormat,
             _mipmap_count: usize,
+            mut output: Vec<u8>,
         ) -> Result<ChainOutcome, DdsError> {
-            Ok(ChainOutcome::Compressed(vec![0xAA, 0xBB]))
+            output.extend_from_slice(&[0xAA, 0xBB]);
+            Ok(ChainOutcome::Compressed(output))
         }
 
         fn name(&self) -> &str {
@@ -1073,7 +1136,7 @@ mod gpu_tests {
     fn test_mipmap_compressor_returns_data() {
         let compressor = MockMipmapCompressor;
         let image = RgbaImage::new(256, 256);
-        let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5);
+        let result = compressor.compress_mipmap_chain(image, DdsFormat::BC1, 5, Vec::new());
         assert!(matches!(result, Ok(ChainOutcome::Compressed(data)) if data == [0xAA, 0xBB]));
     }
 

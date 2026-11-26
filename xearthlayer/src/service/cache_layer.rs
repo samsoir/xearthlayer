@@ -842,7 +842,7 @@ mod tests {
     /// Encodes every image to a well-formed, blank DDS tile.
     struct BlankDdsEncoder;
     impl TextureEncoderAsync for BlankDdsEncoder {
-        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode_blocking(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             let mut dds = vec![0u8; EXPECTED_DDS_SIZE];
             dds[0..4].copy_from_slice(b"DDS ");
             Ok(dds)

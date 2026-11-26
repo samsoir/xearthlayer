@@ -43,6 +43,9 @@ use tokio::sync::Semaphore;
 // Type aliases for the concrete adapter types
 type ProviderAdapter = AsyncProviderAdapter<AsyncProviderType>;
 type EncoderAdapter = TextureEncoderAdapter<Arc<DdsTextureEncoder>>;
+/// A lane's job factory on the cache service's bridges.
+type BridgeFactory<DD, D> =
+    DefaultDdsJobFactory<ProviderAdapter, EncoderAdapter, MemoryCacheBridge, DD, D, TokioExecutor>;
 
 /// Builder for creating an XEarthLayerRuntime with the service's dependencies.
 ///
@@ -55,8 +58,13 @@ pub struct RuntimeBuilder {
     format: DdsFormat,
     /// Async provider for chunk downloads
     async_provider: Option<Arc<AsyncProviderType>>,
-    /// Texture encoder for DDS compression
+    /// Texture encoder for DDS compression: the demand lane's, and the
+    /// prefetch lane's unless [`with_prefetch_encoder`](Self::with_prefetch_encoder)
+    /// gives that lane its own.
     encoder: Arc<DdsTextureEncoder>,
+    /// The prefetch lane's encoder, when it is not `encoder` (#421: with
+    /// the GPU it sends on the prefetch channel).
+    prefetch_encoder: Option<Arc<DdsTextureEncoder>>,
     /// Memory cache (raw cache, will be wrapped in ExecutorCacheAdapter)
     memory_cache: Option<Arc<MemoryCache>>,
     /// Cache directory for disk cache
@@ -98,6 +106,7 @@ impl RuntimeBuilder {
             format,
             async_provider: None,
             encoder,
+            prefetch_encoder: None,
             memory_cache: None,
             cache_dir: None,
             config: RuntimeConfig::default(),
@@ -107,6 +116,25 @@ impl RuntimeBuilder {
             capacity_share: DEFAULT_PREFETCH_CAPACITY_SHARE,
             network_level: crate::config::NetworkLevel::default(),
         }
+    }
+
+    /// Gives the prefetch lane its own encoder (#421). With the GPU encoder
+    /// it is the one on the prefetch channel, which the GPU worker reads
+    /// only while the demand channel is empty; nothing the demand lane holds
+    /// can reach it. Without this both lanes share the builder's encoder, as
+    /// the CPU encoders do.
+    pub fn with_prefetch_encoder(mut self, encoder: Arc<DdsTextureEncoder>) -> Self {
+        self.prefetch_encoder = Some(encoder);
+        self
+    }
+
+    /// The demand and prefetch lanes' encoders: `encoder`, and `prefetch`
+    /// when the prefetch lane has its own.
+    fn lane_encoders(
+        encoder: &Arc<DdsTextureEncoder>,
+        prefetch: Option<&Arc<DdsTextureEncoder>>,
+    ) -> (Arc<DdsTextureEncoder>, Arc<DdsTextureEncoder>) {
+        (Arc::clone(encoder), Arc::clone(prefetch.unwrap_or(encoder)))
     }
 
     /// Sets the async provider for chunk downloads.
@@ -218,16 +246,18 @@ impl RuntimeBuilder {
         let disk_cache = Arc::new(DiskCacheAdapter::new(cache_dir, &self.provider_name));
 
         let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
+        let (demand_encoder, prefetch_encoder) =
+            Self::lane_encoders(&self.encoder, self.prefetch_encoder.as_ref());
         let demand_factory = Self::create_factory_with_disk_cache(
             Arc::clone(&async_provider),
-            Arc::clone(&self.encoder),
+            demand_encoder,
             Arc::clone(&cache_adapter),
             Arc::clone(&disk_cache),
             self.download_config.clone(),
         );
         let prefetch_factory = Self::create_factory_with_disk_cache(
             async_provider,
-            Arc::clone(&self.encoder),
+            prefetch_encoder,
             Arc::clone(&cache_adapter),
             disk_cache,
             Self::prefetch_download_config(&self.download_config, &sizing),
@@ -275,15 +305,17 @@ impl RuntimeBuilder {
         ));
 
         let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
+        let (demand_encoder, prefetch_encoder) =
+            Self::lane_encoders(&self.encoder, self.prefetch_encoder.as_ref());
         let demand_factory = Self::create_factory_without_disk_cache(
             Arc::clone(&async_provider),
-            Arc::clone(&self.encoder),
+            demand_encoder,
             Arc::clone(&cache_adapter),
             self.download_config.clone(),
         );
         let prefetch_factory = Self::create_factory_without_disk_cache(
             async_provider,
-            Arc::clone(&self.encoder),
+            prefetch_encoder,
             Arc::clone(&cache_adapter),
             Self::prefetch_download_config(&self.download_config, &sizing),
         )
@@ -435,23 +467,15 @@ impl RuntimeBuilder {
         let dds_disk_for_daemon = Arc::clone(&dds_disk_bridge);
 
         let sizing = Self::lane_sizing(self.capacity_share, self.network_level);
-        let demand_factory = Self::create_factory_with_bridges(
-            Arc::clone(&async_provider),
-            Arc::clone(&self.encoder),
-            Arc::clone(&memory_bridge),
-            Arc::clone(&dds_disk_bridge),
-            Arc::clone(&disk_bridge),
-            self.download_config.clone(),
-        );
-        let prefetch_factory = Self::create_factory_with_bridges(
+        let (demand_factory, prefetch_factory) = Self::lane_factories_with_bridges(
+            Self::lane_encoders(&self.encoder, self.prefetch_encoder.as_ref()),
             async_provider,
-            Arc::clone(&self.encoder),
             Arc::clone(&memory_bridge),
             dds_disk_bridge,
             disk_bridge,
-            Self::prefetch_download_config(&self.download_config, &sizing),
-        )
-        .with_cache_probe();
+            &self.download_config,
+            &sizing,
+        );
 
         XEarthLayerRuntime::with_metrics_client(
             Arc::new(demand_factory),
@@ -462,6 +486,43 @@ impl RuntimeBuilder {
             runtime_handle,
             self.metrics_client,
         )
+    }
+
+    /// The demand and prefetch lanes' factories on the cache service's
+    /// bridges: each lane's encoder of `(demand, prefetch)` encoders
+    /// ([`lane_encoders`](Self::lane_encoders)), and the prefetch lane's own
+    /// HTTP semaphore and cache probe.
+    fn lane_factories_with_bridges<DD, D>(
+        (demand_encoder, prefetch_encoder): (Arc<DdsTextureEncoder>, Arc<DdsTextureEncoder>),
+        async_provider: Arc<AsyncProviderType>,
+        memory_bridge: Arc<MemoryCacheBridge>,
+        dds_disk_bridge: Arc<DD>,
+        disk_bridge: Arc<D>,
+        download_config: &DownloadConfig,
+        sizing: &LaneSizing,
+    ) -> (BridgeFactory<DD, D>, BridgeFactory<DD, D>)
+    where
+        DD: DdsDiskCache,
+        D: DiskCache,
+    {
+        let demand = Self::create_factory_with_bridges(
+            Arc::clone(&async_provider),
+            demand_encoder,
+            Arc::clone(&memory_bridge),
+            Arc::clone(&dds_disk_bridge),
+            Arc::clone(&disk_bridge),
+            download_config.clone(),
+        );
+        let prefetch = Self::create_factory_with_bridges(
+            async_provider,
+            prefetch_encoder,
+            memory_bridge,
+            dds_disk_bridge,
+            disk_bridge,
+            Self::prefetch_download_config(download_config, sizing),
+        )
+        .with_cache_probe();
+        (demand, prefetch)
     }
 
     /// Creates a factory with bridge adapters from the cache service.
@@ -608,6 +669,92 @@ mod tests {
                 .prefetch_http_permits,
             666
         );
+    }
+
+    /// Without a prefetch encoder both lanes share the builder's (the CPU
+    /// encoders); with one, the prefetch lane gets it (#421).
+    #[test]
+    fn the_prefetch_lane_gets_its_own_encoder_when_given_one() {
+        let encoder = create_test_encoder();
+        let (demand, prefetch) = RuntimeBuilder::lane_encoders(&encoder, None);
+        assert!(Arc::ptr_eq(&demand, &encoder) && Arc::ptr_eq(&prefetch, &encoder));
+
+        let own = create_test_encoder();
+        let builder = RuntimeBuilder::new("test", DdsFormat::BC1, Arc::clone(&encoder))
+            .with_prefetch_encoder(Arc::clone(&own));
+        let (demand, prefetch) =
+            RuntimeBuilder::lane_encoders(&builder.encoder, builder.prefetch_encoder.as_ref());
+        assert!(Arc::ptr_eq(&demand, &encoder) && Arc::ptr_eq(&prefetch, &own));
+    }
+
+    /// The wiring test of #421: with the GPU encoder, the demand factory's
+    /// encoder sends on the demand channel and the prefetch factory's on
+    /// the prefetch channel, from the service's lane encoders through the
+    /// factories the runtime is built with.
+    #[tokio::test]
+    async fn each_lane_factory_encodes_on_its_own_gpu_channel() {
+        use crate::dds::gpu_channel::{gpu_lanes, GpuEncodeReply, GpuTileTiming};
+        use crate::dds::gpu_health::SharedGpuHealth;
+        use crate::executor::TextureEncoderAsync;
+
+        let (channels, mut queues) = gpu_lanes(
+            4,
+            SharedGpuHealth::new(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let encoders =
+            crate::service::builder::gpu_lane_encoders(channels, DdsFormat::BC1, Some(1));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = crate::service::ServiceConfig::builder()
+            .cache_directory(temp_dir.path().join("cache"))
+            .cache_memory_size(1_000_000)
+            .disk_cache_enabled(false)
+            .build();
+        let metrics = crate::metrics::MetricsSystem::new(&tokio::runtime::Handle::current());
+        let cache_layer = crate::service::CacheLayer::new(&config, "bing", metrics.client())
+            .await
+            .unwrap();
+        let (demand, prefetch) = RuntimeBuilder::lane_factories_with_bridges(
+            encoders,
+            create_test_provider(),
+            cache_layer.memory_bridge(),
+            Arc::new(NullDdsDiskCache),
+            Arc::new(NullDiskCache),
+            &DownloadConfig::default(),
+            &LaneSizing::from_configured_share(DEFAULT_PREFETCH_CAPACITY_SHARE),
+        );
+
+        for (factory, lane) in [(&demand, "demand"), (&prefetch, "prefetch")] {
+            // The production path: the job's awaited encode (#422).
+            let encoder = Arc::clone(factory.encoder());
+            let caller = tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                encoder
+                    .encode(image::RgbaImage::new(4, 4), &cancel, &TokioExecutor::new())
+                    .await
+                    .expect("no blocking work")
+            });
+            let (ours, other) = match lane {
+                "demand" => (&mut queues.demand, &mut queues.prefetch),
+                _ => (&mut queues.prefetch, &mut queues.demand),
+            };
+            let request = tokio::time::timeout(Duration::from_secs(5), ours.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the {lane} encoder sent on the {lane} channel"))
+                .unwrap();
+            assert!(
+                other.try_recv().is_err(),
+                "{lane}: nothing on the other lane"
+            );
+            // The worker's answer: the file it was sent, filled in place.
+            let _ = request.response.send(GpuEncodeReply::Processed {
+                result: Ok(request.output),
+                timing: GpuTileTiming::default(),
+            });
+            let dds = caller.await.unwrap().expect("the reply is the tile");
+            assert_eq!(dds.len(), crate::dds::layout::HEADER_LEN + 8, "{lane}");
+        }
+        cache_layer.shutdown().await;
     }
 
     #[test]

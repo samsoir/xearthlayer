@@ -195,6 +195,15 @@ where
     pub fn download_config(&self) -> &DownloadConfig {
         &self.download_config
     }
+
+    /// The encoder these jobs encode with.
+    ///
+    /// Exposed to tests so each lane's encoder is assertable: with the GPU,
+    /// the prefetch lane's sends on the prefetch channel (#421).
+    #[cfg(test)]
+    pub(crate) fn encoder(&self) -> &Arc<E> {
+        &self.encoder
+    }
 }
 
 impl<P, E, M, DD, D, X> DdsJobFactory for DefaultDdsJobFactory<P, E, M, DD, D, X>

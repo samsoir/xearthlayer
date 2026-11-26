@@ -69,7 +69,8 @@ impl TileProcessor for Panics {
         _levels: usize,
         _deadline: Instant,
         _timing: &mut GpuTileTiming,
-    ) -> Result<Vec<u8>, DdsError> {
+        _payload: &mut [u8],
+    ) -> Result<(), DdsError> {
         panic!("Device::poll: device lost")
     }
 }
@@ -94,7 +95,7 @@ async fn a_gpu_failure_logs_one_warning_however_many_tiles_fall_back() {
         Arc::clone(&channel) as Arc<dyn MipmapCompressor>,
         Arc::new(IspcCompressor),
     ));
-    let worker = spawn_tile_worker_with_clock(
+    let mut worker = spawn_tile_worker_with_clock(
         Panics,
         rx,
         CancellationToken::new(),
@@ -115,7 +116,11 @@ async fn a_gpu_failure_logs_one_warning_however_many_tiles_fall_back() {
     for tile in burst {
         failed += usize::from(tile.await.unwrap().is_err());
     }
-    worker.await.expect("the loop never panics");
+    worker
+        .wait(std::time::Duration::from_secs(5))
+        .await
+        .expect("the loop ends within the guard")
+        .expect("the loop never panics");
     // A device-lost callback after the panic, and more tiles.
     device_lost(&health, wgpu::DeviceLostReason::Unknown, "driver reset");
     for _ in 0..3 {

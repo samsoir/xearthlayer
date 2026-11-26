@@ -102,8 +102,8 @@ pub use compressor::{
     compress_level, compress_level_into, create_gpu_resources, default_compressor, ChainOutcome,
     ImageCompressor, IspcCompressor, MipmapCompressor, SoftwareCompressor,
 };
-pub use encoder::DdsEncoder;
-pub use gpu_channel::create_gpu_encoder_channel;
+pub use encoder::{AwaitedEncode, DdsEncoder};
+pub use gpu_channel::create_gpu_encoder_channels;
 pub use types::{DdsError, DdsFormat, DdsHeader};
 
 // Re-export for advanced usage

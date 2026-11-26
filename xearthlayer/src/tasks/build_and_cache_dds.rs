@@ -68,6 +68,12 @@ const MAGENTA: Rgba<u8> = Rgba([255, 0, 255, 255]);
 /// cancel by executor shutdown caches nothing. An incomplete tile is never
 /// cached, cancelled or not (#180, #385).
 ///
+/// With the GPU encoder the encode is awaited, not waited for on a blocking
+/// thread (#422), and the job's token goes with the tile: a job cancelled
+/// before the GPU starts its tile returns `Cancelled` at once, with its CPU
+/// permit, and the tile is not encoded, as it is not paid for yet. A tile
+/// the GPU has started is waited for and cached as above.
+///
 /// # Inputs
 ///
 /// - Key: "chunks" (from DownloadChunksTask)
@@ -350,10 +356,13 @@ where
                 let encode = EncodeGuard::start(&metrics);
                 let encode_start = Instant::now();
 
-                let encoder = Arc::clone(&self.encoder);
+                // Awaited (#422): CPU work runs on the blocking executor
+                // under this task's CPU permit, as before; a GPU encode is
+                // awaited, parking no thread, and is skipped if the job is
+                // cancelled before the GPU starts it.
                 let encode_result = self
-                    .executor
-                    .execute_blocking(move || encoder.encode(image))
+                    .encoder
+                    .encode(image, ctx.cancellation_token(), self.executor.as_ref())
                     .await;
 
                 let dds_data = match encode_result {
@@ -808,7 +817,7 @@ mod tests {
 
     struct StubEncoder;
     impl TextureEncoderAsync for StubEncoder {
-        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode_blocking(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             Ok(stub_dds())
         }
         fn expected_size(&self, _w: u32, _h: u32) -> usize {
@@ -824,7 +833,7 @@ mod tests {
         job: CancellationToken,
     }
     impl TextureEncoderAsync for CancellingEncoder {
-        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode_blocking(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             if let Some(shutdown) = &self.executor_shutdown {
                 shutdown.cancel();
             }
@@ -838,7 +847,7 @@ mod tests {
 
     struct FailingEncoder;
     impl TextureEncoderAsync for FailingEncoder {
-        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode_blocking(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             Err(TextureEncodeError::new("encoder refused the image"))
         }
         fn expected_size(&self, _w: u32, _h: u32) -> usize {
@@ -850,7 +859,7 @@ mod tests {
     /// `ExecutorError::TaskPanicked`, as in production.
     struct PanickingEncoder;
     impl TextureEncoderAsync for PanickingEncoder {
-        fn encode(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
+        fn encode_blocking(&self, _image: image::RgbaImage) -> Result<Vec<u8>, TextureEncodeError> {
             panic!("encoder panicked (test)");
         }
         fn expected_size(&self, _w: u32, _h: u32) -> usize {
@@ -1538,5 +1547,236 @@ mod tests {
         let disk_puts = drain_within(&mut disk_rx, Duration::from_millis(50)).await;
         assert!(mem_puts.is_empty(), "memory cache got {mem_puts:?}");
         assert!(disk_puts.is_empty(), "DDS disk cache got {disk_puts:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // The GPU encoder, awaited, and a job cancelled before its tile starts
+    // (#422)
+    // ------------------------------------------------------------------
+
+    use crate::dds::gpu_channel::{
+        spawn_tile_worker_with_clock, Clock, GpuEncodeReply, GpuEncodeRequest, GpuEncoderChannel,
+        GpuTileTiming, HangRule, TileProcessor, CHANNEL_CAPACITY,
+    };
+    use crate::dds::gpu_health::SharedGpuHealth;
+    use crate::dds::{DdsError, DdsFormat};
+    use crate::executor::TextureEncoderAdapter;
+    use crate::texture::DdsTextureEncoder;
+
+    type GpuEncoder = TextureEncoderAdapter<Arc<DdsTextureEncoder>>;
+
+    /// A fake GPU: reports each tile's width as it starts, then waits for
+    /// one release per tile.
+    struct Gated {
+        starts: UnboundedSender<u32>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl TileProcessor for Gated {
+        fn process(
+            &mut self,
+            image: RgbaImage,
+            _format: DdsFormat,
+            _levels: usize,
+            _deadline: Instant,
+            _timing: &mut GpuTileTiming,
+            payload: &mut [u8],
+        ) -> Result<(), DdsError> {
+            let _ = self.starts.send(image.width());
+            self.release.recv().unwrap();
+            // A complete chain, as far as the encoder can tell.
+            payload.fill(0xA5);
+            Ok(())
+        }
+    }
+
+    /// A clock that never moves: no request waits and no tile takes any
+    /// time, however slow the machine, so the hang rule never fires.
+    struct Frozen(Instant);
+
+    impl Clock for Frozen {
+        fn now(&self) -> Instant {
+            self.0
+        }
+    }
+
+    /// The real worker loop around [`Gated`], the encoder the service
+    /// builds on its channel, and the channel's raw sender, to queue tiles
+    /// the task did not send.
+    struct GpuRig {
+        encoder: GpuEncoder,
+        raw: tokio::sync::mpsc::Sender<GpuEncodeRequest>,
+        starts: UnboundedReceiver<u32>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn gpu_rig() -> GpuRig {
+        let (tx, rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let (starts_tx, starts) = unbounded_channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let health = SharedGpuHealth::new();
+        let clock: Arc<dyn Clock> = Arc::new(Frozen(Instant::now()));
+        spawn_tile_worker_with_clock(
+            Gated {
+                starts: starts_tx,
+                release: release_rx,
+            },
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            HangRule::default(),
+            Arc::clone(&clock),
+        );
+        let channel =
+            GpuEncoderChannel::new(tx.clone(), health, CancellationToken::new()).with_clock(clock);
+        let encoder = TextureEncoderAdapter::new(Arc::new(
+            DdsTextureEncoder::new(DdsFormat::BC1)
+                .with_compressor(Arc::new(crate::dds::IspcCompressor))
+                .with_mipmap_compressor(Arc::new(channel)),
+        ));
+        GpuRig {
+            encoder,
+            raw: tx,
+            starts,
+            release,
+        }
+    }
+
+    /// Queues a 4-wide tile the task did not send, and its reply.
+    fn queue_raw(
+        raw: &tokio::sync::mpsc::Sender<GpuEncodeRequest>,
+        width: u32,
+    ) -> tokio::sync::oneshot::Receiver<GpuEncodeReply> {
+        let (request, reply) = GpuEncodeRequest::new(
+            RgbaImage::new(width, 4),
+            DdsFormat::BC1,
+            1,
+            vec![0; crate::dds::layout::file_len(width, 4, 1, DdsFormat::BC1)],
+            Instant::now(),
+            CancellationToken::new(),
+        );
+        raw.try_send(request).expect("room in the channel");
+        reply
+    }
+
+    async fn next_start(starts: &mut UnboundedReceiver<u32>) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), starts.recv())
+            .await
+            .expect("a tile starts")
+            .expect("the worker is alive")
+    }
+
+    /// Yields until `raw`'s channel holds `n` requests: the task runs on
+    /// this thread, and sends on its first poll after assembly.
+    async fn queued(raw: &tokio::sync::mpsc::Sender<GpuEncodeRequest>, n: usize) {
+        for _ in 0..10_000 {
+            if raw.max_capacity() - raw.capacity() == n {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{n} requests were never queued");
+    }
+
+    /// Whether the cache behind `rx` was written, once every sender is
+    /// gone: the task's, and those of the writes it spawned.
+    async fn written(rx: &mut UnboundedReceiver<(u32, u32, u8)>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the writes end")
+            .is_some()
+    }
+
+    /// The task executed on its own tokio task, as the executor runs it.
+    fn run(
+        task: TestTask<GpuEncoder, InlineBlockingExecutor>,
+        mut ctx: TaskContext,
+    ) -> tokio::task::JoinHandle<TaskResult> {
+        tokio::spawn(async move { task.execute(&mut ctx).await })
+    }
+
+    async fn result_of(handle: tokio::task::JoinHandle<TaskResult>) -> TaskResult {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the task returns")
+            .unwrap()
+    }
+
+    /// A job cancelled while its tile waits behind a busy GPU returns
+    /// `Cancelled` at once, without waiting for the worker; the worker
+    /// never starts that tile; nothing is cached.
+    #[tokio::test]
+    async fn gpu_job_cancelled_while_queued_returns_at_once_and_is_never_encoded() {
+        let mut rig = gpu_rig();
+        let busy = queue_raw(&rig.raw, 4);
+        assert_eq!(next_start(&mut rig.starts).await, 4);
+        let job = CancellationToken::new();
+        let (task, mut mem_rx, mut disk_rx, ctx) = make_task(
+            complete_chunks(),
+            rig.encoder,
+            InlineBlockingExecutor,
+            job.clone(),
+        );
+
+        let handle = run(task, ctx);
+        queued(&rig.raw, 1).await;
+        job.cancel();
+        let result = result_of(handle).await;
+        assert!(matches!(result, TaskResult::Cancelled), "got {result:?}");
+        assert!(!written(&mut mem_rx).await && !written(&mut disk_rx).await);
+
+        // The worker, released, goes past the cancelled tile.
+        rig.release.send(()).unwrap();
+        busy.await.unwrap();
+        let after = queue_raw(&rig.raw, 12);
+        assert_eq!(next_start(&mut rig.starts).await, 12, "not the task's 4096");
+        rig.release.send(()).unwrap();
+        after.await.unwrap();
+    }
+
+    /// A job cancelled while the GPU encodes its tile still caches the
+    /// complete tile (#385): it is paid for.
+    #[tokio::test]
+    async fn gpu_job_cancelled_while_its_tile_is_encoded_caches_it() {
+        let mut rig = gpu_rig();
+        let job = CancellationToken::new();
+        let (task, mut mem_rx, mut disk_rx, ctx) = make_task(
+            complete_chunks(),
+            rig.encoder,
+            InlineBlockingExecutor,
+            job.clone(),
+        );
+
+        let handle = run(task, ctx);
+        assert_eq!(next_start(&mut rig.starts).await, 4096);
+        job.cancel();
+        rig.release.send(()).unwrap();
+        let result = result_of(handle).await;
+        assert!(matches!(result, TaskResult::Cancelled), "got {result:?}");
+        assert!(written(&mut mem_rx).await, "memory cache");
+        assert!(written(&mut disk_rx).await, "DDS disk cache");
+    }
+
+    /// A shutdown while the GPU encodes the tile caches nothing (#385).
+    #[tokio::test]
+    async fn gpu_job_cancelled_by_shutdown_while_encoded_caches_nothing() {
+        let mut rig = gpu_rig();
+        let job = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (task, mut mem_rx, mut disk_rx, ctx) = make_task(
+            complete_chunks(),
+            rig.encoder,
+            InlineBlockingExecutor,
+            job.clone(),
+        );
+
+        let handle = run(task, ctx.with_executor_shutdown(shutdown.clone()));
+        assert_eq!(next_start(&mut rig.starts).await, 4096);
+        shutdown.cancel();
+        job.cancel();
+        rig.release.send(()).unwrap();
+        let result = result_of(handle).await;
+        assert!(matches!(result, TaskResult::Cancelled), "got {result:?}");
+        assert!(!written(&mut mem_rx).await && !written(&mut disk_rx).await);
     }
 }

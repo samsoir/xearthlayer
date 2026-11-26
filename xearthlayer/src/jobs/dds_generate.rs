@@ -265,7 +265,7 @@ mod tests {
 
     struct StubEncoder;
     impl TextureEncoderAsync for StubEncoder {
-        fn encode(
+        fn encode_blocking(
             &self,
             _image: image::RgbaImage,
         ) -> Result<Vec<u8>, crate::executor::TextureEncodeError> {
