@@ -201,6 +201,8 @@ pub struct LitStatsSnapshot {
     pub roads_ready_at_permit: u64,
     /// Write-backs skipped by [`WriteBackSkip`], in its declaration order.
     pub write_backs_skipped: [u64; 5],
+    /// Write-backs dropped because as many as the bound were pending.
+    pub write_backs_dropped: u64,
     /// See [`PayloadLookup::Hit`], by [`PayloadPart`]: head, tail.
     pub payload_hits: [u64; 2],
     /// See [`PayloadLookup::Joined`], by part.
@@ -291,6 +293,7 @@ impl LitStatsSnapshot {
             generations_black: self.generations_black - earlier.generations_black,
             roads_ready_at_permit: self.roads_ready_at_permit - earlier.roads_ready_at_permit,
             write_backs_skipped: each(self.write_backs_skipped, earlier.write_backs_skipped),
+            write_backs_dropped: self.write_backs_dropped - earlier.write_backs_dropped,
             payload_hits: each(self.payload_hits, earlier.payload_hits),
             payload_joins: each(self.payload_joins, earlier.payload_joins),
             payload_misses: each(self.payload_misses, earlier.payload_misses),
@@ -393,6 +396,23 @@ impl Gauge {
         self.peak.fetch_max(now, Ordering::Relaxed);
     }
 
+    /// One more, unless `bound` are in already ([`admits`]): whether it
+    /// arrived. Atomic, so concurrent callers never pass the bound.
+    fn arrive_within(&self, bound: u64) -> bool {
+        let arrived = self
+            .now
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
+                admits(now, bound).then_some(now + 1)
+            });
+        match arrived {
+            Ok(before) => {
+                self.peak.fetch_max(before + 1, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn leave(&self) {
         self.now.fetch_sub(1, Ordering::Relaxed);
     }
@@ -438,6 +458,11 @@ impl Drop for PendingWriteBack {
     }
 }
 
+/// Whether one more may join `now` already in, with at most `bound` at once.
+fn admits(now: u64, bound: u64) -> bool {
+    now < bound
+}
+
 fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
@@ -451,6 +476,7 @@ pub struct LitStats {
     generations_black: AtomicU64,
     roads_ready_at_permit: AtomicU64,
     write_backs_skipped: Tally<5>,
+    write_backs_dropped: AtomicU64,
     payload_hits: Tally<2>,
     payload_joins: Tally<2>,
     payload_misses: Tally<2>,
@@ -534,11 +560,17 @@ impl LitStats {
         }
     }
 
-    /// A write-back about to be spawned: pending until the guard drops,
-    /// which records how it ended through [`PendingWriteBack::finished`].
-    pub fn write_back(self: &Arc<Self>) -> PendingWriteBack {
-        self.write_backs_pending.arrive();
-        PendingWriteBack(Arc::clone(self))
+    /// A write-back about to be spawned, when fewer than `bound` are
+    /// pending: pending until the guard drops, which records how it ended
+    /// through [`PendingWriteBack::finished`]. `None`, counted as dropped,
+    /// at the bound.
+    pub fn write_back(self: &Arc<Self>, bound: u64) -> Option<PendingWriteBack> {
+        if self.write_backs_pending.arrive_within(bound) {
+            Some(PendingWriteBack(Arc::clone(self)))
+        } else {
+            add(&self.write_backs_dropped);
+            None
+        }
     }
 
     pub fn record_write_back_skipped(&self, skip: WriteBackSkip) {
@@ -554,6 +586,7 @@ impl LitStats {
             generations_black: get(&self.generations_black),
             roads_ready_at_permit: get(&self.roads_ready_at_permit),
             write_backs_skipped: self.write_backs_skipped.get(),
+            write_backs_dropped: get(&self.write_backs_dropped),
             payload_hits: self.payload_hits.get(),
             payload_joins: self.payload_joins.get(),
             payload_misses: self.payload_misses.get(),
@@ -650,6 +683,7 @@ impl LitStats {
             write_back_skipped_road_failed = skipped(WriteBackSkip::RoadFailed),
             write_back_skipped_road_sources_changed = skipped(WriteBackSkip::RoadSourcesChanged),
             write_back_skipped_art_failed = skipped(WriteBackSkip::ArtFailed),
+            write_backs_dropped = d.write_backs_dropped,
             payload_head_hits = d.payload_hits(head),
             payload_head_joins = d.payload_joins(head),
             payload_head_misses = d.payload_misses(head),
@@ -830,8 +864,8 @@ mod tests {
         s.record_disk_lookup(MS, Some(EntryReject::Length.into()));
         let stats = Arc::new(s);
         let s = stats.as_ref();
-        stats.write_back().finished(true);
-        stats.write_back().finished(false);
+        stats.write_back(2).unwrap().finished(true);
+        stats.write_back(2).unwrap().finished(false);
         s.record_write_back_skipped(WriteBackSkip::ArtFailed);
         let snap = s.snapshot();
         assert_eq!(snap.disk_hits, 1);
@@ -864,13 +898,26 @@ mod tests {
     #[test]
     fn a_pending_write_back_counts_until_it_drops() {
         let s = Arc::new(LitStats::default());
-        let pending = s.write_back();
+        let pending = s.write_back(1).unwrap();
         assert_eq!(s.write_backs_pending.now(), 1);
         drop(pending);
         assert_eq!(s.write_backs_pending.now(), 0);
         let snap = s.snapshot();
         assert_eq!((snap.disk_writes, snap.disk_write_failures), (0, 0));
         assert_eq!(s.write_backs_pending.take_peak(), 1);
+    }
+
+    #[test]
+    fn a_write_back_past_the_bound_is_dropped_and_counted() {
+        assert!(admits(15, 16));
+        assert!(!admits(16, 16));
+        let s = Arc::new(LitStats::default());
+        let held: Vec<_> = (0..3).map(|_| s.write_back(3).unwrap()).collect();
+        assert!(s.write_back(3).is_none(), "at the bound");
+        assert_eq!(s.snapshot().write_backs_dropped, 1);
+        drop(held);
+        assert!(s.write_back(3).is_some(), "room again");
+        assert_eq!(s.write_backs_pending.take_peak(), 3, "never past the bound");
     }
 
     #[test]

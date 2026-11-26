@@ -105,6 +105,13 @@ const LIT_PROBE_PERMITS: usize = 2;
 /// per session.
 pub(crate) const LIT_DISK_PERMITS: usize = 2;
 
+/// Most lit write-backs pending at once, waiting for a disk permit or
+/// writing (#432). Each holds its payload until written, and reads that
+/// miss memory share the disk permits with them; past the bound a
+/// write-back is dropped (and counted): the payload stays in memory, and a
+/// later session generates it again. A flight's scene loads peaked at 3.
+pub(crate) const MAX_PENDING_WRITE_BACKS: u64 = 16;
+
 /// The lit disk tier's [`LIT_DISK_PERMITS`] permits. Made once where the lit
 /// source and the road service are built, and handed to both
 /// ([`NightLitSource::new`], [`RoadService::new`]), so the tier's work, the
@@ -126,6 +133,13 @@ impl LitDiskPermits {
     /// Whether `other` is these permits, not another set.
     pub(crate) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// `n` permits instead of [`LIT_DISK_PERMITS`], for tests that need
+    /// more work in flight than the tier allows.
+    #[cfg(test)]
+    pub(crate) fn with_permits(n: usize) -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(n)))
     }
 
     /// The permits themselves, for tests that hold or count them.
@@ -591,7 +605,8 @@ impl NightLitSource {
 
     /// Disk first, then generation; a generated payload is written back
     /// without waiting, unless [`write_back_skip`] gives a reason not to (a
-    /// road tile missing, no fingerprint, a doubt among its art lookups).
+    /// road tile missing, no fingerprint, a doubt among its art lookups), or
+    /// [`MAX_PENDING_WRITE_BACKS`] are pending already (dropped, counted).
     /// When the reason is the art, a debug line names the file and why; a
     /// payload skipped for an earlier reason logs none. When the reason is a
     /// changed road DSF, a debug line names the road tile, once per tile for
@@ -692,10 +707,13 @@ impl NightLitSource {
         else {
             return memory_only(generated);
         };
+        // Pending from here, so a write-back spawned but not yet run counts.
+        let Some(pending) = self.stats.write_back(MAX_PENDING_WRITE_BACKS) else {
+            return Ok(payload.clone());
+        };
         let entry = encode_entry(fp, payload);
         let payload = payload.clone();
-        // Pending from here, so a write-back spawned but not yet run counts.
-        let (disk_io, pending) = (self.disk_io.clone(), self.stats.write_back());
+        let disk_io = self.disk_io.clone();
         tokio::spawn(async move {
             let Some(_permit) = disk_io.acquire().await else {
                 return;
@@ -3816,6 +3834,36 @@ mod tests {
             let key = (name.row, name.col, name.zoom);
             assert!(source.payloads.contains(PayloadPart::Head, key));
             assert!(source.payloads.contains(PayloadPart::Tail, key));
+        }
+
+        #[tokio::test]
+        async fn write_backs_past_the_bound_are_dropped_and_counted() {
+            // Writes blocked (the disk double's sets wait), with disk permits
+            // to spare for the reads: the write-backs pending stop at the
+            // bound, and each one past it is dropped.
+            const PAST: u64 = 3;
+            let temp = TempDir::new().unwrap();
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let disk = Recorded::new(Some(gate.clone()));
+            let permits = 2 * MAX_PENDING_WRITE_BACKS as usize;
+            let source = source_with_permits(&temp, LitDiskPermits::with_permits(permits))
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            let layout = LitLayout::new(18, 4);
+            for i in 0..(MAX_PENDING_WRITE_BACKS + PAST) as u32 {
+                let (_, outcome) = source
+                    .served_parts(&small_name(i), &layout, small_levels(&layout))
+                    .await;
+                assert_eq!(outcome, ReadOutcome::Generated, "{i}");
+            }
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.write_backs_dropped, PAST);
+            assert_eq!(snap.disk_writes, 0, "every write is blocked");
+            let w = source.stats.take_window().unwrap();
+            assert_eq!(w.write_backs_pending_peak, MAX_PENDING_WRITE_BACKS);
+            gate.add_permits(permits);
+            let snap = counted(&source, |s| s.disk_writes == MAX_PENDING_WRITE_BACKS).await;
+            assert_eq!(snap.disk_write_failures, 0);
         }
 
         #[test]
