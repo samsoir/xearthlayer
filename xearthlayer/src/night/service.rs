@@ -3671,6 +3671,40 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_disk_entry_of_a_capped_zooms_old_length_is_generated_again() {
+            // Before the cap below ZL16 (#431) a ZL14 payload at t = 4 was
+            // the 4096 px chain. Its entry carries today's fingerprint (no
+            // version was bumped) and fails the length check alone.
+            const OLD_ZL14_PAYLOAD_LEN: u64 = 11_184_824;
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = name_at_zoom(37.20, -122.725, 14);
+            let layout = LitLayout::new(14, 4);
+            assert_ne!(layout.payload_len(), OLD_ZL14_PAYLOAD_LEN);
+            // A generator that draws nothing: what matters is that it is
+            // called, and encoding a 2048 px chain takes seconds unoptimised.
+            let generator = Arc::new(Unencodable::default());
+            let source = source_in(&temp)
+                .with_generator(generator.clone())
+                .with_disk_cache(d.clone());
+            let fp = source.fingerprint(&name).await.expect("a fingerprint");
+            let old = vec![0u8; OLD_ZL14_PAYLOAD_LEN as usize];
+            d.set(
+                &crate::night::lit_cache_key(&name),
+                crate::night::encode_entry(&fp, &old),
+            )
+            .await
+            .unwrap();
+            let (payload, _) = source.served_payload(&name, &layout).await;
+            assert!(payload.is_none(), "the stub's empty image is not served");
+            assert_eq!(generator.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.disk_misses(DiskMiss::Length), 1);
+            assert_eq!(snap.disk_misses, [0, 0, 0, 0, 1, 0], "and no other");
+            assert_eq!(snap.disk_hits, 0);
+        }
+
+        #[tokio::test]
         async fn an_absent_disk_entry_counts_an_absent_miss() {
             let temp = TempDir::new().unwrap();
             let source = source_in(&temp)

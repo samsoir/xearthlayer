@@ -20,6 +20,24 @@ const LIT_FORMAT: DdsFormat = DdsFormat::BC1;
 /// First visible level of a ZL16 lit texture: about 7.5 m per texel.
 pub const FIRST_VISIBLE_ZL16: u32 = 1024;
 
+/// Largest first visible level of a texture below ZL16 (#431). Fixed in
+/// metres, the first visible level doubles per zoom below 16 until the top
+/// cap holds it: 8192 px at ZL12 and ZL13, 64 times a ZL16 generation's work
+/// and memory, for one texture. At 2048 the largest generation is 4 times a
+/// ZL16 one and the top X-Plane uploads at the full setting is 4096 px, the
+/// size of the ortho texture beneath it. The cost is density: ZL14, ZL13 and
+/// ZL12 get a half, a quarter and an eighth of ZL16's, and since the level
+/// X-Plane switches at follows the uploaded top's texel size, their lit layer
+/// starts farther from the aircraft by the same factor. ZL15 (2048) and
+/// every zoom from 16 up are below it at every setting, so unchanged.
+pub const MAX_FIRST_VISIBLE_BELOW_ZL16: u32 = 2048;
+
+/// Most road raster samples per output texel side (#431): a capped texture
+/// has its roads rastered at up to this many times its linear resolution.
+/// 2 gives ZL14 exactly ZL16's road density, and ZL13 and ZL12 a 4096 px
+/// raster for their 2048 px texture.
+pub const MAX_ROAD_SUPERSAMPLE: u32 = 2;
+
 /// Largest top level a lit DDS declares. At the lowest texture setting the
 /// uncapped top would be 32768 px, unverified in X-Plane; the cap shrinks the
 /// first visible level instead (design: Lit DDS layout, Risk).
@@ -52,21 +70,29 @@ pub struct LitLayout {
     pub blank_levels: u32,
     pub first_visible: u32,
     pub total_len: u64,
+    /// See [`LitLayout::road_supersample`].
+    road_supersample: u32,
     header: Bytes,
 }
 
 impl LitLayout {
     /// The layout for a texture at `zoom` under X-Plane texture setting `t` (R15).
+    /// Below ZL16 the first visible level is at most
+    /// [`MAX_FIRST_VISIBLE_BELOW_ZL16`] (#431).
     pub fn new(zoom: u8, texture_setting: u8) -> Self {
         let t = u32::from(texture_setting.min(4));
         let blank_levels = (4 - t) + 1;
-        let wanted_first = if zoom >= 16 {
-            (FIRST_VISIBLE_ZL16 >> (zoom - 16)).max(4)
+        // The first visible level fixed in metres, and the one served.
+        let (fixed_first, wanted_first) = if zoom >= 16 {
+            let fixed = (FIRST_VISIBLE_ZL16 >> (zoom - 16)).max(4);
+            (fixed, fixed)
         } else {
-            (FIRST_VISIBLE_ZL16 << (16 - zoom)).min(MAX_TOP_LEVEL)
+            let fixed = (FIRST_VISIBLE_ZL16 << (16 - zoom)).min(MAX_TOP_LEVEL);
+            (fixed, fixed.min(MAX_FIRST_VISIBLE_BELOW_ZL16))
         };
-        let top = (wanted_first << blank_levels).min(MAX_TOP_LEVEL);
-        let first_visible = top >> blank_levels;
+        let (top, first_visible) = top_and_first_visible(wanted_first, blank_levels);
+        let (_, uncapped_first) = top_and_first_visible(fixed_first, blank_levels);
+        let road_supersample = (uncapped_first / first_visible).min(MAX_ROAD_SUPERSAMPLE);
         let levels = full_chain_levels(top, top);
         let header = Bytes::from(DdsHeader::new(top, top, levels, LIT_FORMAT).to_bytes());
         let total_len = layout::file_len(top, top, levels, LIT_FORMAT) as u64;
@@ -76,8 +102,21 @@ impl LitLayout {
             blank_levels,
             first_visible,
             total_len,
+            road_supersample,
             header,
         }
+    }
+
+    /// Road raster samples per side of a first visible texel (#431): the
+    /// first visible level the density fixed in metres asks for over the one
+    /// served, at most [`MAX_ROAD_SUPERSAMPLE`]. 1 wherever the cap below
+    /// ZL16 changed nothing, so every uncapped texture, ZL15 and up at every
+    /// setting, rasters its roads as before. A road's glow is never narrower
+    /// than a texel, so on a capped texture lamps and roads would widen into
+    /// thick lines; rastered at the uncapped density and averaged down, they
+    /// keep their width on the ground.
+    pub fn road_supersample(&self) -> u32 {
+        self.road_supersample
     }
 
     /// Bytes `[offset, offset + len)` of the all-black texture: the header,
@@ -159,6 +198,14 @@ impl LitLayout {
         }
         self.compose(start, end, Some(payload))
     }
+}
+
+/// The top level and the first visible level for a wanted first visible
+/// level `wanted` under `blank_levels` blank levels: the top is held to
+/// [`MAX_TOP_LEVEL`], which shrinks the first visible level instead.
+fn top_and_first_visible(wanted: u32, blank_levels: u32) -> (u32, u32) {
+    let top = (wanted << blank_levels).min(MAX_TOP_LEVEL);
+    (top, top >> blank_levels)
 }
 
 /// The texture served wherever nothing is lit: 4 x 4 DXT1 with its full
@@ -339,13 +386,15 @@ mod tests {
         // Where the lit layer cuts out is set by the texel size of the
         // blank level X-Plane uploads first. Shrinking the visible level
         // with the setting moved the cut-out 2x farther per notch (flown
-        // 2026-10-18), so the first visible level is fixed in metres.
-        for zoom in [15, 16, 18] {
+        // 2026-10-18), so the first visible level is fixed in metres. The
+        // cap below ZL16 holds a zoom's first visible level to one size at
+        // every setting, so capped zooms keep the rule too.
+        for zoom in 12..=22 {
             let full = LitLayout::new(zoom, 4);
             for t in 1..=3u8 {
                 let l = LitLayout::new(zoom, t);
                 if l.top == MAX_TOP_LEVEL {
-                    continue; // the cap trades visible resolution instead
+                    continue; // the top cap trades visible resolution instead
                 }
                 assert_eq!(l.first_visible, full.first_visible, "ZL{zoom} t = {t}");
                 assert_eq!(l.blank_levels, u32::from(4 - t) + 1, "ZL{zoom} t = {t}");
@@ -365,6 +414,126 @@ mod tests {
         let l = LitLayout::new(16, 0);
         assert_eq!(l.top, MAX_TOP_LEVEL);
         assert_eq!(l.first_visible, MAX_TOP_LEVEL >> l.blank_levels);
+        for zoom in 12..=22 {
+            for t in 0..=4u8 {
+                assert!(
+                    LitLayout::new(zoom, t).top <= MAX_TOP_LEVEL,
+                    "ZL{zoom} t = {t}"
+                );
+            }
+        }
+    }
+
+    /// `(top, first_visible, total_len, payload_len())` of `LitLayout::new(zoom, t)`.
+    fn shape(zoom: u8, t: u8) -> (u32, u32, u64, u64) {
+        let l = LitLayout::new(zoom, t);
+        (l.top, l.first_visible, l.total_len, l.payload_len())
+    }
+
+    #[test]
+    fn every_layout_at_zl16_and_above_is_as_before_the_cap() {
+        // Taken before the cap below ZL16 (#431): every served size and
+        // payload length at ZL16 and above, at every texture setting.
+        #[rustfmt::skip]
+        let before: [(u8, u8, u32, u32, u64, u64); 35] = [
+            (16, 0, 16384, 512, 178_957_112, 174_776),
+            (16, 1, 16384, 1024, 178_957_112, 699_064),
+            (16, 2, 8192, 1024, 44_739_384, 699_064),
+            (16, 3, 4096, 1024, 11_184_952, 699_064),
+            (16, 4, 2048, 1024, 2_796_344, 699_064),
+            (17, 0, 16384, 512, 178_957_112, 174_776),
+            (17, 1, 8192, 512, 44_739_384, 174_776),
+            (17, 2, 4096, 512, 11_184_952, 174_776),
+            (17, 3, 2048, 512, 2_796_344, 174_776),
+            (17, 4, 1024, 512, 699_192, 174_776),
+            (18, 0, 8192, 256, 44_739_384, 43_704),
+            (18, 1, 4096, 256, 11_184_952, 43_704),
+            (18, 2, 2048, 256, 2_796_344, 43_704),
+            (18, 3, 1024, 256, 699_192, 43_704),
+            (18, 4, 512, 256, 174_904, 43_704),
+            (19, 0, 4096, 128, 11_184_952, 10_936),
+            (19, 1, 2048, 128, 2_796_344, 10_936),
+            (19, 2, 1024, 128, 699_192, 10_936),
+            (19, 3, 512, 128, 174_904, 10_936),
+            (19, 4, 256, 128, 43_832, 10_936),
+            (20, 0, 2048, 64, 2_796_344, 2_744),
+            (20, 1, 1024, 64, 699_192, 2_744),
+            (20, 2, 512, 64, 174_904, 2_744),
+            (20, 3, 256, 64, 43_832, 2_744),
+            (20, 4, 128, 64, 11_064, 2_744),
+            (21, 0, 1024, 32, 699_192, 696),
+            (21, 1, 512, 32, 174_904, 696),
+            (21, 2, 256, 32, 43_832, 696),
+            (21, 3, 128, 32, 11_064, 696),
+            (21, 4, 64, 32, 2_872, 696),
+            (22, 0, 512, 16, 174_904, 184),
+            (22, 1, 256, 16, 43_832, 184),
+            (22, 2, 128, 16, 11_064, 184),
+            (22, 3, 64, 16, 2_872, 184),
+            (22, 4, 32, 16, 824, 184),
+        ];
+        for (zoom, t, top, first, total, payload) in before {
+            assert_eq!(
+                shape(zoom, t),
+                (top, first, total, payload),
+                "ZL{zoom} t = {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn below_zl16_the_first_visible_level_is_capped_at_2048() {
+        // Before the cap, ZL12 and ZL13 were 8192 at t = 4 and 4096 at
+        // t = 3, and ZL14 4096 at both: up to 64 times a ZL16 generation.
+        // At t <= 2 the top cap already held them to 2048, and ZL15 is
+        // 2048 at every setting: those are unchanged.
+        #[rustfmt::skip]
+        let after: [(u8, u8, u32, u32, u64, u64); 20] = [
+            (12, 0, 16384, 512, 178_957_112, 174_776),
+            (12, 1, 16384, 1024, 178_957_112, 699_064),
+            (12, 2, 16384, 2048, 178_957_112, 2_796_216),
+            (12, 3, 8192, 2048, 44_739_384, 2_796_216),
+            (12, 4, 4096, 2048, 11_184_952, 2_796_216),
+            (13, 0, 16384, 512, 178_957_112, 174_776),
+            (13, 1, 16384, 1024, 178_957_112, 699_064),
+            (13, 2, 16384, 2048, 178_957_112, 2_796_216),
+            (13, 3, 8192, 2048, 44_739_384, 2_796_216),
+            (13, 4, 4096, 2048, 11_184_952, 2_796_216),
+            (14, 0, 16384, 512, 178_957_112, 174_776),
+            (14, 1, 16384, 1024, 178_957_112, 699_064),
+            (14, 2, 16384, 2048, 178_957_112, 2_796_216),
+            (14, 3, 8192, 2048, 44_739_384, 2_796_216),
+            (14, 4, 4096, 2048, 11_184_952, 2_796_216),
+            (15, 0, 16384, 512, 178_957_112, 174_776),
+            (15, 1, 16384, 1024, 178_957_112, 699_064),
+            (15, 2, 16384, 2048, 178_957_112, 2_796_216),
+            (15, 3, 8192, 2048, 44_739_384, 2_796_216),
+            (15, 4, 4096, 2048, 11_184_952, 2_796_216),
+        ];
+        for (zoom, t, top, first, total, payload) in after {
+            assert_eq!(
+                shape(zoom, t),
+                (top, first, total, payload),
+                "ZL{zoom} t = {t}"
+            );
+            assert!(first <= MAX_FIRST_VISIBLE_BELOW_ZL16, "ZL{zoom} t = {t}");
+        }
+    }
+
+    #[test]
+    fn roads_are_supersampled_only_where_the_cap_lowered_the_density() {
+        // The first visible level the density fixed in metres asks for,
+        // over the capped one, at most 2: ZL12 to ZL14 at t = 3 and 4.
+        for zoom in 12..=22u8 {
+            for t in 0..=4u8 {
+                let want = if zoom <= 14 && t >= 3 { 2 } else { 1 };
+                assert_eq!(
+                    LitLayout::new(zoom, t).road_supersample(),
+                    want,
+                    "ZL{zoom} t = {t}"
+                );
+            }
+        }
     }
 
     #[test]
