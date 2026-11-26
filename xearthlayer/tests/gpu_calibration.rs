@@ -80,8 +80,9 @@ fn fig(s: Option<LatencySummary>) -> String {
 
 fn print_stages(s: &GpuSample) {
     eprintln!(
-        "    tiles={} failed={} fallback={} depth_max={} kernel timing: {}",
+        "    tiles={} overlapped={} failed={} fallback={} depth_max={} kernel timing: {}",
         s.tiles(),
+        s.overlapped,
         s.failed,
         s.fallback,
         s.depth_max,

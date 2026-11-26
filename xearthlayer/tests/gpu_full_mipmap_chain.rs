@@ -257,15 +257,21 @@ async fn kept_resources_do_not_change_a_tile() {
     assert!(back_to_back[1] == fresh_second[0], "the second tile, bytes");
 }
 
-/// The acceptance test of #425's byte identity through the worker: four
-/// different 4096 tiles sent at once on the demand lane, so the worker
-/// begins each while the one before is on the GPU, two resource sets in
-/// turn, each match the same tile encoded alone on a fresh worker, byte for
-/// byte.
-#[tokio::test]
-#[ignore]
-async fn tiles_in_flight_together_do_not_change_a_tile() {
-    let images: Vec<RgbaImage> = (10..14).map(textured).collect();
+/// A deterministic tile of `size` x `size` with texture, `seed` telling
+/// two apart.
+fn textured_of(size: u32, seed: u64) -> RgbaImage {
+    RgbaImage::from_fn(size, size, |x, y| {
+        let mut h = (u64::from(x) << 32 | u64::from(y)) ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 31;
+        image::Rgba([(h >> 8) as u8, (h >> 24) as u8, (h >> 40) as u8, 255])
+    })
+}
+
+/// Encodes `images` on one new GPU worker's demand lane, all sent at once,
+/// full chain each: the replies in the order of `images`, and how many of
+/// the tiles the worker began while another was in flight (#425).
+async fn sent_at_once(images: &[RgbaImage]) -> Option<(Vec<Vec<u8>>, u64)> {
     let shutdown = tokio_util::sync::CancellationToken::new();
     let (channels, mut worker, _adapter) =
         match xearthlayer::dds::gpu_channel::create_gpu_encoder_channels(
@@ -276,18 +282,19 @@ async fn tiles_in_flight_together_do_not_change_a_tile() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Skipping: no usable GPU ({e})");
-                return;
+                return None;
             }
         };
     let channel = Arc::new(channels.demand);
-    let levels = MipmapGenerator::full_chain_count(4096, 4096);
     let sent: Vec<_> = images
         .iter()
         .cloned()
         .map(|image| {
             let ch = Arc::clone(&channel);
+            let (w, h) = image.dimensions();
+            let levels = MipmapGenerator::full_chain_count(w, h);
             tokio::task::spawn_blocking(move || {
-                ch.compress_mipmap_chain(image, DdsFormat::BC1, levels, file(4096, 4096, levels))
+                ch.compress_mipmap_chain(image, DdsFormat::BC1, levels, file(w, h, levels))
             })
         })
         .collect();
@@ -301,13 +308,76 @@ async fn tiles_in_flight_together_do_not_change_a_tile() {
         ));
     }
     let sample = channel.stats().take_sample().expect("the tiles");
-    eprintln!("depth_max {} of 4 tiles", sample.depth_max);
+    eprintln!(
+        "{} tiles, {} begun behind another, depth_max {}",
+        sample.tiles(),
+        sample.overlapped,
+        sample.depth_max
+    );
     shutdown.cancel();
     worker.wait(std::time::Duration::from_secs(10)).await;
-    for (i, image) in images.into_iter().enumerate() {
-        let alone = on_one_worker(vec![image]).await.expect("the GPU again");
-        assert!(together[i] == alone[0], "tile {i}, bytes");
+    Some((together, sample.overlapped))
+}
+
+/// Each of `images` encoded alone, full chain, on a fresh worker.
+async fn each_alone(images: &[RgbaImage]) -> Vec<Vec<u8>> {
+    let mut alone = Vec::new();
+    for image in images {
+        let (mut bytes, overlapped) = sent_at_once(std::slice::from_ref(image))
+            .await
+            .expect("the GPU again");
+        assert_eq!(overlapped, 0, "a lone tile has nothing beside it");
+        alone.push(bytes.remove(0));
     }
+    alone
+}
+
+/// The acceptance test of #425's byte identity through the worker: four
+/// different 4096 tiles sent at once on the demand lane, so the worker
+/// begins each while the one before is on the GPU, two resource sets in
+/// turn, each match the same tile encoded alone on a fresh worker, byte for
+/// byte. The worker's stats show the overlap happened.
+#[tokio::test]
+#[ignore]
+async fn tiles_in_flight_together_do_not_change_a_tile() {
+    let images: Vec<RgbaImage> = (10..14).map(textured).collect();
+    let Some((together, overlapped)) = sent_at_once(&images).await else {
+        return;
+    };
+    assert!(
+        overlapped >= 1,
+        "at least one tile was begun while another was in flight"
+    );
+    let alone = each_alone(&images).await;
+    for (i, (together, alone)) in together.iter().zip(&alone).enumerate() {
+        assert!(together == alone, "tile {i}, bytes");
+    }
+}
+
+/// Two tiles of different sizes in flight together (#425): each begin
+/// records its own kernel work through the one `GpuBlockCompressor`, whose
+/// per-task uniforms the second begin writes while the first tile's work
+/// may still be on the GPU. Each must still be the tile encoded alone,
+/// byte for byte. The pair is sent again (up to five times) until the
+/// worker had both in flight at once, which the stats show.
+#[tokio::test]
+#[ignore]
+async fn two_sizes_in_flight_together_do_not_change_a_tile() {
+    let images = vec![textured_of(4096, 21), textured_of(1024, 22)];
+    let mut tries = 0;
+    let together = loop {
+        tries += 1;
+        let Some((together, overlapped)) = sent_at_once(&images).await else {
+            return;
+        };
+        if overlapped == 1 {
+            break together;
+        }
+        assert!(tries < 5, "the pair was never in flight together");
+    };
+    let alone = each_alone(&images).await;
+    assert!(together[0] == alone[0], "the 4096 tile, bytes");
+    assert!(together[1] == alone[1], "the 1024 tile, bytes");
 }
 
 /// Whether the adapter `selector` names gives a device that can time its
