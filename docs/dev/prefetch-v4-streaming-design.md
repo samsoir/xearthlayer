@@ -52,10 +52,16 @@ machine has.
 | 8 | Flight phase: nothing in Transition; a 30 s ramp after it (`TransitionThrottle`) | **Kept**, as yield conditions |
 | 9 | Region lifecycle: new 1° regions planned whole (GeoIndex `PrefetchedRegion`) | **Kept**, simplified (see Backlog) |
 | 10 | Executor admission gate: no prefetch admitted while demand is in flight | **Kept** (the executor's rule) |
+| 11 | Stale telemetry: nothing submitted after 5 s without telemetry (`TELEMETRY_STALE_THRESHOLD`, `coordinator/constants.rs`; `runner.rs`) | **Changed**: the ranking freezes and the feeder keeps going; a long dropout yields (see Telemetry dropouts) |
 
 Controls 1–5 protected a shared queue that no longer exists. Controls 6–8 and 10
 protect X-Plane and memory, and remain the conditions under which prefetch
-yields.
+yields. Control 11 protected the ranking, not X-Plane, so V4 keeps the ranking
+safe without stopping the stream.
+
+Control 2 binds in flight. On a contributor's EDDM to LBSF flight, held-over
+tiles stayed pending for 25 minutes (8,859 tiles down to 0). While any were
+pending, every cycle submitted only those.
 
 ## Design
 
@@ -105,9 +111,58 @@ The feeder replaces the cycle as the thing that submits tiles.
   - `fuse_pressure` is high (#246);
   - X-Plane is loading scenery or replaying;
   - the flight phase is Transition, or within its ramp, which limits the depth;
-  - the executor's admission gate is closed by demand.
+  - the executor's admission gate is closed by demand;
+  - telemetry has been stale for longer than the dropout limit (see Telemetry
+    dropouts).
 
-  These are pauses, not throughput controls.
+  These are pauses, not throughput controls. The network-health condition
+  (see Failed tiles) lowers the depth rather than stopping the feeder.
+
+### Telemetry dropouts
+
+The V3 coordinator stops submitting after 5 s without telemetry. On the EDDM to
+LBSF flight, telemetry dropped out 22 times, for 33.5 s at the median. That
+pause costs prefetch time, although the backlog it would feed was ranked from a
+position only seconds old.
+
+V4 separates the ranking from the stream:
+
+- **Short dropout: freeze the ranking.** Once telemetry is stale
+  (`TELEMETRY_STALE_THRESHOLD`, 5 s), the feeder stops changing the backlog.
+  It adds no areas, drops none and re-ranks nothing, and cancels no stale work.
+  It keeps feeding the areas already queued, in the order they had at the last
+  known position.
+- **Long dropout: yield.** After a dropout limit (60 s, to be tuned from
+  flights), the feeder stops submitting until telemetry returns. A minute
+  without a position at cruise speed is several kilometres, and a frozen ranking
+  is no longer a good guess.
+- **When telemetry returns,** the coordinator updates the box and re-ranks once,
+  as for a change of nearest area, then resumes.
+- **The other yields don't change.** If X-Plane stopped answering because it is
+  loading scenery, the sim-state yield already pauses the feeder.
+
+### Failed tiles and network health
+
+A prefetch job whose chunks fail or time out still completes. Its tile is served
+to no one and isn't cached (#180, #388). V4 handles it in three parts:
+
+- **The feeder refills on every completion,** whatever the outcome. A failed job
+  frees its place in the lane like any other.
+- **An incomplete tile goes back to the end of its area's backlog,** with an
+  attempt count. An area isn't done until every tile is cached or has run out of
+  attempts. An area with tiles out of attempts becomes `Deferred` under #226's
+  rules (retryable, never `NoCoverage` for indexed tiles), and its tiles are
+  tried again when it next ranks.
+- **Network health lowers the depth.** When chunk failures in a recent window
+  pass a threshold, the feeder lowers the target depth instead of pressing on
+  against a failing network. It restores the depth step by step as failures
+  fall. On the EDDM to LBSF flight, 10,396 of 14,186 chunk timeouts fell in one
+  14-minute window: a storm, not a scattering. A deep stream would have sent
+  more requests into it.
+
+  The signal is the chunk failure rate over a window, from the download
+  orchestrator (`map_provider_error`'s retryable failures). It isn't a count of
+  failed jobs: one tile's 256 chunks would otherwise count once.
 
 ### Stale work
 
@@ -119,9 +174,13 @@ The feeder replaces the cycle as the thing that submits tiles.
 
 ### Observability
 
-- **The `Prefetch sample` line:** backlog areas and tiles, the nearest area's
-  distance, the feed rate, the in-flight depth against its target, and the
-  yield reason with its share of the window.
+- **The `Prefetch sample` line:**
+  - backlog areas and tiles, and the nearest area's distance;
+  - the feed rate, and the in-flight depth against its target;
+  - the yield reason, with its share of the window;
+  - telemetry dropouts, with their frozen and yielding time;
+  - tiles returned to the backlog, areas deferred, and the chunk failure rate
+    behind any lowered depth.
 - **The dashboard:** `PrefetchState` keeps its states (Disabled, Paused by
   demand, Holding for takeoff, Ramping, Active, Idle). Its "Deferred (load)",
   which named the removed backpressure deferral, becomes "Yielding", with the
@@ -145,6 +204,12 @@ The feeder replaces the cycle as the thing that submits tiles.
 - Whether the takeoff ramp can relax once prefetch runs on the GPU, off the
   CPU. Frame time will tell.
 - How far behind the aircraft an admitted job must be before it is cancelled.
+- The telemetry dropout limit (60 s proposed), and whether X-Plane's Web API
+  drops out mainly during scene loads, when the sim-state yield already applies.
+- How many attempts a tile gets before its area is deferred.
+- The network-health threshold and window, and how far it lowers the depth.
+  Logs from a timeout storm would settle it; connection speed varies widely
+  between users.
 
 ## References
 

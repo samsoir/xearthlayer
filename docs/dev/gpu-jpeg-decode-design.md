@@ -74,6 +74,10 @@ JPEG (SOF0), 256 × 256, with no restart markers and nothing progressive.
 The three providers in real use share one profile: baseline 4:2:0, with one
 table set per provider.
 
+That holds beyond San Francisco. A contributor checked 1,000 Apple Maps chunks
+from 40 European regions in their own cache. All were baseline, 256 × 256,
+4:2:0, with no restart markers.
+
 ### Measured decode on the GPU
 
 The prototype is described under Design below.
