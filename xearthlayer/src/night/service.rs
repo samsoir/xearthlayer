@@ -45,8 +45,8 @@ use super::stats::{
 };
 use super::{
     check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
-    ArtRecord, FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
-    TextureSettingSource,
+    ArtRecord, FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, LitParts, Recipe,
+    RecipeStore, TextureSettingSource,
 };
 use crate::cache::Cache;
 use crate::fuse::DdsFilename;
@@ -1178,7 +1178,8 @@ impl LitTextureSource for NightLitSource {
                     (None, ReadOutcome::Blank)
                 };
                 let part = read_part(reached, payload.is_some());
-                let bytes = layout.read_lit(offset, len, payload.as_ref());
+                let parts = payload.map_or_else(LitParts::default, |p| layout.parts_of(&p));
+                let bytes = layout.read_lit(offset, len, &parts);
                 let elapsed = asked.elapsed();
                 self.stats.record_read(outcome, elapsed);
                 // The order X-Plane reads a lit file in shows whether it

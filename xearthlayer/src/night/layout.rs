@@ -125,7 +125,7 @@ impl LitLayout {
     /// static zero buffer, not a new one.
     pub fn read_black(&self, offset: u64, len: u32) -> Bytes {
         let (start, end) = self.clamp(offset, len);
-        self.compose(start, end, None)
+        self.compose(start, end, &LitParts::default())
     }
 
     /// `[offset, offset + len)` clamped to the file.
@@ -137,16 +137,22 @@ impl LitLayout {
         )
     }
 
-    /// Bytes `[start, end)` (within the file) of the header, zeros and,
-    /// from `payload_start`, `payload` (the visible levels, of their full
-    /// length) or zeros without one. Zeros alone come from the static
-    /// buffer when they fit; anything else is one buffer, written once.
-    fn compose(&self, start: u64, end: u64, payload: Option<&Bytes>) -> Bytes {
+    /// Bytes `[start, end)` (within the file) of the header, zeros and the
+    /// present `parts` of the visible levels, each at its place (zeros where
+    /// a part is absent). Zeros alone come from the static buffer when they
+    /// fit; anything else is one buffer, written once.
+    fn compose(&self, start: u64, end: u64, parts: &LitParts) -> Bytes {
         let header_len = self.header.len() as u64;
-        let payload_start = self.payload_start();
-        let in_payload = payload.is_some() && end > payload_start;
+        let overlapped: Vec<_> = PayloadPart::ALL
+            .into_iter()
+            .filter_map(|part| {
+                let range = self.part_range(part);
+                let bytes = parts.get(part)?;
+                (start < range.end && end > range.start).then_some((range, bytes))
+            })
+            .collect();
         let n = (end - start) as usize;
-        if start >= header_len && !in_payload && n <= STATIC_ZEROS_LEN {
+        if start >= header_len && overlapped.is_empty() && n <= STATIC_ZEROS_LEN {
             return Bytes::from_static(&ZEROS[..n]);
         }
         let mut out = vec![0u8; n];
@@ -154,10 +160,10 @@ impl LitLayout {
             let k = (header_len.min(end) - start) as usize;
             out[..k].copy_from_slice(&self.header[start as usize..start as usize + k]);
         }
-        if let Some(payload) = payload.filter(|_| in_payload) {
-            let from = payload_start.max(start);
-            out[(from - start) as usize..].copy_from_slice(
-                &payload[(from - payload_start) as usize..(end - payload_start) as usize],
+        for (range, bytes) in overlapped {
+            let (from, to) = (range.start.max(start), range.end.min(end));
+            out[(from - start) as usize..(to - start) as usize].copy_from_slice(
+                &bytes[(from - range.start) as usize..(to - range.start) as usize],
             );
         }
         Bytes::from(out)
@@ -174,29 +180,153 @@ impl LitLayout {
         self.total_len - self.payload_len()
     }
 
+    /// Bytes of `part` of the visible levels (#432): the first visible level
+    /// for the head, every level below it for the tail.
+    pub fn part_len(&self, part: PayloadPart) -> u64 {
+        let size = self.first_visible;
+        let head = layout::level_len(size, size, LIT_FORMAT) as u64;
+        match part {
+            PayloadPart::Head => head,
+            PayloadPart::Tail => self.payload_len() - head,
+        }
+    }
+
+    /// Where `part` lies in the file: the head from the start of the
+    /// visible levels, the tail after it to the end of the file.
+    pub fn part_range(&self, part: PayloadPart) -> std::ops::Range<u64> {
+        let tail_start = self.payload_start() + self.part_len(PayloadPart::Head);
+        match part {
+            PayloadPart::Head => self.payload_start()..tail_start,
+            PayloadPart::Tail => tail_start..self.total_len,
+        }
+    }
+
+    /// `part` of `payload` (the visible levels, of their full length), a
+    /// slice of it: sharing its allocation, so not for keeping apart.
+    pub fn part_of(&self, payload: &Bytes, part: PayloadPart) -> Bytes {
+        let at = self.payload_start();
+        let range = self.part_range(part);
+        payload.slice((range.start - at) as usize..(range.end - at) as usize)
+    }
+
+    /// Both parts of `payload` as slices of it (see [`Self::part_of`]), or
+    /// none when it is not of the payload's length (it then reads black).
+    pub fn parts_of(&self, payload: &Bytes) -> LitParts {
+        let mut parts = LitParts::default();
+        if payload.len() as u64 == self.payload_len() {
+            for part in PayloadPart::ALL {
+                parts.set(part, self.part_of(payload, part));
+            }
+        }
+        parts
+    }
+
     /// Whether bytes `[offset, offset + len)` overlap the visible levels,
     /// the only generated part: everything before them is black.
     pub fn reaches_payload(&self, offset: u64, len: u32) -> bool {
+        PayloadPart::ALL
+            .into_iter()
+            .any(|part| self.reaches(part, offset, len))
+    }
+
+    /// Whether bytes `[offset, offset + len)` overlap `part`.
+    pub fn reaches(&self, part: PayloadPart, offset: u64, len: u32) -> bool {
         let (start, end) = self.clamp(offset, len);
-        start < end && end > self.payload_start()
+        let range = self.part_range(part);
+        start < end && start < range.end && end > range.start
     }
 
     /// Bytes `[offset, offset + len)` of the lit texture: the header, zero
     /// levels above the visible ones (those the texture setting drops and the
-    /// top X-Plane uploads, which its objects light), then `payload` (BC1
-    /// visible levels). An absent payload, or one of the wrong length, reads
-    /// black (same size, R7).
-    pub fn read_lit(&self, offset: u64, len: u32, payload: Option<&Bytes>) -> Bytes {
-        let Some(payload) = payload.filter(|p| p.len() as u64 == self.payload_len()) else {
-            return self.read_black(offset, len);
-        };
-        let payload_start = self.payload_start();
+    /// top X-Plane uploads, which its objects light), then the visible
+    /// levels from `parts` (BC1), each part from its own buffer (#432). A
+    /// part absent, or of the wrong length, reads black (same size, R7), so
+    /// any split of a read gives the bytes of one read, whatever the parts.
+    pub fn read_lit(&self, offset: u64, len: u32, parts: &LitParts) -> Bytes {
+        let parts = parts.checked(self);
         let (start, end) = self.clamp(offset, len);
-        if start >= payload_start {
-            // Entirely inside the payload: a refcount slice, no copy.
-            return payload.slice((start - payload_start) as usize..(end - payload_start) as usize);
+        for part in PayloadPart::ALL {
+            let range = self.part_range(part);
+            if let Some(bytes) = parts
+                .get(part)
+                .filter(|_| start >= range.start && end <= range.end)
+            {
+                // Entirely inside one part: a refcount slice, no copy.
+                return bytes.slice((start - range.start) as usize..(end - range.start) as usize);
+            }
         }
-        self.compose(start, end, Some(payload))
+        self.compose(start, end, &parts)
+    }
+}
+
+/// The two parts of a lit payload, kept apart in memory (#432): the first
+/// visible level (the head, 512 KiB at ZL16) and every level below it (the
+/// tail, 170.7 KiB at ZL16). X-Plane reads the small levels first, and most
+/// textures never read their first visible level, so the tails of a whole
+/// working set fit where its whole payloads did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadPart {
+    Head,
+    Tail,
+}
+
+impl PayloadPart {
+    /// Both, in file order.
+    pub const ALL: [Self; 2] = [Self::Head, Self::Tail];
+
+    /// Its name in the debug lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::Tail => "tail",
+        }
+    }
+}
+
+/// The parts of a lit payload a read is served from, each present or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LitParts {
+    head: Option<Bytes>,
+    tail: Option<Bytes>,
+}
+
+impl LitParts {
+    pub fn get(&self, part: PayloadPart) -> Option<&Bytes> {
+        match part {
+            PayloadPart::Head => self.head.as_ref(),
+            PayloadPart::Tail => self.tail.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, part: PayloadPart, bytes: Bytes) {
+        *self.slot(part) = Some(bytes);
+    }
+
+    fn slot(&mut self, part: PayloadPart) -> &mut Option<Bytes> {
+        match part {
+            PayloadPart::Head => &mut self.head,
+            PayloadPart::Tail => &mut self.tail,
+        }
+    }
+
+    /// Whether every part is absent.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none() && self.tail.is_none()
+    }
+
+    /// These parts with any of the wrong length for `layout` left out.
+    fn checked(&self, layout: &LitLayout) -> Self {
+        let mut out = self.clone();
+        for part in PayloadPart::ALL {
+            let slot = out.slot(part);
+            if slot
+                .as_ref()
+                .is_some_and(|b| b.len() as u64 != layout.part_len(part))
+            {
+                *slot = None;
+            }
+        }
+        out
     }
 }
 
@@ -250,7 +380,8 @@ mod lit_tests {
     fn lit_reads_compose_header_zeros_and_payload() {
         let l = LitLayout::new(18, 3); // top 1024: 1024 dropped, 512 uploaded, 256 visible
         let payload = Bytes::from(vec![7u8; l.payload_len() as usize]);
-        let read = |offset, len| l.read_lit(offset, len, Some(&payload));
+        let parts = l.parts_of(&payload);
+        let read = |offset, len| l.read_lit(offset, len, &parts);
         assert_eq!(&read(0, 4)[..], b"DDS ");
         let start = l.payload_start();
         assert_eq!(
@@ -267,26 +398,144 @@ mod lit_tests {
         // objects light.
         let l = LitLayout::new(16, 2); // 8192 and 4096 dropped, 2048 uploaded
         let payload = varied(l.payload_len());
-        let file = l.read_lit(0, u32::MAX, Some(&payload));
+        let file = l.read_lit(0, u32::MAX, &l.parts_of(&payload));
         let above = &file[128..l.payload_start() as usize];
         assert_eq!(above.len(), (8192 * 8192 + 4096 * 4096 + 2048 * 2048) / 2);
         assert!(above.iter().all(|&b| b == 0));
         assert_eq!(&file[l.payload_start() as usize..], &payload[..]);
     }
 
+    /// `payload`'s parts copied into allocations of their own, as the
+    /// payload memory keeps them, with only those of `keep`.
+    fn owned_parts(l: &LitLayout, payload: &Bytes, keep: &[PayloadPart]) -> LitParts {
+        let mut parts = LitParts::default();
+        for &part in keep {
+            parts.set(part, Bytes::copy_from_slice(&l.part_of(payload, part)));
+        }
+        parts
+    }
+
     #[test]
     fn any_split_of_a_lit_read_gives_the_same_bytes() {
-        // FUSE reads arrive in ranges of up to 1 MiB at any offset.
+        // FUSE reads arrive in ranges of up to 1 MiB at any offset, and since
+        // #432 the visible levels come from two buffers: whatever the split,
+        // across the part boundary too, the bytes are one read's.
         let l = LitLayout::new(18, 3);
         let payload = varied(l.payload_len());
-        let whole = l.read_lit(0, u32::MAX, Some(&payload));
+        let whole = l.read_lit(0, u32::MAX, &l.parts_of(&payload));
         assert_eq!(whole.len() as u64, l.total_len);
-        for step in [1 << 16, 999, 8 * 1000 + 3] {
-            let pieces: Vec<u8> = (0..l.total_len)
-                .step_by(step)
-                .flat_map(|o| l.read_lit(o, step as u32, Some(&payload)).to_vec())
-                .collect();
-            assert_eq!(pieces, whole.to_vec(), "step {step}");
+        let both = owned_parts(&l, &payload, &PayloadPart::ALL);
+        assert_eq!(
+            l.read_lit(0, u32::MAX, &both),
+            whole,
+            "two buffers, one file"
+        );
+        let boundary = l.part_range(PayloadPart::Tail).start;
+        let read_from = |parts: &LitParts, offsets: &[u64]| -> Vec<u8> {
+            offsets
+                .windows(2)
+                .flat_map(|w| l.read_lit(w[0], (w[1] - w[0]) as u32, parts).to_vec())
+                .collect()
+        };
+        for parts in [l.parts_of(&payload), both.clone()] {
+            for step in [1 << 16, 999, 8 * 1000 + 3] {
+                let mut offsets: Vec<u64> = (0..l.total_len).step_by(step).collect();
+                offsets.push(l.total_len);
+                assert_eq!(read_from(&parts, &offsets), whole.to_vec(), "step {step}");
+            }
+            for cut in [
+                boundary - 9,
+                boundary - 1,
+                boundary,
+                boundary + 1,
+                boundary + 8,
+            ] {
+                let offsets = [0, l.payload_start() - 3, cut, l.total_len];
+                assert_eq!(read_from(&parts, &offsets), whole.to_vec(), "cut at {cut}");
+            }
+        }
+        // With one part absent, it reads black, and a split still gives one
+        // read's bytes.
+        for keep in [PayloadPart::Head, PayloadPart::Tail] {
+            let parts = owned_parts(&l, &payload, &[keep]);
+            let one = l.read_lit(0, u32::MAX, &parts);
+            let offsets = [0, boundary - 5, boundary + 5, l.total_len];
+            assert_eq!(read_from(&parts, &offsets), one.to_vec(), "{keep:?} alone");
+            let kept = l.part_range(keep);
+            assert_eq!(
+                &one[kept.start as usize..kept.end as usize],
+                &whole[kept.start as usize..kept.end as usize]
+            );
+            let other = l.part_range(if keep == PayloadPart::Head {
+                PayloadPart::Tail
+            } else {
+                PayloadPart::Head
+            });
+            assert!(one[other.start as usize..other.end as usize]
+                .iter()
+                .all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn the_parts_are_the_first_visible_level_and_the_levels_below_it() {
+        let l = LitLayout::new(16, 4); // first visible 1024
+        assert_eq!(l.part_len(PayloadPart::Head), 524_288, "1024 x 1024 BC1");
+        assert_eq!(
+            l.part_len(PayloadPart::Tail),
+            174_776,
+            "512 px down to 1 x 1"
+        );
+        assert_eq!(
+            l.part_len(PayloadPart::Head) + l.part_len(PayloadPart::Tail),
+            l.payload_len()
+        );
+        assert_eq!(l.part_range(PayloadPart::Head).start, l.payload_start());
+        assert_eq!(
+            l.part_range(PayloadPart::Head).end,
+            l.part_range(PayloadPart::Tail).start
+        );
+        assert_eq!(l.part_range(PayloadPart::Tail).end, l.total_len);
+        for zoom in 12..=22 {
+            for t in 0..=4u8 {
+                let l = LitLayout::new(zoom, t);
+                assert!(l.part_len(PayloadPart::Tail) > 0, "ZL{zoom} t = {t}");
+                assert_eq!(
+                    l.part_len(PayloadPart::Head) + l.part_len(PayloadPart::Tail),
+                    l.payload_len(),
+                    "ZL{zoom} t = {t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_reaches_a_part_only_where_its_range_overlaps_it() {
+        let l = LitLayout::new(16, 4);
+        let (head, tail) = (PayloadPart::Head, PayloadPart::Tail);
+        let boundary = l.part_range(tail).start;
+        let reached = |offset, len| (l.reaches(head, offset, len), l.reaches(tail, offset, len));
+        assert_eq!(reached(0, 128), (false, false), "header");
+        assert_eq!(reached(l.payload_start() - 8, 8), (false, false), "the top");
+        assert_eq!(reached(l.payload_start() - 8, 9), (true, false));
+        assert_eq!(reached(boundary - 8, 8), (true, false));
+        assert_eq!(reached(boundary - 1, 2), (true, true));
+        assert_eq!(reached(boundary, 8), (false, true));
+        assert_eq!(reached(l.total_len - 8, 1 << 20), (false, true));
+        assert_eq!(reached(0, u32::MAX), (true, true));
+        assert_eq!(reached(boundary, 0), (false, false), "an empty read");
+    }
+
+    #[test]
+    fn a_read_inside_one_part_is_a_slice_of_it() {
+        let l = LitLayout::new(16, 4);
+        let payload = varied(l.payload_len());
+        let parts = owned_parts(&l, &payload, &PayloadPart::ALL);
+        for part in PayloadPart::ALL {
+            let range = l.part_range(part);
+            let read = l.read_lit(range.start + 8, 4096, &parts);
+            let buffer = parts.get(part).unwrap().as_ptr_range();
+            assert!(buffer.contains(&read.as_ptr()), "{part:?}: no copy");
         }
     }
 
@@ -312,6 +561,7 @@ mod lit_tests {
         // The header, the blank levels and the payload at ZL16, setting 3.
         let l = LitLayout::new(16, 3);
         let payload = varied(l.payload_len());
+        let parts = l.parts_of(&payload);
         let start = l.payload_start();
         for (offset, len) in [
             (128, 1 << 20),
@@ -322,8 +572,8 @@ mod lit_tests {
         ] {
             for read in [
                 l.read_black(offset, len),
-                l.read_lit(offset, len, Some(&payload)),
-                l.read_lit(offset, len, None),
+                l.read_lit(offset, len, &parts),
+                l.read_lit(offset, len, &LitParts::default()),
             ] {
                 assert_eq!(read.len(), len as usize, "{offset} + {len}");
                 assert!(is_static_zeros(&read), "{offset} + {len} allocated");
@@ -331,7 +581,7 @@ mod lit_tests {
         }
         // Header bytes, the payload or more than a FUSE read: a buffer.
         for (offset, len) in [(0, 200), (127, 2), (start - 1, 2), (128, (1 << 20) + 1)] {
-            assert!(!is_static_zeros(&l.read_lit(offset, len, Some(&payload))));
+            assert!(!is_static_zeros(&l.read_lit(offset, len, &parts)));
         }
     }
 
@@ -339,8 +589,11 @@ mod lit_tests {
     fn a_missing_or_wrong_size_payload_reads_black() {
         let l = LitLayout::new(18, 4);
         let bad = Bytes::from(vec![7u8; 10]);
-        for payload in [None, Some(&bad)] {
-            assert_eq!(l.read_lit(0, u32::MAX, payload), l.read_black(0, u32::MAX));
+        let mut bad_parts = LitParts::default();
+        bad_parts.set(PayloadPart::Head, bad.clone());
+        bad_parts.set(PayloadPart::Tail, bad.clone());
+        for parts in [LitParts::default(), l.parts_of(&bad), bad_parts] {
+            assert_eq!(l.read_lit(0, u32::MAX, &parts), l.read_black(0, u32::MAX));
         }
     }
 }
