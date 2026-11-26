@@ -257,6 +257,59 @@ async fn kept_resources_do_not_change_a_tile() {
     assert!(back_to_back[1] == fresh_second[0], "the second tile, bytes");
 }
 
+/// The acceptance test of #425's byte identity through the worker: four
+/// different 4096 tiles sent at once on the demand lane, so the worker
+/// begins each while the one before is on the GPU, two resource sets in
+/// turn, each match the same tile encoded alone on a fresh worker, byte for
+/// byte.
+#[tokio::test]
+#[ignore]
+async fn tiles_in_flight_together_do_not_change_a_tile() {
+    let images: Vec<RgbaImage> = (10..14).map(textured).collect();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (channels, mut worker, _adapter) =
+        match xearthlayer::dds::gpu_channel::create_gpu_encoder_channels(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::CHANNEL_CAPACITY,
+            shutdown.clone(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Skipping: no usable GPU ({e})");
+                return;
+            }
+        };
+    let channel = Arc::new(channels.demand);
+    let levels = MipmapGenerator::full_chain_count(4096, 4096);
+    let sent: Vec<_> = images
+        .iter()
+        .cloned()
+        .map(|image| {
+            let ch = Arc::clone(&channel);
+            tokio::task::spawn_blocking(move || {
+                ch.compress_mipmap_chain(image, DdsFormat::BC1, levels, file(4096, 4096, levels))
+            })
+        })
+        .collect();
+    let mut together = Vec::new();
+    for handle in sent {
+        together.push(gpu_bytes(
+            handle
+                .await
+                .expect("join")
+                .expect("the GPU encodes the tile"),
+        ));
+    }
+    let sample = channel.stats().take_sample().expect("the tiles");
+    eprintln!("depth_max {} of 4 tiles", sample.depth_max);
+    shutdown.cancel();
+    worker.wait(std::time::Duration::from_secs(10)).await;
+    for (i, image) in images.into_iter().enumerate() {
+        let alone = on_one_worker(vec![image]).await.expect("the GPU again");
+        assert!(together[i] == alone[0], "tile {i}, bytes");
+    }
+}
+
 /// Whether the adapter `selector` names gives a device that can time its
 /// kernels (#476), its device requested as the worker's is
 /// (`create_gpu_resources`); `None` when the host has no such adapter.

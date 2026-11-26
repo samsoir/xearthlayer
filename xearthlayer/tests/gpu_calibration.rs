@@ -9,7 +9,8 @@
 //!   the demand lane. Lone tiles (one at a time: latency), then bursts back
 //!   to back (tiles/s), with the per-stage breakdown of each from the
 //!   channel's `GpuEncodeStats`, including `gpu_kernel`, the GPU's own time
-//!   from timestamp queries.
+//!   from timestamp queries; then the same bursts on the prefetch lane,
+//!   which never has two tiles in flight (#425).
 //! - **ISPC:** `DdsEncoder` with `IspcCompressor`: lone tiles on one thread,
 //!   and a burst on every thread, with the CPU chain and the BC1 of the
 //!   levels timed apart on one thread.
@@ -311,6 +312,7 @@ fn calibrate_the_encode_pipelines() {
                 }
             };
         eprintln!("\n== GPU `{selector}`: {} ==", adapter_label(&info));
+        let prefetch_channel = Arc::new(channels.prefetch);
         let channel = Arc::new(channels.demand);
         let stats = Arc::clone(channel.stats());
         let encoder = DdsEncoder::new(DdsFormat::BC1)
@@ -360,6 +362,36 @@ fn calibrate_the_encode_pipelines() {
             tiles_per_s: rate,
             stages: burst_stages,
         });
+
+        // The same bursts on the prefetch lane: the worker never has two
+        // prefetch tiles in flight (#425), so this is the serial rate.
+        {
+            let prefetch = DdsEncoder::new(DdsFormat::BC1)
+                .with_mipmap_compressor(
+                    Arc::clone(&prefetch_channel) as Arc<dyn MipmapCompressor>,
+                    Arc::new(IspcCompressor),
+                )
+                .with_mipmap_count(LEVELS);
+            let mut tiles = 0;
+            let mut wall = Duration::ZERO;
+            for _ in 0..bursts {
+                let images: Vec<RgbaImage> = (0..burst).map(|_| source.clone()).collect();
+                let (w, _) = run_burst(&prefetch, images, burst);
+                tiles += burst;
+                wall += w;
+            }
+            let rate = tiles as f64 / wall.as_secs_f64();
+            eprintln!("  prefetch-lane bursts: {rate:.1} tiles/s");
+            if let Some(s) = prefetch_channel.stats().take_sample() {
+                print_stages(&s);
+            }
+            rows.push(Row {
+                device: format!("GPU {}, prefetch lane", info.name),
+                lone: None,
+                tiles_per_s: rate,
+                stages: None,
+            });
+        }
 
         // ISPC on one thread while the GPU encodes a steady stream: four
         // callers keep the GPU's queue from running dry. Their images are
@@ -430,6 +462,7 @@ fn calibrate_the_encode_pipelines() {
         eprintln!("  NVIDIA state after: {}", nv());
 
         drop(encoder);
+        drop(prefetch_channel);
         worker.stop_blocking(Duration::from_secs(10));
     }
 

@@ -9,7 +9,8 @@
 //!
 //! The worker is split in two (#419): the loop ([`spawn_tile_worker`]:
 //! receive, shutdown, `catch_unwind`, drain, reply, the loop's own timing)
-//! is generic over a [`TileProcessor`], which does one tile's work. The
+//! is generic over a [`PipelinedProcessor`], which begins and finishes
+//! each tile's work (a [`TileProcessor`] does a tile in one call). The
 //! production processor is [`WgpuTileProcessor`]; tests drive the real loop
 //! with processors that panic, fail, wait on a gate or record order, so the
 //! loop is covered without a GPU. The loop reads the time on a [`Clock`]:
@@ -36,9 +37,9 @@
 //! back too ([`HangRule::waited_out`]); that is not a miss and never fails
 //! the GPU. So no demand caller waits much longer than the deadline plus one
 //! tile: the tile that was in progress when its wait passed the deadline, or
-//! its own. Prefetch callers have no deadline (see below). The one tile
-//! already inside the processor when the GPU failed is lost and fails as
-//! before.
+//! its own. Prefetch callers have no deadline (see below). A tile whose
+//! processor call panicked is lost and fails; a tile begun behind the one
+//! that failed the GPU or panicked is handed back with its image (#425).
 //!
 //! # Two lanes, one GPU (#421)
 //!
@@ -61,6 +62,21 @@
 //! its channel's capacity (the prefetch lane's CPU pool). When the GPU fails
 //! or the worker shuts down, both channels are closed and every request in
 //! either is answered.
+//!
+//! # Two tiles in flight (#425)
+//!
+//! [`WgpuTileProcessor`] has two resource sets, so the worker can begin a
+//! tile (write its level 0 and submit its work) while the GPU still runs
+//! the one before, and only then wait for that one, copy it out and answer
+//! it: the GPU is not left idle while the worker uploads. `next_begin`
+//! decides: only a request already queued is begun ahead (a finished tile
+//! is never held back for one that has not arrived), demand first, and
+//! never a second prefetch tile, so a demand request still waits behind
+//! one prefetch tile at most. Tiles are finished, judged and answered in
+//! the order they were taken; each has its own deadline from when the
+//! worker took it. A late tile hands back a demand tile begun behind it,
+//! as it hands back the demand queue, and a shutdown finishes every tile
+//! begun before it fails the queue.
 
 mod inner {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -78,7 +94,8 @@ mod inner {
     use crate::dds::compressor::{ChainOutcome, MipmapCompressor};
     use crate::dds::gpu_health::SharedGpuHealth;
     use crate::dds::gpu_mips::{
-        chain_bytes, chain_plan, gpu_filter, upload_row_bytes, write_level0, MipChain, MipPipeline,
+        chain_bytes, chain_plan, gpu_filter, upload_row_bytes, write_level0, LevelPlan, MipChain,
+        MipPipeline,
     };
     use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::gpu_timestamps::{KernelTimer, TimerError};
@@ -443,7 +460,9 @@ mod inner {
         /// the DDS file: the payload's one copy (#423), one copy of the
         /// whole chain since #424.
         pub readback: Duration,
-        /// The processor's whole call, as the loop timed it.
+        /// From the worker taking the tile to its finish returning, as the
+        /// loop timed it. For a tile begun while another was in flight
+        /// (#425) it includes finishing and answering that one.
         pub process: Duration,
     }
 
@@ -593,11 +612,11 @@ mod inner {
         }
     }
 
-    /// One tile's work for the worker loop: the full mip chain of `image`,
-    /// compressed level by level into `payload`, largest first, each level
-    /// in its slot ([`layout::level_len`] bytes after the ones before it).
-    /// The levels must fill `payload` exactly; anything else is an error
-    /// (#423).
+    /// One tile's work for the worker loop, start to end: the full mip chain
+    /// of `image`, compressed level by level into `payload`, largest first,
+    /// each level in its slot ([`layout::level_len`] bytes after the ones
+    /// before it). The levels must fill `payload` exactly; anything else is
+    /// an error (#423).
     ///
     /// Implementations fill the stages of `timing` they perform; the loop
     /// owns `queue_wait` and `process`. A processor should give up at
@@ -605,6 +624,11 @@ mod inner {
     /// giving its poll what remains of it; the loop counts a call
     /// that ends at or past it as a miss either way, and an error in time as
     /// one too. A panic is caught by the loop (see [`spawn_tile_worker`]).
+    ///
+    /// Every `TileProcessor` is a [`PipelinedProcessor`] of depth one: the
+    /// loop runs each tile start to end before it takes the next, as before
+    /// #425. The loop's tests and the processors that panic, fail or wait on
+    /// a gate are written this way.
     ///
     /// Must be `Send`: the loop moves it onto the worker's thread, where it
     /// stays.
@@ -621,6 +645,126 @@ mod inner {
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError>;
+    }
+
+    /// The worker's processor seam in two phases (#425): [`begin`] starts a
+    /// tile and returns at once, [`finish`] waits for it and writes its
+    /// payload. Up to [`DEPTH`] tiles can be begun and not yet finished, so
+    /// the worker can prepare and submit the next tile while the GPU runs
+    /// the one before (`next_begin` says when it does). Tiles are
+    /// finished in the order they were begun.
+    ///
+    /// The loop keeps each tile's image until its finish (a begun tile the
+    /// GPU never finished is handed back with it, #420) and gives it to
+    /// [`finish`]; [`abandon`] ends a begun tile that will not be finished:
+    /// the tile ahead of it ran late or failed the GPU.
+    ///
+    /// A [`TileProcessor`] is one of depth one, all its work in `finish`.
+    /// [`WgpuTileProcessor`] is of depth two, a resource set per tile.
+    ///
+    /// [`begin`]: Self::begin
+    /// [`finish`]: Self::finish
+    /// [`abandon`]: Self::abandon
+    /// [`DEPTH`]: Self::DEPTH
+    pub trait PipelinedProcessor: Send {
+        /// What a begun tile carries to its finish.
+        type InFlight;
+
+        /// Tiles that can be begun and not finished at once: at least one.
+        const DEPTH: usize;
+
+        /// Starts `levels` mip levels of `image` in `format`, into a payload
+        /// of `payload_len` bytes, giving up at `deadline`, filling the
+        /// stages of `timing` it performs. An error here is the tile's
+        /// result, given when its turn to finish comes.
+        fn begin(
+            &mut self,
+            image: &RgbaImage,
+            format: DdsFormat,
+            levels: usize,
+            payload_len: usize,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+        ) -> Result<Self::InFlight, DdsError>;
+
+        /// Ends a tile [`begin`](Self::begin) started: its payload into
+        /// `payload`, by `deadline`.
+        fn finish(
+            &mut self,
+            tile: Self::InFlight,
+            image: RgbaImage,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+            payload: &mut [u8],
+        ) -> Result<(), DdsError>;
+
+        /// Ends a begun tile that will not be finished: its image goes back
+        /// to its caller. Must not wait for the GPU.
+        fn abandon(&mut self, tile: Self::InFlight);
+    }
+
+    /// A [`TileProcessor`] runs each tile start to end in `finish`; its
+    /// `begin` keeps the format and level count for it.
+    impl<P: TileProcessor> PipelinedProcessor for P {
+        type InFlight = (DdsFormat, usize);
+        const DEPTH: usize = 1;
+
+        fn begin(
+            &mut self,
+            _image: &RgbaImage,
+            format: DdsFormat,
+            levels: usize,
+            _payload_len: usize,
+            _deadline: Instant,
+            _timing: &mut GpuTileTiming,
+        ) -> Result<Self::InFlight, DdsError> {
+            Ok((format, levels))
+        }
+
+        fn finish(
+            &mut self,
+            (format, levels): Self::InFlight,
+            image: RgbaImage,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+            payload: &mut [u8],
+        ) -> Result<(), DdsError> {
+            self.process(image, format, levels, deadline, timing, payload)
+        }
+
+        fn abandon(&mut self, _tile: Self::InFlight) {}
+    }
+
+    /// Whether the worker begins another tile before it finishes the ones
+    /// it has begun (#425), and from which lane: `begun` are the lanes of
+    /// the tiles begun and not finished, oldest first, `depth` the
+    /// processor's [`PipelinedProcessor::DEPTH`]. The one place this is
+    /// decided.
+    ///
+    /// - Never past the depth, and never with nothing begun: the idle
+    ///   worker takes its next request by [`next_take`] and waits for one.
+    /// - Only a request already queued, by [`next_take`] (demand first): a
+    ///   finished tile is never held back for a request that may never
+    ///   come.
+    /// - Never a second prefetch tile: at most one prefetch tile is in the
+    ///   processor at a time, so a demand request that arrives behind
+    ///   prefetch work waits for one prefetch tile at most, the bound of
+    ///   #421. A demand tile is begun behind anything; a prefetch tile only
+    ///   behind demand.
+    pub(super) fn next_begin(
+        depth: usize,
+        begun: &[GpuLane],
+        demand: QueueState,
+        prefetch: QueueState,
+    ) -> Option<GpuLane> {
+        if begun.is_empty() || begun.len() >= depth {
+            return None;
+        }
+        match next_take(demand, prefetch) {
+            NextTake::Take(GpuLane::Prefetch) if begun.contains(&GpuLane::Prefetch) => None,
+            NextTake::Take(lane) => Some(lane),
+            NextTake::Wait | NextTake::End => None,
+        }
     }
 
     /// Sender-side handle for submitting GPU encode requests.
@@ -1072,6 +1216,59 @@ mod inner {
         }
     }
 
+    /// A tile's chain, checked before any GPU work ([`plan_tile`]).
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) struct TilePlan {
+        format: DdsFormat,
+        variant: CompressionVariant,
+        /// Its levels, as the GPU holds them.
+        pub(super) levels: Vec<LevelPlan>,
+        /// The payload's length: where the last level ends.
+        pub(super) bytes: usize,
+    }
+
+    /// The chain of `levels` levels of a `width` x `height` tile in
+    /// `format`, refused before any GPU work: an unsupported format, an
+    /// empty image, and a chain whose blocks would not fill `payload_len`
+    /// bytes exactly (#423). No level, for an empty payload, is a tile with
+    /// nothing to do.
+    pub(super) fn plan_tile(
+        (width, height): (u32, u32),
+        format: DdsFormat,
+        levels: usize,
+        payload_len: usize,
+    ) -> Result<TilePlan, DdsError> {
+        let variant = compression_variant(format)?;
+        if width == 0 || height == 0 {
+            return Err(DdsError::InvalidDimensions(width, height));
+        }
+        let levels = chain_plan(width, height, levels, format);
+        let bytes = chain_bytes(&levels);
+        if bytes != payload_len {
+            return Err(DdsError::CompressionFailed(format!(
+                "the mipmap chain filled {bytes} of the {payload_len}-byte payload"
+            )));
+        }
+        Ok(TilePlan {
+            format,
+            variant,
+            levels,
+            bytes,
+        })
+    }
+
+    /// Resource sets of [`WgpuTileProcessor`]: one per tile in flight
+    /// (#425), so two tiles can be begun at once.
+    const RESOURCE_SETS: usize = 2;
+
+    /// The resource set a tile begins on: the first one no begun tile
+    /// holds, `None` when every set is busy (never, while the loop keeps to
+    /// [`PipelinedProcessor::DEPTH`]). The first set serves every tile of a
+    /// serial run, so the second is made only once tiles overlap.
+    pub(super) fn free_set(busy: [bool; RESOURCE_SETS]) -> Option<usize> {
+        busy.iter().position(|&b| !b)
+    }
+
     /// A tile whose work is submitted ([`WgpuTileProcessor`]'s `begin`),
     /// for `finish` to wait for and copy out.
     struct Submitted {
@@ -1083,16 +1280,26 @@ mod inner {
         timer: Option<(MapAnswer, u32)>,
     }
 
-    /// The production [`TileProcessor`]: the GPU device, its queue, the
-    /// `block_compression` kernels and the mip shader's pipeline, owned by
-    /// the worker thread, and the resources of the tile size it last
-    /// encoded (#423).
+    /// A tile begun on [`WgpuTileProcessor`]: its resource set and its
+    /// submission (`None` for a chain of no level).
+    pub struct WgpuTile {
+        pub(super) set: usize,
+        submitted: Option<Submitted>,
+    }
+
+    /// The production [`PipelinedProcessor`], of depth two (#425): the GPU
+    /// device, its queue, the `block_compression` kernels and the mip
+    /// shader's pipeline, owned by the worker thread, and two resource sets
+    /// (#423), each the resources of the tile size it last encoded, one per
+    /// tile in flight.
     pub struct WgpuTileProcessor {
         device: wgpu::Device,
         queue: wgpu::Queue,
         compressor: GpuBlockCompressor,
         mips: MipPipeline,
-        resources: Option<TileResources>,
+        sets: [Option<TileResources>; RESOURCE_SETS],
+        /// Which sets a begun tile holds.
+        busy: [bool; RESOURCE_SETS],
         /// Kernel timers dropped after an unmapped readback (#476): the
         /// first is logged at warn, the rest at debug.
         timer_drops: u32,
@@ -1112,12 +1319,14 @@ mod inner {
                 queue,
                 compressor,
                 mips,
-                resources: None,
+                sets: Default::default(),
+                busy: [false; RESOURCE_SETS],
                 timer_drops: 0,
             }
         }
 
-        /// Starts a tile (#424): writes `image` into the upload buffer as
+        /// Starts a tile planned by [`plan_tile`] on resource set `set`
+        /// (#424, #425): writes `image` into that set's upload buffer as
         /// level 0, then records and submits the tile's one submission:
         /// the copy of level 0 into its texture, the mip shader building
         /// every level below it (one pass), the BC1 kernel compressing every
@@ -1125,31 +1334,22 @@ mod inner {
         /// blocks into the readback buffer and the kernel timer's resolve;
         /// then asks for the readback, the timer and the upload buffer (for
         /// the next tile) to be mapped. Nothing waits for the GPU here.
-        ///
-        /// Refused before any GPU work: an unsupported format, an empty
-        /// image, and a chain whose blocks would not fill `payload_len`
-        /// bytes exactly.
-        fn begin(
+        fn begin_on(
             &mut self,
+            set: usize,
             image: &RgbaImage,
-            format: DdsFormat,
-            mipmap_count: usize,
-            payload_len: usize,
+            tile: &TilePlan,
             deadline: Instant,
             timing: &mut GpuTileTiming,
         ) -> Result<Option<Submitted>, DdsError> {
             let (width, height) = image.dimensions();
-            let variant = compression_variant(format)?;
-            if width == 0 || height == 0 {
-                return Err(DdsError::InvalidDimensions(width, height));
-            }
-            let plan = chain_plan(width, height, mipmap_count, format);
-            let bytes = chain_bytes(&plan);
-            if bytes != payload_len {
-                return Err(DdsError::CompressionFailed(format!(
-                    "the mipmap chain filled {bytes} of the {payload_len}-byte payload"
-                )));
-            }
+            let TilePlan {
+                format,
+                variant,
+                levels: plan,
+                bytes,
+            } = tile;
+            let (format, variant, bytes) = (*format, *variant, *bytes);
             let Some(&level0) = plan.first() else {
                 // No level asked for, and an empty payload: nothing to do.
                 return Ok(None);
@@ -1160,9 +1360,10 @@ mod inner {
                 queue,
                 compressor,
                 mips,
-                resources,
+                sets,
                 ..
             } = self;
+            let resources = &mut sets[set];
             if !resources
                 .as_ref()
                 .is_some_and(|r| r.fits(width, height, format))
@@ -1308,8 +1509,9 @@ mod inner {
         /// submission until `deadline` (#420), then copies its blocks from
         /// the mapped readback into `payload`, whose length `begin` checked,
         /// and reads its kernel time.
-        fn finish(
+        fn finish_on(
             &mut self,
+            set: usize,
             submitted: Submitted,
             deadline: Instant,
             timing: &mut GpuTileTiming,
@@ -1323,11 +1525,11 @@ mod inner {
             } = submitted;
             let Self {
                 device,
-                resources,
+                sets,
                 timer_drops,
                 ..
             } = self;
-            let resources = resources
+            let resources = sets[set]
                 .as_mut()
                 .expect("a submitted tile's resources are kept until it is finished");
 
@@ -1422,10 +1624,10 @@ mod inner {
             Ok(())
         }
 
-        /// One tile, start to end: [`begin`](Self::begin), then
-        /// [`finish`](Self::finish). The image is dropped once it is in the
-        /// upload buffer, before the wait.
-        fn process_tile(
+        /// One tile, start to end: [`PipelinedProcessor::begin`] then
+        /// [`PipelinedProcessor::finish`], as the loop runs a tile with
+        /// nothing else in flight.
+        pub fn process(
             &mut self,
             image: RgbaImage,
             format: DdsFormat,
@@ -1434,7 +1636,8 @@ mod inner {
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError> {
-            let submitted = self.begin(
+            let tile = PipelinedProcessor::begin(
+                self,
                 &image,
                 format,
                 mipmap_count,
@@ -1442,16 +1645,24 @@ mod inner {
                 deadline,
                 timing,
             )?;
-            drop(image);
-            match submitted {
-                Some(submitted) => self.finish(submitted, deadline, timing, payload),
-                None => Ok(()),
+            PipelinedProcessor::finish(self, tile, image, deadline, timing, payload)
+        }
+
+        /// Drops set `set`'s resources: the next tile on it makes fresh
+        /// ones.
+        fn discard(&mut self, set: usize) {
+            if self.sets[set].take().is_some() {
+                tracing::debug!(
+                    set,
+                    "GPU worker dropped a resource set after a failed or abandoned tile"
+                );
             }
         }
     }
 
-    /// What [`WgpuTileProcessor`] does with its kept [`TileResources`] once
-    /// a tile is over ([`AfterTile::of`]).
+    /// What [`WgpuTileProcessor`] does with the kept [`TileResources`] of
+    /// the set a tile ran on once the tile is over ([`AfterTile::of`]): the
+    /// other set, and the tile in flight on it, are left alone (#425).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum AfterTile {
         /// Keep them for the next tile of the size (#423).
@@ -1480,30 +1691,71 @@ mod inner {
         }
     }
 
-    impl TileProcessor for WgpuTileProcessor {
-        /// `process_tile`, then the kept resources are dropped if the tile
-        /// failed (`AfterTile::of`).
-        ///
-        /// Dropping them while the late tile's work may still be on the GPU
-        /// is safe: wgpu-core holds every buffer and texture a submission
-        /// uses until that submission completes (its trackers keep a
-        /// reference) and destroys the raw resource only when the last
-        /// reference goes; dropping a buffer whose map is pending aborts the
-        /// map, whose callback then sends into a channel nobody reads.
-        fn process(
+    /// Each tile on a resource set of its own (`free_set`); the set is
+    /// dropped after a tile that failed ([`AfterTile::of`]) or was
+    /// abandoned, and only that set.
+    ///
+    /// Dropping a set while its tile's work may still be on the GPU is
+    /// safe: wgpu-core holds every buffer and texture a submission uses
+    /// until that submission completes (its trackers keep a reference) and
+    /// destroys the raw resource only when the last reference goes;
+    /// dropping a buffer whose map is pending aborts the map, whose
+    /// callback then sends into a channel nobody reads.
+    impl PipelinedProcessor for WgpuTileProcessor {
+        type InFlight = WgpuTile;
+        const DEPTH: usize = RESOURCE_SETS;
+
+        fn begin(
             &mut self,
-            image: RgbaImage,
+            image: &RgbaImage,
             format: DdsFormat,
             levels: usize,
+            payload_len: usize,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+        ) -> Result<WgpuTile, DdsError> {
+            let set = free_set(self.busy).ok_or_else(|| {
+                DdsError::CompressionFailed("every GPU resource set is in use".to_string())
+            })?;
+            let planned = plan_tile(image.dimensions(), format, levels, payload_len);
+            match planned.and_then(|tile| self.begin_on(set, image, &tile, deadline, timing)) {
+                Ok(submitted) => {
+                    self.busy[set] = true;
+                    Ok(WgpuTile { set, submitted })
+                }
+                Err(e) => {
+                    self.discard(set);
+                    Err(e)
+                }
+            }
+        }
+
+        /// Drops `image` (it went to the GPU in `begin`), waits for the
+        /// tile and copies it out.
+        fn finish(
+            &mut self,
+            tile: WgpuTile,
+            image: RgbaImage,
             deadline: Instant,
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError> {
-            let outcome = self.process_tile(image, format, levels, deadline, timing, payload);
-            if AfterTile::of(&outcome) == AfterTile::Discard && self.resources.take().is_some() {
-                tracing::debug!("GPU worker dropped its kept resources after a failed tile");
+            drop(image);
+            let WgpuTile { set, submitted } = tile;
+            let outcome = match submitted {
+                Some(submitted) => self.finish_on(set, submitted, deadline, timing, payload),
+                None => Ok(()),
+            };
+            self.busy[set] = false;
+            if AfterTile::of(&outcome) == AfterTile::Discard {
+                self.discard(set);
             }
             outcome
+        }
+
+        fn abandon(&mut self, tile: WgpuTile) {
+            self.busy[tile.set] = false;
+            self.discard(tile.set);
         }
     }
 
@@ -1566,7 +1818,7 @@ mod inner {
     /// outside the loop's `catch_unwind`, and after a panic nothing is known
     /// of the device. The GPU is never used again in the session, and the
     /// process's exit reclaims what is leaked.
-    pub(super) fn run_worker_loop<P: TileProcessor>(
+    pub(super) fn run_worker_loop<P: PipelinedProcessor>(
         mut processor: P,
         mut queues: WorkerQueues,
         shutdown: CancellationToken,
@@ -1593,9 +1845,10 @@ mod inner {
     }
 
     /// The loop itself: serves requests until something ends it, and says
-    /// why. The decisions are [`HangRule::waited_out`], [`Misses::judge`]
-    /// and [`LoopEnd::ending`]; this acts on them.
-    fn serve<P: TileProcessor>(
+    /// why. The decisions are [`next_take`], [`next_begin`], [`admit`],
+    /// [`HangRule::waited_out`], [`Misses::judge`] and [`LoopEnd::ending`];
+    /// [`Serving`] acts on them.
+    fn serve<P: PipelinedProcessor>(
         processor: &mut P,
         queues: &mut WorkerQueues,
         shutdown: &CancellationToken,
@@ -1603,44 +1856,128 @@ mod inner {
         rule: HangRule,
         clock: &dyn Clock,
     ) -> LoopEnd {
-        let mut misses = Misses::default();
-        loop {
-            if shutdown.is_cancelled() {
-                tracing::info!("GPU pipeline worker: shutdown signal received");
-                let failed = queues.drain(|request| {
-                    let _ = request
-                        .response
-                        .send(GpuEncodeReply::failed(SHUT_DOWN, GpuTileTiming::default()));
-                });
-                if failed > 0 {
-                    tracing::debug!(failed, "GPU worker failed its queue at shutdown");
+        Serving {
+            processor,
+            queues,
+            shutdown,
+            health,
+            rule,
+            clock,
+            misses: Misses::default(),
+            begun: std::collections::VecDeque::new(),
+        }
+        .run()
+    }
+
+    /// A tile the worker began and has not finished (#425).
+    struct Begun<T> {
+        lane: GpuLane,
+        /// When the worker took it: its deadline and `process` run from
+        /// here.
+        taken: Instant,
+        deadline: Instant,
+        /// Kept until the finish, for a hand-back if the tile is never
+        /// finished.
+        image: RgbaImage,
+        output: Vec<u8>,
+        response: oneshot::Sender<GpuEncodeReply>,
+        timing: GpuTileTiming,
+        /// The processor's handle, or the error its `begin` returned: the
+        /// tile's result, given when its turn to finish comes, so tiles are
+        /// judged in the order they were taken.
+        tile: Result<T, DdsError>,
+        span: tracing::Span,
+    }
+
+    /// The loop's state: the tiles begun and not finished, oldest first,
+    /// and the misses in a row.
+    struct Serving<'a, P: PipelinedProcessor> {
+        processor: &'a mut P,
+        queues: &'a mut WorkerQueues,
+        shutdown: &'a CancellationToken,
+        health: &'a SharedGpuHealth,
+        rule: HangRule,
+        clock: &'a dyn Clock,
+        misses: Misses,
+        begun: std::collections::VecDeque<Begun<P::InFlight>>,
+    }
+
+    impl<P: PipelinedProcessor> Serving<'_, P> {
+        fn run(mut self) -> LoopEnd {
+            loop {
+                if self.begun.is_empty() {
+                    if self.shutdown.is_cancelled() {
+                        tracing::info!("GPU pipeline worker: shutdown signal received");
+                        let failed = self.queues.drain(|request| {
+                            let _ = request
+                                .response
+                                .send(GpuEncodeReply::failed(SHUT_DOWN, GpuTileTiming::default()));
+                        });
+                        if failed > 0 {
+                            tracing::debug!(failed, "GPU worker failed its queue at shutdown");
+                        }
+                        return LoopEnd::ShutDown;
+                    }
+                    // Failed from outside the loop: the device was lost.
+                    if let Some(reason) = self.health.failure() {
+                        hand_back_all(self.queues, reason);
+                        return LoopEnd::DeviceLost;
+                    }
+                    let (lane, request) = match self.queues.take() {
+                        Taken::Request(lane, request) => (lane, request),
+                        Taken::Empty => {
+                            match wait_for_work(self.queues, self.shutdown, self.health) {
+                                Woken::Request(lane, request) => (lane, request),
+                                // A shutdown, a failure or a lane closed: the
+                                // checks above and `take` see which.
+                                Woken::Signal => continue,
+                            }
+                        }
+                        Taken::Closed => return LoopEnd::Closed,
+                    };
+                    if let Err(end) = self.start(lane, request) {
+                        return end;
+                    }
+                    continue;
                 }
-                return LoopEnd::ShutDown;
-            }
-            // Failed from outside the loop: the device was lost.
-            if let Some(reason) = health.failure() {
-                hand_back_all(queues, reason);
-                return LoopEnd::DeviceLost;
-            }
 
-            let (lane, request) = match queues.take() {
-                Taken::Request(lane, request) => (lane, request),
-                Taken::Empty => match wait_for_work(queues, shutdown, health) {
-                    Woken::Request(lane, request) => (lane, request),
-                    // A shutdown, a failure or a lane closed: the checks
-                    // above and `take` see which.
-                    Woken::Signal => continue,
-                },
-                Taken::Closed => return LoopEnd::Closed,
-            };
+                // Tiles are begun: begin the next one now while the rule
+                // allows (#425), never after a shutdown or a failure.
+                while !self.shutdown.is_cancelled() && !self.health.is_failed() {
+                    let lanes: Vec<GpuLane> = self.begun.iter().map(|b| b.lane).collect();
+                    let Some(lane) = next_begin(
+                        P::DEPTH,
+                        &lanes,
+                        state(&self.queues.demand),
+                        state(&self.queues.prefetch),
+                    ) else {
+                        break;
+                    };
+                    // The one reader: a buffered request is still there.
+                    let Ok(request) = self.queues.lane(lane).try_recv() else {
+                        break;
+                    };
+                    if let Err(end) = self.start(lane, request) {
+                        return end;
+                    }
+                }
 
-            let taken = clock.now();
+                if let Err(end) = self.finish_oldest() {
+                    return end;
+                }
+            }
+        }
+
+        /// Admits a request the worker took ([`admit`]) and, if it starts,
+        /// begins it. `Err` ends the loop: the processor panicked.
+        fn start(&mut self, lane: GpuLane, request: GpuEncodeRequest) -> Result<(), LoopEnd> {
+            let taken = self.clock.now();
             let queue_wait = taken.saturating_duration_since(request.sent_at);
             match admit(
                 lane,
                 request.cancel.is_cancelled(),
                 queue_wait,
-                &rule,
+                &self.rule,
                 &request.claim,
             ) {
                 Admission::Start => {}
@@ -1652,14 +1989,14 @@ mod inner {
                         "GPU worker skipped a tile whose job was cancelled"
                     );
                     let _ = request.response.send(GpuEncodeReply::Cancelled);
-                    continue;
+                    return Ok(());
                 }
                 Admission::CallerLeft => {
                     tracing::debug!(
                         lane = lane.name(),
                         "GPU worker skipped a tile whose caller left"
                     );
-                    continue;
+                    return Ok(());
                 }
                 // The valve exists for the FUSE timeout: a prefetch request
                 // has no deadline and waits for the GPU (#421). Not a miss:
@@ -1674,10 +2011,10 @@ mod inner {
                         request,
                         &format!(
                             "waited {waited_ms} ms in the queue, past the GPU's {} ms deadline",
-                            rule.deadline.as_millis()
+                            self.rule.deadline.as_millis()
                         ),
                     );
-                    continue;
+                    return Ok(());
                 }
             }
 
@@ -1686,76 +2023,129 @@ mod inner {
                 format,
                 mipmap_count,
                 sent_at: _,
-                mut output,
+                output,
                 cancel: _,
                 claim: _,
                 response,
             } = request;
-
             let mut timing = GpuTileTiming {
                 queue_wait,
                 ..GpuTileTiming::default()
             };
-
             tracing::debug!(
                 format = ?format,
                 width = image.width(),
                 height = image.height(),
                 mipmap_count,
                 lane = lane.name(),
+                in_flight = self.begun.len(),
                 "GPU pipeline: processing full tile"
             );
-
-            let tile_span = tracing::debug_span!(
+            let span = tracing::debug_span!(
                 target: "profiling",
                 "gpu_tile",
                 width = image.width(),
                 height = image.height(),
                 levels = mipmap_count,
                 lane = lane.name(),
+                gpu_mips_us = tracing::field::Empty,
                 gpu_kernel_us = tracing::field::Empty,
-            )
-            .entered();
-            let deadline = taken + rule.deadline;
+            );
+            let deadline = taken + self.rule.deadline;
             // The chain is written into the caller's file, after its
             // header, in place (#423).
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let payload = output.get_mut(layout::HEADER_LEN..).ok_or_else(|| {
-                    DdsError::CompressionFailed(
-                        "the DDS file is shorter than its header".to_string(),
+            let payload_len = output.len().checked_sub(layout::HEADER_LEN);
+            let processor = &mut *self.processor;
+            let begun = span.in_scope(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let payload_len = payload_len.ok_or_else(|| {
+                        DdsError::CompressionFailed(
+                            "the DDS file is shorter than its header".to_string(),
+                        )
+                    })?;
+                    processor.begin(
+                        &image,
+                        format,
+                        mipmap_count,
+                        payload_len,
+                        deadline,
+                        &mut timing,
                     )
-                })?;
-                processor.process(image, format, mipmap_count, deadline, &mut timing, payload)
-            }))
-            .map(|processed| processed.map(|()| output));
-            timing.process = clock.now().saturating_duration_since(taken);
-            // The GPU's own time for the tile's compute passes, from
-            // timestamp queries, where the device has them (#476).
-            if let Some(kernel) = timing.gpu_kernel {
-                tile_span.record("gpu_kernel_us", kernel.as_micros() as u64);
-            }
-            drop(tile_span);
-
-            let result = match result {
-                Ok(result) => result,
+                }))
+            });
+            let tile = match begun {
+                Ok(tile) => tile,
                 Err(panic_info) => {
-                    let msg = crate::panic::panic_message(panic_info.as_ref());
-                    let message = format!("GPU worker panicked: {msg}");
-                    health.fail(message.clone());
-                    // The image was inside the processor: this tile is lost.
-                    let _ = response.send(GpuEncodeReply::failed(message, timing));
-                    hand_back_all(queues, health.failure().unwrap_or_default());
-                    return LoopEnd::Panicked;
+                    timing.process = self.clock.now().saturating_duration_since(taken);
+                    return Err(self.panicked(panic_info.as_ref(), response, timing));
+                }
+            };
+            self.begun.push_back(Begun {
+                lane,
+                taken,
+                deadline,
+                image,
+                output,
+                response,
+                timing,
+                tile,
+                span,
+            });
+            Ok(())
+        }
+
+        /// Finishes the oldest begun tile, judges it and answers it. `Err`
+        /// ends the loop: the processor panicked, or the misses failed the
+        /// GPU.
+        fn finish_oldest(&mut self) -> Result<(), LoopEnd> {
+            let Some(Begun {
+                lane,
+                taken,
+                deadline,
+                image,
+                mut output,
+                response,
+                mut timing,
+                tile,
+                span,
+            }) = self.begun.pop_front()
+            else {
+                return Ok(());
+            };
+            let processor = &mut *self.processor;
+            let finished = span.in_scope(|| match tile {
+                Err(error) => Ok(Err(error)),
+                Ok(tile) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let payload = &mut output[layout::HEADER_LEN..];
+                    processor.finish(tile, image, deadline, &mut timing, payload)
+                })),
+            });
+            timing.process = self.clock.now().saturating_duration_since(taken);
+            // The GPU's own time for the tile's compute passes, from
+            // timestamp queries, where the device has them (#476, #424).
+            if let Some(mips) = timing.gpu_mips {
+                span.record("gpu_mips_us", mips.as_micros() as u64);
+            }
+            if let Some(kernel) = timing.gpu_kernel {
+                span.record("gpu_kernel_us", kernel.as_micros() as u64);
+            }
+            drop(span);
+
+            let result = match finished {
+                Ok(result) => result.map(|()| output),
+                Err(panic_info) => {
+                    return Err(self.panicked(panic_info.as_ref(), response, timing))
                 }
             };
 
             let error = result.as_ref().err().map(ToString::to_string);
-            let verdict = misses.judge(rule, timing.process, error);
+            let verdict = self.misses.judge(self.rule, timing.process, error);
             let reply = GpuEncodeReply::Processed { result, timing };
             if verdict != Verdict::InTime {
                 tracing::debug!(
-                    misses = misses.count(),
+                    misses = self.misses.count(),
                     ?verdict,
+                    lane = lane.name(),
                     process_ms = timing.process.as_millis() as u64,
                     "GPU tile missed its deadline or failed"
                 );
@@ -1770,27 +2160,83 @@ mod inner {
                 }
                 Verdict::Missed { late } => {
                     if late {
-                        // The queue behind a slow tile goes to the CPU now
+                        // The tiles behind a slow tile go to the CPU now
                         // rather than wait for the next one, on the lanes
-                        // that have a deadline: prefetch waits (#421).
+                        // that have a deadline: prefetch waits (#421). A
+                        // tile already begun behind it is one of them
+                        // (#425).
+                        let reason = "a GPU tile ahead of it missed its deadline";
+                        self.abandon_begun(reason, GpuLane::has_deadline);
                         for lane in [GpuLane::Demand, GpuLane::Prefetch] {
                             if lane.has_deadline() {
-                                hand_back_queued(
-                                    queues.lane(lane),
-                                    "a GPU tile ahead of it missed its deadline",
-                                );
+                                hand_back_queued(self.queues.lane(lane), reason);
                             }
                         }
                     }
                     let _ = response.send(reply);
                 }
                 Verdict::Failed { reason, hung } => {
-                    health.fail(reason);
-                    hand_back_all(queues, health.failure().unwrap_or_default());
+                    self.health.fail(reason);
+                    let reason = self.health.failure().unwrap_or_default().to_string();
+                    self.abandon_begun(&reason, |_| true);
+                    hand_back_all(self.queues, &reason);
                     let _ = response.send(reply);
-                    return LoopEnd::Missed { hung };
+                    return Err(LoopEnd::Missed { hung });
                 }
             }
+            Ok(())
+        }
+
+        /// Abandons the begun tiles of the lanes `which` selects and hands
+        /// their images back, oldest first; the others stay begun.
+        fn abandon_begun(&mut self, reason: &str, which: impl Fn(GpuLane) -> bool) {
+            let mut kept = std::collections::VecDeque::new();
+            while let Some(begun) = self.begun.pop_front() {
+                if !which(begun.lane) {
+                    kept.push_back(begun);
+                    continue;
+                }
+                if let Ok(tile) = begun.tile {
+                    self.processor.abandon(tile);
+                }
+                tracing::debug!(
+                    lane = begun.lane.name(),
+                    reason,
+                    "GPU worker handed back a begun tile"
+                );
+                let _ = begun.response.send(GpuEncodeReply::Returned {
+                    image: begun.image,
+                    reason: reason.to_string(),
+                });
+            }
+            self.begun = kept;
+        }
+
+        /// The processor panicked in a tile's `begin` or `finish`: that tile
+        /// fails with the panic's message, the GPU is failed, and every
+        /// other begun tile and every queued request is handed back (#420).
+        /// Nothing more is asked of the processor: after a panic nothing is
+        /// known of it.
+        fn panicked(
+            &mut self,
+            panic_info: &(dyn std::any::Any + Send),
+            response: oneshot::Sender<GpuEncodeReply>,
+            timing: GpuTileTiming,
+        ) -> LoopEnd {
+            let msg = crate::panic::panic_message(panic_info);
+            let message = format!("GPU worker panicked: {msg}");
+            self.health.fail(message.clone());
+            // The image was inside the processor: this tile is lost.
+            let _ = response.send(GpuEncodeReply::failed(message, timing));
+            let reason = self.health.failure().unwrap_or_default().to_string();
+            for begun in std::mem::take(&mut self.begun) {
+                let _ = begun.response.send(GpuEncodeReply::Returned {
+                    image: begun.image,
+                    reason: reason.clone(),
+                });
+            }
+            hand_back_all(self.queues, &reason);
+            LoopEnd::Panicked
         }
     }
 
@@ -2023,8 +2469,8 @@ mod inner {
     /// and wait for it, from async code ([`stop`](Self::stop)) or from a
     /// `Drop` ([`stop_blocking`](Self::stop_blocking)).
     ///
-    /// A wait never outlasts its bound: a worker in a tile ends after it,
-    /// within the tile's deadline ([`HangRule`]), but a driver call that
+    /// A wait never outlasts its bound: a worker with tiles begun ends
+    /// after them, each within its deadline ([`HangRule`]), but a driver call that
     /// never returns would hold its thread for good, and the handle then
     /// leaves it, as the process exit reclaims it.
     pub struct GpuWorkerHandle {
@@ -2063,7 +2509,7 @@ mod inner {
         }
 
         /// Cancels the worker's shutdown token, then [`wait`](Self::wait)s:
-        /// the worker finishes the tile in progress, fails every request
+        /// the worker finishes the tiles it has begun, fails every request
         /// queued in either lane (#464) and ends.
         pub async fn stop(&mut self, within: Duration) -> Option<std::thread::Result<()>> {
             self.shutdown.cancel();
@@ -2095,21 +2541,26 @@ mod inner {
     /// loop ends:
     ///
     /// - when the shutdown token is cancelled, at once if idle, else
-    ///   between tiles: a tile in progress is finished and answered; every
+    ///   between tiles: the tiles begun are finished and answered; every
     ///   queued request of either lane, and every one whose sender already
     ///   holds a slot, fails with "GPU worker shut down" (#464);
     /// - when every sender of both channels is dropped, after the buffered
     ///   requests;
-    /// - when the GPU fails (#420): the processor panics (the request in
-    ///   progress fails with the panic's message), `health` is failed from
-    ///   outside (the device was lost), or `rule.misses` tiles in a row end
-    ///   at or past `rule.deadline` or fail before it. `health` turns Failed
-    ///   with the reason, and every queued request of either lane is handed
-    ///   back.
+    /// - when the GPU fails (#420): the processor panics (the request whose
+    ///   call panicked fails with the panic's message), `health` is failed
+    ///   from outside (the device was lost), or `rule.misses` tiles in a row
+    ///   end at or past `rule.deadline` or fail before it. `health` turns
+    ///   Failed with the reason, and every tile begun behind and every
+    ///   queued request of either lane is handed back.
+    ///
+    /// A processor of depth two ([`PipelinedProcessor::DEPTH`]) has the
+    /// next tile begun while the one before is on the GPU, by
+    /// `next_begin` (#425); one of depth one, every [`TileProcessor`],
+    /// runs each tile start to end.
     ///
     /// On the demand channel only (#421), a tile past its deadline that
     /// does not fail the GPU hands back the demand requests queued behind
-    /// it, and a demand request taken after waiting past the deadline in the
+    /// it, and a demand tile begun behind it, and a demand request taken after waiting past the deadline in the
     /// queue is handed back unprocessed ([`HangRule::waited_out`]). A
     /// prefetch request is processed however long it waited.
     ///
@@ -2123,7 +2574,7 @@ mod inner {
     /// # Errors
     ///
     /// The OS refused a thread.
-    pub fn try_spawn_tile_worker<P: TileProcessor + 'static>(
+    pub fn try_spawn_tile_worker<P: PipelinedProcessor + 'static>(
         processor: P,
         queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
@@ -2149,7 +2600,7 @@ mod inner {
     /// # Errors
     ///
     /// The OS refused a thread.
-    pub fn try_spawn_tile_worker_with_clock<P: TileProcessor + 'static>(
+    pub fn try_spawn_tile_worker_with_clock<P: PipelinedProcessor + 'static>(
         processor: P,
         queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
@@ -2176,7 +2627,7 @@ mod inner {
 
     /// [`try_spawn_tile_worker`], panicking if the OS refuses a thread: for
     /// tests.
-    pub fn spawn_tile_worker<P: TileProcessor + 'static>(
+    pub fn spawn_tile_worker<P: PipelinedProcessor + 'static>(
         processor: P,
         queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
@@ -2189,7 +2640,7 @@ mod inner {
 
     /// [`try_spawn_tile_worker_with_clock`], panicking if the OS refuses a
     /// thread: for tests.
-    pub fn spawn_tile_worker_with_clock<P: TileProcessor + 'static>(
+    pub fn spawn_tile_worker_with_clock<P: PipelinedProcessor + 'static>(
         processor: P,
         queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
@@ -2753,7 +3204,7 @@ mod tests {
 
     /// The worker loop around `processor` on `clock`, with the production
     /// rule.
-    fn spawn_with<P: TileProcessor + 'static>(
+    fn spawn_with<P: PipelinedProcessor + 'static>(
         processor: P,
         queues: impl Into<WorkerQueues>,
         shutdown: CancellationToken,
@@ -5242,6 +5693,572 @@ mod tests {
     }
 
     // =========================================================================
+    // Two tiles in flight (#425)
+    // =========================================================================
+
+    /// The overlap rule, given the processor's depth, the lanes of the
+    /// tiles begun (oldest first) and each channel's state: the next tile
+    /// is begun only from a request already queued, demand first, never
+    /// past the depth or with nothing begun, and never a second prefetch
+    /// tile, so a demand request waits behind one prefetch tile at most.
+    #[test]
+    fn the_next_tile_is_begun_by_depth_lane_and_queue() {
+        use GpuLane::{Demand as D, Prefetch as P};
+        use QueueState::{Closed, Empty, Ready};
+        for (depth, begun, demand, prefetch, next) in [
+            // Nothing begun: the idle worker takes by `next_take`.
+            (2, &[][..], Ready, Ready, None),
+            // Depth one never overlaps.
+            (1, &[D][..], Ready, Ready, None),
+            (1, &[P][..], Ready, Empty, None),
+            // At the depth, nothing more.
+            (2, &[D, D][..], Ready, Ready, None),
+            (2, &[P, D][..], Ready, Empty, None),
+            // Demand is begun behind anything, before prefetch.
+            (2, &[D][..], Ready, Ready, Some(D)),
+            (2, &[P][..], Ready, Ready, Some(D)),
+            (2, &[P][..], Ready, Closed, Some(D)),
+            // Prefetch only behind demand, and only with no demand queued.
+            (2, &[D][..], Empty, Ready, Some(P)),
+            (2, &[D][..], Closed, Ready, Some(P)),
+            (2, &[P][..], Empty, Ready, None),
+            (3, &[D, P][..], Empty, Ready, None),
+            (3, &[D, D][..], Empty, Ready, Some(P)),
+            // Nothing queued: the begun tile is finished at once.
+            (2, &[D][..], Empty, Empty, None),
+            (2, &[P][..], Closed, Closed, None),
+        ] {
+            assert_eq!(
+                next_begin(depth, begun, demand, prefetch),
+                next,
+                "depth {depth}, begun {begun:?}, demand {demand:?}, prefetch {prefetch:?}"
+            );
+        }
+    }
+
+    /// A tile begins on the first resource set no begun tile holds: a
+    /// serial run uses the first set only.
+    #[test]
+    fn a_tile_begins_on_the_first_free_resource_set() {
+        for (busy, set) in [
+            ([false, false], Some(0)),
+            ([true, false], Some(1)),
+            ([false, true], Some(0)),
+            ([true, true], None),
+        ] {
+            assert_eq!(free_set(busy), set, "{busy:?}");
+        }
+    }
+
+    /// What the GPU processor refuses before any GPU work, and what it
+    /// plans otherwise: the chain's levels and the payload they fill.
+    #[test]
+    fn a_tile_is_planned_or_refused_before_any_gpu_work() {
+        let bc1 = DdsFormat::BC1;
+        let full = crate::dds::layout::chain_len(4096, 4096, 13, bc1);
+        let plan = plan_tile((4096, 4096), bc1, 13, full).expect("a 4096 tile");
+        assert_eq!(plan.levels.len(), 13);
+        assert_eq!(plan.bytes, full);
+        assert_eq!(plan.bytes + crate::dds::layout::HEADER_LEN, 11_184_952);
+        let none = plan_tile((64, 64), bc1, 0, 0).expect("no level, no payload");
+        assert!(none.levels.is_empty());
+
+        for (case, (dims, format, levels, payload), error) in [
+            (
+                "a format the GPU does not encode",
+                ((64, 64), DdsFormat::BC3, 7, 0),
+                DdsFormat::BC3.ensure_supported().unwrap_err(),
+            ),
+            (
+                "an empty image",
+                ((0, 64), bc1, 7, 0),
+                DdsError::InvalidDimensions(0, 64),
+            ),
+            (
+                "a file one block longer than its chain",
+                ((4096, 4096), bc1, 13, full + 8),
+                DdsError::CompressionFailed(format!(
+                    "the mipmap chain filled {full} of the {}-byte payload",
+                    full + 8
+                )),
+            ),
+        ] {
+            let refused = plan_tile(dims, format, levels, payload).expect_err(case);
+            assert_eq!(refused.to_string(), error.to_string(), "{case}");
+        }
+    }
+
+    /// What [`TwoPhase`] saw, by the tile's width.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Phase {
+        Begin(u32),
+        Finish(u32),
+        Abandon(u32),
+    }
+
+    type Phases = Arc<std::sync::Mutex<Vec<Phase>>>;
+
+    /// A processor of depth two for the loop's tests: records each begin,
+    /// finish and abandon by the tile's width. Before each finish it
+    /// reports the width (`finishing`), waits for the test's word when
+    /// gated (a dropped sender lets every finish through), then runs
+    /// `on_finish`, which may advance the clock, fail or panic. `on_begin`
+    /// may fail a begin.
+    struct TwoPhase {
+        phases: Phases,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+        finishing: Option<mpsc::UnboundedSender<u32>>,
+        on_begin: Box<dyn FnMut(u32) -> Result<(), DdsError> + Send>,
+        on_finish: Box<dyn FnMut(u32) -> Result<(), DdsError> + Send>,
+    }
+
+    impl TwoPhase {
+        fn new() -> (Self, Phases) {
+            let phases = Phases::default();
+            let processor = Self {
+                phases: Arc::clone(&phases),
+                gate: None,
+                finishing: None,
+                on_begin: Box::new(|_| Ok(())),
+                on_finish: Box::new(|_| Ok(())),
+            };
+            (processor, phases)
+        }
+
+        /// Gated: each finish waits for one message on the sender, and is
+        /// reported as it reaches the gate.
+        fn gated(
+            mut self,
+        ) -> (
+            Self,
+            std::sync::mpsc::Sender<()>,
+            mpsc::UnboundedReceiver<u32>,
+        ) {
+            let (open, gate) = std::sync::mpsc::channel();
+            let (finishing, reached) = mpsc::unbounded_channel();
+            self.gate = Some(gate);
+            self.finishing = Some(finishing);
+            (self, open, reached)
+        }
+
+        fn on_finish(
+            mut self,
+            f: impl FnMut(u32) -> Result<(), DdsError> + Send + 'static,
+        ) -> Self {
+            self.on_finish = Box::new(f);
+            self
+        }
+
+        fn on_begin(mut self, f: impl FnMut(u32) -> Result<(), DdsError> + Send + 'static) -> Self {
+            self.on_begin = Box::new(f);
+            self
+        }
+    }
+
+    impl PipelinedProcessor for TwoPhase {
+        type InFlight = u32;
+        const DEPTH: usize = 2;
+
+        fn begin(
+            &mut self,
+            image: &RgbaImage,
+            _format: DdsFormat,
+            _levels: usize,
+            _payload_len: usize,
+            _deadline: Instant,
+            _timing: &mut GpuTileTiming,
+        ) -> Result<u32, DdsError> {
+            let width = image.width();
+            self.phases.lock().unwrap().push(Phase::Begin(width));
+            (self.on_begin)(width).map(|()| width)
+        }
+
+        fn finish(
+            &mut self,
+            width: u32,
+            image: RgbaImage,
+            _deadline: Instant,
+            _timing: &mut GpuTileTiming,
+            _payload: &mut [u8],
+        ) -> Result<(), DdsError> {
+            assert_eq!(
+                image.width(),
+                width,
+                "each tile finishes with its own image"
+            );
+            if let Some(finishing) = &self.finishing {
+                let _ = finishing.send(width);
+            }
+            if let Some(gate) = &self.gate {
+                let _ = gate.recv();
+            }
+            self.phases.lock().unwrap().push(Phase::Finish(width));
+            (self.on_finish)(width)
+        }
+
+        fn abandon(&mut self, width: u32) {
+            self.phases.lock().unwrap().push(Phase::Abandon(width));
+        }
+    }
+
+    fn phases(phases: &Phases) -> Vec<Phase> {
+        phases.lock().unwrap().clone()
+    }
+
+    fn encoded(reply: GpuEncodeReply) {
+        let (result, _) = processed(reply);
+        result.expect("the tile encoded");
+    }
+
+    /// With two requests queued, the worker begins the second before it
+    /// finishes the first (#425), and finishes them in order.
+    #[tokio::test]
+    async fn with_two_requests_queued_the_second_is_begun_before_the_first_is_finished() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8]);
+        let (processor, seen) = TwoPhase::new();
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        for reply in replies {
+            encoded(reply_of(reply).await);
+        }
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Finish(8)]);
+    }
+
+    /// With one request, the tile is finished at once: the worker does not
+    /// wait for a second request that may never come (the channel stays
+    /// open, so a wait would never end).
+    #[tokio::test]
+    async fn a_lone_tile_is_finished_without_waiting_for_another() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let reply = one(&tx, &clock, 4);
+        let (processor, seen) = TwoPhase::new();
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        encoded(reply_of(reply).await);
+        assert_eq!(phases(&seen), [Begin(4), Finish(4)]);
+        assert!(!tx.is_closed(), "the channel was open throughout");
+    }
+
+    /// Prefetch tiles alone never overlap: at most one prefetch tile is in
+    /// the processor.
+    #[tokio::test]
+    async fn two_prefetch_tiles_are_never_in_the_processor_at_once() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (_demand_tx, prefetch_tx, queues) = lanes();
+        let replies = queue(&prefetch_tx, &clock, &[4, 8, 12]);
+        let (processor, seen) = TwoPhase::new();
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        for reply in replies {
+            encoded(reply_of(reply).await);
+        }
+        assert_eq!(
+            phases(&seen),
+            [
+                Begin(4),
+                Finish(4),
+                Begin(8),
+                Finish(8),
+                Begin(12),
+                Finish(12)
+            ]
+        );
+    }
+
+    /// Demand over prefetch still holds with overlap: with both queued the
+    /// demand tile is begun first, and the prefetch tile behind it.
+    #[tokio::test]
+    async fn demand_is_begun_first_and_prefetch_behind_it() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let prefetch = one(&prefetch_tx, &clock, 4);
+        let demand = one(&demand_tx, &clock, 8);
+        let (processor, seen) = TwoPhase::new();
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        encoded(reply_of(demand).await);
+        encoded(reply_of(prefetch).await);
+        assert_eq!(phases(&seen), [Begin(8), Begin(4), Finish(8), Finish(4)]);
+    }
+
+    /// The demand bound stays at one tile (#421, #425): a demand request
+    /// that arrives while a prefetch tile is being finished, with more
+    /// prefetch queued, waits for that one prefetch tile only. The second
+    /// prefetch tile was not begun behind the first, and the demand tile
+    /// is begun before it.
+    #[tokio::test]
+    async fn a_demand_request_behind_prefetch_waits_for_one_prefetch_tile() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let prefetch = queue(&prefetch_tx, &clock, &[4, 8]);
+        let (processor, open, mut reached) = TwoPhase::new().0.gated();
+        let seen = Arc::clone(&processor.phases);
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        // The worker is finishing prefetch 4: it decided what to begin
+        // before that.
+        assert_eq!(next_start(&mut reached).await, 4);
+        assert_eq!(phases(&seen), [Begin(4)], "prefetch 8 is not begun");
+        let demand = one(&demand_tx, &clock, 12);
+        drop(open);
+
+        encoded(reply_of(demand).await);
+        for reply in prefetch {
+            encoded(reply_of(reply).await);
+        }
+        assert_eq!(
+            phases(&seen),
+            [
+                Begin(4),
+                Finish(4),
+                Begin(12),
+                Begin(8),
+                Finish(12),
+                Finish(8)
+            ]
+        );
+    }
+
+    /// A late tile hands back the demand tile begun behind it, as it hands
+    /// back the demand queue (#420): abandoned, its image back to its
+    /// caller, never finished. Not a miss of its own.
+    #[tokio::test]
+    async fn a_late_tile_hands_back_the_demand_tile_begun_behind_it() {
+        use Phase::{Abandon, Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8]);
+        let ticking = clock.clone();
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_finish(move |width| {
+            if width == 4 {
+                ticking.advance(LATE);
+            }
+            Ok(())
+        });
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        let mut replies = replies.into_iter();
+        let (result, timing) = processed(reply_of(replies.next().unwrap()).await);
+        assert!(
+            result.is_ok() && timing.process >= TILE_DEADLINE,
+            "4 was late"
+        );
+        let (image, reason) = returned(reply_of(replies.next().unwrap()).await);
+        assert_eq!(image.width(), 8);
+        assert_eq!(reason, "a GPU tile ahead of it missed its deadline");
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Abandon(8)]);
+        assert!(!health.is_failed(), "one late tile does not fail the GPU");
+    }
+
+    /// Prefetch has no deadline (#421): a prefetch tile begun behind a late
+    /// demand tile is finished, not handed back.
+    #[tokio::test]
+    async fn a_late_tile_leaves_the_prefetch_tile_begun_behind_it() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let demand = one(&demand_tx, &clock, 4);
+        let prefetch = one(&prefetch_tx, &clock, 8);
+        let ticking = clock.clone();
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_finish(move |width| {
+            if width == 4 {
+                ticking.advance(LATE);
+            }
+            Ok(())
+        });
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        encoded(reply_of(demand).await);
+        encoded(reply_of(prefetch).await);
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Finish(8)]);
+    }
+
+    /// A panic in one tile fails that tile and hands back the one begun
+    /// behind it, with its image (#420): nothing more is asked of the
+    /// processor, not even an abandon.
+    #[tokio::test]
+    async fn a_panic_hands_back_the_tile_begun_behind_it() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8]);
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_finish(|width| panic!("kernel asserted on width {width}"));
+        let health = SharedGpuHealth::new();
+        let handle = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        loop_ends(handle).await;
+        let mut replies = replies.into_iter();
+        let (first, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(
+            error_text(&first),
+            "Compression failed: GPU worker panicked: kernel asserted on width 4"
+        );
+        let (image, reason) = returned(reply_of(replies.next().unwrap()).await);
+        assert_eq!(image.width(), 8);
+        assert_eq!(reason, "GPU worker panicked: kernel asserted on width 4");
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4)]);
+        assert!(health.is_failed());
+    }
+
+    /// The miss that fails the GPU abandons the tile begun behind it and
+    /// hands its image back, with the rest of the queue (#420).
+    #[tokio::test]
+    async fn failing_the_gpu_hands_back_the_tile_begun_behind_it() {
+        use Phase::{Abandon, Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8, 12]);
+        let (processor, seen) = TwoPhase::new();
+        let processor =
+            processor.on_finish(|_| Err(DdsError::CompressionFailed("device destroyed".into())));
+        let health = SharedGpuHealth::new();
+        let rule = HangRule {
+            deadline: TILE_DEADLINE,
+            misses: 1,
+        };
+        let handle = spawn_tile_worker_with_clock(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            rule,
+            clock.shared(),
+        );
+        loop_ends(handle).await;
+        let mut replies = replies.into_iter();
+        let (first, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(error_text(&first), "Compression failed: device destroyed");
+        for width in [8, 12] {
+            let (image, reason) = returned(reply_of(replies.next().unwrap()).await);
+            assert_eq!(image.width(), width);
+            assert_eq!(
+                reason,
+                "1 tiles in a row failed on the GPU, the last with: \
+                 Compression failed: device destroyed"
+            );
+        }
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Abandon(8)]);
+        assert!(health.is_failed());
+    }
+
+    /// A shutdown finishes both tiles begun and answers them, then fails
+    /// the queue (#464).
+    #[tokio::test]
+    async fn a_shutdown_finishes_the_tiles_begun_then_fails_the_queue() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8, 12]);
+        let (processor, open, mut reached) = TwoPhase::new().0.gated();
+        let seen = Arc::clone(&processor.phases);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_with(
+            processor,
+            rx,
+            shutdown.clone(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        assert_eq!(next_start(&mut reached).await, 4);
+        shutdown.cancel();
+        drop(open);
+        loop_ends(handle).await;
+        let mut replies = replies.into_iter();
+        for _ in [4, 8] {
+            encoded(reply_of(replies.next().unwrap()).await);
+        }
+        let (last, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(
+            error_text(&last),
+            "Compression failed: GPU worker shut down"
+        );
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Finish(8)]);
+    }
+
+    /// A tile whose begin failed is answered with its error in its turn,
+    /// after the tile begun before it, and judged in that order.
+    #[tokio::test]
+    async fn a_tile_whose_begin_failed_is_answered_in_its_turn() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8, 12]);
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_begin(|width| match width {
+            8 => Err(DdsError::CompressionFailed("no upload buffer".into())),
+            _ => Ok(()),
+        });
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            SharedGpuHealth::new(),
+            &clock,
+        );
+        let mut replies = replies.into_iter();
+        encoded(reply_of(replies.next().unwrap()).await);
+        let (second, _) = processed(reply_of(replies.next().unwrap()).await);
+        assert_eq!(error_text(&second), "Compression failed: no upload buffer");
+        encoded(reply_of(replies.next().unwrap()).await);
+        assert_eq!(
+            phases(&seen),
+            [Begin(4), Begin(8), Finish(4), Begin(12), Finish(12)]
+        );
+    }
+
+    // =========================================================================
     // Full-tile GPU pipeline tests (require GPU hardware)
     // =========================================================================
 
@@ -5618,6 +6635,136 @@ mod tests {
                 .filter(|(a, b)| a != b)
                 .count();
             assert_eq!(differ, 0, "{w}x{h}, {levels} levels: bytes differ");
+        }
+    }
+
+    /// The acceptance test of #425's byte identity, on the processor: two
+    /// tiles begun at once, each on its own resource set, are each the
+    /// tile encoded alone; an abandoned tile leaves its set to fresh
+    /// resources and the other set untouched; a tile that runs late with
+    /// another begun behind it fails alone, and the other is still right.
+    #[test]
+    #[ignore] // Requires GPU hardware
+    fn two_tiles_in_flight_encode_as_one_at_a_time() {
+        let Some((device, queue, compressor)) = gpu_resources_or_skip() else {
+            eprintln!("Skipping: no usable GPU");
+            return;
+        };
+        let mut reference =
+            block_compression::GpuBlockCompressor::new(device.clone(), queue.clone());
+        let mut processor = WgpuTileProcessor::new(device.clone(), queue.clone(), compressor);
+        let levels = |w: u32| crate::dds::layout::full_chain_levels(w, w) as usize;
+        let tile = |size: u32, seed: u32| {
+            RgbaImage::from_fn(size, size, |x, y| {
+                let h =
+                    (u64::from(y) << 32 | u64::from(x ^ seed)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                image::Rgba([(h >> 40) as u8, (h >> 48) as u8, (h >> 56) as u8, 255])
+            })
+        };
+        let (a, b, c) = (tile(4096, 1), tile(4096, 2), tile(1024, 3));
+        let mut expected = |image: &RgbaImage| {
+            cpu_chain_on_the_gpu_kernel(
+                &device,
+                &queue,
+                &mut reference,
+                image,
+                levels(image.width()),
+            )
+        };
+        let (want_a, want_b, want_c) = (expected(&a), expected(&b), expected(&c));
+        let later = || Instant::now() + Duration::from_secs(60);
+        let begin = |p: &mut WgpuTileProcessor, image: &RgbaImage, deadline: Instant| {
+            let len = crate::dds::layout::chain_len(
+                image.width(),
+                image.height(),
+                levels(image.width()) as u32,
+                DdsFormat::BC1,
+            );
+            let tile = PipelinedProcessor::begin(
+                p,
+                image,
+                DdsFormat::BC1,
+                levels(image.width()),
+                len,
+                deadline,
+                &mut GpuTileTiming::default(),
+            )
+            .expect("the tile begins");
+            (tile, len)
+        };
+        let finish = |p: &mut WgpuTileProcessor,
+                      (tile, len): (WgpuTile, usize),
+                      _image: &RgbaImage,
+                      deadline: Instant| {
+            let mut payload = vec![0; len];
+            // The processor drops the image it is given: no clone, which
+            // would delay a late tile's poll past its work.
+            PipelinedProcessor::finish(
+                p,
+                tile,
+                RgbaImage::new(1, 1),
+                deadline,
+                &mut GpuTileTiming::default(),
+                &mut payload,
+            )
+            .map(|()| payload)
+        };
+
+        // Two in flight, finished in order.
+        let first = begin(&mut processor, &a, later());
+        let second = begin(&mut processor, &b, later());
+        assert_eq!((first.0.set, second.0.set), (0, 1), "a set each");
+        assert!(
+            finish(&mut processor, first, &a, later()).unwrap() == want_a,
+            "a"
+        );
+        assert!(
+            finish(&mut processor, second, &b, later()).unwrap() == want_b,
+            "b"
+        );
+
+        // A smaller tile on the first set, the second abandoned.
+        let small = begin(&mut processor, &c, later());
+        let dropped = begin(&mut processor, &a, later());
+        PipelinedProcessor::abandon(&mut processor, dropped.0);
+        assert!(
+            finish(&mut processor, small, &c, later()).unwrap() == want_c,
+            "c"
+        );
+        let again = begin(&mut processor, &b, later());
+        let behind = begin(&mut processor, &a, later());
+        assert!(
+            finish(&mut processor, again, &b, later()).unwrap() == want_b,
+            "b again"
+        );
+        assert!(
+            finish(&mut processor, behind, &a, later()).unwrap() == want_a,
+            "a on fresh resources"
+        );
+
+        // Late, with another in flight: the late one fails alone. (Finished
+        // at once after its begin, so its poll times out before its work is
+        // done; the loop finishes in order, the processor need not.)
+        let other = begin(&mut processor, &b, later());
+        let late = begin(&mut processor, &a, Instant::now());
+        let failed = finish(&mut processor, late, &a, Instant::now());
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("timed out")),
+            "the late tile times out: {:?}",
+            failed.map(|p| p.len())
+        );
+        assert!(
+            finish(&mut processor, other, &b, later()).unwrap() == want_b,
+            "the other tile"
+        );
+        for (image, want) in [(&a, &want_a), (&c, &want_c), (&b, &want_b)] {
+            let tile = begin(&mut processor, image, later());
+            assert!(
+                finish(&mut processor, tile, image, later()).unwrap() == *want,
+                "after"
+            );
         }
     }
 }
