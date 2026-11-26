@@ -257,3 +257,124 @@ async fn kept_resources_do_not_change_a_tile() {
     assert!(back_to_back[0] == fresh_first[0], "the first tile, bytes");
     assert!(back_to_back[1] == fresh_second[0], "the second tile, bytes");
 }
+
+/// Whether the adapter `selector` names gives a device that can time its
+/// kernels (#476), its device requested as the worker's is
+/// (`create_gpu_resources`); `None` when the host has no such adapter.
+fn kernel_timing_on(selector: &str) -> Option<bool> {
+    use xearthlayer::dds::gpu_timestamps::{requested_features, KernelTimer};
+    let adapters = xearthlayer::system::enumerate_gpus_raw();
+    let adapter = xearthlayer::system::find_gpu(&adapters, selector).ok()?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("xel-test-kernel-timing"),
+        required_features: requested_features(adapter.features()),
+        ..Default::default()
+    }))
+    .ok()?;
+    Some(KernelTimer::available(&device, &queue))
+}
+
+/// Sends one tile of `size` x `size`, `levels` levels, in `file`, on
+/// `channel`, from a blocking thread.
+async fn encode_on(
+    channel: &Arc<xearthlayer::dds::gpu_channel::GpuEncoderChannel>,
+    size: u32,
+    levels: usize,
+    file: Vec<u8>,
+) -> Result<ChainOutcome, xearthlayer::dds::DdsError> {
+    let ch = Arc::clone(channel);
+    tokio::task::spawn_blocking(move || {
+        let image = RgbaImage::from_pixel(size, size, image::Rgba([96, 120, 64, 255]));
+        ch.compress_mipmap_chain(image, DdsFormat::BC1, levels, file)
+    })
+    .await
+    .expect("join")
+}
+
+/// The production wiring of the kernel time (#476): on a device that can
+/// time its kernels, every tile the worker encodes carries a kernel time,
+/// within its `gpu` stage, whatever its size and level count, and so does
+/// the tile after a failed one, for which the worker made its resources,
+/// kernel timer included, again (#423's `AfterTile`).
+#[tokio::test]
+#[ignore]
+async fn every_tile_carries_its_kernel_time_on_a_device_with_timestamps() {
+    match kernel_timing_on(&gpu_device()) {
+        None => {
+            eprintln!("Skipping: no usable GPU");
+            return;
+        }
+        Some(false) => {
+            eprintln!("Skipping: the device cannot time its kernels (no timestamp queries)");
+            return;
+        }
+        Some(true) => {}
+    }
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (channels, mut worker, selection) =
+        xearthlayer::dds::gpu_channel::create_gpu_encoder_channels(
+            &gpu_device(),
+            xearthlayer::dds::gpu_channel::CHANNEL_CAPACITY,
+            shutdown,
+        )
+        .expect("the GPU that was just opened");
+    eprintln!("Adapter: {}", selection.adapter);
+    let channel = Arc::new(channels.demand);
+
+    // One tile's sample: its kernel time is there and within its `gpu`.
+    let kernel_within_gpu = |case: &str| {
+        let sample = channel
+            .stats()
+            .take_sample()
+            .unwrap_or_else(|| panic!("{case}: the tile is in the sample"));
+        assert_eq!((sample.tiles(), sample.failed), (1, 0), "{case}");
+        let kernel = sample
+            .gpu_kernel
+            .unwrap_or_else(|| panic!("{case}: the tile carries a kernel time"));
+        let gpu = sample.gpu.expect("the gpu stage");
+        eprintln!(
+            "{case}: kernel {} us within gpu {} us",
+            kernel.max_us, gpu.max_us
+        );
+        assert_eq!(kernel.count, 1, "{case}");
+        assert!(kernel.max_us <= gpu.max_us, "{case}: kernel within gpu");
+        assert_eq!(sample.kernel_timing(), "timestamps", "{case}");
+    };
+
+    let full = |size: u32| MipmapGenerator::full_chain_count(size, size);
+    // A full chain; the same size truncated, on the kept resources; a
+    // smaller tile, on resources made for it.
+    for (case, size, levels) in [
+        ("4096, full chain", 4096, full(4096)),
+        ("4096, 5 levels", 4096, 5),
+        ("1024, full chain", 1024, full(1024)),
+    ] {
+        gpu_bytes(
+            encode_on(&channel, size, levels, file(size, size, levels))
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e}")),
+        );
+        kernel_within_gpu(case);
+    }
+
+    // A tile of the same size that fails: its file is one block longer
+    // than its chain, which the worker fills and then refuses. The worker
+    // drops its kept resources after it, and the next tile makes them again.
+    let mut long = file(1024, 1024, full(1024));
+    long.extend_from_slice(&[0; 8]);
+    assert!(
+        encode_on(&channel, 1024, full(1024), long).await.is_err(),
+        "a file longer than its chain fails the tile"
+    );
+    let sample = channel.stats().take_sample().expect("the failure");
+    assert_eq!((sample.tiles(), sample.failed), (0, 1));
+
+    gpu_bytes(
+        encode_on(&channel, 1024, full(1024), file(1024, 1024, full(1024)))
+            .await
+            .expect("the tile after the failed one"),
+    );
+    kernel_within_gpu("1024, after a failed tile");
+
+    worker.stop(std::time::Duration::from_secs(10)).await;
+}

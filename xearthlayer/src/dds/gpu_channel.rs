@@ -1033,6 +1033,9 @@ mod inner {
         queue: wgpu::Queue,
         compressor: GpuBlockCompressor,
         resources: Option<TileResources>,
+        /// Kernel timers dropped after an unmapped readback (#476): the
+        /// first is logged at warn, the rest at debug.
+        timer_drops: u32,
     }
 
     impl WgpuTileProcessor {
@@ -1046,6 +1049,7 @@ mod inner {
                 queue,
                 compressor,
                 resources: None,
+                timer_drops: 0,
             }
         }
 
@@ -1081,6 +1085,7 @@ mod inner {
                 queue,
                 compressor,
                 resources,
+                timer_drops,
             } = self;
             if !resources
                 .as_ref()
@@ -1266,9 +1271,11 @@ mod inner {
                     match timer.read(&mapped, timed_levels as u32) {
                         Ok(levels) => {
                             timing.gpu_kernel = Some(levels.iter().sum());
-                            let levels_us: Vec<u64> =
-                                levels.iter().map(|d| d.as_micros() as u64).collect();
-                            tracing::debug!(?levels_us, "GPU kernel time per level");
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let levels_us: Vec<u64> =
+                                    levels.iter().map(|d| d.as_micros() as u64).collect();
+                                tracing::debug!(?levels_us, "GPU kernel time per level");
+                            }
                         }
                         Err(TimerError::Unusable) => {
                             tracing::debug!("GPU kernel timestamps unusable for this tile");
@@ -1276,8 +1283,25 @@ mod inner {
                         // Its buffer may still be mapped or pending: never
                         // used again. Kernel timing stays off until the
                         // resources are made again (after a failed tile).
+                        // Logged at warn the first time only: a driver that
+                        // never maps the timer's buffer would otherwise warn
+                        // after every failed tile.
                         Err(TimerError::Unmapped(reason)) => {
-                            tracing::debug!(%reason, "GPU kernel timer dropped");
+                            *timer_drops += 1;
+                            if *timer_drops == 1 {
+                                tracing::warn!(
+                                    %reason,
+                                    "GPU kernel timer dropped: its readback did not map; \
+                                     no kernel time until the GPU resources are made \
+                                     again after a failed tile (reported once)"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    %reason,
+                                    drops = *timer_drops,
+                                    "GPU kernel timer dropped"
+                                );
+                            }
                             drop_timer = true;
                         }
                     }

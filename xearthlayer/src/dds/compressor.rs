@@ -573,7 +573,9 @@ mod gpu {
 
         tracing::info!(
             adapter = %selected.adapter,
-            kernel_timing = !required_features.is_empty(),
+            // Whether the worker can build its kernel timer: timestamp
+            // queries and a usable timestamp period (#476).
+            kernel_timing = crate::dds::gpu_timestamps::KernelTimer::available(&device, &queue),
             "GPU resources initialized"
         );
 

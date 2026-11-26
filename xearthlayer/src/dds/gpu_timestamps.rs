@@ -32,6 +32,14 @@ pub fn requested_features(adapter: wgpu::Features) -> wgpu::Features {
     adapter & wgpu::Features::TIMESTAMP_QUERY
 }
 
+/// `period_ns` (`Queue::get_timestamp_period`) when ticks can be turned
+/// into time with it: a positive finite number of nanoseconds per tick.
+/// Shared by [`KernelTimer::new`], which builds no timer on a device whose
+/// period fails it, and [`kernel_durations`].
+fn usable_period(period_ns: f32) -> Option<f32> {
+    (period_ns.is_finite() && period_ns > 0.0).then_some(period_ns)
+}
+
 /// Each dispatch's kernel time from its pass's resolved timestamps.
 ///
 /// `ticks` holds a begin and an end timestamp per dispatch, in that order
@@ -39,29 +47,36 @@ pub fn requested_features(adapter: wgpu::Features) -> wgpu::Features {
 /// `period_ns` is nanoseconds per tick (`Queue::get_timestamp_period`).
 ///
 /// `None` when the figures cannot be trusted: no dispatch, an odd count, a
-/// period that is not a positive finite number, an end before its begin
-/// (a counter that wrapped or was reset), or a pair of zeros (a driver
-/// that wrote nothing). One bad pair spoils the tile's sum, so the whole
-/// tile is `None` rather than a figure that leaves a level out.
-pub fn kernel_durations(ticks: &[u64], period_ns: f32) -> Option<Vec<Duration>> {
-    if ticks.is_empty()
-        || !ticks.len().is_multiple_of(2)
-        || !period_ns.is_finite()
-        || period_ns <= 0.0
-    {
+/// period that is not a positive finite number ([`usable_period`]), a zero
+/// tick (a query the GPU never wrote resolves to zero), an end before its
+/// begin (a counter that wrapped or was reset), or every dispatch taking
+/// no time at all: a tile's passes do real work, so a zero sum means a
+/// counter that did not advance, not a fast GPU. One dispatch of zero
+/// among others is kept: a 1 x 1 level can finish within one tick of a
+/// coarse counter. One bad pair spoils the tile's sum, so the whole tile
+/// is `None` rather than a figure that leaves a level out.
+///
+/// A difference too large for `u64` nanoseconds saturates at
+/// `u64::MAX` ns rather than wrapping: a figure that absurd is still
+/// visibly wrong in the log, where a wrapped one could pass for real.
+fn kernel_durations(ticks: &[u64], period_ns: f32) -> Option<Vec<Duration>> {
+    let period_ns = usable_period(period_ns)?;
+    if ticks.is_empty() || !ticks.len().is_multiple_of(2) {
         return None;
     }
-    ticks
+    let durations = ticks
         .chunks_exact(2)
         .map(|pair| {
             let (begin, end) = (pair[0], pair[1]);
-            if end < begin || (begin == 0 && end == 0) {
+            if begin == 0 || end == 0 || end < begin {
                 return None;
             }
+            // `as u64` from f64 saturates (and is never negative here).
             let nanos = ((end - begin) as f64 * f64::from(period_ns)).round();
             Some(Duration::from_nanos(nanos as u64))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    durations.iter().any(|d| !d.is_zero()).then_some(durations)
 }
 
 /// A timestamp query set for up to `capacity` dispatches, with the buffers
@@ -84,15 +99,25 @@ pub enum TimerError {
     /// timer must not be used again, as its buffer may still be mapped or
     /// pending.
     Unmapped(String),
-    /// The ticks were read but are unusable ([`kernel_durations`]). The
-    /// timer can be used again.
+    /// The ticks were read but are unusable (a zero tick, an end before
+    /// its begin, or no time at all). The timer can be used again.
     Unusable,
 }
 
 impl KernelTimer {
+    /// Whether a timer can be built on `device`: it has timestamp queries
+    /// and `queue` reports a usable period, a positive finite number of
+    /// nanoseconds per tick. What the
+    /// GPU's startup line reports as `kernel_timing`.
+    pub fn available(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+        device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            && usable_period(queue.get_timestamp_period()).is_some()
+    }
+
     /// A timer for `capacity` dispatches on `device`, or `None` when the
-    /// device has no timestamp queries or `capacity` is zero or past what
-    /// one query set holds.
+    /// device has no timestamp queries, `queue`'s timestamp period is not a
+    /// positive finite number, or `capacity` is zero or past what one query
+    /// set holds.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, capacity: u32) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
             || capacity == 0
@@ -100,6 +125,7 @@ impl KernelTimer {
         {
             return None;
         }
+        let period_ns = usable_period(queue.get_timestamp_period())?;
         let queries = 2 * capacity;
         let bytes = u64::from(queries) * TICK_BYTES;
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -124,7 +150,7 @@ impl KernelTimer {
             resolve,
             readback,
             capacity,
-            period_ns: queue.get_timestamp_period(),
+            period_ns,
         })
     }
 
@@ -255,14 +281,49 @@ mod tests {
     fn a_fractional_period_rounds_to_the_nearest_nanosecond() {
         // Some Intel and Apple drivers report non-integer periods.
         assert_eq!(
-            kernel_durations(&[0, 3], 83.333_336),
+            kernel_durations(&[1, 4], 83.333_336),
             Some(vec![Duration::from_nanos(250)])
         );
     }
 
     #[test]
-    fn a_dispatch_that_ends_where_it_begins_took_no_time() {
-        assert_eq!(kernel_durations(&[7, 7], 1.0), Some(vec![Duration::ZERO]));
+    fn a_dispatch_that_ends_where_it_begins_took_no_time_beside_others() {
+        // A 1 x 1 level within one tick of a coarse counter.
+        assert_eq!(
+            kernel_durations(&[1, 9, 7, 7], 1.0),
+            Some(vec![Duration::from_nanos(8), Duration::ZERO])
+        );
+    }
+
+    #[test]
+    fn a_tile_whose_passes_all_took_no_time_has_no_figure() {
+        // A counter that did not advance, not a fast GPU.
+        assert_eq!(kernel_durations(&[7, 7], 1.0), None);
+        assert_eq!(kernel_durations(&[7, 7, 9, 9], 10.0), None);
+    }
+
+    #[test]
+    fn a_difference_past_u64_nanoseconds_saturates() {
+        // (u64::MAX - 1) ticks of 10 ns: past u64::MAX ns, which it stops at
+        // rather than wrapping to a small, plausible figure.
+        assert_eq!(
+            kernel_durations(&[1, u64::MAX], 10.0),
+            Some(vec![Duration::from_nanos(u64::MAX)])
+        );
+        // Summed over a whole chain it still fits a Duration.
+        let ticks: Vec<u64> = (0..13).flat_map(|_| [1, u64::MAX]).collect();
+        let total: Duration = kernel_durations(&ticks, 10.0).unwrap().iter().sum();
+        assert_eq!(total, Duration::from_nanos(u64::MAX) * 13);
+    }
+
+    #[test]
+    fn a_period_is_usable_only_when_positive_and_finite() {
+        assert_eq!(usable_period(1.0), Some(1.0));
+        assert_eq!(usable_period(83.333_336), Some(83.333_336));
+        assert_eq!(usable_period(f32::MIN_POSITIVE), Some(f32::MIN_POSITIVE));
+        for period in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(usable_period(period), None, "{period}");
+        }
     }
 
     #[test]
@@ -272,8 +333,10 @@ mod tests {
         assert_eq!(kernel_durations(&[1, 2, 3], 1.0), None);
         // An end before its begin: the counter wrapped or was reset.
         assert_eq!(kernel_durations(&[1, 2, 10, 9], 1.0), None);
-        // A pair of zeros: the driver wrote nothing.
+        // A zero tick: a query the GPU never wrote, at either end.
         assert_eq!(kernel_durations(&[1, 2, 0, 0], 1.0), None);
+        assert_eq!(kernel_durations(&[1, 2, 0, 5], 1.0), None);
+        assert_eq!(kernel_durations(&[1, 2, 5, 0], 1.0), None);
         // A period that is not a positive finite number.
         for period in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             assert_eq!(kernel_durations(&[1, 2], period), None, "{period}");

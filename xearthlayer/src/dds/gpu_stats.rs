@@ -98,9 +98,22 @@ impl GpuSample {
     }
 
     /// What the sample line says of the kernel time (#476): `timestamps`
-    /// when tiles carried one, `unavailable` when tiles were encoded and
-    /// none did (no timestamp queries on the device), `no tiles` when
-    /// nothing was encoded.
+    /// when tiles carried one, `no tiles` when nothing was encoded, and
+    /// `unavailable` when tiles were encoded and none carried one, for any
+    /// of these causes:
+    ///
+    /// - the device has no timestamp queries
+    ///   (`wgpu::Features::TIMESTAMP_QUERY` not offered by the adapter);
+    /// - the queue's timestamp period is not a positive finite number, so
+    ///   no timer is built (`KernelTimer::new`);
+    /// - the timer was dropped after its readback did not map
+    ///   (`TimerError::Unmapped`), and no tile since failed, which would
+    ///   have made the resources, and a timer, again;
+    /// - every tile's ticks were unusable (`TimerError::Unusable`: a zero
+    ///   tick, an end before its begin, or no time at all).
+    ///
+    /// The last two can also leave only some tiles timed:
+    /// `gpu_kernel_tiles` on the sample line counts the tiles that were.
     pub fn kernel_timing(&self) -> &'static str {
         match (self.gpu_kernel, self.tiles()) {
             (Some(_), _) => "timestamps",
@@ -246,6 +259,8 @@ impl GpuEncodeStats {
         let (gpu_p50_ms, gpu_p95_ms, gpu_max_ms) = fig(s.gpu);
         // Zero, with `gpu_kernel` saying why, when no tile had one.
         let (gpu_kernel_p50_ms, gpu_kernel_p95_ms, gpu_kernel_max_ms) = fig(s.gpu_kernel);
+        // The tiles that carried a kernel time, of `tiles`.
+        let gpu_kernel_tiles = s.gpu_kernel.map_or(0, |k| k.count as u64);
         let (readback_p50_ms, readback_p95_ms, readback_max_ms) = fig(s.readback);
         let (process_p50_ms, process_p95_ms, process_max_ms) = fig(s.process);
         tracing::info!(
@@ -278,6 +293,7 @@ impl GpuEncodeStats {
             gpu_p95_ms,
             gpu_max_ms,
             gpu_kernel = s.kernel_timing(),
+            gpu_kernel_tiles,
             gpu_kernel_p50_ms,
             gpu_kernel_p95_ms,
             gpu_kernel_max_ms,
@@ -543,6 +559,7 @@ mod tests {
             ("upload_max_ms", "3.0"),
             ("gpu_p50_ms", "4.0"),
             ("gpu_kernel", "\"timestamps\""),
+            ("gpu_kernel_tiles", "1"),
             ("gpu_kernel_p50_ms", "2.5"),
             ("gpu_kernel_max_ms", "2.5"),
             ("readback_p50_ms", "5.0"),
@@ -566,8 +583,34 @@ mod tests {
             .expect("a sample line");
         for (field, value) in [
             ("gpu_kernel", "\"unavailable\""),
+            ("gpu_kernel_tiles", "0"),
             ("gpu_kernel_p50_ms", "0.0"),
             ("gpu_p50_ms", "4.0"),
+        ] {
+            assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
+        }
+    }
+
+    /// When only some tiles carried a kernel time, the line counts them
+    /// beside the tiles, so the percentiles are read against the tiles
+    /// they cover (#476).
+    #[test]
+    fn the_sample_line_counts_the_tiles_that_carried_a_kernel_time() {
+        let stats = GpuEncodeStats::default();
+        stats.record_encoded(&timing(1), ms(16));
+        stats.record_encoded(&untimed(2), ms(31));
+        stats.record_encoded(&timing(3), ms(40));
+
+        let events = capture_events(|| stats.log_sample(GpuLane::Demand, &SharedGpuHealth::new()));
+        let line = events
+            .iter()
+            .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
+            .expect("a sample line");
+        for (field, value) in [
+            ("tiles", "3"),
+            ("gpu_kernel", "\"timestamps\""),
+            ("gpu_kernel_tiles", "2"),
+            ("gpu_kernel_max_ms", "7.5"),
         ] {
             assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
         }
