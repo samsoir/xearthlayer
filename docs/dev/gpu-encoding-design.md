@@ -257,7 +257,7 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 | `downsample` | CPU mip generation (`MipmapStream`, which works one level ahead) and the padding of the sub-block tail |
 | `upload` | The tile's output and readback buffers, each level's texture and `queue.write_texture` |
 | `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included. It also holds wgpu's copy from staging into the textures, which runs inside the submission |
-| `gpu_kernel` | The BC1 compute passes alone, from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476), summed over the tile's levels. Present only where the adapter offers `TIMESTAMP_QUERY`; the sample line says `gpu_kernel = timestamps`, `unavailable` or `no tiles` |
+| `gpu_kernel` | The BC1 compute passes alone, from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476), summed over the tile's levels. Present only where the adapter offers `TIMESTAMP_QUERY` with a usable timestamp period. The sample line gives `gpu_kernel_tiles` (how many of the window's tiles carried a kernel time) and `gpu_kernel = timestamps`, `unavailable` or `no tiles`; `unavailable` means no timestamp feature, an unusable period, the timer dropped after its buffer failed to map (warned once; it returns with the resources a failed tile rebuilds), or no usable ticks in the window |
 | `readback` | Receiving the map, copying out of the mapped range and growing the result `Vec` |
 | `process` | The processor's whole call, on the worker |
 | total | On the caller, from its send to the reply |
