@@ -152,9 +152,10 @@ impl MipmapGenerator {
     /// Works on the raw RGBA bytes, one output row at a time, each output
     /// pixel from a pair of pixels of each of its two source rows, with no
     /// per-pixel bounds checks (#389), in [`downsample_row`]. The output is
-    /// the only allocation. Cost of the whole chain of a 4096×4096 tile, one
-    /// thread, release build, Ryzen 7 9800X3D: about 14 ms, against 4.7 ms
-    /// for the stored-value average it replaced (`time_the_4096_mip_chain`).
+    /// the only allocation. Cost of the whole chain of a 4096×4096 tile in
+    /// this allocating form, one thread, release build, glibc's default
+    /// malloc, Ryzen 7 9800X3D: about 14 ms, against 4.7 ms for the
+    /// stored-value average it replaced (`time_the_4096_mip_chain`).
     ///
     /// The CPU backends, ISPC and software, run the same arithmetic through
     /// [`MipmapStream`] for every level of every tile, in place
@@ -189,17 +190,21 @@ impl MipmapGenerator {
     /// [`downsample_box_2x`](Self::downsample_box_2x), the same bytes,
     /// written over the start of the source's own buffer, which is cut to
     /// the new length (`truncate`, not `shrink_to_fit`: the buffer stays
-    /// held to the end of the chain, so a chain's peak is level 0 alone
-    /// instead of level 0 and level 1, and no level after the first is a
-    /// fresh allocation).
+    /// held to the end of the chain, so a chain holds level 0's buffer
+    /// instead of level 0 and level 1, and no level gets a buffer of its
+    /// own). The one allocation is a copy of the first two source rows
+    /// (32 KiB for a 4096 level), for row 0.
     ///
     /// The point is the allocator, not the arithmetic. With
-    /// `M_MMAP_THRESHOLD` at 1 MiB (what XEarthLayer runs with, #227) every
-    /// level of 1 MiB and up (16, 4 and 1 MiB on a 4096 tile) was a new
-    /// mapping whose pages fault in on first write. Measured on real tiles
-    /// the chain fell from 16.2 to 17.4 ms to 13.1 to 13.6 ms, and stayed
-    /// at 13.2 to 13.9 ms with glibc's default malloc
-    /// (`time_the_4096_mip_chain`).
+    /// `M_MMAP_THRESHOLD` at 1 MiB (XEarthLayer's setting on glibc unless
+    /// the environment overrides it, #227) the buffers of levels 1 to 3 of a 4096 tile (16, 4 and 1 MiB)
+    /// were each a new mapping whose pages fault in on first write.
+    /// `time_the_4096_mip_chain` (a noise tile) with that threshold: 18.4 ms
+    /// allocating, 15.2 ms in place; with glibc's default malloc, which
+    /// serves the levels from the heap, 14.4 ms allocating and 15.2 ms in
+    /// place. Real tiles, the same filter in a benchmark outside this
+    /// repository: 16.2 to 17.4 ms down to 13.1 to 13.6 ms with the
+    /// threshold, 13.2 to 13.9 ms either way without it.
     ///
     /// Output row `y` is `out_row = 4 * (w / 2)` bytes at `y * out_row`; its
     /// source rows start at `2 * y * 4 * w`. Since `out_row <= 2 * w` (equal
@@ -327,7 +332,8 @@ impl MipmapStream {
 
     /// The next level, largest first: the source on the first call, then
     /// each half the size of the last. `None` after `count` levels, or when
-    /// the last was 1 wide or 1 high. The level is valid until the next call.
+    /// the last was not both wider and higher than 1. The level is valid
+    /// until the next call.
     pub fn next_level(&mut self) -> Option<&RgbaImage> {
         if self.remaining == 0 {
             return None;
@@ -821,7 +827,7 @@ mod tests {
     /// load. Run with `cargo test --release -p xearthlayer --lib
     /// time_the_4096_mip_chain -- --ignored --nocapture`. The in-place gain
     /// shows only with `MALLOC_MMAP_THRESHOLD_=1048576` in front of the
-    /// command, which is how XEarthLayer runs (#227): glibc's default
+    /// command, XEarthLayer's own setting on glibc (#227): glibc's default
     /// threshold adapts upward and serves the levels from the heap anyway.
     #[test]
     #[ignore]

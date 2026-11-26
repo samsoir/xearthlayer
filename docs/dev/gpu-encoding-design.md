@@ -86,7 +86,7 @@ pub enum CompressorBackend {
 }
 ```
 
-- `Image`: Fused `MipmapStream` loop -- iterate levels, compress each, drop immediately
+- `Image`: Fused `MipmapStream` loop -- borrow each level, compress it, build the next over it
 - `Mipmap`: Pass owned source image to GPU worker -- one channel round-trip per tile
 
 ### Channel-Based GPU Worker
@@ -316,8 +316,8 @@ Each lane has its own `GpuEncodeStats` and its own `GPU encode sample` line, wit
 ### MipmapStream
 
 `MipmapStream` lends one mipmap level at a time and builds each in the
-buffer of the previous one, so a chain never holds more than level 0's
-buffer:
+buffer of the previous one, so no level after the first gets a buffer of
+its own:
 
 ```rust
 impl MipmapStream {
@@ -329,8 +329,8 @@ impl MipmapStream {
 - Owns the source image; the first call lends it, each later call writes the
   next level over it (`MipmapGenerator::downsample_box_2x_in_place`)
 - The level is valid until the next call; it is not an `Iterator`
-- Memory footprint: the base image only (~64 MB for a 4096 tile), held until
-  the stream is dropped
+- Memory footprint: the base image's buffer (~64 MB for a 4096 tile), held
+  until the stream is dropped, plus a copy of two source rows per step
 
 ### GPU Path Zero-Clone
 
@@ -465,7 +465,7 @@ No changes to task, executor, or job code. The compressor is injected via the ex
 | `dds/gpu_channel.rs` | `GpuEncoderChannel` (implements `MipmapCompressor`), the worker loop (`spawn_tile_worker`), `TileProcessor` and `WgpuTileProcessor`, `GpuTileTiming` |
 | `dds/gpu_stats.rs` | `GpuEncodeStats`: stage windows, failures, queue depth, the `GPU encode sample` line |
 | `tests/gpu_pipeline_stress.rs` | Ignored GPU benchmark: lone tiles and bursts on the production chain, with the ISPC reference |
-| `dds/mipmap.rs` | `MipmapStream` iterator |
+| `dds/mipmap.rs` | `MipmapStream` (lends levels, built in place) |
 | `dds/encoder.rs` | `DdsEncoder`, `CompressorBackend` dispatch |
 | `service/builder.rs` | Compressor construction and wiring |
 | `config/keys.rs` | `TextureCompressor`, `TextureGpuDevice` config keys |

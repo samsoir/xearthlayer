@@ -204,9 +204,10 @@ light of every level of a 4096 chain within half a step of the source's. A
 sum of four whites (or of 1020 for alpha) averages to white, so opaque stays
 opaque.
 
-The whole 4096×4096 chain takes about 14 ms on one core (release build, Ryzen
-7 9800X3D, `time_the_4096_mip_chain`), against 4.7 ms for the stored-value
-average and about 42 ms for the ISPC encode of the tile. The CPU backends,
+The whole 4096×4096 chain takes about 14 to 15 ms on one core (release build,
+Ryzen 7 9800X3D, `time_the_4096_mip_chain`, glibc's default malloc; the table
+below), against 4.7 ms for the stored-value average and about 42 ms for the
+ISPC encode of the tile. The CPU backends,
 ISPC and software, use it through `MipmapStream`, and so does a GPU tile that
 falls back to ISPC.
 
@@ -215,34 +216,39 @@ falls back to ISPC.
 previous level's buffer (`MipmapGenerator::downsample_box_2x_in_place`, the
 same bytes as `downsample_box_2x`, one row routine, `downsample_row`, behind
 both). The buffer is truncated, not shrunk, so it is held to the end of the
-chain: the peak is level 0 alone, not level 0 and level 1. The reason is the
-allocator. XEarthLayer runs with `M_MMAP_THRESHOLD` at 1 MiB (#227), so every
-level of 1 MiB and up (16, 4 and 1 MiB) was a fresh mapping faulting in its
-pages. `time_the_4096_mip_chain` on a noise tile, median of 21 runs, same
+chain: the chain holds level 0's buffer, not level 0 and level 1, and no
+level gets a buffer of its own (each step copies its first two source rows,
+32 KiB for a 4096 level). The reason is the allocator. On glibc XEarthLayer
+sets `M_MMAP_THRESHOLD` to 1 MiB unless the environment overrides it (#227), so the buffers of levels 1 to 3
+(16, 4 and 1 MiB) were each a fresh mapping faulting in its pages. `time_the_4096_mip_chain` on a noise tile, median of 21 runs, same
 machine, one thread:
 
 | malloc | allocating | in place |
 |--------|-----------:|---------:|
 | glibc default | 14.4 ms | 15.2 ms |
-| `MALLOC_MMAP_THRESHOLD_=1048576` (as XEarthLayer runs) | 18.4 ms | 15.2 ms |
+| `MALLOC_MMAP_THRESHOLD_=1048576` (XEarthLayer's default on glibc) | 18.4 ms | 15.2 ms |
 
-On real tiles with the threshold set, the chain fell from 16.2 to 17.4 ms to
-13.1 to 13.6 ms. With glibc's default the allocating form was already at
-the in-place figure on real tiles (13.2 to 13.9 ms), and on the noise tile
-in place is a little slower (the first step, 4096 to 2048, is where it
-loses). Run the test with the variable set to see the gain. Figures of one
+On seven real tiles (Apple imagery, the same filter in a benchmark outside
+this repository) with the threshold set, the chain fell from 16.2 to 17.4 ms
+to 13.1 to 13.6 ms. With glibc's default the two forms were level on real
+tiles (13.2 to 13.9 ms), and on the noise tile in place is 0.8 ms slower (the
+test's 4096 to 2048 step: 11.1 ms allocating, 11.6 ms in place). Run the test
+with the variable set to see the gain. Figures of one
 machine are a reference, not a promise.
 
 **Measured and not built:**
 
 - Copying uniform 2×2 blocks instead of averaging them: on land tiles fewer
   than 2% of the blocks are uniform and the check costs about 10% there; only
-  water tiles (54 to 80% uniform blocks) gain.
+  water tiles gain (54 to 80% uniform blocks; 13.1 to 7.5 ms on the one with
+  80%).
 - A smaller encode table: 13% slower in an earlier measurement.
 - Folding the rounding into a 256 KiB encode table with a u32 decode table:
-  1 to 1.5 ms faster, not taken (one lever, a small change). The GPU worker builds its levels on the GPU with the same
-filter and the same two tables (`MipmapGenerator::FILTER`, `dds/gpu_mips.rs`),
-byte for byte, so this cost is not paid there.
+  1 to 1.5 ms faster, not taken (one lever, a small change).
+
+The GPU worker builds its levels on the GPU with the same filter and the same
+two tables (`MipmapGenerator::FILTER`, `dds/gpu_mips.rs`), byte for byte, so
+the CPU chain's cost is not paid there.
 Night lighting does not: its levels are averaged by `lit_chain` (see
 `night-lighting-design.md`), which averages each level from the f32 light of
 the whole level above and uses a 2.2
