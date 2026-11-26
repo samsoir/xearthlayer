@@ -388,6 +388,43 @@ pub fn ispc_bc1_parallel(image: &RgbaImage, pool: &rayon::ThreadPool) -> Vec<u8>
     out
 }
 
+/// The CPU the one-thread ISPC measurements run on (`XEL_BENCH_PIN_CPU`,
+/// default 1; `none` leaves them to the scheduler). Pinning keeps a
+/// comparison on one core type: on a hybrid CPU (this laptop's Zen 5 and
+/// Zen 5c cores, 5.2 and 3.3 GHz) the scheduler otherwise moves a thread
+/// to a slow core when the fast ones are busy, which alone costs half again.
+pub fn pin_cpu() -> Option<usize> {
+    match std::env::var("XEL_BENCH_PIN_CPU") {
+        Ok(v) if v == "none" => None,
+        Ok(v) => v.parse().ok(),
+        Err(_) => Some(1),
+    }
+}
+
+/// Runs `f` on a thread of its own, pinned to `cpu` when given, so that
+/// threads the caller spawns later do not inherit the pin.
+pub fn on_cpu<T: Send>(cpu: Option<usize>, f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                if let Some(cpu) = cpu {
+                    // SAFETY: a zeroed cpu_set_t is a valid empty set, and
+                    // CPU_SET and sched_setaffinity only touch it and the
+                    // calling thread (pid 0).
+                    unsafe {
+                        let mut set: libc::cpu_set_t = std::mem::zeroed();
+                        libc::CPU_SET(cpu, &mut set);
+                        let ok = libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set);
+                        assert_eq!(ok, 0, "pinning to CPU {cpu}");
+                    }
+                }
+                f()
+            })
+            .join()
+            .expect("the pinned thread")
+    })
+}
+
 /// The median of `samples` (sorted in place).
 pub fn median(samples: &mut [Duration]) -> Duration {
     samples.sort();

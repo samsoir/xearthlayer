@@ -95,6 +95,8 @@ struct KernelRun {
     /// Per level: size, blocks, median kernel time.
     levels: Vec<(u32, u64, Duration)>,
     level0: (f64, f64),
+    /// Blocks of the whole chain byte for byte ISPC's, and all blocks.
+    same_as_ispc: (u64, u64),
     chain: (f64, f64),
 }
 
@@ -118,6 +120,11 @@ impl KernelRun {
             self.chain.1,
             self.chain.0,
         );
+        eprintln!(
+            "      blocks identical to ISPC's: {:.2}% of {}",
+            100.0 * self.same_as_ispc.0 as f64 / self.same_as_ispc.1 as f64,
+            self.same_as_ispc.1
+        );
     }
 
     fn print_levels(&self) {
@@ -140,7 +147,6 @@ impl KernelRun {
 }
 
 struct Native {
-    module: wgpu::ShaderModule,
     fit: wgpu::ComputePipeline,
     refine: wgpu::ComputePipeline,
 }
@@ -155,11 +161,7 @@ impl Native {
             });
         let fit = pipeline(gpu, &module, "bc1_fit");
         let refine = pipeline(gpu, &module, "bc1_fit_refine");
-        Self {
-            module,
-            fit,
-            refine,
-        }
+        Self { fit, refine }
     }
 }
 
@@ -219,6 +221,13 @@ fn run_kernel(
         };
         run.levels.push((w, blocks, median(&mut times)));
         let bytes = gpu.read(&out, blocks * 8);
+        let ispc = ispc_bc1(level);
+        run.same_as_ispc.0 += bytes
+            .chunks_exact(8)
+            .zip(ispc.chunks_exact(8))
+            .filter(|(a, b)| a == b)
+            .count() as u64;
+        run.same_as_ispc.1 += blocks;
         let decoded = decode_bc1(&bytes, w, h);
         let (s, c) = sq_error(level, &decoded);
         if i == 0 {
@@ -227,7 +236,6 @@ fn run_kernel(
         sum += s;
         n += c;
     }
-    let _ = &native.module;
     run.chain = psnr_of(sum, n);
     run
 }
@@ -251,8 +259,11 @@ fn bc1_kernels_throughput_and_quality() {
         eprintln!("\n== ISPC BC1 on {name} ==");
         let level0 = &levels[0];
         let b0 = blocks_of(level0) as f64;
-        let one = time_median(5, || {
-            std::hint::black_box(ispc_bc1(level0));
+        let pin = pin_cpu();
+        let one = on_cpu(pin, || {
+            time_median(5, || {
+                std::hint::black_box(ispc_bc1(level0));
+            })
         });
         let all = time_median(10, || {
             std::hint::black_box(ispc_bc1_parallel(level0, &pool));
@@ -262,10 +273,12 @@ fn bc1_kernels_throughput_and_quality() {
             ispc_bc1_parallel(level0, &pool),
             "strips encode the same blocks"
         );
-        let chain_one = time_median(5, || {
-            for l in levels {
-                std::hint::black_box(ispc_bc1(l));
-            }
+        let chain_one = on_cpu(pin, || {
+            time_median(5, || {
+                for l in levels {
+                    std::hint::black_box(ispc_bc1(l));
+                }
+            })
         });
         let total_blocks: u64 = levels.iter().map(blocks_of).sum();
         let (mut sum, mut n) = (0.0, 0.0);
@@ -281,7 +294,7 @@ fn bc1_kernels_throughput_and_quality() {
         }
         let chain_err = psnr_of(sum, n);
         eprintln!(
-            "  ISPC 1 thread            level 0: {:>8.3} ms {:>8.1} M blocks/s | chain: {:>8.3} ms {:>8.1} M blocks/s",
+            "  ISPC 1 thread (CPU {pin:?})  level 0: {:>8.3} ms {:>8.1} M blocks/s | chain: {:>8.3} ms {:>8.1} M blocks/s",
             ms(one),
             b0 / one.as_secs_f64() / 1e6,
             ms(chain_one),

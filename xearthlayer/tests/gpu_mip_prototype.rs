@@ -311,21 +311,25 @@ fn gpu_mip_chain_against_the_cpu_chain() {
     let images = test_images();
 
     // The CPU chain on one thread, as the GPU worker runs it today.
-    eprintln!("\n== CPU chain, one thread ==");
+    let pin = pin_cpu();
+    eprintln!("\n== CPU chain, one thread (pinned to CPU {pin:?}) ==");
     for (name, img) in &images {
-        let mut samples = Vec::new();
-        for _ in 0..11 {
-            let source = img.clone();
-            let t = Instant::now();
-            let levels: usize = MipmapStream::new(source, 13)
-                .map(|l| l.width() as usize)
-                .sum();
-            samples.push(t.elapsed());
-            std::hint::black_box(levels);
-        }
-        let stored = median(&mut samples[1..].to_vec());
-        let linear = time_median(2, || {
-            std::hint::black_box(linear_chain(img, 13, &tables));
+        let (stored, linear) = on_cpu(pin, || {
+            let mut samples = Vec::new();
+            for _ in 0..11 {
+                let source = img.clone();
+                let t = Instant::now();
+                let levels: usize = MipmapStream::new(source, 13)
+                    .map(|l| l.width() as usize)
+                    .sum();
+                samples.push(t.elapsed());
+                std::hint::black_box(levels);
+            }
+            let stored = median(&mut samples[1..].to_vec());
+            let linear = time_median(2, || {
+                std::hint::black_box(linear_chain(img, 13, &tables));
+            });
+            (stored, linear)
         });
         eprintln!(
             "  {name}: stored-value chain (MipmapStream) {:.2} ms; linear-light reference \
@@ -411,33 +415,63 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             }
         }
 
-        // The upload: level 0 into a storage buffer, against every level
-        // into textures as production does now. Wall time from the queued
-        // write (wgpu's staging copy) to the end of the wait.
+        // The upload: level 0 alone, against every level into textures as
+        // production does now. Each split in two: the queued write, which
+        // copies into a wgpu staging buffer on the CPU (production's
+        // `upload` stage), and the submit and wait that follow, in which
+        // the GPU copies the staging buffer into place (inside production's
+        // `gpu` stage). An empty submit and wait is the round trip's floor.
         let img = &images[0].1;
-        let level0 = time_median(10, || {
-            chain.upload(&gpu, img);
-            gpu.submit_wait(gpu.device.create_command_encoder(&Default::default()));
-        });
         let cpu = MipmapGenerator::generate_chain_with_count(img, 13);
         let padded: Vec<RgbaImage> = cpu.iter().map(pad_to_blocks).collect();
         let textures: Vec<(wgpu::Texture, wgpu::TextureView)> =
             padded.iter().map(|l| gpu.texture(l)).collect();
-        let every = time_median(10, || {
+        let split = |write: &dyn Fn()| -> (Duration, Duration) {
+            let (mut writes, mut waits) = (Vec::new(), Vec::new());
+            for i in 0..11 {
+                let t = Instant::now();
+                write();
+                let w = t.elapsed();
+                let s = gpu.submit_wait(gpu.device.create_command_encoder(&Default::default()));
+                if i > 0 {
+                    writes.push(w);
+                    waits.push(s);
+                }
+            }
+            (median(&mut writes), median(&mut waits))
+        };
+        let empty = time_median(20, || {
+            gpu.submit_wait(gpu.device.create_command_encoder(&Default::default()));
+        });
+        let buffer0 = split(&|| chain.upload(&gpu, img));
+        let texture0 = split(&|| gpu.write_texture(&textures[0].0, &padded[0]));
+        let every = split(&|| {
             for (l, (t, _)) in padded.iter().zip(&textures) {
                 gpu.write_texture(t, l);
             }
-            gpu.submit_wait(gpu.device.create_command_encoder(&Default::default()));
         });
-        let bytes = |v: &[RgbaImage]| v.iter().map(|l| l.as_raw().len()).sum::<usize>() as f64;
+        let mib =
+            |v: &[RgbaImage]| v.iter().map(|l| l.as_raw().len()).sum::<usize>() as f64 / 1048576.0;
         eprintln!(
-            "  upload: level 0 into a buffer {:.2} MiB in {:.2} ms; every level into textures \
-             {:.2} MiB in {:.2} ms",
-            img.as_raw().len() as f64 / 1048576.0,
-            ms(level0),
-            bytes(&padded) / 1048576.0,
-            ms(every)
+            "  upload (queued write on the CPU + submit and wait; empty submit and wait {:.3} ms):",
+            ms(empty)
         );
+        for (what, size, (w, s)) in [
+            ("level 0 into a storage buffer", mib(&padded[..1]), buffer0),
+            ("level 0 into a texture", mib(&padded[..1]), texture0),
+            (
+                "every level into textures (production)",
+                mib(&padded),
+                every,
+            ),
+        ] {
+            eprintln!(
+                "    {what:<40} {size:>6.2} MiB: write {:.2} ms + submit/wait {:.2} ms = {:.2} ms",
+                ms(w),
+                ms(s),
+                ms(w + s)
+            );
+        }
         eprintln!(
             "  NVIDIA state after: {}",
             nvidia_state().unwrap_or_else(|| "-".into())

@@ -26,8 +26,10 @@
 //!
 //! Besides `XEL_BENCH_GPUS` (see `support/gpu_bench.rs`):
 //! `XEL_BENCH_LONE` lone tiles per device (default 20),
-//! `XEL_BENCH_BURST` tiles per burst (default 32) and `XEL_BENCH_BURSTS`
-//! bursts back to back (default 3).
+//! `XEL_BENCH_BURST` tiles per burst (default 32), `XEL_BENCH_BURSTS`
+//! bursts back to back (default 3) and `XEL_BENCH_STREAM_POOL` images
+//! cloned beforehand for the GPU's stream while ISPC is timed (default 96,
+//! 6 GiB). Images are always cloned before they are timed.
 
 #[path = "support/gpu_bench.rs"]
 #[allow(dead_code)]
@@ -135,11 +137,13 @@ fn run_burst(
     (start.elapsed(), latencies)
 }
 
-/// `n` tiles one at a time on the calling thread: each tile's latency.
+/// `n` tiles one at a time on the calling thread: each tile's latency. The
+/// images are cloned first, so no copy runs between the tiles.
 fn run_lone(encoder: &DdsEncoder, source: &RgbaImage, n: usize) -> Vec<Duration> {
-    (0..n)
-        .map(|_| {
-            let img = source.clone();
+    let images: Vec<RgbaImage> = (0..n).map(|_| source.clone()).collect();
+    images
+        .into_iter()
+        .map(|img| {
             let t = Instant::now();
             encoder.encode(img).expect("the tile encodes");
             t.elapsed()
@@ -179,29 +183,35 @@ fn calibrate_the_encode_pipelines() {
 
     // ISPC first, on an idle machine.
     let ispc = ispc_encoder();
-    run_lone(&ispc, &source, 2);
-    let lone = run_lone(&ispc, &source, lone_n);
+    let pin = pin_cpu();
+    let lone = on_cpu(pin, || {
+        run_lone(&ispc, &source, 2);
+        run_lone(&ispc, &source, lone_n)
+    });
     let idle_lone = summary(&lone);
-    eprintln!("\n== ISPC, one thread ==");
+    eprintln!("\n== ISPC, one thread (pinned to CPU {pin:?}) ==");
     eprintln!("  lone tile  {}", fig(idle_lone));
-    // Its parts, on one thread: the CPU chain and the BC1 of its levels.
-    let chain = time_median(10, || {
-        let n: u32 = MipmapStream::new(source.clone(), LEVELS)
-            .map(|l| l.width())
-            .sum();
-        std::hint::black_box(n);
-    });
-    let clone = time_median(10, || {
-        std::hint::black_box(source.clone());
-    });
+    // Its parts, on the same core: the CPU chain and the BC1 of its levels.
     let levels: Vec<RgbaImage> = MipmapGenerator::generate_chain_with_count(&source, LEVELS)
         .iter()
         .map(pad_to_blocks)
         .collect();
-    let bc1 = time_median(10, || {
-        for l in &levels {
-            std::hint::black_box(ispc_bc1(l));
-        }
+    let (chain, clone, bc1) = on_cpu(pin, || {
+        let chain = time_median(10, || {
+            let n: u32 = MipmapStream::new(source.clone(), LEVELS)
+                .map(|l| l.width())
+                .sum();
+            std::hint::black_box(n);
+        });
+        let clone = time_median(10, || {
+            std::hint::black_box(source.clone());
+        });
+        let bc1 = time_median(10, || {
+            for l in &levels {
+                std::hint::black_box(ispc_bc1(l));
+            }
+        });
+        (chain, clone, bc1)
     });
     eprintln!(
         "  parts: chain (MipmapStream) {:.2} ms, net of the image clone the test makes ({:.2} ms); \
@@ -218,6 +228,41 @@ fn calibrate_the_encode_pipelines() {
         tiles_per_s: one_thread_rate,
         stages: None,
     });
+
+    // The control for the measurement under each GPU below: ISPC on the
+    // same core while one thread does the GPU worker's CPU work with no
+    // GPU, back to back: the chain and an 85.33 MiB copy per tile
+    // (`generate_chain_with_count` copies level 0 and keeps a copy of each
+    // level, as `write_texture` copies every level into staging). Any
+    // slowdown here is the CPU side's, not the GPU's.
+    {
+        let stop = AtomicBool::new(false);
+        let done = AtomicUsize::new(0);
+        let (lone, wall, during) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::black_box(MipmapGenerator::generate_chain_with_count(
+                        &source, LEVELS,
+                    ));
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let started = done.load(Ordering::Relaxed);
+            let t = Instant::now();
+            let lone = on_cpu(pin, || run_lone(&ispc, &source, lone_n));
+            let wall = t.elapsed();
+            let during = done.load(Ordering::Relaxed) - started;
+            stop.store(true, Ordering::Relaxed);
+            (lone, wall, during)
+        });
+        eprintln!(
+            "  control: ISPC lone tile {} while one thread does the GPU worker's CPU work \
+             without a GPU ({:.1} tiles/s)",
+            fig(summary(&lone)),
+            during as f64 / wall.as_secs_f64()
+        );
+    }
 
     eprintln!("\n== ISPC, {threads} threads ==");
     let images: Vec<RgbaImage> = (0..threads * 4).map(|_| source.clone()).collect();
@@ -302,14 +347,24 @@ fn calibrate_the_encode_pipelines() {
         });
 
         // ISPC on one thread while the GPU encodes a steady stream: four
-        // callers keep the GPU's queue from running dry.
+        // callers keep the GPU's queue from running dry. Their images are
+        // cloned beforehand, so the only CPU work beside ISPC is the GPU
+        // path's own (the worker's downsample, upload and readback).
+        let pool = std::sync::Mutex::new(
+            (0..env_or("XEL_BENCH_STREAM_POOL", 96usize))
+                .map(|_| source.clone())
+                .collect::<Vec<_>>(),
+        );
         let stop = AtomicBool::new(false);
         let streamed = AtomicUsize::new(0);
         let (cpu_under_load, stream_wall) = std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
-                        encoder.encode(source.clone()).expect("the tile encodes");
+                        let Some(img) = pool.lock().unwrap().pop() else {
+                            break;
+                        };
+                        encoder.encode(img).expect("the tile encodes");
                         streamed.fetch_add(1, Ordering::Relaxed);
                     }
                 });
@@ -319,14 +374,22 @@ fn calibrate_the_encode_pipelines() {
             let _ = take(&stats);
             let started = streamed.load(Ordering::Relaxed);
             let t_cpu = Instant::now();
-            let lone = run_lone(&ispc, &source, lone_n);
+            let lone = on_cpu(pin, || run_lone(&ispc, &source, lone_n));
             let cpu_wall = t_cpu.elapsed();
             let during = streamed.load(Ordering::Relaxed) - started;
             stop.store(true, Ordering::Relaxed);
             (lone, (during, cpu_wall))
         });
         let (during, cpu_wall) = stream_wall;
-        eprintln!("  ISPC one thread while this GPU encodes:");
+        let left = pool.lock().unwrap().len();
+        eprintln!(
+            "  ISPC one thread while this GPU encodes{}:",
+            if left == 0 {
+                " (the stream's images ran out before the end: raise XEL_BENCH_STREAM_POOL)"
+            } else {
+                ""
+            }
+        );
         eprintln!(
             "    ISPC lone tile {} (idle: {})",
             fig(summary(&cpu_under_load)),
