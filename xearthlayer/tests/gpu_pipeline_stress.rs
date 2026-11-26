@@ -127,19 +127,22 @@ mod gpu_stress {
 
     fn print_sample(title: &str, s: &GpuSample) {
         eprintln!(
-            "{title}: tiles={} (unsampled {}) failed={} fallback={} depth_now={} depth_max={}",
+            "{title}: tiles={} (unsampled {}) failed={} fallback={} depth_now={} depth_max={} \
+             kernel timing: {}",
             s.tiles(),
             s.unsampled,
             s.failed,
             s.fallback,
             s.depth_now,
-            s.depth_max
+            s.depth_max,
+            s.kernel_timing()
         );
         for (name, stage) in [
             ("queue_wait", s.queue_wait),
             ("downsample", s.downsample),
             ("upload", s.upload),
             ("gpu", s.gpu),
+            ("gpu_kernel", s.gpu_kernel),
             ("readback", s.readback),
             ("process", s.process),
             ("total", s.total),
