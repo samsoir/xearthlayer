@@ -313,25 +313,24 @@ Each lane has its own `GpuEncodeStats` and its own `GPU encode sample` line, wit
 
 ## Memory Optimization
 
-### MipmapStream Iterator
+### MipmapStream
 
-`MipmapStream` yields one mipmap level at a time, eliminating intermediate clones:
+`MipmapStream` lends one mipmap level at a time and builds each in the
+buffer of the previous one, so a chain never holds more than level 0's
+buffer:
 
 ```rust
-pub struct MipmapStream {
-    base: RgbaImage,
-    current_level: u8,
-}
-
-impl Iterator for MipmapStream {
-    type Item = (u8, RgbaImage);
+impl MipmapStream {
+    pub fn new(image: RgbaImage, count: usize) -> Self;
+    pub fn next_level(&mut self) -> Option<&RgbaImage>;
 }
 ```
 
-- Stores only base image + downsampling state
-- Each `next()` yields one level with no clones
-- Memory footprint: ~64 MB (base) + ~32 MB (current level) max
-- Proper cleanup in `Drop` if iteration is interrupted early
+- Owns the source image; the first call lends it, each later call writes the
+  next level over it (`MipmapGenerator::downsample_box_2x_in_place`)
+- The level is valid until the next call; it is not an `Iterator`
+- Memory footprint: the base image only (~64 MB for a 4096 tile), held until
+  the stream is dropped
 
 ### GPU Path Zero-Clone
 

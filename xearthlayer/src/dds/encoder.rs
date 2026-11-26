@@ -294,8 +294,10 @@ impl DdsEncoder {
     /// (#393: grown by appending, a 4096 tile held 16 MiB for 10.67 MiB,
     /// and every level was compressed to a buffer of its own and copied).
     ///
-    /// Each mipmap level is generated, compressed, and dropped before the
-    /// next is produced — only one uncompressed level lives in memory at a time.
+    /// Each mipmap level is built over the previous one in the source's own
+    /// buffer and compressed before the next is built, so only one
+    /// uncompressed level lives in memory at a time, in the one buffer of
+    /// level 0.
     fn encode_mipmap_stream(
         &self,
         compressor: &dyn ImageCompressor,
@@ -444,16 +446,16 @@ impl DdsEncoder {
 /// zeros.
 pub(crate) fn compress_chain_into(
     compressor: &dyn ImageCompressor,
-    levels: impl Iterator<Item = RgbaImage>,
+    mut levels: MipmapStream,
     format: DdsFormat,
     payload: &mut [u8],
 ) -> Result<(), DdsError> {
     let mut slots = LevelSlots::new(payload, format);
-    for level in levels {
+    while let Some(level) = levels.next_level() {
         let (width, height) = level.dimensions();
         let slot = slots.next(width, height)?;
         let len = slot.len();
-        compress_level_into(compressor, &level, format, slot)?;
+        compress_level_into(compressor, level, format, slot)?;
 
         debug!(
             level = slots.written() - 1,
@@ -463,7 +465,7 @@ pub(crate) fn compress_chain_into(
             compressed_bytes = len,
             "Compressed mipmap level"
         );
-        // `level` dropped here — memory reclaimed before next iteration
+        // The next level is built over this one.
     }
     slots.finish()
 }
@@ -821,8 +823,9 @@ mod tests {
             ) -> Result<ChainOutcome, DdsError> {
                 let sw = SoftwareCompressor;
                 let mut offset = crate::dds::layout::HEADER_LEN;
-                for level in MipmapStream::new(image, mipmap_count) {
-                    let compressed = sw.compress(&level, format)?;
+                let mut levels = MipmapStream::new(image, mipmap_count);
+                while let Some(level) = levels.next_level() {
+                    let compressed = sw.compress(level, format)?;
                     output[offset..offset + compressed.len()].copy_from_slice(&compressed);
                     offset += compressed.len();
                 }
@@ -1078,8 +1081,9 @@ mod tests {
         let (width, height) = image.dimensions();
         let count = layout::chain_levels(width, height, requested);
         let mut output = DdsHeader::new(width, height, count, DdsFormat::BC1).to_bytes();
-        for level in MipmapStream::new(image, count as usize) {
-            output.extend_from_slice(&compress_level(kernel, &level, DdsFormat::BC1).unwrap());
+        let mut levels = MipmapStream::new(image, count as usize);
+        while let Some(level) = levels.next_level() {
+            output.extend_from_slice(&compress_level(kernel, level, DdsFormat::BC1).unwrap());
         }
         output
     }
@@ -1199,9 +1203,11 @@ mod tests {
     fn a_chain_that_fills_the_payload_is_its_levels_in_order() {
         let mut payload = vec![0; layout::chain_len(16, 16, 3, DdsFormat::BC1)];
         compress_chain_into(&IspcCompressor, chain(16, 3), DdsFormat::BC1, &mut payload).unwrap();
-        let expected: Vec<u8> = chain(16, 3)
-            .flat_map(|level| compress_level(&IspcCompressor, &level, DdsFormat::BC1).unwrap())
-            .collect();
+        let mut levels = chain(16, 3);
+        let mut expected = Vec::new();
+        while let Some(level) = levels.next_level() {
+            expected.extend(compress_level(&IspcCompressor, level, DdsFormat::BC1).unwrap());
+        }
         assert_eq!(payload, expected);
     }
 

@@ -320,9 +320,11 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             for _ in 0..11 {
                 let source = img.clone();
                 let t = Instant::now();
-                let levels: usize = MipmapStream::new(source, 13)
-                    .map(|l| l.width() as usize)
-                    .sum();
+                let mut stream = MipmapStream::new(source, 13);
+                let mut levels = 0usize;
+                while let Some(level) = stream.next_level() {
+                    levels += level.width() as usize;
+                }
                 samples.push(t.elapsed());
                 std::hint::black_box(levels);
             }

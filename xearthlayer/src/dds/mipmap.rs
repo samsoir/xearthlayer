@@ -151,60 +151,120 @@ impl MipmapGenerator {
     ///
     /// Works on the raw RGBA bytes, one output row at a time, each output
     /// pixel from a pair of pixels of each of its two source rows, with no
-    /// per-pixel bounds checks (#389). R, G and B go to linear light through
-    /// [`SRGB_TO_LINEAR`] and back through [`LINEAR_TO_SRGB`]. The output is
+    /// per-pixel bounds checks (#389), in [`downsample_row`]. The output is
     /// the only allocation. Cost of the whole chain of a 4096×4096 tile, one
     /// thread, release build, Ryzen 7 9800X3D: about 14 ms, against 4.7 ms
     /// for the stored-value average it replaced (`time_the_4096_mip_chain`).
     ///
-    /// The CPU backends, ISPC and software, run this through
-    /// [`MipmapStream`] for every level of every tile. The GPU worker builds
+    /// The CPU backends, ISPC and software, run the same arithmetic through
+    /// [`MipmapStream`] for every level of every tile, in place
+    /// ([`downsample_box_2x_in_place`](Self::downsample_box_2x_in_place)). The GPU worker builds
     /// its levels in a shader with the same filter and tables
     /// (`dds::gpu_mips`, [`Self::FILTER`]).
     pub(crate) fn downsample_box_2x(source: &RgbaImage) -> RgbaImage {
-        const CHANNELS: usize = 4;
-
         let new_width = source.width() / 2;
         let new_height = source.height() / 2;
         if new_width == 0 || new_height == 0 {
-            // `chunks_exact` refuses a zero chunk size.
             return RgbaImage::new(new_width, new_height);
         }
 
-        let to_linear = &*SRGB_TO_LINEAR;
-        let to_srgb = &*LINEAR_TO_SRGB;
         let src_row = source.width() as usize * CHANNELS;
         let out_row = new_width as usize * CHANNELS;
         let mut output = vec![0u8; out_row * new_height as usize];
 
-        // `chunks_exact` drops an odd last source row, and an odd last
-        // source pixel (a pair of pixels is 8 bytes), as the halved
+        // `chunks_exact` drops an odd last source row, as the halved
         // dimensions require.
         for (out, rows) in output
             .chunks_exact_mut(out_row)
             .zip(source.as_raw().chunks_exact(2 * src_row))
         {
             let (top, bottom) = rows.split_at(src_row);
-            for ((pixel, t), b) in out
-                .chunks_exact_mut(CHANNELS)
-                .zip(top.chunks_exact(2 * CHANNELS))
-                .zip(bottom.chunks_exact(2 * CHANNELS))
-            {
-                for c in 0..3 {
-                    let light = |v: u8| u32::from(to_linear[usize::from(v)]);
-                    let sum =
-                        light(t[c]) + light(t[c + CHANNELS]) + light(b[c]) + light(b[c + CHANNELS]);
-                    // The mean of four u16 values is a u16.
-                    pixel[c] = to_srgb[quarter_half_to_even(sum) as usize];
-                }
-                let alpha = [t[3], t[7], b[3], b[7]].map(u32::from);
-                // The mean of four bytes is a byte.
-                pixel[3] = quarter_half_to_even(alpha.iter().sum()) as u8;
-            }
+            downsample_row(out, top, bottom);
         }
 
         RgbaImage::from_raw(new_width, new_height, output)
             .expect("output buffer is sized from the halved dimensions")
+    }
+
+    /// [`downsample_box_2x`](Self::downsample_box_2x), the same bytes,
+    /// written over the start of the source's own buffer, which is cut to
+    /// the new length (`truncate`, not `shrink_to_fit`: the buffer stays
+    /// held to the end of the chain, so a chain's peak is level 0 alone
+    /// instead of level 0 and level 1, and no level after the first is a
+    /// fresh allocation).
+    ///
+    /// The point is the allocator, not the arithmetic. With
+    /// `M_MMAP_THRESHOLD` at 1 MiB (what XEarthLayer runs with, #227) every
+    /// level of 1 MiB and up (16, 4 and 1 MiB on a 4096 tile) was a new
+    /// mapping whose pages fault in on first write. Measured on real tiles
+    /// the chain fell from 16.2 to 17.4 ms to 13.1 to 13.6 ms, and stayed
+    /// at 13.2 to 13.9 ms with glibc's default malloc
+    /// (`time_the_4096_mip_chain`).
+    ///
+    /// Output row `y` is `out_row = 4 * (w / 2)` bytes at `y * out_row`; its
+    /// source rows start at `2 * y * 4 * w`. Since `out_row <= 2 * w` (equal
+    /// to half a source row for even `w`, less for odd `w`), the output row
+    /// ends at `(y + 1) * out_row <= (y + 1) * 2 * w`, which is at most
+    /// `2 * y * 4 * w` for every `y >= 1`. So every row after the first lies
+    /// wholly before its source rows and the two are split apart with
+    /// `split_at_mut`; row 0 overlaps its own source rows and is built from
+    /// a copy of them.
+    pub(crate) fn downsample_box_2x_in_place(image: &mut RgbaImage) {
+        let new_width = image.width() / 2;
+        let new_height = image.height() / 2;
+        let src_row = image.width() as usize * CHANNELS;
+        let out_row = new_width as usize * CHANNELS;
+
+        let mut raw = std::mem::replace(image, RgbaImage::new(0, 0)).into_raw();
+        if new_width == 0 || new_height == 0 {
+            raw.clear();
+        } else {
+            // Row 0: its output bytes overlap its own source rows.
+            let rows = raw[..2 * src_row].to_vec();
+            let (top, bottom) = rows.split_at(src_row);
+            downsample_row(&mut raw[..out_row], top, bottom);
+
+            for y in 1..new_height as usize {
+                let (done, rest) = raw.split_at_mut(2 * y * src_row);
+                let (top, rest) = rest.split_at(src_row);
+                downsample_row(
+                    &mut done[y * out_row..(y + 1) * out_row],
+                    top,
+                    &rest[..src_row],
+                );
+            }
+            raw.truncate(out_row * new_height as usize);
+        }
+        *image = RgbaImage::from_raw(new_width, new_height, raw)
+            .expect("buffer is cut to the halved dimensions");
+    }
+}
+
+const CHANNELS: usize = 4;
+
+/// One output row of [`MipmapGenerator::downsample_box_2x`] from its two
+/// source rows: no per-pixel bounds checks (#389). R, G and B go to linear
+/// light through [`SRGB_TO_LINEAR`] and back through [`LINEAR_TO_SRGB`].
+/// An odd last source pixel has no partner and is ignored (the output row
+/// sets how many pixels are written).
+#[inline(always)]
+fn downsample_row(out: &mut [u8], top: &[u8], bottom: &[u8]) {
+    let to_linear = &*SRGB_TO_LINEAR;
+    let to_srgb = &*LINEAR_TO_SRGB;
+    for ((pixel, t), b) in out
+        .chunks_exact_mut(CHANNELS)
+        .zip(top.chunks_exact(2 * CHANNELS))
+        .zip(bottom.chunks_exact(2 * CHANNELS))
+    {
+        for c in 0..3 {
+            let light = |v: u8| u32::from(to_linear[usize::from(v)]);
+            let sum = light(t[c]) + light(t[c + CHANNELS]) + light(b[c]) + light(b[c + CHANNELS]);
+            // The mean of four u16 values is a u16.
+            pixel[c] = to_srgb[quarter_half_to_even(sum) as usize];
+        }
+        let alpha = [t[3], t[7], b[3], b[7]].map(u32::from);
+        // The mean of four bytes is a byte.
+        pixel[3] = quarter_half_to_even(alpha.iter().sum()) as u8;
     }
 }
 
@@ -228,24 +288,26 @@ const fn quarter_half_to_even(sum: u32) -> u32 {
     (sum + 1 + ((sum >> 2) & 1)) >> 2
 }
 
-/// Streaming mipmap generator that yields one level at a time.
+/// Streaming mipmap generator that lends one level at a time.
 ///
-/// Takes ownership of the source image and produces mipmap levels
-/// incrementally. Each call to `next()` returns the next downsampled
-/// level. The previous level is consumed during downsampling, so only
-/// one uncompressed level is held in memory at a time.
+/// Takes ownership of the source image and builds the levels in its buffer:
+/// each [`next_level`](Self::next_level) after the first writes the next
+/// level over the start of the previous one
+/// ([`MipmapGenerator::downsample_box_2x_in_place`]), so the previous level
+/// is gone once the next is lent.
 ///
 /// # Memory
 ///
-/// Peak memory is the size of the current level plus the downsampled
-/// output — roughly 1.25× the current level, not the entire chain.
+/// One buffer, the size of level 0, held until the stream is dropped: the
+/// chain never holds a second level, and after the first no level is a new
+/// allocation.
 pub struct MipmapStream {
-    /// The next image to yield (or downsample from).
-    current: Option<RgbaImage>,
-    /// Number of levels remaining to yield.
+    /// The level lent last, or the source before the first call.
+    image: RgbaImage,
+    /// Number of levels remaining to lend.
     remaining: usize,
-    /// Whether the first (original) image has been yielded.
-    yielded_first: bool,
+    /// Whether the first (original) image has been lent.
+    lent_first: bool,
 }
 
 impl MipmapStream {
@@ -254,48 +316,32 @@ impl MipmapStream {
     /// # Arguments
     ///
     /// * `image` - Source image (ownership transferred, no clone)
-    /// * `count` - Total number of mipmap levels to yield (including the original)
+    /// * `count` - Total number of mipmap levels to lend (including the original)
     pub fn new(image: RgbaImage, count: usize) -> Self {
         Self {
-            current: if count > 0 { Some(image) } else { None },
+            image,
             remaining: count,
-            yielded_first: false,
+            lent_first: false,
         }
     }
-}
 
-impl Iterator for MipmapStream {
-    type Item = RgbaImage;
-
-    fn next(&mut self) -> Option<RgbaImage> {
+    /// The next level, largest first: the source on the first call, then
+    /// each half the size of the last. `None` after `count` levels, or when
+    /// the last was 1 wide or 1 high. The level is valid until the next call.
+    pub fn next_level(&mut self) -> Option<&RgbaImage> {
         if self.remaining == 0 {
             return None;
         }
-
-        let current = self.current.take()?;
-
-        if !self.yielded_first {
-            // First call: yield the original image (moved, not cloned)
-            self.yielded_first = true;
-            self.remaining -= 1;
-
-            // Prepare next level if we need more
-            if self.remaining > 0 && current.width() > 1 && current.height() > 1 {
-                self.current = Some(MipmapGenerator::downsample_box_2x(&current));
+        if self.lent_first {
+            if self.image.width() <= 1 || self.image.height() <= 1 {
+                self.remaining = 0;
+                return None;
             }
-
-            return Some(current);
+            MipmapGenerator::downsample_box_2x_in_place(&mut self.image);
         }
-
-        // Subsequent calls: yield the pre-computed downsample
+        self.lent_first = true;
         self.remaining -= 1;
-
-        // Prepare the next level if we need more
-        if self.remaining > 0 && current.width() > 1 && current.height() > 1 {
-            self.current = Some(MipmapGenerator::downsample_box_2x(&current));
-        }
-
-        Some(current)
+        Some(&self.image)
     }
 }
 
@@ -610,12 +656,13 @@ mod tests {
         let count = MipmapGenerator::full_chain_count(4096, 4096);
 
         let mut expected = source.clone();
+        let mut stream = MipmapStream::new(source, count);
         let mut levels = 0;
-        for (level, actual) in MipmapStream::new(source, count).enumerate() {
-            if level > 0 {
+        while let Some(actual) = stream.next_level() {
+            if levels > 0 {
                 expected = downsample_box_2x_reference(&expected);
             }
-            assert_same_image(&actual, &expected, &format!("level {level}"));
+            assert_same_image(actual, &expected, &format!("level {levels}"));
             levels += 1;
         }
         assert_eq!(levels, 13);
@@ -671,9 +718,11 @@ mod tests {
         let source_means = light_means(&source);
         let count = MipmapGenerator::full_chain_count(4096, 4096);
 
+        let mut stream = MipmapStream::new(source, count);
         let mut levels = 0;
-        for (level, image) in MipmapStream::new(source, count).enumerate() {
-            let means = light_means(&image);
+        while let Some(image) = stream.next_level() {
+            let level = levels;
+            let means = light_means(image);
             for c in 0..4 {
                 let drift = means[c] - source_means[c];
                 assert!(
@@ -766,10 +815,14 @@ mod tests {
         assert_eq!(downsampled.as_raw(), &expected);
     }
 
-    /// Release-build timing of the full 4096×4096 chain, new against the
-    /// per-pixel reference, single thread. The two alternate run by run so
-    /// both see the same machine load. Run with `cargo test --release -p
-    /// xearthlayer --lib time_the_4096_mip_chain -- --ignored --nocapture`.
+    /// Release-build timing of the full 4096×4096 chain, the raw-slice
+    /// filter and its in-place form against the per-pixel reference, single
+    /// thread. The three alternate run by run so all see the same machine
+    /// load. Run with `cargo test --release -p xearthlayer --lib
+    /// time_the_4096_mip_chain -- --ignored --nocapture`. The in-place gain
+    /// shows only with `MALLOC_MMAP_THRESHOLD_=1048576` in front of the
+    /// command, which is how XEarthLayer runs (#227): glibc's default
+    /// threshold adapts upward and serves the levels from the heap anyway.
     #[test]
     #[ignore]
     fn time_the_4096_mip_chain() {
@@ -788,12 +841,28 @@ mod tests {
             std::hint::black_box(&level);
             (chain, first)
         };
+        // The same, in place: each run gets its own copy of the source, made
+        // before the clock starts.
+        let run_in_place = || {
+            let mut level = source.clone();
+            let started = std::time::Instant::now();
+            MipmapGenerator::downsample_box_2x_in_place(&mut level);
+            let first = started.elapsed();
+            while level.width() > 1 && level.height() > 1 {
+                MipmapGenerator::downsample_box_2x_in_place(&mut level);
+            }
+            let chain = started.elapsed();
+            std::hint::black_box(&level);
+            (chain, first)
+        };
 
         let mut reference = Vec::with_capacity(RUNS);
         let mut raw = Vec::with_capacity(RUNS);
+        let mut in_place = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
             reference.push(run(downsample_box_2x_reference));
             raw.push(run(MipmapGenerator::downsample_box_2x));
+            in_place.push(run_in_place());
         }
         let summary = |runs: &[(std::time::Duration, std::time::Duration)]| {
             let mut chain: Vec<_> = runs.iter().map(|r| r.0).collect();
@@ -808,9 +877,10 @@ mod tests {
             )
         };
         println!(
-            "4096 chain, {RUNS} runs each: reference {}; raw slices {}",
+            "4096 chain, {RUNS} runs each: reference {}; raw slices {}; in place {}",
             summary(&reference),
-            summary(&raw)
+            summary(&raw),
+            summary(&in_place)
         );
     }
 
@@ -967,19 +1037,25 @@ mod tests {
         );
     }
 
+    /// Every level a stream lends, copied out.
+    fn stream_levels(image: RgbaImage, count: usize) -> Vec<RgbaImage> {
+        let mut stream = MipmapStream::new(image, count);
+        let mut levels = Vec::new();
+        while let Some(level) = stream.next_level() {
+            levels.push(level.clone());
+        }
+        levels
+    }
+
     #[test]
     fn test_mipmap_stream_yields_correct_count() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 5);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 5);
         assert_eq!(levels.len(), 5);
     }
 
     #[test]
     fn test_mipmap_stream_dimensions_halve_each_level() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 5);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 5);
 
         assert_eq!(levels[0].dimensions(), (256, 256));
         assert_eq!(levels[1].dimensions(), (128, 128));
@@ -992,16 +1068,14 @@ mod tests {
     fn test_mipmap_stream_first_yield_matches_source_dimensions() {
         let image = RgbaImage::new(4096, 4096);
         let mut stream = MipmapStream::new(image, 3);
-        let first = stream.next().unwrap();
+        let first = stream.next_level().unwrap();
         assert_eq!(first.dimensions(), (4096, 4096));
     }
 
     #[test]
     fn test_mipmap_stream_terminates_early_at_1x1() {
-        let image = RgbaImage::new(4, 4);
         // Request 10 levels but only 3 are possible (4 -> 2 -> 1)
-        let stream = MipmapStream::new(image, 10);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(4, 4), 10);
 
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[0].dimensions(), (4, 4));
@@ -1011,9 +1085,7 @@ mod tests {
 
     #[test]
     fn test_mipmap_stream_single_level() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 1);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 1);
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].dimensions(), (256, 256));
@@ -1027,7 +1099,7 @@ mod tests {
         }
 
         let mut stream = MipmapStream::new(image, 2);
-        let first = stream.next().unwrap();
+        let first = stream.next_level().unwrap();
 
         // First level should have the same pixel data as the source
         for pixel in first.pixels() {
@@ -1040,10 +1112,61 @@ mod tests {
 
     #[test]
     fn test_mipmap_stream_zero_count_yields_nothing() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 0);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 0);
         assert_eq!(levels.len(), 0);
+    }
+
+    #[test]
+    fn a_stream_that_has_ended_stays_ended() {
+        let mut stream = MipmapStream::new(RgbaImage::new(2, 2), 5);
+        assert!(stream.next_level().is_some());
+        assert!(stream.next_level().is_some());
+        assert!(stream.next_level().is_none());
+        assert!(stream.next_level().is_none());
+    }
+
+    const IN_PLACE_SHAPES: [(u32, u32); 12] = [
+        (7, 5),
+        (5, 7),
+        (2, 2),
+        (1, 4),
+        (4, 1),
+        (3, 3),
+        (1, 1),
+        (2, 1),
+        (9, 2),
+        (256, 256),
+        (64, 16),
+        (130, 66),
+    ];
+
+    #[test]
+    fn in_place_is_byte_for_byte_the_allocating_downsample() {
+        for (w, h) in IN_PLACE_SHAPES {
+            let source = noise(w, h, u64::from(w) * 1000 + u64::from(h));
+            let expected = MipmapGenerator::downsample_box_2x(&source);
+            let mut actual = source.clone();
+            MipmapGenerator::downsample_box_2x_in_place(&mut actual);
+            assert_same_image(&actual, &expected, &format!("{w}x{h}"));
+        }
+    }
+
+    #[test]
+    fn the_levels_of_a_stream_are_the_levels_of_generate_chain_with_count() {
+        for (w, h) in IN_PLACE_SHAPES {
+            for count in [0, 1, 2, 3, 5, 20] {
+                let source = noise(w, h, 7 + u64::from(w) + u64::from(h) * 31);
+                let expected = MipmapGenerator::generate_chain_with_count(&source, count);
+                // `generate_chain_with_count` always holds the source, so a
+                // count of 0 gives one level where the stream gives none.
+                let expected = &expected[..expected.len().min(count)];
+                let actual = stream_levels(source, count);
+                assert_eq!(actual.len(), expected.len(), "{w}x{h} count {count}");
+                for (level, (a, e)) in actual.iter().zip(expected).enumerate() {
+                    assert_same_image(a, e, &format!("{w}x{h} count {count} level {level}"));
+                }
+            }
+        }
     }
 
     #[test]

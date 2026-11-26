@@ -209,9 +209,11 @@ fn calibrate_the_encode_pipelines() {
         .collect();
     let (chain, clone, bc1) = on_cpu(pin, || {
         let chain = time_median(10, || {
-            let n: u32 = MipmapStream::new(source.clone(), LEVELS)
-                .map(|l| l.width())
-                .sum();
+            let mut stream = MipmapStream::new(source.clone(), LEVELS);
+            let mut n = 0u32;
+            while let Some(level) = stream.next_level() {
+                n += level.width();
+            }
             std::hint::black_box(n);
         });
         let clone = time_median(10, || {
