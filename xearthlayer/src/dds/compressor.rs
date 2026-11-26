@@ -547,8 +547,12 @@ mod gpu {
             ),
         };
 
+        // Timestamp queries for the kernel's own time (#476), only where
+        // the adapter offers them: log and trace only.
+        let required_features = crate::dds::gpu_timestamps::requested_features(adapter.features());
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xearthlayer-dds"),
+            required_features,
             ..Default::default()
         }))
         .map_err(|e| DdsError::CompressionFailed(format!("Failed to create wgpu device: {e}")))?;
@@ -567,7 +571,13 @@ mod gpu {
 
         let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
-        tracing::info!(adapter = %selected.adapter, "GPU resources initialized");
+        tracing::info!(
+            adapter = %selected.adapter,
+            // Whether the worker can build its kernel timer: timestamp
+            // queries and a usable timestamp period (#476).
+            kernel_timing = crate::dds::gpu_timestamps::KernelTimer::available(&device, &queue),
+            "GPU resources initialized"
+        );
 
         Ok((device, queue, compressor, selected))
     }

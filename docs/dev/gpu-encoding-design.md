@@ -256,7 +256,8 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 | `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. An idle worker blocks on its channels and wakes for a request (#423): there is no poll interval |
 | `downsample` | CPU mip generation (`MipmapStream`, which works one level ahead) and the padding of the sub-block tail |
 | `upload` | The tile's output and readback buffers, each level's texture and `queue.write_texture` |
-| `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included (no timestamp queries) |
+| `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included. It also holds wgpu's copy from staging into the textures, which runs inside the submission |
+| `gpu_kernel` | The BC1 compute passes alone, from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476), summed over the tile's levels. Present only where the adapter offers `TIMESTAMP_QUERY` with a usable timestamp period. The sample line gives `gpu_kernel_tiles` (how many of the window's tiles carried a kernel time) and `gpu_kernel = timestamps`, `unavailable` or `no tiles`; `unavailable` means no timestamp feature, an unusable period, the timer dropped after its buffer failed to map (warned once; it returns with the resources a failed tile rebuilds), or no usable ticks in the window |
 | `readback` | Receiving the map, copying out of the mapped range and growing the result `Vec` |
 | `process` | The processor's whole call, on the worker |
 | total | On the caller, from its send to the reply |
@@ -346,7 +347,35 @@ What the numbers show:
 - **On this laptop, the NVIDIA driver's power management cut the discrete GPU's rate by two thirds under bursty work.** After about 7 bursts with 1 s idle gaps, the driver moved the GPU from P0 (12,001 MHz memory, PCIe gen 4) to P5 and P8 (810 and 405 MHz memory, PCIe gen 1 to 2) at 38 °C. Upload rose to 31 ms and submit-to-poll to 21 ms, and throughput fell to 14 tiles/s, in two runs out of two. Bursts back to back stayed at about 45 tiles/s. Whether a desktop GPU or another driver does the same is not known; a GPU that renders nothing else between tiles would see this load pattern in flight.
 - **Memory:** process RSS grew about 200 MB on the NVIDIA driver over a run, and between 3 and 110 MB on RADV.
 
-The GPU figure is wall time from submit to poll, driver included: timestamp queries are not used. Header assembly in `DdsEncoder` is not in the table.
+The GPU figure is wall time from submit to poll, driver included. Header assembly in `DdsEncoder` is not in the table.
+
+### Where the time goes (#476)
+
+Measured on 2026-11-26 on the same laptop, quiet, on AC (Radeon 890M on RADV, Mesa 26.3.1; RTX 5070 Laptop on NVIDIA 620.73.04; release build), with the ignored tests `gpu_calibration`, `gpu_bc1_kernels` and `gpu_mip_prototype` (#476) on a synthetic 4096 tile and a real Apple imagery tile of San Francisco. **Reference figures from one laptop.** Times are p50 per 4096 tile in ms, in bursts back to back.
+
+| Stage | 890M | RTX 5070 Laptop |
+|---|---|---|
+| downsample (CPU chain, on the worker) | 6.4 | 6.2 |
+| upload (`write_texture`, CPU copy into wgpu staging) | 4.2 | 8.0 |
+| gpu (submit to poll) | 5.5 | 3.4 |
+| **gpu_kernel (BC1 passes, timestamps)** | **1.41** | **0.26** |
+| readback | 0.48 | 0.50 |
+| worker total | 17.0 | 18.4 |
+| throughput | 56–58 tiles/s | 51–54 tiles/s |
+
+ISPC on the same tile: 31.4 ms on one pinned thread, 184–197 tiles/s on all 24 threads.
+
+- **The worker is bound by its own CPU work, not the GPU.** The BC1 kernel is about 8% of the worker's time on the 890M and 1.4% on the 5070. Most of `gpu` beyond the kernel is wgpu's staging-to-texture copy (2.9 ms and 1.6 ms timed alone); an empty submit and wait costs 0.02 ms.
+- **The kernel is not the problem.** `block_compression`'s BC1 runs at 1.1 G blocks/s on the 890M and 5.8 G blocks/s on the 5070 (ISPC: 55 M blocks/s per thread). It matches a minimal GPU-native kernel within 3%, and its quality matches ISPC: within 0.07 dB PSNR on RADV, and 99.9% of blocks byte-identical on NVIDIA. A native kernel of equal quality (principal-axis fit plus one least-squares refit) was 10 to 25% slower. Mixing GPU and ISPC tiles in one area would not be visible numerically.
+- **Mips on the GPU.** A compute shader averaging stored values with #394's rounding is byte-identical to `downsample_box_2x` at every level on both GPUs, for 4096 tiles and odd sizes (37×23, 1001×777, 4095×4097). It builds the chain in 1.4 ms (890M) and 0.26 ms (5070), against about 6 ms on one CPU thread. The linear-light filter of #467 costs almost nothing more on the GPU (+0 to 7%). Uploading level 0 only (64 MiB) instead of every level (85.33 MiB) saves about 1.5 ms (890M) and 2.8 ms (5070); the CPU copy into wgpu's staging runs at about 11 GB/s on NVIDIA.
+- **Encoding on the GPU slows the CPU.** One ISPC thread ran 45 to 58% slower while either GPU encoded a steady stream (12% with the worker's CPU work alone and no GPU). It is the same on the discrete GPU, so not shared-memory contention on the iGPU; likely candidates are wgpu allocating, mapping and zeroing about 85 MiB of staging per tile, driver threads and memory bandwidth. The figure is sensitive to setup (+23% unpinned).
+- **NVIDIA power states.** With 1 s idle gaps the 5070 sat in P4 for most of the run; throughput fell from 51 to 44 to 47 tiles/s, and `gpu` p95 rose to 10.3 ms while the kernel moved only from 0.26 to 0.33 ms: the cost is transfer and synchronisation, not compute.
+
+**What follows for phase 2 (#475):**
+- **#424:** generate the mip chain on the GPU, upload level 0 only, one submission per tile. Estimates: about 110 tiles/s on the 890M and 125 on the 5070.
+- **A persistently mapped upload buffer** (or assembling chunks straight into it) joins or follows #424, since the staging copy then dominates on NVIDIA.
+- **#425:** two tiles in flight bound a tile at the larger of its CPU side (about 3.5 to 6.5 ms) and GPU side. Estimates: about 180 tiles/s on the 890M and 160 on the 5070.
+- **No kernel work** is warranted.
 
 ## Diagnostics
 
