@@ -75,6 +75,7 @@ mod inner {
     use crate::dds::compressor::{ChainOutcome, MipmapCompressor};
     use crate::dds::gpu_health::SharedGpuHealth;
     use crate::dds::gpu_stats::GpuEncodeStats;
+    use crate::dds::gpu_timestamps::{KernelTimer, TimerError};
     use crate::dds::layout;
     use crate::dds::{DdsError, DdsFormat};
 
@@ -394,9 +395,12 @@ mod inner {
     ///
     /// The worker loop fills [`queue_wait`](Self::queue_wait) and
     /// [`process`](Self::process); the [`TileProcessor`] fills the stages
-    /// inside its call, each summed over the tile's mip levels. The GPU
-    /// figure is wall time from recording to the end of the poll, not a GPU
-    /// timestamp query, so it includes the driver.
+    /// inside its call, each summed over the tile's mip levels. The
+    /// [`gpu`](Self::gpu) figure is wall time from recording to the end of
+    /// the poll, so it includes the driver and the synchronisation;
+    /// [`gpu_kernel`](Self::gpu_kernel) is the GPU's own time for the
+    /// compute passes, from timestamp queries, where the device has them
+    /// (#476).
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct GpuTileTiming {
         /// From the caller starting its send (time blocked on a full channel
@@ -415,6 +419,13 @@ mod inner {
         pub upload: Duration,
         /// Command recording, submit and the blocking poll: GPU and driver.
         pub gpu: Duration,
+        /// The compute passes' own time on the GPU, summed over the tile's
+        /// levels: each pass's end timestamp less its begin (#476). Part of
+        /// [`gpu`](Self::gpu), which adds the driver and the
+        /// synchronisation. `None` when the device has no timestamp queries
+        /// (`wgpu::Features::TIMESTAMP_QUERY`) or the tile's timestamps
+        /// could not be read.
+        pub gpu_kernel: Option<Duration>,
         /// Waiting for the buffer map, and copying the mapped range into the
         /// level's slot of the DDS file: the payload's one copy (#423).
         pub readback: Duration,
@@ -798,6 +809,8 @@ mod inner {
                 downsample_us = us(t.downsample),
                 upload_us = us(t.upload),
                 gpu_us = us(t.gpu),
+                // Absent where the device has no timestamp queries (#476).
+                gpu_kernel_us = t.gpu_kernel.map(us),
                 readback_us = us(t.readback),
                 process_us = us(t.process),
                 total_us = us(total),
@@ -917,9 +930,11 @@ mod inner {
 
     /// The GPU resources of one tile size, kept across tiles (#423): the
     /// output and readback buffers, sized for level 0 and reused by every
-    /// level, and each level's texture and view, made the first time a tile
-    /// of this size reaches that level. Held for the session: every tile
-    /// of a session is the same size, so it is made once.
+    /// level, each level's texture and view, made the first time a tile
+    /// of this size reaches that level, and the kernel timer, a timestamp
+    /// pair per level, on a device with timestamp queries (#476). Held for
+    /// the session: every tile of a session is the same size, so it is made
+    /// once.
     struct TileResources {
         width: u32,
         height: u32,
@@ -927,10 +942,17 @@ mod inner {
         output: wgpu::Buffer,
         readback: wgpu::Buffer,
         levels: Vec<LevelTexture>,
+        timer: Option<KernelTimer>,
     }
 
     impl TileResources {
-        fn new(device: &wgpu::Device, width: u32, height: u32, format: DdsFormat) -> Self {
+        fn new(
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            width: u32,
+            height: u32,
+            format: DdsFormat,
+        ) -> Self {
             // Level 0 is the largest: smaller levels use a prefix.
             let size = compressed_size(width, height, format);
             let output = device.create_buffer(&wgpu::BufferDescriptor {
@@ -952,6 +974,8 @@ mod inner {
                 output,
                 readback,
                 levels: Vec::new(),
+                // No chain of this size has more levels than this.
+                timer: KernelTimer::new(device, queue, layout::full_chain_levels(width, height)),
             }
         }
 
@@ -1065,17 +1089,25 @@ mod inner {
                 timed(
                     &mut timing.upload,
                     tracing::debug_span!(target: "profiling", "gpu_buffers"),
-                    || *resources = Some(TileResources::new(device, width, height, format)),
+                    || *resources = Some(TileResources::new(device, queue, width, height, format)),
                 );
             }
             let resources = resources.as_mut().expect("made above");
 
             let mut slots = crate::dds::encoder::LevelSlots::new(payload, format);
             let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
+            // The levels the stream yields: the timestamps of all of them
+            // are resolved with the last one's readback (#476).
+            let chain_levels = mipmap_count.min(layout::full_chain_levels(width, height) as usize);
+            let timed_levels = resources
+                .timer
+                .as_ref()
+                .map_or(0, |t| chain_levels.min(t.capacity() as usize));
 
             // At most `mipmap_count` takes, so a full chain makes no extra call
             // that only finds the stream's end (one is made, and spanned, only
             // when the count asks for more levels than the image has).
+            let mut drop_timer = false;
             for level_idx in 0..mipmap_count {
                 // The stream works one level ahead: taking level `i` computes
                 // level `i + 1`, which this span names as `computes_level`. The
@@ -1131,9 +1163,16 @@ mod inner {
                 let texture_view = &resources.levels[level_idx].view;
                 let output_buffer = &resources.output;
                 let readback_buffer = &resources.readback;
+                // This level's pass is timed, and the last one resolves
+                // every level's timestamps in its own submission (#476).
+                let timer = resources
+                    .timer
+                    .as_ref()
+                    .filter(|_| level_idx < timed_levels);
+                let resolves_timer = timer.filter(|_| level_idx + 1 == timed_levels);
 
                 let buffer_slice = readback_buffer.slice(..level_output_size);
-                let map_rx = timed(
+                let (map_rx, timer_rx) = timed(
                     &mut timing.gpu,
                     tracing::debug_span!(target: "profiling", "gpu_submit_poll", level = level_idx),
                     || -> Result<_, DdsError> {
@@ -1157,7 +1196,8 @@ mod inner {
                             let mut pass =
                                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                                     label: Some("tile-compute"),
-                                    timestamp_writes: None,
+                                    timestamp_writes: timer
+                                        .map(|t| t.pass_writes(level_idx as u32)),
                                 });
                             compressor.compress(&mut pass);
                         }
@@ -1169,6 +1209,9 @@ mod inner {
                             0,
                             level_output_size,
                         );
+                        if let Some(timer) = resolves_timer {
+                            timer.resolve(&mut encoder, timed_levels as u32);
+                        }
 
                         let sub_idx = queue.submit(std::iter::once(encoder.finish()));
 
@@ -1177,6 +1220,7 @@ mod inner {
                         buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
                             let _ = map_tx.send(r);
                         });
+                        let timer_rx = resolves_timer.map(|t| t.map(timed_levels as u32));
 
                         device
                             .poll(wgpu::PollType::Wait {
@@ -1189,7 +1233,7 @@ mod inner {
                                 )),
                                 e => DdsError::CompressionFailed(format!("GPU poll failed: {e}")),
                             })?;
-                        Ok(map_rx)
+                        Ok((map_rx, timer_rx))
                     },
                 )?;
 
@@ -1218,6 +1262,27 @@ mod inner {
                     },
                 )?;
 
+                if let (Some(timer), Some(mapped)) = (resolves_timer, timer_rx) {
+                    match timer.read(&mapped, timed_levels as u32) {
+                        Ok(levels) => {
+                            timing.gpu_kernel = Some(levels.iter().sum());
+                            let levels_us: Vec<u64> =
+                                levels.iter().map(|d| d.as_micros() as u64).collect();
+                            tracing::debug!(?levels_us, "GPU kernel time per level");
+                        }
+                        Err(TimerError::Unusable) => {
+                            tracing::debug!("GPU kernel timestamps unusable for this tile");
+                        }
+                        // Its buffer may still be mapped or pending: never
+                        // used again. Kernel timing stays off until the
+                        // resources are made again (after a failed tile).
+                        Err(TimerError::Unmapped(reason)) => {
+                            tracing::debug!(%reason, "GPU kernel timer dropped");
+                            drop_timer = true;
+                        }
+                    }
+                }
+
                 tracing::debug!(
                     level = level_idx,
                     width = lw,
@@ -1227,6 +1292,9 @@ mod inner {
                 );
 
                 // `level` dropped here — CPU memory reclaimed before next downsample
+            }
+            if drop_timer {
+                resources.timer = None;
             }
 
             slots.finish()
@@ -1496,6 +1564,7 @@ mod inner {
                 height = image.height(),
                 levels = mipmap_count,
                 lane = lane.name(),
+                gpu_kernel_us = tracing::field::Empty,
             )
             .entered();
             let deadline = taken + rule.deadline;
@@ -1511,6 +1580,11 @@ mod inner {
             }))
             .map(|processed| processed.map(|()| output));
             timing.process = clock.now().saturating_duration_since(taken);
+            // The GPU's own time for the tile's compute passes, from
+            // timestamp queries, where the device has them (#476).
+            if let Some(kernel) = timing.gpu_kernel {
+                tile_span.record("gpu_kernel_us", kernel.as_micros() as u64);
+            }
             drop(tile_span);
 
             let result = match result {

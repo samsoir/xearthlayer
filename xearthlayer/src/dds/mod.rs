@@ -92,6 +92,7 @@ mod encoder;
 pub mod gpu_channel;
 pub mod gpu_health;
 pub mod gpu_stats;
+pub mod gpu_timestamps;
 mod header;
 pub mod layout;
 mod mipmap;

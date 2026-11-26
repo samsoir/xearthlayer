@@ -41,6 +41,8 @@ struct StageWindows {
     downsample: LatencyWindow,
     upload: LatencyWindow,
     gpu: LatencyWindow,
+    /// Only the tiles that carried a kernel time (#476).
+    gpu_kernel: LatencyWindow,
     readback: LatencyWindow,
     process: LatencyWindow,
     total: LatencyWindow,
@@ -55,6 +57,11 @@ pub struct GpuSample {
     pub downsample: Option<LatencySummary>,
     pub upload: Option<LatencySummary>,
     pub gpu: Option<LatencySummary>,
+    /// The GPU's own time for each tile's compute passes, from timestamp
+    /// queries (#476): `None` when no tile of the sample had one, as on a
+    /// device without timestamp queries. Its count can be below the
+    /// tiles' when some tiles' timestamps could not be read.
+    pub gpu_kernel: Option<LatencySummary>,
     pub readback: Option<LatencySummary>,
     /// The worker's whole call per tile.
     pub process: Option<LatencySummary>,
@@ -88,6 +95,18 @@ impl GpuSample {
     /// Tiles encoded in the sample.
     pub fn tiles(&self) -> u64 {
         self.total.map_or(0, |s| s.count as u64) + self.unsampled
+    }
+
+    /// What the sample line says of the kernel time (#476): `timestamps`
+    /// when tiles carried one, `unavailable` when tiles were encoded and
+    /// none did (no timestamp queries on the device), `no tiles` when
+    /// nothing was encoded.
+    pub fn kernel_timing(&self) -> &'static str {
+        match (self.gpu_kernel, self.tiles()) {
+            (Some(_), _) => "timestamps",
+            (None, 0) => "no tiles",
+            (None, _) => "unavailable",
+        }
     }
 
     /// Nothing was encoded, failed or waiting during the sample.
@@ -132,6 +151,9 @@ impl GpuEncodeStats {
         w.downsample.record(micros(timing.downsample));
         w.upload.record(micros(timing.upload));
         w.gpu.record(micros(timing.gpu));
+        if let Some(kernel) = timing.gpu_kernel {
+            w.gpu_kernel.record(micros(kernel));
+        }
         w.readback.record(micros(timing.readback));
         w.process.record(micros(timing.process));
         w.total.record(micros(total));
@@ -190,6 +212,7 @@ impl GpuEncodeStats {
             downsample: w.downsample.take(),
             upload: w.upload.take(),
             gpu: w.gpu.take(),
+            gpu_kernel: w.gpu_kernel.take(),
             readback: w.readback.take(),
             process: w.process.take(),
             total: w.total.take(),
@@ -221,6 +244,8 @@ impl GpuEncodeStats {
         let (downsample_p50_ms, downsample_p95_ms, downsample_max_ms) = fig(s.downsample);
         let (upload_p50_ms, upload_p95_ms, upload_max_ms) = fig(s.upload);
         let (gpu_p50_ms, gpu_p95_ms, gpu_max_ms) = fig(s.gpu);
+        // Zero, with `gpu_kernel` saying why, when no tile had one.
+        let (gpu_kernel_p50_ms, gpu_kernel_p95_ms, gpu_kernel_max_ms) = fig(s.gpu_kernel);
         let (readback_p50_ms, readback_p95_ms, readback_max_ms) = fig(s.readback);
         let (process_p50_ms, process_p95_ms, process_max_ms) = fig(s.process);
         tracing::info!(
@@ -252,6 +277,10 @@ impl GpuEncodeStats {
             gpu_p50_ms,
             gpu_p95_ms,
             gpu_max_ms,
+            gpu_kernel = s.kernel_timing(),
+            gpu_kernel_p50_ms,
+            gpu_kernel_p95_ms,
+            gpu_kernel_max_ms,
             readback_p50_ms,
             readback_p95_ms,
             readback_max_ms,
@@ -324,8 +353,17 @@ mod tests {
             downsample: ms(2 * scale),
             upload: ms(3 * scale),
             gpu: ms(4 * scale),
+            gpu_kernel: Some(Duration::from_micros(2_500 * scale)),
             readback: ms(5 * scale),
             process: ms(14 * scale),
+        }
+    }
+
+    /// A tile from a device without timestamp queries.
+    fn untimed(scale: u64) -> GpuTileTiming {
+        GpuTileTiming {
+            gpu_kernel: None,
+            ..timing(scale)
         }
     }
 
@@ -349,6 +387,7 @@ mod tests {
         assert_eq!(max(s.downsample), Some((4_000, 2)));
         assert_eq!(max(s.upload), Some((6_000, 2)));
         assert_eq!(max(s.gpu), Some((8_000, 2)));
+        assert_eq!(max(s.gpu_kernel), Some((5_000, 2)));
         assert_eq!(max(s.readback), Some((10_000, 2)));
         assert_eq!(max(s.process), Some((28_000, 2)));
         assert_eq!(max(s.total), Some((31_000, 2)));
@@ -373,6 +412,39 @@ mod tests {
         stats.record_encoded(&timing(1), ms(16));
         let s = stats.take_sample().expect("a busy sample");
         assert_eq!((s.total.unwrap().count, s.unsampled), (1, 0));
+    }
+
+    /// The kernel window holds only the tiles that carried a kernel time:
+    /// a tile whose timestamps could not be read leaves it, not a zero.
+    #[test]
+    fn the_kernel_time_is_summarised_over_the_tiles_that_have_one() {
+        let stats = GpuEncodeStats::default();
+        stats.record_encoded(&timing(1), ms(16));
+        stats.record_encoded(&untimed(2), ms(31));
+        stats.record_encoded(&timing(3), ms(40));
+
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!(s.tiles(), 3);
+        let kernel = s.gpu_kernel.expect("two tiles had a kernel time");
+        assert_eq!((kernel.count, kernel.max_us), (2, 7_500));
+        assert_eq!(s.kernel_timing(), "timestamps");
+    }
+
+    #[test]
+    fn a_device_without_timestamps_has_no_kernel_summary() {
+        let stats = GpuEncodeStats::default();
+        stats.record_encoded(&untimed(1), ms(16));
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!(s.gpu_kernel, None);
+        assert_eq!(s.kernel_timing(), "unavailable");
+    }
+
+    #[test]
+    fn a_sample_without_tiles_says_so_of_the_kernel_time() {
+        let stats = GpuEncodeStats::default();
+        stats.record_failed();
+        let s = stats.take_sample().expect("a failure is not idle");
+        assert_eq!(s.kernel_timing(), "no tiles");
     }
 
     #[test]
@@ -470,8 +542,32 @@ mod tests {
             ("downsample_p95_ms", "2.0"),
             ("upload_max_ms", "3.0"),
             ("gpu_p50_ms", "4.0"),
+            ("gpu_kernel", "\"timestamps\""),
+            ("gpu_kernel_p50_ms", "2.5"),
+            ("gpu_kernel_max_ms", "2.5"),
             ("readback_p50_ms", "5.0"),
             ("process_p50_ms", "14.0"),
+        ] {
+            assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
+        }
+    }
+
+    /// On a device without timestamp queries the line says the kernel time
+    /// is unavailable, its figures zero (#476).
+    #[test]
+    fn the_sample_line_says_when_the_kernel_time_is_unavailable() {
+        let stats = GpuEncodeStats::default();
+        stats.record_encoded(&untimed(1), ms(16));
+
+        let events = capture_events(|| stats.log_sample(GpuLane::Demand, &SharedGpuHealth::new()));
+        let line = events
+            .iter()
+            .find(|e| e.get("message").map(String::as_str) == Some("GPU encode sample"))
+            .expect("a sample line");
+        for (field, value) in [
+            ("gpu_kernel", "\"unavailable\""),
+            ("gpu_kernel_p50_ms", "0.0"),
+            ("gpu_p50_ms", "4.0"),
         ] {
             assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");
         }
