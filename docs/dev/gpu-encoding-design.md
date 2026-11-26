@@ -158,24 +158,53 @@ drive the real loop with processors that panic, sleep, fail or record their
 order, so the loop's failure handling, shutdown and drain are tested without
 a GPU.
 
-**Worker loop:**
-1. Take a request, demand first (blocking while both channels are empty)
-2. Admit it: skip it if its job was cancelled before it started, hand it back if it waited past the deadline (demand only)
-3. Create `MipmapStream::new(image, mipmap_count)` -- worker owns the iteration
-4. For each level: upload -> dispatch compute -> readback into the level's slice of the output file
-5. Return the file on the oneshot
+**One tile, one submission (#424).** The worker no longer builds mip levels on
+the CPU or uploads them. For each tile it:
+1. writes level 0 into a persistently mapped upload buffer kept with the
+   tile's resources (`write_level0`: one copy of 64 MiB for a 4096 tile, no
+   per-call staging), padded to whole blocks as the CPU pads it;
+2. records, in one command encoder: the copy of level 0 into its texture, one
+   mip pass (`dds/gpu_mips.rs`, `gpu_mips.wgsl`) that writes every lower level
+   into `Rgba8Unorm` write-only storage textures, one BC1 pass
+   (`block_compression::compress` once, every level at its offset in the
+   payload), the copy into the readback buffer and the timer resolve;
+3. submits once, polls once, maps once and copies the payload into its slice
+   of the DDS file (#423's in-place output).
 
-The CPU downsample of level N+1 does not overlap the GPU work of level N today: `MipmapStream` computes the next level before it returns the current one, and each level is a synchronous round trip. Taking that work off the worker thread is #424.
+The mip shader is byte-identical to `downsample_box_2x` at every level,
+padding included (#394's round half to even, odd sizes truncated as on the
+CPU), checked on both GPUs for 4096 tiles and odd and sub-block sizes. Its
+filter follows the CPU chain's (`MipmapGenerator::FILTER`, `MipFilter`), so
+the two paths change together: today stored values; #467's linear light is a
+tested shader variant nothing wires yet. The shader's uniform buffers are
+written through the queue, never mapped at creation, so rebuilding resources
+on a destroyed device fails tiles (and #420 fails the GPU) rather than
+panicking.
 
-**GPU resource reuse:** the worker's textures and output and readback buffers are kept across tiles of the same size and format and dropped after a failed tile (#423); within a tile, one set serves every level.
+**Two tiles in flight (#425).** The worker drives a `PipelinedProcessor`
+(`begin`, `finish`, `abandon`, `DEPTH`); every older `TileProcessor` is depth
+1. `WgpuTileProcessor` has two resource sets (`free_set`: the first free one,
+so serial work only ever builds one). While the GPU runs tile A, the worker
+begins tile B (writes its level 0, records and submits it), then finishes A.
+`next_begin(depth, begun_lanes, demand, prefetch)` decides, as a pure
+function: it begins another tile only if one is already queued (demand
+first), never past the depth, and **never two prefetch tiles at once**, so a
+demand tile still waits behind at most one prefetch tile (#421). With nothing
+queued, A is finished at once: a finished tile is never held back. Prefetch-only
+bursts therefore run at #424's serial rate; demand bursts gain the overlap.
+Begun tiles keep their image (64 MiB each, at most two) until finished, so
+#420's rules apply per tile in flight: each has its own deadline from when the
+worker took it; a late tile hands back a demand tile begun behind it (and the
+demand queue) but finishes a prefetch one; a GPU failure or panic hands back
+the tile behind; a failed or abandoned tile discards only its own set
+(`AfterTile`); a shutdown finishes every begun tile, then fails the queue.
+`plan_tile` refuses a chain that does not fill its payload before any GPU
+work.
 
-### Pipeline Overlap (Approach 3)
-
-The worker uses an adaptive overlap strategy for inter-tile pipelining:
-- When more requests are queued: defer readback to overlap with the next upload (pipeline depth 2)
-- When queue is empty: complete immediately to avoid deadlock on single/last request
-
-VRAM budget: pipeline depth 2 with 4096x4096 tiles ~ 160MB peak.
+**GPU resource reuse:** each resource set (level textures, mip storage
+textures, the mapped upload buffer, output and readback buffers, the kernel
+timer) is kept across tiles of the same size and format and dropped after a
+failed tile (#423).
 
 ### Shared Resource Factory
 
@@ -254,17 +283,17 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 | Stage | What it covers |
 |---|---|
 | `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. An idle worker blocks on its channels and wakes for a request (#423): there is no poll interval |
-| `downsample` | CPU mip generation (`MipmapStream`, which works one level ahead) and the padding of the sub-block tail |
-| `upload` | The tile's output and readback buffers, each level's texture and `queue.write_texture` |
-| `gpu` | Command recording, the compute dispatch, submit, `map_async` and `poll(Wait)`: wall time, driver included. It also holds wgpu's copy from staging into the textures, which runs inside the submission |
-| `gpu_kernel` | The BC1 compute passes alone, from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476), summed over the tile's levels. Present only where the adapter offers `TIMESTAMP_QUERY` with a usable timestamp period. The sample line gives `gpu_kernel_tiles` (how many of the window's tiles carried a kernel time) and `gpu_kernel = timestamps`, `unavailable` or `no tiles`; `unavailable` means no timestamp feature, an unusable period, the timer dropped after its buffer failed to map (warned once; it returns with the resources a failed tile rebuilds), or no usable ticks in the window |
+| `upload` | Creating the tile's resources when needed, and writing level 0 into the mapped upload buffer (#424) |
+| `gpu` | Recording, the submit and the poll for the whole tile: wall time, driver included. Under #425 the GPU work of a tile mostly runs while the worker uploads the next one, so `gpu` is near zero in bursts |
+| `gpu_mips` | The mip pass alone, from GPU timestamp queries (#424) |
+| `gpu_kernel` | The BC1 pass alone (one pass for every level since #424), from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476). Present only where the adapter offers `TIMESTAMP_QUERY` with a usable timestamp period. The sample line gives `gpu_kernel_tiles` (how many of the window's tiles carried a kernel time) and `gpu_kernel = timestamps`, `unavailable` or `no tiles`; `unavailable` means no timestamp feature, an unusable period, the timer dropped after its buffer failed to map (warned once; it returns with the resources a failed tile rebuilds), or no usable ticks in the window |
 | `readback` | Receiving the map, copying out of the mapped range and growing the result `Vec` |
-| `process` | The processor's whole call, on the worker |
+| `process` | The processor's work for the tile on the worker; under #425 it includes finishing the tile ahead of it |
 | total | On the caller, from its send to the reply |
 
 They appear in three places:
 
-- **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker), and per level `gpu_downsample` (`computes_level`), `gpu_buffers`, `gpu_upload`, `gpu_submit_poll` and `gpu_readback`, plus `dds_header_assembly` in `DdsEncoder`.
+- **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker, with `gpu_kernel_us` and `gpu_mips_us`), and `gpu_buffers`, `gpu_upload`, `gpu_submit`, `gpu_poll` and `gpu_readback`. The debug line `GPU kernel time` gives `bc1_us` and `mips_us` per tile.
 - **The debug log**: one `GPU encode: tile stages` line per tile. Since #423 the worker writes the levels into the DDS file in place, so there is no header assembly copy.
 - **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply), `fallback` (tiles handed back and encoded on ISPC: after a failure, or by the queue-age valve), `health` (`healthy` or `failed`) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
 
@@ -371,7 +400,26 @@ ISPC on the same tile: 31.4 ms on one pinned thread, 184–197 tiles/s on all 24
 - **Encoding on the GPU slows the CPU.** One ISPC thread ran 45 to 58% slower while either GPU encoded a steady stream (12% with the worker's CPU work alone and no GPU). It is the same on the discrete GPU, so not shared-memory contention on the iGPU; likely candidates are wgpu allocating, mapping and zeroing about 85 MiB of staging per tile, driver threads and memory bandwidth. The figure is sensitive to setup (+23% unpinned).
 - **NVIDIA power states.** With 1 s idle gaps the 5070 sat in P4 for most of the run; throughput fell from 51 to 44 to 47 tiles/s, and `gpu` p95 rose to 10.3 ms while the kernel moved only from 0.26 to 0.33 ms: the cost is transfer and synchronisation, not compute.
 
-**What follows for phase 2 (#475):**
+### After #424 and #425
+
+Measured on 2026-11-26 with `tests/gpu_calibration.rs` on the same laptop (release, synthetic 4096 tile, two runs each; Firefox at about 50% CPU throughout). **Reference figures from one laptop.**
+
+| | 890M before | 890M #424 | 890M #425 | 5070 before | 5070 #424 | 5070 #425 |
+|---|---|---|---|---|---|---|
+| Demand bursts, tiles/s | 55.6–58.5 | 109.5–112.9 | 116.2–119.7 | 51.1–52.2 | 104.2–107.4 | 135.3–138.0 |
+| Prefetch-lane bursts, tiles/s | same | same | 111.8–113.3 | same | same | 101.9–107.0 |
+| Lone tile p50, ms | 16.9–17.3 | 8.9–9.1 | 8.6–9.1 | 18.4–19.3 | 9.2–9.3 | 9.3–9.6 |
+| Upload p50, ms | 4.3 | 3.1 | 5.7 | 8.1 | 5.9 | 5.95 |
+| Mip pass (timestamps), ms | (CPU 6.5) | 1.30 | 1.7 | (CPU 6.4) | 0.23 | 0.25 |
+| BC1 kernel (timestamps), ms | 1.43 | 1.23 | 1.6 | 0.26 | 0.26 | 0.28 |
+
+ISPC on the same tile: about 32 ms on one thread, about 190 tiles/s on all 24.
+
+- **A demand tile is now served about 3.5 times faster on either GPU than by an ISPC thread**, and a GPU sustains 60 to 70% of all-core ISPC throughput without using the cores.
+- **The CPU still pays for the GPU running.** At an equal GPU rate (30 tiles/s), a concurrent ISPC thread ran 30 to 40% slower before and after, although the worker's own CPU time per tile fell about four times (about 17 ms to 3.5 ms); a control doing the old worker's CPU work without a GPU costs 12 to 15%. The rest is the GPU running at all: shared memory bandwidth on the iGPU and the laptop's power and thermal budget. Uncapped, the slowdown rises with the GPU's doubled rate. Frame time decides whether the scheduler caps the GPU's rate (#475).
+- **On the RTX 5070 the level-0 upload is now the limit** (see Future Considerations).
+
+**What followed for phase 2 (#475), as planned before #424 and #425:**
 - **#424:** generate the mip chain on the GPU, upload level 0 only, one submission per tile. Estimates: about 110 tiles/s on the 890M and 125 on the 5070.
 - **A persistently mapped upload buffer** (or assembling chunks straight into it) joins or follows #424, since the staging copy then dominates on NVIDIA.
 - **#425:** two tiles in flight bound a tile at the larger of its CPU side (about 3.5 to 6.5 ms) and GPU side. Estimates: about 180 tiles/s on the 890M and 160 on the 5070.
@@ -413,6 +461,6 @@ No changes to task, executor, or job code. The compressor is injected via the ex
 
 ## Future Considerations
 
-- **GPU mipmap generation**: Add a downsample compute shader if CPU mipmap becomes a bottleneck (currently ~5ms, unlikely)
-- **Auto-selection**: `compressor = auto` could probe for GPU availability and fall back to ISPC
+- **Scheduling across the CPU and GPUs**: `compressor = auto`, calibrated per machine, is the plan in #475 (GPU-first, ISPC as overflow)
+- **Upload placement on discrete GPUs**: wgpu places the mapped upload buffer in device-local (resizable BAR) memory, so the 64 MiB write crosses PCIe at about 11 GB/s on the laptop RTX 5070, about 6 ms per tile, which caps it near 140 tiles/s; wgpu offers no control of that placement
 - **Mac Apple Silicon**: iGPU reports as `IntegratedGpu` but is the only GPU; works transparently via Metal backend
