@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### GPU
 
 - **The GPU encoder reports where its time goes** ([#419](https://github.com/samsoir/xearthlayer/issues/419)): With `texture.compressor = gpu`, the flight log gets a `GPU encode sample` line every minute in which tiles were encoded. It gives the time each tile spent waiting for the GPU worker, building its smaller levels, uploading to the GPU, compressing and reading back, how many tiles were waiting at most, and how many failed; `run --debug` adds a line per tile, and `run --profile` shows each stage in the trace. Reference figures from one laptop (its integrated Radeon and its laptop RTX 5070, not representative of most systems) are in the design document. See [GPU encoding](docs/dev/gpu-encoding-design.md#performance).
+- **The GPU encoder also reports the GPU's own compute time** ([#476](https://github.com/samsoir/xearthlayer/issues/476)): Where the graphics driver supports GPU timestamps, the `GPU encode sample` line now also gives the time the GPU spent compressing each tile, apart from the time spent copying the tile to and from it. Measured this way on one laptop, the compression itself is a small part of each tile's time; the rest is work around it that the next GPU changes take on.
 
 ### Changed
 
