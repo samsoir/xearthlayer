@@ -73,8 +73,9 @@
 //! is never held back for one that has not arrived), demand first, and
 //! never a second prefetch tile, so a demand request still waits behind
 //! one prefetch tile at most. Tiles are finished, judged and answered in
-//! the order they were taken; each has its own deadline from when the
-//! worker took it. A late tile hands back a demand tile begun behind it,
+//! the order they were taken; each has its own deadline, from when it
+//! became the oldest tile in flight (`judged_from`): when the worker took
+//! it, or when the tile ahead of it finished. A late tile hands back a demand tile begun behind it,
 //! as it hands back the demand queue, and a shutdown finishes every tile
 //! begun before it fails the queue.
 
@@ -330,7 +331,8 @@ mod inner {
     /// The worker thread's name, in `top` and profilers (#423).
     pub const WORKER_THREAD: &str = "xel-gpu-encoder";
 
-    /// The GPU's time for one tile, from the worker taking it: the tile's
+    /// The GPU's time for one tile, from the worker taking it, or, for a
+    /// tile begun behind another, from that one's finish (#425): the tile's
     /// poll waits for what remains of it (#420). A 4096 tile takes tens of
     /// milliseconds on a working GPU; the FUSE generation timeout is 10 s.
     pub const TILE_DEADLINE: Duration = Duration::from_secs(2);
@@ -349,7 +351,8 @@ mod inner {
     /// [`Clock`].
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct HangRule {
-        /// The time one tile may take, from the worker taking it.
+        /// The time one tile may take, from the worker taking it, or, for a
+        /// tile begun behind another, from that one's finish (#425).
         pub deadline: Duration,
         /// Missed tiles in a row that fail the GPU.
         pub misses: u32,
@@ -368,12 +371,26 @@ mod inner {
             queue_wait > self.deadline
         }
 
-        /// Whether a tile whose processor call took `took`, from the worker
-        /// taking it, missed the [`deadline`](Self::deadline): at it or past
+        /// Whether a tile that took `took`, from the instant it is judged
+        /// from (`judged_from`: its taking, or the finish of the tile ahead
+        /// of it), missed the [`deadline`](Self::deadline): at it or past
         /// it. The one place this threshold is decided.
         pub fn is_late(&self, took: Duration) -> bool {
             took >= self.deadline
         }
+    }
+
+    /// The instant a tile's time on the GPU is judged from, and its
+    /// deadline runs from (#420, #425): when it became the oldest tile in
+    /// flight. That is when the worker took it, or, for a tile begun behind
+    /// another, when the tile ahead of it finished, whichever is later. So a
+    /// tile is never charged for the one ahead of it: one late tile is one
+    /// miss, and a backlog of tiles each in time is in time, as when the
+    /// worker ran one tile at a time. `ahead_finished` is when the worker
+    /// last finished a tile, `None` before its first. The one place this is
+    /// decided.
+    pub(super) fn judged_from(taken: Instant, ahead_finished: Option<Instant>) -> Instant {
+        ahead_finished.map_or(taken, |finished| finished.max(taken))
     }
 
     impl Default for HangRule {
@@ -416,16 +433,25 @@ mod inner {
 
     /// Wall time of each stage of one tile on the GPU path.
     ///
-    /// The worker loop fills [`queue_wait`](Self::queue_wait) and
-    /// [`process`](Self::process); the [`TileProcessor`] fills the stages
-    /// inside its call. Since #424 the whole tile is one submission: level
-    /// 0 is uploaded, and the GPU builds the mip chain, compresses every
-    /// level and copies the blocks out. The [`gpu`](Self::gpu) figure is
-    /// wall time from recording that submission to the end of its poll, so
-    /// it includes the driver and the synchronisation;
-    /// [`gpu_mips`](Self::gpu_mips) and [`gpu_kernel`](Self::gpu_kernel) are
-    /// the GPU's own time for its compute passes, from timestamp queries,
-    /// where the device has them (#476).
+    /// The worker loop fills [`queue_wait`](Self::queue_wait),
+    /// [`process`](Self::process) and [`overlapped`](Self::overlapped); the
+    /// processor fills the stages inside its calls. Since #424 the whole
+    /// tile is one submission: level 0 is uploaded, and the GPU builds the
+    /// mip chain, compresses every level and copies the blocks out. The
+    /// [`gpu`](Self::gpu) figure is wall time from recording that
+    /// submission to the end of its poll, so it includes the driver and the
+    /// synchronisation; [`gpu_mips`](Self::gpu_mips) and
+    /// [`gpu_kernel`](Self::gpu_kernel) are the GPU's own time for its
+    /// compute passes, from timestamp queries, where the device has them
+    /// (#476).
+    ///
+    /// With two tiles in flight (#425) the stages of one tile overlap the
+    /// next's. [`upload`](Self::upload), [`gpu_mips`](Self::gpu_mips),
+    /// [`gpu_kernel`](Self::gpu_kernel) and [`readback`](Self::readback)
+    /// are still this tile's own cost. [`gpu`](Self::gpu) and
+    /// [`process`](Self::process) are not: they are wall time that includes
+    /// other tiles' work, so under a backlog they are latency, not cost per
+    /// tile, and the throughput is tiles over wall time.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct GpuTileTiming {
         /// From the caller starting its send (time blocked on a full channel
@@ -442,28 +468,50 @@ mod inner {
         /// Recording the tile's one submission, the submit, and the blocking
         /// poll until the GPU has run it: the copy of level 0 into its
         /// texture, the mip chain, the BC1 kernel and the copy of the blocks
-        /// into the readback buffer, with the driver and the waiting.
+        /// into the readback buffer, with the driver and the waiting. Its
+        /// poll starts only when the tile's turn to finish comes: for a tile
+        /// begun behind another (#425), the GPU runs part or all of its
+        /// work while the worker finishes that one and begins the next, and
+        /// that part is in no stage of this tile. Under overlap `gpu` is
+        /// what the worker still waited for, not the tile's GPU time, and
+        /// is often less than [`gpu_mips`](Self::gpu_mips) +
+        /// [`gpu_kernel`](Self::gpu_kernel).
         pub gpu: Duration,
         /// The mip shader's own time on the GPU, every level below level 0
-        /// in one compute pass, from its timestamps (#424). Part of
-        /// [`gpu`](Self::gpu). `None` for a tile of one level, which builds
-        /// no level, and when [`gpu_kernel`](Self::gpu_kernel) is `None`.
+        /// in one compute pass, from its timestamps (#424): this tile's
+        /// cost, whatever else was in flight. Within [`gpu`](Self::gpu)
+        /// for a tile with nothing in flight beside it; under overlap
+        /// (#425) part of it can run before the tile's poll starts, so
+        /// `gpu_mips` + [`gpu_kernel`](Self::gpu_kernel) above `gpu` is
+        /// normal. `None` for a tile of one level, which builds no level,
+        /// and when [`gpu_kernel`](Self::gpu_kernel) is `None`.
         pub gpu_mips: Option<Duration>,
         /// The BC1 kernel's own time on the GPU, every level in one compute
-        /// pass: its end timestamp less its begin (#476). Part of
-        /// [`gpu`](Self::gpu), which adds the copies, the mip chain, the
-        /// driver and the synchronisation. `None` when the device has no
-        /// timestamp queries (`wgpu::Features::TIMESTAMP_QUERY`) or the
-        /// tile's timestamps could not be read.
+        /// pass: its end timestamp less its begin (#476): this tile's cost,
+        /// whatever else was in flight. For a tile with nothing in flight
+        /// beside it, within [`gpu`](Self::gpu), which adds the copies, the
+        /// mip chain, the driver and the synchronisation; under overlap
+        /// (#425) see [`gpu_mips`](Self::gpu_mips). `None` when the device
+        /// has no timestamp queries (`wgpu::Features::TIMESTAMP_QUERY`) or
+        /// the tile's timestamps could not be read.
         pub gpu_kernel: Option<Duration>,
         /// Checking the readback's map, and copying the mapped blocks into
         /// the DDS file: the payload's one copy (#423), one copy of the
         /// whole chain since #424.
         pub readback: Duration,
         /// From the worker taking the tile to its finish returning, as the
-        /// loop timed it. For a tile begun while another was in flight
-        /// (#425) it includes finishing and answering that one.
+        /// loop timed it: the tile's latency in the worker, not its cost.
+        /// For a tile begun while another was in flight (#425) it includes
+        /// finishing and answering that one, and, when the next tile is
+        /// begun before this one is finished, beginning that one too, so
+        /// under a steady backlog it is about two tile periods. The tile is
+        /// judged against the deadline by its own time only, from when it
+        /// became the oldest tile in flight (#420, #425).
         pub process: Duration,
+        /// Whether the worker began this tile while another tile was in
+        /// flight (#425): counted per sample as `overlapped`, to show the
+        /// overlap happens.
+        pub overlapped: bool,
     }
 
     /// Message sent from callers to the GPU worker for compression.
@@ -619,7 +667,7 @@ mod inner {
     /// an error (#423).
     ///
     /// Implementations fill the stages of `timing` they perform; the loop
-    /// owns `queue_wait` and `process`. A processor should give up at
+    /// owns `queue_wait`, `process` and `overlapped`. A processor should give up at
     /// `deadline` (the loop's [`HangRule`]), as [`WgpuTileProcessor`] does by
     /// giving its poll what remains of it; the loop counts a call
     /// that ends at or past it as a miss either way, and an error in time as
@@ -674,8 +722,9 @@ mod inner {
         const DEPTH: usize;
 
         /// Starts `levels` mip levels of `image` in `format`, into a payload
-        /// of `payload_len` bytes, giving up at `deadline`, filling the
-        /// stages of `timing` it performs. An error here is the tile's
+        /// of `payload_len` bytes, giving up at `deadline` (the rule's
+        /// deadline from the worker taking it), filling the stages of
+        /// `timing` it performs. An error here is the tile's
         /// result, given when its turn to finish comes.
         fn begin(
             &mut self,
@@ -688,7 +737,9 @@ mod inner {
         ) -> Result<Self::InFlight, DdsError>;
 
         /// Ends a tile [`begin`](Self::begin) started: its payload into
-        /// `payload`, by `deadline`.
+        /// `payload`, by `deadline`, the rule's deadline from when the tile
+        /// became the oldest in flight (when the tile ahead of it finished,
+        /// if that was after its taking).
         fn finish(
             &mut self,
             tile: Self::InFlight,
@@ -972,6 +1023,7 @@ mod inner {
                 gpu_kernel_us = t.gpu_kernel.map(us),
                 readback_us = us(t.readback),
                 process_us = us(t.process),
+                overlapped = t.overlapped,
                 total_us = us(total),
                 "GPU encode: tile stages"
             );
@@ -1122,6 +1174,10 @@ mod inner {
         /// submission; `None` while it is mapped (from its creation, or once
         /// a pending map answered).
         upload_map: Option<MapAnswer>,
+        /// This set's last submission, the one `upload_map` waits on: the
+        /// upload buffer's poll waits for it alone, never for the other
+        /// set's tile in flight (#425).
+        last_submission: Option<wgpu::SubmissionIndex>,
         output: wgpu::Buffer,
         readback: wgpu::Buffer,
         timer: Option<KernelTimer>,
@@ -1167,6 +1223,7 @@ mod inner {
                 upload,
                 upload_row_bytes,
                 upload_map: None,
+                last_submission: None,
                 output,
                 readback,
                 timer: KernelTimer::new(device, queue, MIP_PASS + 1),
@@ -1178,8 +1235,9 @@ mod inner {
         }
 
         /// Waits, until `deadline`, for the upload buffer's map: asked for
-        /// with the last tile's submission, it is complete once that tile's
-        /// poll returned, so this normally finds it done.
+        /// with this set's last submission, it is complete once that tile's
+        /// poll returned, so this normally finds it done. If not, it polls
+        /// for that submission only.
         fn upload_mapped(
             &mut self,
             device: &wgpu::Device,
@@ -1193,7 +1251,7 @@ mod inner {
                 Err(_) => {
                     device
                         .poll(wgpu::PollType::Wait {
-                            submission_index: None,
+                            submission_index: self.last_submission.clone(),
                             timeout: Some(deadline.saturating_duration_since(Instant::now())),
                         })
                         .map_err(|e| {
@@ -1478,6 +1536,7 @@ mod inner {
                         timer.resolve(&mut encoder, passes);
                     }
                     let index = queue.submit(std::iter::once(encoder.finish()));
+                    resources.last_submission = Some(index.clone());
                     let readback = map(
                         resources.readback.slice(..bytes as u64),
                         wgpu::MapMode::Read,
@@ -1626,8 +1685,9 @@ mod inner {
 
         /// One tile, start to end: [`PipelinedProcessor::begin`] then
         /// [`PipelinedProcessor::finish`], as the loop runs a tile with
-        /// nothing else in flight.
-        pub fn process(
+        /// nothing else in flight. For the hardware tests.
+        #[cfg(test)]
+        pub(crate) fn process(
             &mut self,
             image: RgbaImage,
             format: DdsFormat,
@@ -1865,6 +1925,8 @@ mod inner {
             clock,
             misses: Misses::default(),
             begun: std::collections::VecDeque::new(),
+            last_finished: None,
+            lanes: Vec::new(),
         }
         .run()
     }
@@ -1872,10 +1934,10 @@ mod inner {
     /// A tile the worker began and has not finished (#425).
     struct Begun<T> {
         lane: GpuLane,
-        /// When the worker took it: its deadline and `process` run from
-        /// here.
+        /// When the worker took it: `process` runs from here, and so does
+        /// its deadline unless a tile ahead of it finishes later
+        /// ([`judged_from`]).
         taken: Instant,
-        deadline: Instant,
         /// Kept until the finish, for a hand-back if the tile is never
         /// finished.
         image: RgbaImage,
@@ -1890,7 +1952,7 @@ mod inner {
     }
 
     /// The loop's state: the tiles begun and not finished, oldest first,
-    /// and the misses in a row.
+    /// the misses in a row, and when the last tile finished.
     struct Serving<'a, P: PipelinedProcessor> {
         processor: &'a mut P,
         queues: &'a mut WorkerQueues,
@@ -1900,6 +1962,12 @@ mod inner {
         clock: &'a dyn Clock,
         misses: Misses,
         begun: std::collections::VecDeque<Begun<P::InFlight>>,
+        /// When the worker last finished a tile: the next tile is judged
+        /// from here at the earliest ([`judged_from`]).
+        last_finished: Option<Instant>,
+        /// The lanes of `begun`, oldest first, for `next_begin`: kept so
+        /// the begin loop does not allocate on every pass.
+        lanes: Vec<GpuLane>,
     }
 
     impl<P: PipelinedProcessor> Serving<'_, P> {
@@ -1941,13 +2009,25 @@ mod inner {
                     continue;
                 }
 
-                // Tiles are begun: begin the next one now while the rule
-                // allows (#425), never after a shutdown or a failure.
-                while !self.shutdown.is_cancelled() && !self.health.is_failed() {
-                    let lanes: Vec<GpuLane> = self.begun.iter().map(|b| b.lane).collect();
+                // Tiles are begun, and the GPU was failed from outside the
+                // loop: the device was lost. The tiles not yet finishing go
+                // back to their callers, images and all, as the queue does
+                // once nothing is begun (the check above), rather than be
+                // finished on a dead device.
+                if let Some(reason) = self.health.failure() {
+                    let reason = reason.to_string();
+                    self.abandon_begun(&reason, |_| true);
+                    continue;
+                }
+
+                // Begin the next tile now while the rule allows (#425),
+                // never after a shutdown.
+                while !self.shutdown.is_cancelled() {
+                    self.lanes.clear();
+                    self.lanes.extend(self.begun.iter().map(|b| b.lane));
                     let Some(lane) = next_begin(
                         P::DEPTH,
-                        &lanes,
+                        &self.lanes,
                         state(&self.queues.demand),
                         state(&self.queues.prefetch),
                     ) else {
@@ -2030,6 +2110,7 @@ mod inner {
             } = request;
             let mut timing = GpuTileTiming {
                 queue_wait,
+                overlapped: !self.begun.is_empty(),
                 ..GpuTileTiming::default()
             };
             tracing::debug!(
@@ -2051,7 +2132,10 @@ mod inner {
                 gpu_mips_us = tracing::field::Empty,
                 gpu_kernel_us = tracing::field::Empty,
             );
-            let deadline = taken + self.rule.deadline;
+            // The bound on the begin itself. Its finish gets the deadline
+            // that runs from when it becomes the oldest tile
+            // (`finish_oldest`).
+            let begin_deadline = taken + self.rule.deadline;
             // The chain is written into the caller's file, after its
             // header, in place (#423).
             let payload_len = output.len().checked_sub(layout::HEADER_LEN);
@@ -2068,7 +2152,7 @@ mod inner {
                         format,
                         mipmap_count,
                         payload_len,
-                        deadline,
+                        begin_deadline,
                         &mut timing,
                     )
                 }))
@@ -2083,7 +2167,6 @@ mod inner {
             self.begun.push_back(Begun {
                 lane,
                 taken,
-                deadline,
                 image,
                 output,
                 response,
@@ -2101,7 +2184,6 @@ mod inner {
             let Some(Begun {
                 lane,
                 taken,
-                deadline,
                 image,
                 mut output,
                 response,
@@ -2112,6 +2194,10 @@ mod inner {
             else {
                 return Ok(());
             };
+            // The tile is the oldest now: its time runs from here, never
+            // from behind the tile ahead of it (#425).
+            let from = judged_from(taken, self.last_finished);
+            let deadline = from + self.rule.deadline;
             let processor = &mut *self.processor;
             let finished = span.in_scope(|| match tile {
                 Err(error) => Ok(Err(error)),
@@ -2120,7 +2206,11 @@ mod inner {
                     processor.finish(tile, image, deadline, &mut timing, payload)
                 })),
             });
-            timing.process = self.clock.now().saturating_duration_since(taken);
+            let finished_at = self.clock.now();
+            self.last_finished = Some(finished_at);
+            timing.process = finished_at.saturating_duration_since(taken);
+            // What the tile is judged by: its own time as the oldest tile.
+            let took = finished_at.saturating_duration_since(from);
             // The GPU's own time for the tile's compute passes, from
             // timestamp queries, where the device has them (#476, #424).
             if let Some(mips) = timing.gpu_mips {
@@ -2139,13 +2229,14 @@ mod inner {
             };
 
             let error = result.as_ref().err().map(ToString::to_string);
-            let verdict = self.misses.judge(self.rule, timing.process, error);
+            let verdict = self.misses.judge(self.rule, took, error);
             let reply = GpuEncodeReply::Processed { result, timing };
             if verdict != Verdict::InTime {
                 tracing::debug!(
                     misses = self.misses.count(),
                     ?verdict,
                     lane = lane.name(),
+                    took_ms = took.as_millis() as u64,
                     process_ms = timing.process.as_millis() as u64,
                     "GPU tile missed its deadline or failed"
                 );
@@ -2550,13 +2641,15 @@ mod inner {
     ///   call panicked fails with the panic's message), `health` is failed
     ///   from outside (the device was lost), or `rule.misses` tiles in a row
     ///   end at or past `rule.deadline` or fail before it. `health` turns
-    ///   Failed with the reason, and every tile begun behind and every
-    ///   queued request of either lane is handed back.
+    ///   Failed with the reason, and every tile begun and not finished and
+    ///   every queued request of either lane is handed back.
     ///
     /// A processor of depth two ([`PipelinedProcessor::DEPTH`]) has the
     /// next tile begun while the one before is on the GPU, by
     /// `next_begin` (#425); one of depth one, every [`TileProcessor`],
-    /// runs each tile start to end.
+    /// runs each tile start to end. Either way a tile's deadline runs from
+    /// when it became the oldest tile in flight (`judged_from`): a tile is
+    /// never charged for the one ahead of it.
     ///
     /// On the demand channel only (#421), a tile past its deadline that
     /// does not fail the GPU hands back the demand requests queued behind
@@ -5750,6 +5843,33 @@ mod tests {
         }
     }
 
+    /// A tile is judged from when it became the oldest tile in flight
+    /// (#425): its taking, or the finish of the tile ahead of it, whichever
+    /// is later.
+    #[test]
+    fn a_tile_is_judged_from_its_taking_or_the_finish_of_the_tile_ahead() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for (case, taken, ahead_finished, from) in [
+            ("the worker's first tile", at(0), None, at(0)),
+            (
+                "taken idle, after the last finish",
+                at(5),
+                Some(at(3)),
+                at(5),
+            ),
+            ("taken as the last tile finished", at(5), Some(at(5)), at(5)),
+            (
+                "begun behind a tile that finished later",
+                at(5),
+                Some(at(9)),
+                at(9),
+            ),
+        ] {
+            assert_eq!(judged_from(taken, ahead_finished), from, "{case}");
+        }
+    }
+
     /// What the GPU processor refuses before any GPU work, and what it
     /// plans otherwise: the chain's levels and the payload they fill.
     #[test]
@@ -5798,14 +5918,18 @@ mod tests {
 
     type Phases = Arc<std::sync::Mutex<Vec<Phase>>>;
 
+    /// The deadline each finish was given, by the tile's width.
+    type Deadlines = Arc<std::sync::Mutex<Vec<(u32, Instant)>>>;
+
     /// A processor of depth two for the loop's tests: records each begin,
-    /// finish and abandon by the tile's width. Before each finish it
-    /// reports the width (`finishing`), waits for the test's word when
-    /// gated (a dropped sender lets every finish through), then runs
-    /// `on_finish`, which may advance the clock, fail or panic. `on_begin`
-    /// may fail a begin.
+    /// finish and abandon by the tile's width, and each finish's deadline.
+    /// Before each finish it reports the width (`finishing`), waits for the
+    /// test's word when gated (a dropped sender lets every finish through),
+    /// then runs `on_finish`, which may advance the clock, fail or panic.
+    /// `on_begin` may fail a begin.
     struct TwoPhase {
         phases: Phases,
+        deadlines: Deadlines,
         gate: Option<std::sync::mpsc::Receiver<()>>,
         finishing: Option<mpsc::UnboundedSender<u32>>,
         on_begin: Box<dyn FnMut(u32) -> Result<(), DdsError> + Send>,
@@ -5817,6 +5941,7 @@ mod tests {
             let phases = Phases::default();
             let processor = Self {
                 phases: Arc::clone(&phases),
+                deadlines: Deadlines::default(),
                 gate: None,
                 finishing: None,
                 on_begin: Box::new(|_| Ok(())),
@@ -5877,7 +6002,7 @@ mod tests {
             &mut self,
             width: u32,
             image: RgbaImage,
-            _deadline: Instant,
+            deadline: Instant,
             _timing: &mut GpuTileTiming,
             _payload: &mut [u8],
         ) -> Result<(), DdsError> {
@@ -5886,6 +6011,7 @@ mod tests {
                 width,
                 "each tile finishes with its own image"
             );
+            self.deadlines.lock().unwrap().push((width, deadline));
             if let Some(finishing) = &self.finishing {
                 let _ = finishing.send(width);
             }
@@ -6091,7 +6217,10 @@ mod tests {
     }
 
     /// Prefetch has no deadline (#421): a prefetch tile begun behind a late
-    /// demand tile is finished, not handed back.
+    /// demand tile is finished, not handed back. It is not a second miss
+    /// (#425): with two misses failing the GPU, the GPU stays healthy, and
+    /// the prefetch tile's finish has the whole deadline from the late
+    /// tile's finish.
     #[tokio::test]
     async fn a_late_tile_leaves_the_prefetch_tile_begun_behind_it() {
         use Phase::{Begin, Finish};
@@ -6101,22 +6230,38 @@ mod tests {
         let prefetch = one(&prefetch_tx, &clock, 8);
         let ticking = clock.clone();
         let (processor, seen) = TwoPhase::new();
+        let deadlines = Arc::clone(&processor.deadlines);
         let processor = processor.on_finish(move |width| {
             if width == 4 {
                 ticking.advance(LATE);
             }
             Ok(())
         });
-        let _worker = spawn_with(
+        let health = SharedGpuHealth::new();
+        let rule = HangRule {
+            deadline: TILE_DEADLINE,
+            misses: 2,
+        };
+        let _worker = spawn_tile_worker_with_clock(
             processor,
             queues,
             CancellationToken::new(),
-            SharedGpuHealth::new(),
-            &clock,
+            health.clone(),
+            rule,
+            clock.shared(),
         );
         encoded(reply_of(demand).await);
         encoded(reply_of(prefetch).await);
         assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Finish(8)]);
+        assert!(!health.is_failed(), "one late tile is one miss of two");
+        let start = clock.base;
+        assert_eq!(
+            *deadlines.lock().unwrap(),
+            [
+                (4, start + TILE_DEADLINE),
+                (8, start + LATE + TILE_DEADLINE)
+            ]
+        );
     }
 
     /// A panic in one tile fails that tile and hands back the one begun
@@ -6256,6 +6401,257 @@ mod tests {
             phases(&seen),
             [Begin(4), Begin(8), Finish(4), Begin(12), Finish(12)]
         );
+    }
+
+    /// One late demand tile with a prefetch tile begun behind it is one
+    /// miss (#425): the prefetch tile is judged from the late tile's
+    /// finish, so it is in time and clears the misses. One more late tile
+    /// then does not fail the GPU, where the prefetch tile counted late
+    /// would have made it the third miss in a row of the production rule.
+    #[tokio::test]
+    async fn one_late_tile_with_a_prefetch_tile_begun_behind_it_is_one_miss() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let demand = one(&demand_tx, &clock, 4);
+        let prefetch = one(&prefetch_tx, &clock, 8);
+        let ticking = clock.clone();
+        let (processor, seen) = TwoPhase::new();
+        // Every demand tile runs late; the prefetch tile takes no time of
+        // its own.
+        let processor = processor.on_finish(move |width| {
+            if width != 8 {
+                ticking.advance(LATE);
+            }
+            Ok(())
+        });
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        let (_, late) = processed(reply_of(demand).await);
+        assert!(late.process >= TILE_DEADLINE, "4 was late");
+        let (result, behind) = processed(reply_of(prefetch).await);
+        result.expect("the prefetch tile encoded");
+        assert!(
+            behind.process >= TILE_DEADLINE,
+            "its time in the worker includes the late tile's"
+        );
+        let (result, _) = processed(reply_of(one(&demand_tx, &clock, 12)).await);
+        result.expect("the next late tile encoded");
+        assert!(!health.is_failed(), "two misses, not three in a row");
+        assert_eq!(
+            phases(&seen),
+            [
+                Begin(4),
+                Begin(8),
+                Finish(4),
+                Finish(8),
+                Begin(12),
+                Finish(12)
+            ]
+        );
+    }
+
+    /// A tile begun behind an in-time tile is judged from that tile's
+    /// finish (#425): its finish gets the whole deadline from there, and
+    /// two tiles each just inside it are both in time, though the second's
+    /// time from its taking is past it. One miss would fail the GPU here.
+    #[tokio::test]
+    async fn a_tile_behind_an_in_time_tile_is_judged_from_that_tiles_finish() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8]);
+        let ticking = clock.clone();
+        let (processor, seen) = TwoPhase::new();
+        let deadlines = Arc::clone(&processor.deadlines);
+        let processor = processor.on_finish(move |_| {
+            ticking.advance(IN_TIME);
+            Ok(())
+        });
+        let health = SharedGpuHealth::new();
+        let rule = HangRule {
+            deadline: TILE_DEADLINE,
+            misses: 1,
+        };
+        let _worker = spawn_tile_worker_with_clock(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            rule,
+            clock.shared(),
+        );
+        let mut times = Vec::new();
+        for reply in replies {
+            let (result, timing) = processed(reply_of(reply).await);
+            result.expect("the tile encoded");
+            times.push(timing.process);
+        }
+        assert_eq!(times, [IN_TIME, IN_TIME + IN_TIME], "from each taking");
+        assert!(!health.is_failed(), "neither tile missed");
+        let start = clock.base;
+        assert_eq!(
+            *deadlines.lock().unwrap(),
+            [
+                (4, start + TILE_DEADLINE),
+                (8, start + IN_TIME + TILE_DEADLINE)
+            ]
+        );
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Finish(8)]);
+    }
+
+    /// Three demand tiles, each just inside the deadline and each begun
+    /// behind the one before (#425), are all in time: none is handed back
+    /// for the others' time, as none was when the worker ran them one at a
+    /// time. The first is begun alone, the others behind another.
+    #[tokio::test]
+    async fn three_tiles_each_under_the_deadline_overlapped_are_all_in_time() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8, 12]);
+        let ticking = clock.clone();
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_finish(move |_| {
+            ticking.advance(IN_TIME);
+            Ok(())
+        });
+        let health = SharedGpuHealth::new();
+        let _worker = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        let mut overlapped = Vec::new();
+        for reply in replies {
+            let (result, timing) = processed(reply_of(reply).await);
+            result.expect("the tile encoded");
+            overlapped.push(timing.overlapped);
+        }
+        assert_eq!(overlapped, [false, true, true]);
+        assert!(!health.is_failed());
+        assert_eq!(
+            phases(&seen),
+            [
+                Begin(4),
+                Begin(8),
+                Finish(4),
+                Begin(12),
+                Finish(8),
+                Finish(12)
+            ]
+        );
+    }
+
+    /// A device lost from outside while a tile is being finished and
+    /// another is begun behind it: the one finishing is answered with its
+    /// result, the one begun is handed back with its image, not finished on
+    /// the dead device, and the loop ends as for a lost device.
+    #[tokio::test]
+    async fn a_device_lost_from_outside_hands_back_the_tile_begun_behind() {
+        use Phase::{Abandon, Begin, Finish};
+        let clock = FakeClock::new();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let replies = queue(&tx, &clock, &[4, 8]);
+        let (processor, open, mut reached) = TwoPhase::new().0.gated();
+        let seen = Arc::clone(&processor.phases);
+        let health = SharedGpuHealth::new();
+        let handle = spawn_with(
+            processor,
+            rx,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        assert_eq!(next_start(&mut reached).await, 4);
+        health.fail("device lost");
+        drop(open);
+        loop_ends(handle).await;
+        let mut replies = replies.into_iter();
+        encoded(reply_of(replies.next().unwrap()).await);
+        let (image, reason) = returned(reply_of(replies.next().unwrap()).await);
+        assert_eq!((image.width(), reason.as_str()), (8, "device lost"));
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Abandon(8)]);
+    }
+
+    /// The miss that fails the GPU hands back a prefetch tile begun behind
+    /// it too, with its image (#420): a failed GPU takes nothing more, and
+    /// the prefetch lane's having no deadline does not keep it.
+    #[tokio::test]
+    async fn failing_the_gpu_hands_back_the_prefetch_tile_begun_behind_it() {
+        use Phase::{Abandon, Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let demand = one(&demand_tx, &clock, 4);
+        let prefetch = one(&prefetch_tx, &clock, 8);
+        let (processor, seen) = TwoPhase::new();
+        let processor =
+            processor.on_finish(|_| Err(DdsError::CompressionFailed("device destroyed".into())));
+        let health = SharedGpuHealth::new();
+        let rule = HangRule {
+            deadline: TILE_DEADLINE,
+            misses: 1,
+        };
+        let handle = spawn_tile_worker_with_clock(
+            processor,
+            queues,
+            CancellationToken::new(),
+            health.clone(),
+            rule,
+            clock.shared(),
+        );
+        loop_ends(handle).await;
+        let (first, _) = processed(reply_of(demand).await);
+        assert_eq!(error_text(&first), "Compression failed: device destroyed");
+        let (image, reason) = returned(reply_of(prefetch).await);
+        assert_eq!(image.width(), 8);
+        assert_eq!(
+            reason,
+            "1 tiles in a row failed on the GPU, the last with: \
+             Compression failed: device destroyed"
+        );
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4), Abandon(8)]);
+        assert!(health.is_failed());
+    }
+
+    /// A panic hands back a prefetch tile begun behind the tile whose call
+    /// panicked, with its image (#420).
+    #[tokio::test]
+    async fn a_panic_hands_back_the_prefetch_tile_begun_behind_it() {
+        use Phase::{Begin, Finish};
+        let clock = FakeClock::new();
+        let (demand_tx, prefetch_tx, queues) = lanes();
+        let demand = one(&demand_tx, &clock, 4);
+        let prefetch = one(&prefetch_tx, &clock, 8);
+        let (processor, seen) = TwoPhase::new();
+        let processor = processor.on_finish(|width| panic!("kernel asserted on width {width}"));
+        let health = SharedGpuHealth::new();
+        let handle = spawn_with(
+            processor,
+            queues,
+            CancellationToken::new(),
+            health.clone(),
+            &clock,
+        );
+        loop_ends(handle).await;
+        let (first, _) = processed(reply_of(demand).await);
+        assert_eq!(
+            error_text(&first),
+            "Compression failed: GPU worker panicked: kernel asserted on width 4"
+        );
+        let (image, reason) = returned(reply_of(prefetch).await);
+        assert_eq!(image.width(), 8);
+        assert_eq!(reason, "GPU worker panicked: kernel asserted on width 4");
+        assert_eq!(phases(&seen), [Begin(4), Begin(8), Finish(4)]);
+        assert!(health.is_failed());
     }
 
     // =========================================================================
@@ -6614,6 +7010,10 @@ mod tests {
             (37, 23, full(37, 23)),
             (256, 64, full(256, 64)),
             (6, 6, 2),
+            // One level: no mip pass, level 0 straight to the kernel.
+            (4096, 4096, 1),
+            (37, 23, 1),
+            (4, 4, 1),
         ] {
             let image = varied(w, h);
             let expected =

@@ -37,6 +37,9 @@ struct StageWindows {
     recorded: usize,
     /// Encoded tiles past the cap.
     unsampled: u64,
+    /// Encoded tiles begun while another was in flight (#425), past the cap
+    /// too.
+    overlapped: u64,
     queue_wait: LatencyWindow,
     upload: LatencyWindow,
     gpu: LatencyWindow,
@@ -67,12 +70,19 @@ pub struct GpuSample {
     /// tiles' when some tiles' timestamps could not be read.
     pub gpu_kernel: Option<LatencySummary>,
     pub readback: Option<LatencySummary>,
-    /// The worker's whole call per tile.
+    /// The worker's whole time per tile, from taking it to its finish
+    /// (`GpuTileTiming::process`): under overlap (#425), latency that
+    /// includes the tiles around it, not cost.
     pub process: Option<LatencySummary>,
     /// The caller's round trip, from starting its send to the reply.
     pub total: Option<LatencySummary>,
     /// Encoded tiles past [`WINDOW_CAP`], in no summary.
     pub unsampled: u64,
+    /// Encoded tiles the worker began while another tile was in flight
+    /// (#425): of [`tiles`](Self::tiles), how many overlapped the one
+    /// before. Zero on the prefetch lane alone, which never has two in
+    /// flight.
+    pub overlapped: u64,
     /// Requests that came back without a tile: an error from the worker,
     /// a worker gone before replying, or a handle already shut down.
     pub failed: u64,
@@ -159,6 +169,7 @@ impl GpuEncodeStats {
         let Ok(mut w) = self.window.lock() else {
             return;
         };
+        w.overlapped += u64::from(timing.overlapped);
         if w.recorded >= WINDOW_CAP {
             w.unsampled += 1;
             return;
@@ -236,6 +247,7 @@ impl GpuEncodeStats {
             process: w.process.take(),
             total: w.total.take(),
             unsampled: std::mem::take(&mut w.unsampled),
+            overlapped: std::mem::take(&mut w.overlapped),
             failed,
             fallback,
             cancelled,
@@ -273,6 +285,7 @@ impl GpuEncodeStats {
             lane = lane.name(),
             tiles = s.tiles(),
             unsampled = s.unsampled,
+            overlapped = s.overlapped,
             failed = s.failed,
             fallback = s.fallback,
             cancelled = s.cancelled,
@@ -378,6 +391,7 @@ mod tests {
             gpu_kernel: Some(Duration::from_micros(2_500 * scale)),
             readback: ms(5 * scale),
             process: ms(14 * scale),
+            overlapped: false,
         }
     }
 
@@ -415,6 +429,7 @@ mod tests {
         assert_eq!(max(s.process), Some((28_000, 2)));
         assert_eq!(max(s.total), Some((31_000, 2)));
         assert_eq!(s.total.unwrap().median_us, 16_000);
+        assert_eq!(s.overlapped, 0);
 
         assert!(stats.take_sample().is_none(), "taking starts a new sample");
     }
@@ -435,6 +450,29 @@ mod tests {
         stats.record_encoded(&timing(1), ms(16));
         let s = stats.take_sample().expect("a busy sample");
         assert_eq!((s.total.unwrap().count, s.unsampled), (1, 0));
+    }
+
+    /// Tiles begun while another was in flight (#425) are counted, past the
+    /// cap too, and the count starts again with the next sample.
+    #[test]
+    fn the_tiles_begun_behind_another_are_counted() {
+        let stats = GpuEncodeStats::default();
+        let behind = GpuTileTiming {
+            overlapped: true,
+            ..timing(1)
+        };
+        stats.record_encoded(&timing(1), ms(16));
+        stats.record_encoded(&behind, ms(16));
+        stats.record_encoded(&behind, ms(16));
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!((s.tiles(), s.overlapped), (3, 2));
+
+        for _ in 0..WINDOW_CAP {
+            stats.record_encoded(&timing(1), ms(16));
+        }
+        stats.record_encoded(&behind, ms(16));
+        let s = stats.take_sample().expect("a busy sample");
+        assert_eq!((s.unsampled, s.overlapped), (1, 1));
     }
 
     /// The kernel window holds only the tiles that carried a kernel time:
@@ -574,6 +612,7 @@ mod tests {
             ("lane", "\"prefetch\""),
             ("tiles", "1"),
             ("unsampled", "0"),
+            ("overlapped", "0"),
             ("failed", "0"),
             ("fallback", "0"),
             ("cancelled", "0"),
