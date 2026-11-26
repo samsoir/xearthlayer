@@ -228,10 +228,10 @@ machine, one thread:
 | glibc default | 14.4 ms | 15.2 ms |
 | `MALLOC_MMAP_THRESHOLD_=1048576` (XEarthLayer's default on glibc) | 18.4 ms | 15.2 ms |
 
-On seven real tiles (Apple imagery, the same filter in a benchmark outside
+On six real tiles (Apple imagery, the same filter in a benchmark outside
 this repository) with the threshold set, the chain fell from 16.2 to 17.4 ms
 to 13.1 to 13.6 ms. With glibc's default the two forms were level on real
-tiles (13.2 to 13.9 ms), and on the noise tile in place is 0.8 ms slower (the
+tiles (13.1 to 13.7 ms), and on the noise tile in place is 0.8 ms slower (the
 test's 4096 to 2048 step: 11.1 ms allocating, 11.6 ms in place). Run the test
 with the variable set to see the gain. Figures of one
 machine are a reference, not a promise.
@@ -240,11 +240,13 @@ machine are a reference, not a promise.
 
 - Copying uniform 2×2 blocks instead of averaging them: on land tiles fewer
   than 2% of the blocks are uniform and the check costs about 10% there; only
-  water tiles gain (54 to 80% uniform blocks; 13.1 to 7.5 ms on the one with
+  water tiles gain (54 to 80% uniform blocks; 13.3 to 7.4 ms on the one with
   80%).
 - A smaller encode table: 13% slower in an earlier measurement.
 - Folding the rounding into a 256 KiB encode table with a u32 decode table:
-  1 to 1.5 ms faster, not taken (one lever, a small change).
+  1.2 to 1.8 ms faster on the six real tiles (allocating form, glibc's
+  default malloc; not measured together with the in-place chain), not taken
+  (one lever, a small change).
 
 The GPU worker builds its levels on the GPU with the same filter and the same
 two tables (`MipmapGenerator::FILTER`, `dds/gpu_mips.rs`), byte for byte, so

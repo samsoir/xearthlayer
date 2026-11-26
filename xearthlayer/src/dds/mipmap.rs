@@ -204,7 +204,7 @@ impl MipmapGenerator {
     /// serves the levels from the heap, 14.4 ms allocating and 15.2 ms in
     /// place. Real tiles, the same filter in a benchmark outside this
     /// repository: 16.2 to 17.4 ms down to 13.1 to 13.6 ms with the
-    /// threshold, 13.2 to 13.9 ms either way without it.
+    /// threshold, 13.1 to 13.7 ms either way without it.
     ///
     /// Output row `y` is `out_row = 4 * (w / 2)` bytes at `y * out_row`; its
     /// source rows start at `2 * y * 4 * w`. Since `out_row <= 2 * w` (equal
