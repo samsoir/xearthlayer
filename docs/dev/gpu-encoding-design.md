@@ -193,10 +193,14 @@ demand tile still waits behind at most one prefetch tile (#421). With nothing
 queued, A is finished at once: a finished tile is never held back. Prefetch-only
 bursts therefore run at #424's serial rate; demand bursts gain the overlap.
 Begun tiles keep their image (64 MiB each, at most two) until finished, so
-#420's rules apply per tile in flight: each has its own deadline from when the
-worker took it; a late tile hands back a demand tile begun behind it (and the
-demand queue) but finishes a prefetch one; a GPU failure or panic hands back
-the tile behind; a failed or abandoned tile discards only its own set
+#420's rules apply per tile in flight: each is judged by its own time,
+from when it becomes the oldest tile in flight (`judged_from(taken,
+ahead_finished)`, the later of when it was taken and when the tile ahead
+finished), so the tile ahead's time never counts against it and a backlog of
+in-time tiles stays in time, exactly as when tiles ran one at a time; a late tile hands back a demand tile begun behind it (and the
+demand queue) but finishes a prefetch one; a GPU failure, a panic, or a device lost
+from outside while tiles are begun hands back every tile not yet finishing,
+with its image; a failed or abandoned tile discards only its own set
 (`AfterTile`); a shutdown finishes every begun tile, then fails the queue.
 `plan_tile` refuses a chain that does not fill its payload before any GPU
 work.
@@ -204,7 +208,14 @@ work.
 **GPU resource reuse:** each resource set (level textures, mip storage
 textures, the mapped upload buffer, output and readback buffers, the kernel
 timer) is kept across tiles of the same size and format and dropped after a
-failed tile (#423).
+failed tile (#423). For a 4096 tile a set is about 171 MiB (a 64 MiB upload
+buffer, 85.3 MiB of level textures, two 10.67 MiB output and readback
+buffers); both sets are about 341 MiB, kept for the session once created
+(system memory on an integrated GPU), against about 107 MiB before #424. They
+are deliberately not released when the worker goes idle: re-creating a set
+costs about 11 ms, which cut bursts of two tiles from about 115 to about 71
+tiles/s on both GPUs measured, and the memory is small beside a typical
+session's.
 
 ### Shared Resource Factory
 
@@ -285,17 +296,17 @@ Each tile's `GpuTileTiming` comes back in its `GpuEncodeReply`:
 | `queue_wait` | From the caller starting its send, time blocked on a full channel included, to the worker taking the request. An idle worker blocks on its channels and wakes for a request (#423): there is no poll interval |
 | `upload` | Creating the tile's resources when needed, and writing level 0 into the mapped upload buffer (#424) |
 | `gpu` | Recording, the submit and the poll for the whole tile: wall time, driver included. Under #425 the GPU work of a tile mostly runs while the worker uploads the next one, so `gpu` is near zero in bursts |
-| `gpu_mips` | The mip pass alone, from GPU timestamp queries (#424) |
+| `gpu_mips` | The mip pass alone, from GPU timestamp queries (#424). Under overlap `gpu_mips + gpu_kernel > gpu` is normal |
 | `gpu_kernel` | The BC1 pass alone (one pass for every level since #424), from GPU timestamp queries (`dds/gpu_timestamps.rs`, #476). Present only where the adapter offers `TIMESTAMP_QUERY` with a usable timestamp period. The sample line gives `gpu_kernel_tiles` (how many of the window's tiles carried a kernel time) and `gpu_kernel = timestamps`, `unavailable` or `no tiles`; `unavailable` means no timestamp feature, an unusable period, the timer dropped after its buffer failed to map (warned once; it returns with the resources a failed tile rebuilds), or no usable ticks in the window |
 | `readback` | Receiving the map, copying out of the mapped range and growing the result `Vec` |
-| `process` | The processor's work for the tile on the worker; under #425 it includes finishing the tile ahead of it |
+| `process` | The tile's latency on the worker, from taken to finished. Under a backlog it spans about two tile periods (finishing the tile ahead, beginning the next), so it is not a per-tile cost; `upload`, `gpu_mips`, `gpu_kernel` and `readback` are. The deadline is judged by the tile's own time (see Two tiles in flight) |
 | total | On the caller, from its send to the reply |
 
 They appear in three places:
 
 - **The profile trace** (`run --profile`): spans `gpu_encode` (caller), `gpu_tile` (worker, with `gpu_kernel_us` and `gpu_mips_us`), and `gpu_buffers`, `gpu_upload`, `gpu_submit`, `gpu_poll` and `gpu_readback`. The debug line `GPU kernel time` gives `bc1_us` and `mips_us` per tile.
 - **The debug log**: one `GPU encode: tile stages` line per tile. Since #423 the worker writes the levels into the DDS file in place, so there is no header assembly copy.
-- **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply), `fallback` (tiles handed back and encoded on ISPC: after a failure, or by the queue-age valve), `health` (`healthy` or `failed`) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
+- **A `GPU encode sample` line every 60 s** at info, only when the window saw a tile or a failure. It gives p50, p95 and max per stage, tiles, `failed` (every request that came back without a tile: worker errors, a worker not running, a dropped reply), `fallback` (tiles handed back and encoded on ISPC: after a failure, or by the queue-age valve), `health` (`healthy` or `failed`), `overlapped` (tiles begun while another was in flight, #425) and the queue depth, now and the window's maximum. The service builder starts it, so a channel built in a test has no logger taking its samples. A window keeps at most 10,000 tiles (`WINDOW_CAP`) and counts the rest as `unsampled`.
 
 Each lane has its own `GpuEncodeStats` and its own `GPU encode sample` line, with a `lane` field (`demand` or `prefetch`) and a `cancelled` count (#421, #422). The queue depth is raised before the send and lowered when the reply, the failure or the caller's cancel is back, by a guard that drops on every path. It counts callers, including those waiting on a full channel, which the channel's own capacity does not show; a caller that leaves on a cancel stops counting while its request may still be buffered.
 
