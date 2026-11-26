@@ -6,6 +6,7 @@
 //! --nocapture`.
 
 use super::*;
+use crate::night::roads::dsf::read_dsf_file;
 use crate::xworld_pro::SCENERY_PACKS_FILE;
 
 const INSTALL: &str = "/media/FlightSim/X-Plane 12-beta";
@@ -52,6 +53,7 @@ fn service(skip: Vec<PathBuf>, disk: Option<Arc<dyn Cache>>) -> Arc<RoadService>
         INSTALL.into(),
         skip,
         disk,
+        LitDiskPermits::new(),
         RoadServiceConfig {
             probe_wait: Duration::from_secs(600),
             generate_wait: Duration::from_secs(600),

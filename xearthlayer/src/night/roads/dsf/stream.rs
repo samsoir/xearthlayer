@@ -4,7 +4,6 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
 
 use super::pool::{Pool, MAX_POOL_POINTS};
 use super::walk::{walk_commands, Segmenter, MAX_WALK_VISITS, WALK_SLACK};
@@ -35,13 +34,27 @@ const SC32: u32 = 0x5343_3332;
 const CMDS: u32 = 0x434D_4453;
 
 /// Reads the roads of the DSF at `path`, raw or the first file of a 7z,
-/// without holding the file or the decompressed DSF in memory.
+/// without holding the file or the decompressed DSF in memory. Tests and
+/// measurements only: the road service opens the file itself, to take its
+/// identity from the handle ([`read_dsf_open`]).
+#[cfg(test)]
 pub fn read_dsf_file(
-    path: &Path,
+    path: &std::path::Path,
     keep: impl Fn(u8) -> bool,
     mode: ReadMode,
 ) -> Result<(DsfRoads, DsfFileStats), DsfError> {
-    let mut file = File::open(path).map_err(io_error)?;
+    read_dsf_open(File::open(path).map_err(io_error)?, keep, mode)
+}
+
+/// Reads the roads of a DSF already open at its start, raw or the first
+/// file of a 7z, without holding the file or the decompressed DSF in
+/// memory, so a caller can take the identity of the very file it reads
+/// from the handle.
+pub fn read_dsf_open(
+    mut file: File,
+    keep: impl Fn(u8) -> bool,
+    mode: ReadMode,
+) -> Result<(DsfRoads, DsfFileStats), DsfError> {
     let file_bytes = file.metadata().map_err(io_error)?.len();
     let mut magic = Vec::with_capacity(SEVENZ_MAGIC.len());
     (&mut file)

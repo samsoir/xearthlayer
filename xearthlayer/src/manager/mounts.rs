@@ -304,16 +304,21 @@ impl MountManager {
             .join("Output")
             .join("preferences")
             .join("X-Plane.prf");
+        // The lit disk tier's one set of permits, shared by the source and
+        // the road service: the night permit budget counts it once.
+        let disk_permits = crate::night::LitDiskPermits::new();
         let mut source = crate::night::NightLitSource::new(
             Arc::new(crate::night::RecipeStore::from_index(index)),
             Arc::new(crate::night::LaminarArt::new(art_root)),
             Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
+            disk_permits.clone(),
         )
         .with_brightness(self.night_brightness);
         let roads = crate::night::roads::service::RoadService::new(
             env.installation_path().to_path_buf(),
             vec![ortho_mount.to_path_buf()],
             disk.clone(),
+            disk_permits,
         );
         source = source.with_roads(roads);
         if let Some(disk) = disk {
