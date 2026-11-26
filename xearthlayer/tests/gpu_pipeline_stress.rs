@@ -139,9 +139,9 @@ mod gpu_stress {
         );
         for (name, stage) in [
             ("queue_wait", s.queue_wait),
-            ("downsample", s.downsample),
             ("upload", s.upload),
             ("gpu", s.gpu),
+            ("gpu_mips", s.gpu_mips),
             ("gpu_kernel", s.gpu_kernel),
             ("readback", s.readback),
             ("process", s.process),

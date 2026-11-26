@@ -757,7 +757,9 @@ mod tests {
 }
 
 /// How long shutdown waits for the GPU worker to end after stopping it: it
-/// finishes the tile in progress first, bounded by the tile's deadline.
+/// finishes the tiles it has begun first (two at most, #425), each bounded
+/// by its deadline from when it was taken, and the second is taken while
+/// the first is on the GPU, so both end within about one deadline.
 const GPU_WORKER_STOP: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Logs how the GPU worker ended, `None` if it had not within

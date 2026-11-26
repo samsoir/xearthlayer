@@ -2,10 +2,31 @@
 
 use image::RgbaImage;
 
+/// How a mip level averages each 2×2 block of the level above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MipFilter {
+    /// The stored bytes, averaged and rounded half to even (#394):
+    /// [`MipmapGenerator::downsample_box_2x`].
+    StoredValues,
+    /// R, G and B averaged in linear light, alpha as stored (#467, after
+    /// #458). Implemented on the GPU only (`dds::gpu_mips`), as a tested
+    /// option: no chain uses it until the CPU chain does.
+    LinearLight,
+}
+
 /// Mipmap generator.
 pub struct MipmapGenerator;
 
 impl MipmapGenerator {
+    /// The filter of every mip chain XEarthLayer encodes. It describes the
+    /// CPU chain ([`downsample_box_2x`](Self::downsample_box_2x)), which
+    /// does not read it: a test (`the_filter_describes_the_cpu_chain`)
+    /// holds the value to what the chain does. The GPU worker's chain
+    /// reads it (#424, `dds::gpu_mips::gpu_filter`), so a tile's levels are
+    /// the same bytes on either path. #467 changes this one value, with the
+    /// CPU's filter, to switch both.
+    pub const FILTER: MipFilter = MipFilter::StoredValues;
+
     /// Generate full mipmap chain from source image.
     ///
     /// Continues downsampling by 2× until reaching 1×1 or a minimum size.
@@ -435,6 +456,23 @@ mod tests {
                 round_half_to_even_quarter(sum),
                 "sum {sum}"
             );
+        }
+    }
+
+    /// [`MipmapGenerator::FILTER`] describes the CPU chain, which does not
+    /// read it: the chain's levels are what the filter it names gives,
+    /// computed here by its definition. A filter the CPU does not implement
+    /// fails here, until the CPU chain implements it (#467).
+    #[test]
+    fn the_filter_describes_the_cpu_chain() {
+        let source = noise(64, 48, 7);
+        let chain = MipmapGenerator::generate_chain_with_count(&source, 4);
+        for (level, pair) in chain.windows(2).enumerate() {
+            let expected = match MipmapGenerator::FILTER {
+                MipFilter::StoredValues => downsample_box_2x_reference(&pair[0]),
+                MipFilter::LinearLight => panic!("the CPU chain does not average in linear light"),
+            };
+            assert_same_image(&pair[1], &expected, &format!("level {}", level + 1));
         }
     }
 
