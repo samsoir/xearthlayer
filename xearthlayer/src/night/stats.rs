@@ -17,6 +17,7 @@ use moka::notification::RemovalCause;
 use tracing::debug;
 
 use super::disk::EntryReject;
+use super::layout::PayloadPart;
 use super::service::RoadsState;
 use crate::metrics::{LatencySummary, LatencyWindow};
 
@@ -57,17 +58,27 @@ impl ReadOutcome {
     }
 }
 
-/// What one payload cache lookup did.
+/// What one lookup of a payload part in memory did (#432: the head and the
+/// tail are looked up apart, each part a read wants once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadLookup {
-    /// The payload was in the cache when asked for, and its load did not run.
+    /// The part was in memory when asked for, and no load ran for it.
     Hit,
-    /// The payload was not in the cache when asked for, and its load did not
-    /// run: the lookup joined another's load in flight. Also, rarely, a
-    /// payload inserted between the two checks.
+    /// The part was not in memory when asked for, and this read's load did
+    /// not run: the read joined another's load in flight. Also, rarely, a
+    /// part kept between the two checks.
     Joined,
-    /// Its load ran: a miss.
+    /// This read's load ran: a miss.
     Loaded,
+}
+
+/// Entries and bytes of each part of the payload memory now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadOccupancy {
+    pub head_entries: u64,
+    pub head_bytes: u64,
+    pub tail_entries: u64,
+    pub tail_bytes: u64,
 }
 
 /// What a probe answered, and from what.
@@ -190,14 +201,14 @@ pub struct LitStatsSnapshot {
     pub roads_ready_at_permit: u64,
     /// Write-backs skipped by [`WriteBackSkip`], in its declaration order.
     pub write_backs_skipped: [u64; 5],
-    /// See [`PayloadLookup::Hit`].
-    pub payload_hits: u64,
-    /// See [`PayloadLookup::Joined`].
-    pub payload_joins: u64,
-    /// See [`PayloadLookup::Loaded`].
-    pub payload_misses: u64,
-    /// Payloads evicted for size.
-    pub payload_evictions: u64,
+    /// See [`PayloadLookup::Hit`], by [`PayloadPart`]: head, tail.
+    pub payload_hits: [u64; 2],
+    /// See [`PayloadLookup::Joined`], by part.
+    pub payload_joins: [u64; 2],
+    /// See [`PayloadLookup::Loaded`], by part.
+    pub payload_misses: [u64; 2],
+    /// Parts evicted for size, by part.
+    pub payload_evictions: [u64; 2],
     pub disk_hits: u64,
     /// By [`DiskMiss`], in its declaration order.
     pub disk_misses: [u64; 6],
@@ -230,10 +241,29 @@ impl LitStatsSnapshot {
         self.disk_misses[miss as usize]
     }
 
-    /// Hits over every payload lookup, joins and loads included; `None`
+    pub fn payload_hits(&self, part: PayloadPart) -> u64 {
+        self.payload_hits[part as usize]
+    }
+
+    pub fn payload_joins(&self, part: PayloadPart) -> u64 {
+        self.payload_joins[part as usize]
+    }
+
+    pub fn payload_misses(&self, part: PayloadPart) -> u64 {
+        self.payload_misses[part as usize]
+    }
+
+    pub fn payload_evictions(&self, part: PayloadPart) -> u64 {
+        self.payload_evictions[part as usize]
+    }
+
+    /// Hits over every lookup of `part`, joins and loads included; `None`
     /// without any.
-    pub fn payload_hit_rate(&self) -> Option<f64> {
-        hit_rate(self.payload_hits, self.payload_joins + self.payload_misses)
+    pub fn payload_hit_rate(&self, part: PayloadPart) -> Option<f64> {
+        hit_rate(
+            self.payload_hits(part),
+            self.payload_joins(part) + self.payload_misses(part),
+        )
     }
 
     /// Hits over the disk lookups that could hit: without a fingerprint no
@@ -261,10 +291,10 @@ impl LitStatsSnapshot {
             generations_black: self.generations_black - earlier.generations_black,
             roads_ready_at_permit: self.roads_ready_at_permit - earlier.roads_ready_at_permit,
             write_backs_skipped: each(self.write_backs_skipped, earlier.write_backs_skipped),
-            payload_hits: self.payload_hits - earlier.payload_hits,
-            payload_joins: self.payload_joins - earlier.payload_joins,
-            payload_misses: self.payload_misses - earlier.payload_misses,
-            payload_evictions: self.payload_evictions - earlier.payload_evictions,
+            payload_hits: each(self.payload_hits, earlier.payload_hits),
+            payload_joins: each(self.payload_joins, earlier.payload_joins),
+            payload_misses: each(self.payload_misses, earlier.payload_misses),
+            payload_evictions: each(self.payload_evictions, earlier.payload_evictions),
             disk_hits: self.disk_hits - earlier.disk_hits,
             disk_misses: each(self.disk_misses, earlier.disk_misses),
             disk_writes: self.disk_writes - earlier.disk_writes,
@@ -421,10 +451,10 @@ pub struct LitStats {
     generations_black: AtomicU64,
     roads_ready_at_permit: AtomicU64,
     write_backs_skipped: Tally<5>,
-    payload_hits: AtomicU64,
-    payload_joins: AtomicU64,
-    payload_misses: AtomicU64,
-    payload_evictions: AtomicU64,
+    payload_hits: Tally<2>,
+    payload_joins: Tally<2>,
+    payload_misses: Tally<2>,
+    payload_evictions: Tally<2>,
     disk_hits: AtomicU64,
     disk_misses: Tally<6>,
     disk_writes: AtomicU64,
@@ -473,19 +503,22 @@ impl LitStats {
         }
     }
 
-    pub fn record_payload_lookup(&self, lookup: PayloadLookup) {
-        add(match lookup {
+    /// A lookup of `part` in the payload memory.
+    pub fn record_payload_lookup(&self, part: PayloadPart, lookup: PayloadLookup) {
+        match lookup {
             PayloadLookup::Hit => &self.payload_hits,
             PayloadLookup::Joined => &self.payload_joins,
             PayloadLookup::Loaded => &self.payload_misses,
-        });
+        }
+        .add(part as usize);
     }
 
-    /// A payload left the cache. Only evictions for size are counted: the
-    /// cache invalidates nothing, has no expiry and never replaces a value.
-    pub fn record_payload_removal(&self, cause: RemovalCause) {
+    /// A `part` left the payload memory. Only evictions for size are
+    /// counted: the memory invalidates nothing, has no expiry and never
+    /// replaces a part it holds.
+    pub fn record_payload_removal(&self, part: PayloadPart, cause: RemovalCause) {
         if cause == RemovalCause::Size {
-            add(&self.payload_evictions);
+            self.payload_evictions.add(part as usize);
         }
     }
 
@@ -521,10 +554,10 @@ impl LitStats {
             generations_black: get(&self.generations_black),
             roads_ready_at_permit: get(&self.roads_ready_at_permit),
             write_backs_skipped: self.write_backs_skipped.get(),
-            payload_hits: get(&self.payload_hits),
-            payload_joins: get(&self.payload_joins),
-            payload_misses: get(&self.payload_misses),
-            payload_evictions: get(&self.payload_evictions),
+            payload_hits: self.payload_hits.get(),
+            payload_joins: self.payload_joins.get(),
+            payload_misses: self.payload_misses.get(),
+            payload_evictions: self.payload_evictions.get(),
             disk_hits: get(&self.disk_hits),
             disk_misses: self.disk_misses.get(),
             disk_writes: get(&self.disk_writes),
@@ -570,9 +603,10 @@ impl LitStats {
     }
 
     /// Logs the window as `Night lighting: summary`, unless nothing
-    /// happened. `payload_entries` and `payload_bytes` are the payload
-    /// cache's entry count and weighted size now.
-    pub fn log_summary(&self, payload_entries: u64, payload_bytes: u64) {
+    /// happened. `memory` is the payload memory's occupancy now:
+    /// `payload_entries` and `payload_bytes` are both parts', then each
+    /// part's apart.
+    pub fn log_summary(&self, memory: PayloadOccupancy) {
         let Some(w) = self.take_window() else {
             return;
         };
@@ -581,6 +615,7 @@ impl LitStats {
         let read = |o: ReadOutcome| ms(w.read(o));
         let skipped = |s: WriteBackSkip| d.write_backs_skipped(s);
         let miss = |m: DiskMiss| d.disk_misses(m);
+        let (head, tail) = (PayloadPart::Head, PayloadPart::Tail);
         debug!(
             reads_dark = d.reads(ReadOutcome::Dark),
             reads_blank = d.reads(ReadOutcome::Blank),
@@ -615,13 +650,22 @@ impl LitStats {
             write_back_skipped_road_failed = skipped(WriteBackSkip::RoadFailed),
             write_back_skipped_road_sources_changed = skipped(WriteBackSkip::RoadSourcesChanged),
             write_back_skipped_art_failed = skipped(WriteBackSkip::ArtFailed),
-            payload_hits = d.payload_hits,
-            payload_joins = d.payload_joins,
-            payload_misses = d.payload_misses,
-            payload_hit_rate = d.payload_hit_rate(),
-            payload_evictions = d.payload_evictions,
-            payload_entries,
-            payload_bytes,
+            payload_head_hits = d.payload_hits(head),
+            payload_head_joins = d.payload_joins(head),
+            payload_head_misses = d.payload_misses(head),
+            payload_head_hit_rate = d.payload_hit_rate(head),
+            payload_head_evictions = d.payload_evictions(head),
+            payload_tail_hits = d.payload_hits(tail),
+            payload_tail_joins = d.payload_joins(tail),
+            payload_tail_misses = d.payload_misses(tail),
+            payload_tail_hit_rate = d.payload_hit_rate(tail),
+            payload_tail_evictions = d.payload_evictions(tail),
+            payload_entries = memory.head_entries + memory.tail_entries,
+            payload_bytes = memory.head_bytes + memory.tail_bytes,
+            payload_head_entries = memory.head_entries,
+            payload_head_bytes = memory.head_bytes,
+            payload_tail_entries = memory.tail_entries,
+            payload_tail_bytes = memory.tail_bytes,
             disk_hits = d.disk_hits,
             disk_hit_rate = d.disk_hit_rate(),
             disk_miss_absent = miss(DiskMiss::Absent),
@@ -697,13 +741,21 @@ mod tests {
             s.write_backs_skipped.len()
         );
         assert_eq!(DiskMiss::NoFingerprint as usize + 1, s.disk_misses.len());
+        for parts in [
+            s.payload_hits,
+            s.payload_joins,
+            s.payload_misses,
+            s.payload_evictions,
+        ] {
+            assert_eq!(PayloadPart::Tail as usize + 1, parts.len());
+        }
     }
 
     #[test]
     fn a_window_where_nothing_happened_has_no_summary() {
         let s = LitStats::default();
         assert_eq!(s.take_window(), None);
-        s.log_summary(0, 0); // logs nothing, and does not panic
+        s.log_summary(PayloadOccupancy::default()); // logs nothing, and does not panic
     }
 
     #[test]
@@ -754,17 +806,17 @@ mod tests {
     #[test]
     fn a_window_reports_only_its_own_counts() {
         let s = LitStats::default();
-        s.record_payload_lookup(PayloadLookup::Loaded);
+        s.record_payload_lookup(PayloadPart::Tail, PayloadLookup::Loaded);
         s.take_window().unwrap();
-        s.record_payload_lookup(PayloadLookup::Hit);
-        s.record_payload_removal(RemovalCause::Size);
-        s.record_payload_removal(RemovalCause::Explicit);
+        s.record_payload_lookup(PayloadPart::Tail, PayloadLookup::Hit);
+        s.record_payload_removal(PayloadPart::Head, RemovalCause::Size);
+        s.record_payload_removal(PayloadPart::Head, RemovalCause::Explicit);
         let w = s.take_window().unwrap();
         assert_eq!(
             w.delta,
             LitStatsSnapshot {
-                payload_hits: 1,
-                payload_evictions: 1,
+                payload_hits: [0, 1],
+                payload_evictions: [1, 0],
                 ..LitStatsSnapshot::default()
             }
         );
@@ -822,19 +874,27 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_hit_rate_counts_only_hits_and_joins_as_lookups() {
+    fn the_payload_hit_rate_of_a_part_counts_hits_over_its_lookups() {
         let s = LitStats::default();
-        assert_eq!(s.snapshot().payload_hit_rate(), None);
-        s.record_payload_lookup(PayloadLookup::Hit);
-        s.record_payload_lookup(PayloadLookup::Joined);
-        s.record_payload_lookup(PayloadLookup::Joined);
-        s.record_payload_lookup(PayloadLookup::Loaded);
+        let tail = PayloadPart::Tail;
+        assert_eq!(s.snapshot().payload_hit_rate(tail), None);
+        s.record_payload_lookup(tail, PayloadLookup::Hit);
+        s.record_payload_lookup(tail, PayloadLookup::Joined);
+        s.record_payload_lookup(tail, PayloadLookup::Joined);
+        s.record_payload_lookup(tail, PayloadLookup::Loaded);
+        s.record_payload_lookup(PayloadPart::Head, PayloadLookup::Loaded);
         let snap = s.snapshot();
         assert_eq!(
-            (snap.payload_hits, snap.payload_joins, snap.payload_misses),
+            (
+                snap.payload_hits(tail),
+                snap.payload_joins(tail),
+                snap.payload_misses(tail)
+            ),
             (1, 2, 1)
         );
-        assert_eq!(snap.payload_hit_rate(), Some(0.25));
+        assert_eq!(snap.payload_hit_rate(tail), Some(0.25));
+        assert_eq!(snap.payload_hit_rate(PayloadPart::Head), Some(0.0));
+        assert_eq!(snap.payload_misses, [1, 1]);
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod generator;
 pub mod laminar;
 pub mod layout;
 pub(crate) mod math;
+pub(crate) mod payloads;
 pub mod prefs;
 pub mod recipe;
 pub(crate) mod retry;
