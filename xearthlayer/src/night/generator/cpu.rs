@@ -482,6 +482,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_supersampled_road_field_with_no_road_leaves_the_output_byte_for_byte() {
+        // A capped texture's roads are rastered at twice its size (#431):
+        // with no road near, the field is empty and nothing moves.
+        use crate::night::roads::field::tests::{crossing, merged};
+        let n = name_at(46.5, 6.5);
+        let varied = synthetic(
+            46,
+            6,
+            120,
+            |_, _| 1,
+            120,
+            |r, c| ((r * 37 + c * 11) % 256) as u8,
+        );
+        let recipes = move |a: i32, b: i32| ((a, b) == (46, 6)).then(|| varied.clone());
+        let any_speckled = |_: &str| speckled("lib/g10/terrain10/urban_tmp_sdry3.ter");
+        let generate = |roads: &RoadField| {
+            CpuLitGenerator.generate(&LitRequest {
+                name: &n,
+                size: 128,
+                brightness: 1.0,
+                recipes: &recipes,
+                patterns: &any_speckled,
+                regions: &|_, _| LedRegion::Na,
+                led: &LedModel::DEFAULT,
+                roads,
+                road_model: &RoadModel::DEFAULT,
+            })
+        };
+        let without = generate(&RoadField::empty(128));
+        let far = merged((47, 6), &[(100, vec![(6.5, 47.9), (6.6, 47.9)])]);
+        for tiles in [vec![], vec![far]] {
+            let field = RoadField::raster_supersampled(&n, 128, 2, &tiles, &RoadModel::DEFAULT);
+            assert!(field.is_empty());
+            assert!(generate(&field) == without, "{} tiles", tiles.len());
+        }
+        // And a road near it is drawn.
+        let road = RoadField::raster_supersampled(&n, 128, 2, &[crossing(&n)], &RoadModel::DEFAULT);
+        assert!(generate(&road) != without);
+    }
+
     /// Every texel of the 128 px golden fixture samples the field and the
     /// pattern as the code before #437 did, bit for bit: class weights,
     /// radiance, and the speckled pattern at every class.
