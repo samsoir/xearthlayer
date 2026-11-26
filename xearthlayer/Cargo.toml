@@ -91,4 +91,8 @@ proptest = "1.4"
 rand = "0.9"
 tempfile.workspace = true
 futures = "0.3"
+# Compiles the GPU worker's WGSL in the default tests, with no GPU: parsed,
+# validated, and written as MSL and SPIR-V (`dds::gpu_mips`). The version
+# wgpu already brings in.
+naga = { version = "=30.0.1", features = ["wgsl-in", "msl-out", "spv-out"] }
 filetime = "0.2"

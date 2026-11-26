@@ -436,13 +436,51 @@ mod tests {
         assert_eq!(MipFilter::LinearLight.entry_point(), "mip_linear");
     }
 
+    /// The shader compiles, with no GPU: naga, the compiler wgpu runs on
+    /// it, parses and validates it, and writes each filter's entry point as
+    /// Metal (MSL, at the versions macOS 15 and 26 give wgpu) and as
+    /// Vulkan's SPIR-V. A shader error fails here on every CI host, Linux
+    /// included, rather than at the worker's start on a host with that GPU.
     #[test]
-    fn the_shader_has_an_entry_point_for_each_filter() {
+    fn the_shader_compiles_for_metal_and_vulkan_with_an_entry_point_per_filter() {
+        use naga::back::{msl, spv};
+        use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let module = naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(SHADER)));
+        let info = Validator::new(ValidationFlags::all(), Capabilities::default())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(SHADER)));
         for filter in [MipFilter::StoredValues, MipFilter::LinearLight] {
+            let entry = filter.entry_point();
             assert!(
-                SHADER.contains(&format!("fn {}(", filter.entry_point())),
-                "{filter:?}"
+                module
+                    .entry_points
+                    .iter()
+                    .any(|ep| ep.name == entry && ep.stage == naga::ShaderStage::Compute),
+                "{entry} is a compute entry point"
             );
+            for lang_version in [(3, 2), (4, 0)] {
+                let options = msl::Options {
+                    lang_version,
+                    ..msl::Options::default()
+                };
+                let pipeline = msl::PipelineOptions {
+                    entry_point: Some((naga::ShaderStage::Compute, entry.to_string())),
+                    ..msl::PipelineOptions::default()
+                };
+                let (source, _) = msl::write_string(&module, &info, &options, &pipeline)
+                    .unwrap_or_else(|e| panic!("{entry} in MSL {lang_version:?}: {e}"));
+                assert!(source.contains(entry), "{entry} in MSL {lang_version:?}");
+            }
+            let pipeline = spv::PipelineOptions {
+                shader_stage: naga::ShaderStage::Compute,
+                entry_point: entry.to_string(),
+            };
+            let words = spv::write_vec(&module, &info, &spv::Options::default(), Some(&pipeline))
+                .unwrap_or_else(|e| panic!("{entry} in SPIR-V: {e}"));
+            // SPIR-V's magic number opens every module.
+            assert_eq!(words.first(), Some(&0x0723_0203), "{entry} in SPIR-V");
         }
     }
 

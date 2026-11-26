@@ -4856,6 +4856,7 @@ dependencies = [
  "libc",
  "memory-stats",
  "moka",
+ "naga",
  "nix",
  "parking_lot",
  "pollster",
