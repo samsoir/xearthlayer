@@ -85,11 +85,13 @@ The prototype is described under Design below.
 | Google GO2, 16 batched | 7.8 ms (128 tiles/s) | 3.9 ms (258 tiles/s) |
 | ArcGIS, 16 batched | 23–35 ms (noisy) | 4.3 ms (235 tiles/s) |
 | USGS (4:4:4), 16 batched | 12.7 ms (79 tiles/s) | 6.3 ms (159 tiles/s) |
-| Apple Maps | to be measured | to be measured |
+| Apple Maps, one tile | ~56 ms | ~33 ms |
+| Apple Maps, 16 batched | **7.6 ms (131 tiles/s)** | **3.4 ms (299 tiles/s)** |
 | CPU (zune), Bing, one core | 41 ms | |
+| CPU (zune), Apple Maps, one core | 48 ms | |
 
-Apple's timings are pending: the first run was taken on battery power and
-discarded. Its format and correctness results stand.
+The Apple tile is larger than the Bing one: 4.8 MB of chunks against 3.8 MB. As
+a result, zune takes longer on it, but the batched GPU decode does not.
 
 **Correctness.** Each chunk was compared with zune's RGBA output. Mean PSNR is
 51–55 dB on the 4:2:0 providers and 61 dB on USGS; the worst chunk is 45.9 dB.
@@ -191,7 +193,6 @@ This is decided by the scheduler (#475 phase 4), using calibration.
 
 ## Open items
 
-- Apple Maps timings, on AC power.
 - ArcGIS's per-chunk tables are slow on RADV (global-memory lookups). Options:
   u16 table entries, or grouping chunks by table set. The provider is rarely
   used, so this is low priority.
