@@ -91,6 +91,7 @@ mod conversion;
 mod encoder;
 pub mod gpu_channel;
 pub mod gpu_health;
+mod gpu_mips;
 pub mod gpu_stats;
 pub mod gpu_timestamps;
 mod header;
@@ -108,4 +109,4 @@ pub use gpu_channel::create_gpu_encoder_channels;
 pub use types::{DdsError, DdsFormat, DdsHeader};
 
 // Re-export for advanced usage
-pub use mipmap::{MipmapGenerator, MipmapStream};
+pub use mipmap::{MipFilter, MipmapGenerator, MipmapStream};

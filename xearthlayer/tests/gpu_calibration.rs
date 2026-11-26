@@ -29,7 +29,8 @@
 //! `XEL_BENCH_BURST` tiles per burst (default 32), `XEL_BENCH_BURSTS`
 //! bursts back to back (default 3) and `XEL_BENCH_STREAM_POOL` images
 //! cloned beforehand for the GPU's stream while ISPC is timed (default 96,
-//! 6 GiB). `XEL_BENCH_ISPC_BURST` sets the ISPC burst on every thread
+//! 6 GiB), and `XEL_BENCH_STREAM_RATE` caps that stream's tiles per second
+//! (default none), to compare the CPU's slowdown at the same GPU work. `XEL_BENCH_ISPC_BURST` sets the ISPC burst on every thread
 //! (default four tiles a thread). Images are always cloned before they are
 //! timed, and each is 64 MiB: the ISPC burst holds all of its images at
 //! once, 8 GiB by default on 32 threads, so lower it on a host with less
@@ -87,9 +88,9 @@ fn print_stages(s: &GpuSample) {
     );
     for (name, stage) in [
         ("queue_wait", s.queue_wait),
-        ("downsample", s.downsample),
         ("upload", s.upload),
         ("gpu", s.gpu),
+        ("gpu_mips", s.gpu_mips),
         ("gpu_kernel", s.gpu_kernel),
         ("readback", s.readback),
         ("process", s.process),
@@ -171,6 +172,10 @@ fn calibrate_the_encode_pipelines() {
     let lone_n: usize = env_or("XEL_BENCH_LONE", 20);
     let burst: usize = env_or("XEL_BENCH_BURST", 32);
     let bursts: usize = env_or("XEL_BENCH_BURSTS", 3);
+    let stream_rate: Option<f64> = std::env::var("XEL_BENCH_STREAM_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|r: &f64| *r > 0.0);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     eprintln!("Machine: {}", machine_label());
     eprintln!(
@@ -359,7 +364,7 @@ fn calibrate_the_encode_pipelines() {
         // ISPC on one thread while the GPU encodes a steady stream: four
         // callers keep the GPU's queue from running dry. Their images are
         // cloned beforehand, so the only CPU work beside ISPC is the GPU
-        // path's own (the worker's downsample, upload and readback).
+        // path's own (the worker's upload and readback).
         let pool = std::sync::Mutex::new(
             (0..env_or("XEL_BENCH_STREAM_POOL", 96usize))
                 .map(|_| source.clone())
@@ -367,10 +372,19 @@ fn calibrate_the_encode_pipelines() {
         );
         let stop = AtomicBool::new(false);
         let streamed = AtomicUsize::new(0);
+        // With `XEL_BENCH_STREAM_RATE`, tile `n` of the stream is sent no
+        // sooner than `n / rate` seconds in: the same GPU work per second
+        // on any build, so the CPU's slowdown compares like for like.
+        let paced = stream_rate.map(|rate| (Instant::now(), rate, AtomicUsize::new(0)));
         let (cpu_under_load, stream_wall) = std::thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
+                        if let Some((start, rate, sent)) = &paced {
+                            let n = sent.fetch_add(1, Ordering::Relaxed);
+                            let at = *start + Duration::from_secs_f64(n as f64 / rate);
+                            std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                        }
                         let Some(img) = pool.lock().unwrap().pop() else {
                             break;
                         };
@@ -393,7 +407,8 @@ fn calibrate_the_encode_pipelines() {
         let (during, cpu_wall) = stream_wall;
         let left = pool.lock().unwrap().len();
         eprintln!(
-            "  ISPC one thread while this GPU encodes{}:",
+            "  ISPC one thread while this GPU encodes{}{}:",
+            stream_rate.map_or(String::new(), |r| format!(" at most {r} tiles/s")),
             if left == 0 {
                 " (the stream's images ran out before the end: raise XEL_BENCH_STREAM_POOL)"
             } else {
@@ -426,9 +441,9 @@ fn calibrate_the_encode_pipelines() {
         "lone p50",
         "tiles/s",
         "queue",
-        "downs",
         "upload",
         "gpu",
+        "mips",
         "kernel",
         "readbk",
         "process"
@@ -446,9 +461,9 @@ fn calibrate_the_encode_pipelines() {
             p50(r.lone),
             r.tiles_per_s,
             p50(st.queue_wait),
-            p50(st.downsample),
             p50(st.upload),
             p50(st.gpu),
+            p50(st.gpu_mips),
             p50(st.gpu_kernel),
             p50(st.readback),
             p50(st.process),

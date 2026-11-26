@@ -2,7 +2,10 @@
 //!
 //! Provides the message types and channel handle for submitting
 //! full tile requests to a dedicated GPU worker thread. The worker
-//! owns mipmap iteration internally, reducing cross-thread round-trips.
+//! owns the mip chain, reducing cross-thread round-trips: since #424 it
+//! uploads level 0 only, and the GPU builds the chain (`dds::gpu_mips`),
+//! compresses every level and copies the blocks out in one submission
+//! per tile ([`WgpuTileProcessor`]).
 //!
 //! The worker is split in two (#419): the loop ([`spawn_tile_worker`]:
 //! receive, shutdown, `catch_unwind`, drain, reply, the loop's own timing)
@@ -74,6 +77,9 @@ mod inner {
 
     use crate::dds::compressor::{ChainOutcome, MipmapCompressor};
     use crate::dds::gpu_health::SharedGpuHealth;
+    use crate::dds::gpu_mips::{
+        chain_bytes, chain_plan, gpu_filter, upload_row_bytes, write_level0, MipChain, MipPipeline,
+    };
     use crate::dds::gpu_stats::GpuEncodeStats;
     use crate::dds::gpu_timestamps::{KernelTimer, TimerError};
     use crate::dds::layout;
@@ -307,7 +313,7 @@ mod inner {
     /// The worker thread's name, in `top` and profilers (#423).
     pub const WORKER_THREAD: &str = "xel-gpu-encoder";
 
-    /// The GPU's time for one tile, from the worker taking it: each level's
+    /// The GPU's time for one tile, from the worker taking it: the tile's
     /// poll waits for what remains of it (#420). A 4096 tile takes tens of
     /// milliseconds on a working GPU; the FUSE generation timeout is 10 s.
     pub const TILE_DEADLINE: Duration = Duration::from_secs(2);
@@ -395,12 +401,14 @@ mod inner {
     ///
     /// The worker loop fills [`queue_wait`](Self::queue_wait) and
     /// [`process`](Self::process); the [`TileProcessor`] fills the stages
-    /// inside its call, each summed over the tile's mip levels. The
-    /// [`gpu`](Self::gpu) figure is wall time from recording to the end of
-    /// the poll, so it includes the driver and the synchronisation;
-    /// [`gpu_kernel`](Self::gpu_kernel) is the GPU's own time for the
-    /// compute passes, from timestamp queries, where the device has them
-    /// (#476).
+    /// inside its call. Since #424 the whole tile is one submission: level
+    /// 0 is uploaded, and the GPU builds the mip chain, compresses every
+    /// level and copies the blocks out. The [`gpu`](Self::gpu) figure is
+    /// wall time from recording that submission to the end of its poll, so
+    /// it includes the driver and the synchronisation;
+    /// [`gpu_mips`](Self::gpu_mips) and [`gpu_kernel`](Self::gpu_kernel) are
+    /// the GPU's own time for its compute passes, from timestamp queries,
+    /// where the device has them (#476).
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct GpuTileTiming {
         /// From the caller starting its send (time blocked on a full channel
@@ -408,26 +416,32 @@ mod inner {
         /// is the idle worker's wake-up alone: it blocks on its channels
         /// rather than poll them (#423).
         pub queue_wait: Duration,
-        /// CPU mip generation ([`MipmapStream`](crate::dds::MipmapStream))
-        /// and the padding of the sub-block tail. The stream works one level
-        /// ahead: taking level `i` computes level `i + 1`.
-        pub downsample: Duration,
-        /// Creating the output and readback buffers and each level's
-        /// texture, on the first tile of a size only (they are kept for the
-        /// next, #423), and `queue.write_texture`, which copies the level
-        /// into a wgpu staging buffer.
+        /// The CPU's part of the upload: creating the tile's GPU resources,
+        /// on the first tile of a size only (they are kept for the next,
+        /// #423), and writing level 0 into the persistently mapped upload
+        /// buffer, the image's one copy on the CPU (#424). The copy into
+        /// the level 0 texture runs on the GPU, inside [`gpu`](Self::gpu).
         pub upload: Duration,
-        /// Command recording, submit and the blocking poll: GPU and driver.
+        /// Recording the tile's one submission, the submit, and the blocking
+        /// poll until the GPU has run it: the copy of level 0 into its
+        /// texture, the mip chain, the BC1 kernel and the copy of the blocks
+        /// into the readback buffer, with the driver and the waiting.
         pub gpu: Duration,
-        /// The compute passes' own time on the GPU, summed over the tile's
-        /// levels: each pass's end timestamp less its begin (#476). Part of
-        /// [`gpu`](Self::gpu), which adds the driver and the
-        /// synchronisation. `None` when the device has no timestamp queries
-        /// (`wgpu::Features::TIMESTAMP_QUERY`) or the tile's timestamps
-        /// could not be read.
+        /// The mip shader's own time on the GPU, every level below level 0
+        /// in one compute pass, from its timestamps (#424). Part of
+        /// [`gpu`](Self::gpu). `None` for a tile of one level, which builds
+        /// no level, and when [`gpu_kernel`](Self::gpu_kernel) is `None`.
+        pub gpu_mips: Option<Duration>,
+        /// The BC1 kernel's own time on the GPU, every level in one compute
+        /// pass: its end timestamp less its begin (#476). Part of
+        /// [`gpu`](Self::gpu), which adds the copies, the mip chain, the
+        /// driver and the synchronisation. `None` when the device has no
+        /// timestamp queries (`wgpu::Features::TIMESTAMP_QUERY`) or the
+        /// tile's timestamps could not be read.
         pub gpu_kernel: Option<Duration>,
-        /// Waiting for the buffer map, and copying the mapped range into the
-        /// level's slot of the DDS file: the payload's one copy (#423).
+        /// Checking the readback's map, and copying the mapped blocks into
+        /// the DDS file: the payload's one copy (#423), one copy of the
+        /// whole chain since #424.
         pub readback: Duration,
         /// The processor's whole call, as the loop timed it.
         pub process: Duration,
@@ -588,7 +602,7 @@ mod inner {
     /// Implementations fill the stages of `timing` they perform; the loop
     /// owns `queue_wait` and `process`. A processor should give up at
     /// `deadline` (the loop's [`HangRule`]), as [`WgpuTileProcessor`] does by
-    /// giving each level's poll what remains of it; the loop counts a call
+    /// giving its poll what remains of it; the loop counts a call
     /// that ends at or past it as a miss either way, and an error in time as
     /// one too. A panic is caught by the loop (see [`spawn_tile_worker`]).
     ///
@@ -806,10 +820,11 @@ mod inner {
                 levels = mipmap_count,
                 encoded,
                 queue_wait_us = us(t.queue_wait),
-                downsample_us = us(t.downsample),
                 upload_us = us(t.upload),
                 gpu_us = us(t.gpu),
-                // Absent where the device has no timestamp queries (#476).
+                // Absent where the device has no timestamp queries (#476),
+                // and the mips for a tile of one level (#424).
+                gpu_mips_us = t.gpu_mips.map(us),
                 gpu_kernel_us = t.gpu_kernel.map(us),
                 readback_us = us(t.readback),
                 process_us = us(t.process),
@@ -905,11 +920,6 @@ mod inner {
         }
     }
 
-    /// Compressed bytes of one `width` x `height` level, as a GPU buffer size.
-    fn compressed_size(width: u32, height: u32, format: DdsFormat) -> u64 {
-        layout::level_len(width, height, format) as u64
-    }
-
     /// Runs `f`, adding its wall time to `stage` inside `span` (target
     /// `profiling`, so `run --profile` shows it).
     fn timed<T>(stage: &mut Duration, span: tracing::Span, f: impl FnOnce() -> T) -> T {
@@ -920,28 +930,56 @@ mod inner {
         out
     }
 
-    /// One level's input texture, kept across tiles (#423).
-    struct LevelTexture {
-        texture: wgpu::Texture,
-        view: wgpu::TextureView,
-        width: u32,
-        height: u32,
+    /// A buffer map's answer: sent by wgpu's callback during the device
+    /// poll that sees the buffer's last submission complete.
+    type MapAnswer = std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>;
+
+    /// Asks for `slice` to be mapped in `mode` once the GPU is done with
+    /// it; the answer comes during a later device poll.
+    fn map(slice: wgpu::BufferSlice<'_>, mode: wgpu::MapMode) -> MapAnswer {
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(mode, move |r| {
+            let _ = tx.send(r);
+        });
+        rx
     }
 
-    /// The GPU resources of one tile size, kept across tiles (#423): the
-    /// output and readback buffers, sized for level 0 and reused by every
-    /// level, each level's texture and view, made the first time a tile
-    /// of this size reaches that level, and the kernel timer, a timestamp
-    /// pair per level, on a device with timestamp queries (#476). Held for
-    /// the session: every tile of a session is the same size, so it is made
-    /// once.
+    /// The kernel timer's pass for the BC1 kernel, every level (#476).
+    const BC1_PASS: u32 = 0;
+    /// The kernel timer's pass for the mip chain, every level below level 0
+    /// (#424). Recorded only for a tile of more than one level.
+    const MIP_PASS: u32 = 1;
+
+    /// The GPU resources of one tile size, kept across tiles (#423):
+    ///
+    /// - the upload buffer, persistently mapped (#424): written at creation
+    ///   and after each tile, mapped again for the next with the tile's
+    ///   submission, so a tile's level 0 goes straight into it, with no
+    ///   staging buffer made per call as `queue.write_texture` makes;
+    /// - the chain's level textures and the mip shader's bind groups
+    ///   ([`MipChain`]);
+    /// - the output buffer the BC1 kernel writes every level into, at its
+    ///   offset in the DDS payload, and the readback buffer it is copied to,
+    ///   each the size of the full chain's blocks;
+    /// - the kernel timer, a timestamp pair for the BC1 pass and one for the
+    ///   mip pass, on a device with timestamp queries (#476).
+    ///
+    /// Held for the session: every tile of a session is the same size, so
+    /// they are made once, and again only after a failed tile
+    /// ([`AfterTile`]).
     struct TileResources {
         width: u32,
         height: u32,
         format: DdsFormat,
+        chain: MipChain,
+        upload: wgpu::Buffer,
+        upload_row_bytes: u32,
+        /// The upload buffer's pending map, asked for after its last tile's
+        /// submission; `None` while it is mapped (from its creation, or once
+        /// a pending map answered).
+        upload_map: Option<MapAnswer>,
         output: wgpu::Buffer,
         readback: wgpu::Buffer,
-        levels: Vec<LevelTexture>,
         timer: Option<KernelTimer>,
     }
 
@@ -949,12 +987,22 @@ mod inner {
         fn new(
             device: &wgpu::Device,
             queue: &wgpu::Queue,
+            mips: &MipPipeline,
             width: u32,
             height: u32,
             format: DdsFormat,
         ) -> Self {
-            // Level 0 is the largest: smaller levels use a prefix.
-            let size = compressed_size(width, height, format);
+            let chain = MipChain::new(device, queue, mips, width, height, format);
+            let level0 = chain.plan()[0];
+            let upload_row_bytes = upload_row_bytes(level0.padded_width);
+            let upload = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tile-upload"),
+                size: u64::from(upload_row_bytes) * u64::from(level0.padded_height),
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            // The full chain's blocks: a shorter chain uses a prefix.
+            let size = chain_bytes(chain.plan()) as u64;
             let output = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tile-output"),
                 size,
@@ -971,11 +1019,13 @@ mod inner {
                 width,
                 height,
                 format,
+                chain,
+                upload,
+                upload_row_bytes,
+                upload_map: None,
                 output,
                 readback,
-                levels: Vec::new(),
-                // No chain of this size has more levels than this.
-                timer: KernelTimer::new(device, queue, layout::full_chain_levels(width, height)),
+                timer: KernelTimer::new(device, queue, MIP_PASS + 1),
             }
         }
 
@@ -983,55 +1033,65 @@ mod inner {
             (self.width, self.height, self.format) == (width, height, format)
         }
 
-        /// The texture of level `index`, `width` x `height` (padded to whole
-        /// blocks), made now if no tile of this size has reached it yet.
-        fn level(
+        /// Waits, until `deadline`, for the upload buffer's map: asked for
+        /// with the last tile's submission, it is complete once that tile's
+        /// poll returned, so this normally finds it done.
+        fn upload_mapped(
             &mut self,
             device: &wgpu::Device,
-            index: usize,
-            width: u32,
-            height: u32,
-        ) -> &LevelTexture {
-            let fits = |l: &LevelTexture| (l.width, l.height) == (width, height);
-            if self.levels.get(index).is_some_and(|l| !fits(l)) {
-                // Not reached: a size's levels are fixed. Made anew if so.
-                self.levels.truncate(index);
-            }
-            if self.levels.len() <= index {
-                // Levels are taken in order, so `index` is the next one.
-                let texture = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("tile-input"),
-                    size: wgpu::Extent3d {
-                        width,
-                        height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                self.levels.push(LevelTexture {
-                    texture,
-                    view,
-                    width,
-                    height,
-                });
-            }
-            &self.levels[index]
+            deadline: Instant,
+        ) -> Result<(), DdsError> {
+            let Some(pending) = &self.upload_map else {
+                return Ok(());
+            };
+            let answer = match pending.try_recv() {
+                Ok(answer) => answer,
+                Err(_) => {
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(deadline.saturating_duration_since(Instant::now())),
+                        })
+                        .map_err(|e| {
+                            DdsError::CompressionFailed(format!(
+                                "GPU poll for the upload buffer failed: {e}"
+                            ))
+                        })?;
+                    pending.try_recv().map_err(|_| {
+                        DdsError::CompressionFailed(
+                            "the upload buffer's map did not complete".to_string(),
+                        )
+                    })?
+                }
+            };
+            answer.map_err(|e| {
+                DdsError::CompressionFailed(format!("upload buffer mapping failed: {e}"))
+            })?;
+            self.upload_map = None;
+            Ok(())
         }
     }
 
-    /// The production [`TileProcessor`]: the GPU device, its queue and the
-    /// `block_compression` kernels, owned by the worker thread, and the
-    /// resources of the tile size it last encoded (#423).
+    /// A tile whose work is submitted ([`WgpuTileProcessor`]'s `begin`),
+    /// for `finish` to wait for and copy out.
+    struct Submitted {
+        index: wgpu::SubmissionIndex,
+        /// The chain's blocks: the payload's length.
+        bytes: usize,
+        readback: MapAnswer,
+        /// The kernel timer's map and how many passes it resolved.
+        timer: Option<(MapAnswer, u32)>,
+    }
+
+    /// The production [`TileProcessor`]: the GPU device, its queue, the
+    /// `block_compression` kernels and the mip shader's pipeline, owned by
+    /// the worker thread, and the resources of the tile size it last
+    /// encoded (#423).
     pub struct WgpuTileProcessor {
         device: wgpu::Device,
         queue: wgpu::Queue,
         compressor: GpuBlockCompressor,
+        mips: MipPipeline,
         resources: Option<TileResources>,
         /// Kernel timers dropped after an unmapped readback (#476): the
         /// first is logged at warn, the rest at debug.
@@ -1039,34 +1099,332 @@ mod inner {
     }
 
     impl WgpuTileProcessor {
+        /// The processor for `device`, building the mip chain with the CPU
+        /// chain's filter ([`gpu_filter`]).
         pub fn new(
             device: wgpu::Device,
             queue: wgpu::Queue,
             compressor: GpuBlockCompressor,
         ) -> Self {
+            let mips = MipPipeline::new(&device, &queue, gpu_filter());
             Self {
                 device,
                 queue,
                 compressor,
+                mips,
                 resources: None,
                 timer_drops: 0,
             }
         }
 
-        /// Process a full tile: generate mipmaps, compress each level on
-        /// GPU, and copy each level from the mapped readback buffer straight
-        /// into its slot of `payload` (#423).
+        /// Starts a tile (#424): writes `image` into the upload buffer as
+        /// level 0, then records and submits the tile's one submission:
+        /// the copy of level 0 into its texture, the mip shader building
+        /// every level below it (one pass), the BC1 kernel compressing every
+        /// level into its place in the payload (one pass), the copy of the
+        /// blocks into the readback buffer and the kernel timer's resolve;
+        /// then asks for the readback, the timer and the upload buffer (for
+        /// the next tile) to be mapped. Nothing waits for the GPU here.
         ///
-        /// The worker owns the mipmap iteration via [`MipmapStream`]. The
-        /// output and readback buffers and the level textures are kept
-        /// across tiles of one size ([`TileResources`]). Each stage's wall
-        /// time is added to `timing`.
-        ///
-        /// Each level's poll waits for what remains until `deadline` (#420): a
-        /// GPU that stops making progress fails the tile at the deadline rather
-        /// than after a timeout per level.
-        ///
-        /// [`MipmapStream`]: crate::dds::MipmapStream
+        /// Refused before any GPU work: an unsupported format, an empty
+        /// image, and a chain whose blocks would not fill `payload_len`
+        /// bytes exactly.
+        fn begin(
+            &mut self,
+            image: &RgbaImage,
+            format: DdsFormat,
+            mipmap_count: usize,
+            payload_len: usize,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+        ) -> Result<Option<Submitted>, DdsError> {
+            let (width, height) = image.dimensions();
+            let variant = compression_variant(format)?;
+            if width == 0 || height == 0 {
+                return Err(DdsError::InvalidDimensions(width, height));
+            }
+            let plan = chain_plan(width, height, mipmap_count, format);
+            let bytes = chain_bytes(&plan);
+            if bytes != payload_len {
+                return Err(DdsError::CompressionFailed(format!(
+                    "the mipmap chain filled {bytes} of the {payload_len}-byte payload"
+                )));
+            }
+            let Some(&level0) = plan.first() else {
+                // No level asked for, and an empty payload: nothing to do.
+                return Ok(None);
+            };
+
+            let Self {
+                device,
+                queue,
+                compressor,
+                mips,
+                resources,
+                ..
+            } = self;
+            if !resources
+                .as_ref()
+                .is_some_and(|r| r.fits(width, height, format))
+            {
+                timed(
+                    &mut timing.upload,
+                    tracing::debug_span!(target: "profiling", "gpu_buffers"),
+                    || {
+                        *resources = Some(TileResources::new(
+                            device, queue, mips, width, height, format,
+                        ));
+                    },
+                );
+            }
+            let resources = resources.as_mut().expect("made above");
+
+            timed(
+                &mut timing.upload,
+                tracing::debug_span!(target: "profiling", "gpu_upload"),
+                || -> Result<(), DdsError> {
+                    resources.upload_mapped(device, deadline)?;
+                    let mut view =
+                        resources
+                            .upload
+                            .slice(..)
+                            .get_mapped_range_mut()
+                            .map_err(|e| {
+                                DdsError::CompressionFailed(format!(
+                                    "upload buffer unavailable: {e}"
+                                ))
+                            })?;
+                    write_level0(
+                        image,
+                        level0.padded_width,
+                        level0.padded_height,
+                        resources.upload_row_bytes,
+                        |at, data| view.slice(at..at + data.len()).copy_from_slice(data),
+                    );
+                    drop(view);
+                    resources.upload.unmap();
+                    Ok(())
+                },
+            )?;
+
+            let submitted = timed(
+                &mut timing.gpu,
+                tracing::debug_span!(target: "profiling", "gpu_submit", levels = plan.len()),
+                || {
+                    let mut encoder =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("tile"),
+                        });
+                    let level0_texture = &resources.chain.level(0).texture;
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &resources.upload,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(resources.upload_row_bytes),
+                                rows_per_image: Some(level0.padded_height),
+                            },
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: level0_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: level0.padded_width,
+                            height: level0.padded_height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    let timer = resources.timer.as_ref();
+                    let passes = if plan.len() > 1 {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("tile-mips"),
+                            timestamp_writes: timer.map(|t| t.pass_writes(MIP_PASS)),
+                        });
+                        resources.chain.record(mips, &mut pass, plan.len());
+                        MIP_PASS + 1
+                    } else {
+                        BC1_PASS + 1
+                    };
+                    for (index, level) in plan.iter().enumerate() {
+                        compressor.add_compression_task(
+                            variant,
+                            &resources.chain.level(index).view,
+                            level.padded_width,
+                            level.padded_height,
+                            &resources.output,
+                            None,
+                            Some(level.offset as u32),
+                        );
+                    }
+                    {
+                        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("tile-bc1"),
+                            timestamp_writes: timer.map(|t| t.pass_writes(BC1_PASS)),
+                        });
+                        compressor.compress(&mut pass);
+                    }
+                    encoder.copy_buffer_to_buffer(
+                        &resources.output,
+                        0,
+                        &resources.readback,
+                        0,
+                        bytes as u64,
+                    );
+                    if let Some(timer) = timer {
+                        timer.resolve(&mut encoder, passes);
+                    }
+                    let index = queue.submit(std::iter::once(encoder.finish()));
+                    let readback = map(
+                        resources.readback.slice(..bytes as u64),
+                        wgpu::MapMode::Read,
+                    );
+                    let timer = timer.map(|t| (t.map(passes), passes));
+                    // Mapped again for the next tile once this one's copy
+                    // out of it is done: complete by this tile's poll.
+                    resources.upload_map =
+                        Some(map(resources.upload.slice(..), wgpu::MapMode::Write));
+                    Submitted {
+                        index,
+                        bytes,
+                        readback,
+                        timer,
+                    }
+                },
+            );
+            tracing::debug!(
+                width,
+                height,
+                levels = plan.len(),
+                compressed_bytes = bytes,
+                "GPU tile submitted"
+            );
+            Ok(Some(submitted))
+        }
+
+        /// Ends a tile [`begin`](Self::begin) submitted: waits for its
+        /// submission until `deadline` (#420), then copies its blocks from
+        /// the mapped readback into `payload`, whose length `begin` checked,
+        /// and reads its kernel time.
+        fn finish(
+            &mut self,
+            submitted: Submitted,
+            deadline: Instant,
+            timing: &mut GpuTileTiming,
+            payload: &mut [u8],
+        ) -> Result<(), DdsError> {
+            let Submitted {
+                index,
+                bytes,
+                readback: readback_map,
+                timer: timer_map,
+            } = submitted;
+            let Self {
+                device,
+                resources,
+                timer_drops,
+                ..
+            } = self;
+            let resources = resources
+                .as_mut()
+                .expect("a submitted tile's resources are kept until it is finished");
+
+            timed(
+                &mut timing.gpu,
+                tracing::debug_span!(target: "profiling", "gpu_poll"),
+                || {
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: Some(index),
+                            timeout: Some(deadline.saturating_duration_since(Instant::now())),
+                        })
+                        .map_err(|e| match e {
+                            wgpu::PollError::Timeout => DdsError::CompressionFailed(
+                                "GPU poll timed out at the tile's deadline".to_string(),
+                            ),
+                            e => DdsError::CompressionFailed(format!("GPU poll failed: {e}")),
+                        })
+                },
+            )?;
+
+            timed(
+                &mut timing.readback,
+                tracing::debug_span!(target: "profiling", "gpu_readback"),
+                || -> Result<(), DdsError> {
+                    readback_map
+                        .try_recv()
+                        .map_err(|_| {
+                            DdsError::CompressionFailed(
+                                "the readback's map did not complete".into(),
+                            )
+                        })?
+                        .map_err(|e| {
+                            DdsError::CompressionFailed(format!("buffer mapping failed: {e}"))
+                        })?;
+                    let slice = resources.readback.slice(..bytes as u64);
+                    let data = slice.get_mapped_range().map_err(|e| {
+                        DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
+                    })?;
+                    // The payload's one copy: the whole chain, straight
+                    // into the DDS file (#423, #424).
+                    payload.copy_from_slice(&data);
+                    drop(data);
+                    resources.readback.unmap();
+                    Ok(())
+                },
+            )?;
+
+            if let (Some(timer), Some((mapped, passes))) = (&resources.timer, timer_map) {
+                match timer.read(&mapped, passes) {
+                    Ok(times) => {
+                        timing.gpu_kernel = times.get(BC1_PASS as usize).copied();
+                        timing.gpu_mips = times.get(MIP_PASS as usize).copied();
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            let us = |d: Option<Duration>| d.map(|d| d.as_micros() as u64);
+                            tracing::debug!(
+                                bc1_us = us(timing.gpu_kernel),
+                                mips_us = us(timing.gpu_mips),
+                                "GPU kernel time"
+                            );
+                        }
+                    }
+                    Err(TimerError::Unusable) => {
+                        tracing::debug!("GPU kernel timestamps unusable for this tile");
+                    }
+                    // Its buffer may still be mapped or pending: never
+                    // used again. Kernel timing stays off until the
+                    // resources are made again (after a failed tile).
+                    // Logged at warn the first time only: a driver that
+                    // never maps the timer's buffer would otherwise warn
+                    // after every failed tile.
+                    Err(TimerError::Unmapped(reason)) => {
+                        *timer_drops += 1;
+                        if *timer_drops == 1 {
+                            tracing::warn!(
+                                %reason,
+                                "GPU kernel timer dropped: its readback did not map; \
+                                 no kernel time until the GPU resources are made \
+                                 again after a failed tile (reported once)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                %reason,
+                                drops = *timer_drops,
+                                "GPU kernel timer dropped"
+                            );
+                        }
+                        resources.timer = None;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// One tile, start to end: [`begin`](Self::begin), then
+        /// [`finish`](Self::finish). The image is dropped once it is in the
+        /// upload buffer, before the wait.
         fn process_tile(
             &mut self,
             image: RgbaImage,
@@ -1076,252 +1434,19 @@ mod inner {
             timing: &mut GpuTileTiming,
             payload: &mut [u8],
         ) -> Result<(), DdsError> {
-            let width = image.width();
-            let height = image.height();
-            let variant = compression_variant(format)?;
-
-            let Self {
-                device,
-                queue,
-                compressor,
-                resources,
-                timer_drops,
-            } = self;
-            if !resources
-                .as_ref()
-                .is_some_and(|r| r.fits(width, height, format))
-            {
-                timed(
-                    &mut timing.upload,
-                    tracing::debug_span!(target: "profiling", "gpu_buffers"),
-                    || *resources = Some(TileResources::new(device, queue, width, height, format)),
-                );
+            let submitted = self.begin(
+                &image,
+                format,
+                mipmap_count,
+                payload.len(),
+                deadline,
+                timing,
+            )?;
+            drop(image);
+            match submitted {
+                Some(submitted) => self.finish(submitted, deadline, timing, payload),
+                None => Ok(()),
             }
-            let resources = resources.as_mut().expect("made above");
-
-            let mut slots = crate::dds::encoder::LevelSlots::new(payload, format);
-            let mut stream = crate::dds::mipmap::MipmapStream::new(image, mipmap_count);
-            // The levels the stream yields: the timestamps of all of them
-            // are resolved with the last one's readback (#476).
-            let chain_levels = mipmap_count.min(layout::full_chain_levels(width, height) as usize);
-            let timed_levels = resources
-                .timer
-                .as_ref()
-                .map_or(0, |t| chain_levels.min(t.capacity() as usize));
-
-            // At most `mipmap_count` takes, so a full chain makes no extra call
-            // that only finds the stream's end (one is made, and spanned, only
-            // when the count asks for more levels than the image has).
-            let mut drop_timer = false;
-            for level_idx in 0..mipmap_count {
-                // The stream works one level ahead: taking level `i` computes
-                // level `i + 1`, which this span names as `computes_level`. The
-                // last take computes nothing, and its span is near zero.
-                let downsample = tracing::debug_span!(
-                    target: "profiling",
-                    "gpu_downsample",
-                    computes_level = level_idx + 1
-                )
-                .entered();
-                let started = Instant::now();
-                let Some(level) = stream.next() else {
-                    break;
-                };
-                // The GPU kernel asserts both dimensions are multiples of 4, so the
-                // 2×2 and 1×1 tail of a full mipmap chain must be padded up to one
-                // whole block first. Without this the worker panics and shuts down
-                // for the rest of the process lifetime.
-                let level = crate::dds::compressor::pad_to_block_multiple(&level);
-                timing.downsample += started.elapsed();
-                drop(downsample);
-
-                let lw = level.width();
-                let lh = level.height();
-                let level_output_size = compressed_size(lw, lh, format);
-
-                timed(
-                    &mut timing.upload,
-                    tracing::debug_span!(target: "profiling", "gpu_upload", level = level_idx),
-                    || {
-                        let texture = &resources.level(device, level_idx, lw, lh).texture;
-                        queue.write_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            level.as_raw(),
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(lw * 4),
-                                rows_per_image: Some(lh),
-                            },
-                            wgpu::Extent3d {
-                                width: lw,
-                                height: lh,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                    },
-                );
-                let texture_view = &resources.levels[level_idx].view;
-                let output_buffer = &resources.output;
-                let readback_buffer = &resources.readback;
-                // This level's pass is timed, and the last one resolves
-                // every level's timestamps in its own submission (#476).
-                let timer = resources
-                    .timer
-                    .as_ref()
-                    .filter(|_| level_idx < timed_levels);
-                let resolves_timer = timer.filter(|_| level_idx + 1 == timed_levels);
-
-                let buffer_slice = readback_buffer.slice(..level_output_size);
-                let (map_rx, timer_rx) = timed(
-                    &mut timing.gpu,
-                    tracing::debug_span!(target: "profiling", "gpu_submit_poll", level = level_idx),
-                    || -> Result<_, DdsError> {
-                        // Dispatch compute pass
-                        let mut encoder =
-                            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("tile-compress"),
-                            });
-
-                        compressor.add_compression_task(
-                            variant,
-                            texture_view,
-                            lw,
-                            lh,
-                            output_buffer,
-                            None,
-                            None,
-                        );
-
-                        {
-                            let mut pass =
-                                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                                    label: Some("tile-compute"),
-                                    timestamp_writes: timer
-                                        .map(|t| t.pass_writes(level_idx as u32)),
-                                });
-                            compressor.compress(&mut pass);
-                        }
-
-                        encoder.copy_buffer_to_buffer(
-                            output_buffer,
-                            0,
-                            readback_buffer,
-                            0,
-                            level_output_size,
-                        );
-                        if let Some(timer) = resolves_timer {
-                            timer.resolve(&mut encoder, timed_levels as u32);
-                        }
-
-                        let sub_idx = queue.submit(std::iter::once(encoder.finish()));
-
-                        // Map readback buffer and wait for completion
-                        let (map_tx, map_rx) = std::sync::mpsc::channel();
-                        buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
-                            let _ = map_tx.send(r);
-                        });
-                        let timer_rx = resolves_timer.map(|t| t.map(timed_levels as u32));
-
-                        device
-                            .poll(wgpu::PollType::Wait {
-                                submission_index: Some(sub_idx),
-                                timeout: Some(deadline.saturating_duration_since(Instant::now())),
-                            })
-                            .map_err(|e| match e {
-                                wgpu::PollError::Timeout => DdsError::CompressionFailed(format!(
-                                    "GPU poll timed out at the tile's deadline, level {level_idx}"
-                                )),
-                                e => DdsError::CompressionFailed(format!("GPU poll failed: {e}")),
-                            })?;
-                        Ok((map_rx, timer_rx))
-                    },
-                )?;
-
-                timed(
-                    &mut timing.readback,
-                    tracing::debug_span!(target: "profiling", "gpu_readback", level = level_idx),
-                    || -> Result<(), DdsError> {
-                        map_rx
-                            .recv()
-                            .map_err(|_| {
-                                DdsError::CompressionFailed("map_async callback never fired".into())
-                            })?
-                            .map_err(|e| {
-                                DdsError::CompressionFailed(format!("buffer mapping failed: {e}"))
-                            })?;
-
-                        let data = buffer_slice.get_mapped_range().map_err(|e| {
-                            DdsError::CompressionFailed(format!("mapped range unavailable: {e}"))
-                        })?;
-                        // The payload's one copy: straight into the level's
-                        // slot of the DDS file (#423).
-                        let copied = slots.next(lw, lh).map(|slot| slot.copy_from_slice(&data));
-                        drop(data);
-                        readback_buffer.unmap();
-                        copied
-                    },
-                )?;
-
-                if let (Some(timer), Some(mapped)) = (resolves_timer, timer_rx) {
-                    match timer.read(&mapped, timed_levels as u32) {
-                        Ok(levels) => {
-                            timing.gpu_kernel = Some(levels.iter().sum());
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                let levels_us: Vec<u64> =
-                                    levels.iter().map(|d| d.as_micros() as u64).collect();
-                                tracing::debug!(?levels_us, "GPU kernel time per level");
-                            }
-                        }
-                        Err(TimerError::Unusable) => {
-                            tracing::debug!("GPU kernel timestamps unusable for this tile");
-                        }
-                        // Its buffer may still be mapped or pending: never
-                        // used again. Kernel timing stays off until the
-                        // resources are made again (after a failed tile).
-                        // Logged at warn the first time only: a driver that
-                        // never maps the timer's buffer would otherwise warn
-                        // after every failed tile.
-                        Err(TimerError::Unmapped(reason)) => {
-                            *timer_drops += 1;
-                            if *timer_drops == 1 {
-                                tracing::warn!(
-                                    %reason,
-                                    "GPU kernel timer dropped: its readback did not map; \
-                                     no kernel time until the GPU resources are made \
-                                     again after a failed tile (reported once)"
-                                );
-                            } else {
-                                tracing::debug!(
-                                    %reason,
-                                    drops = *timer_drops,
-                                    "GPU kernel timer dropped"
-                                );
-                            }
-                            drop_timer = true;
-                        }
-                    }
-                }
-
-                tracing::debug!(
-                    level = level_idx,
-                    width = lw,
-                    height = lh,
-                    compressed_bytes = level_output_size,
-                    "GPU compressed mipmap level"
-                );
-
-                // `level` dropped here — CPU memory reclaimed before next downsample
-            }
-            if drop_timer {
-                resources.timer = None;
-            }
-
-            slots.finish()
         }
     }
 
@@ -2079,9 +2204,9 @@ mod inner {
     /// Spawn the GPU pipeline worker: [`try_spawn_tile_worker`] with a
     /// [`WgpuTileProcessor`].
     ///
-    /// The worker receives full tile requests via the channel, generates
-    /// mipmaps internally, and compresses each level on the GPU. One message
-    /// in, one result out — no per-level channel round-trips. It gives up on
+    /// The worker receives full tile requests via the channel, and the GPU
+    /// builds each tile's mip chain and compresses every level, in one
+    /// submission (#424). One message in, one result out. It gives up on
     /// the GPU by the default [`HangRule`].
     ///
     /// # Errors
@@ -3078,7 +3203,7 @@ mod tests {
         let ticking = clock.clone();
         let processor = FnProcessor(move |_: RgbaImage, timing: &mut GpuTileTiming| {
             ticking.advance(TILE);
-            timing.downsample = Duration::from_millis(1);
+            timing.gpu_mips = Some(Duration::from_millis(1));
             timing.upload = Duration::from_millis(2);
             timing.gpu = Duration::from_millis(3);
             timing.readback = Duration::from_millis(4);
@@ -3096,9 +3221,9 @@ mod tests {
             let (result, t) = processed(reply_of(reply).await);
             assert!(result.is_ok());
             assert_eq!(
-                (t.downsample, t.upload, t.gpu, t.readback),
+                (t.gpu_mips, t.upload, t.gpu, t.readback),
                 (
-                    Duration::from_millis(1),
+                    Some(Duration::from_millis(1)),
                     Duration::from_millis(2),
                     Duration::from_millis(3),
                     Duration::from_millis(4)
@@ -4952,7 +5077,7 @@ mod tests {
                     return Err(DdsError::CompressionFailed("simulated".into()));
                 }
                 ticking.advance(Duration::from_millis(5));
-                timing.downsample = Duration::from_millis(1);
+                timing.gpu_mips = Some(Duration::from_millis(1));
                 timing.upload = Duration::from_millis(2);
                 timing.gpu = Duration::from_millis(3);
                 timing.readback = Duration::from_millis(4);
@@ -4968,7 +5093,7 @@ mod tests {
         let s = channel.stats().take_sample().expect("a busy sample");
         assert_eq!((s.tiles(), s.failed, s.fallback), (1, 1, 0));
         let max = |s: Option<crate::metrics::LatencySummary>| s.unwrap().max_us;
-        assert_eq!(max(s.downsample), 1_000);
+        assert_eq!(max(s.gpu_mips), 1_000);
         assert_eq!(max(s.upload), 2_000);
         assert_eq!(max(s.gpu), 3_000);
         assert_eq!(max(s.readback), 4_000);
@@ -5351,6 +5476,148 @@ mod tests {
             let payload = encode(&mut worker, in_time())
                 .unwrap_or_else(|e| panic!("tile {tile} after the late one: {e}"));
             assert!(payload == expected, "tile {tile} is the fresh one's");
+        }
+    }
+
+    /// The payload the GPU path wrote before #424, for comparison: the
+    /// CPU's chain (`MipmapGenerator`, padded as the CPU pads a level),
+    /// each level uploaded as its own texture and compressed by the same
+    /// `block_compression` kernel into its place.
+    fn cpu_chain_on_the_gpu_kernel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        compressor: &mut block_compression::GpuBlockCompressor,
+        image: &RgbaImage,
+        levels: usize,
+    ) -> Vec<u8> {
+        use crate::dds::compressor::pad_to_block_multiple;
+        let chain: Vec<RgbaImage> =
+            crate::dds::MipmapGenerator::generate_chain_with_count(image, levels)
+                .iter()
+                .map(|l| pad_to_block_multiple(l).into_owned())
+                .collect();
+        let bytes: usize = chain
+            .iter()
+            .map(|l| crate::dds::layout::level_len(l.width(), l.height(), DdsFormat::BC1))
+            .sum();
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: bytes as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut offset = 0;
+        let mut textures = Vec::new();
+        for level in &chain {
+            let size = wgpu::Extent3d {
+                width: level.width(),
+                height: level.height(),
+                depth_or_array_layers: 1,
+            };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                texture.as_image_copy(),
+                level.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(level.width() * 4),
+                    rows_per_image: Some(level.height()),
+                },
+                size,
+            );
+            let view = texture.create_view(&Default::default());
+            compressor.add_compression_task(
+                block_compression::CompressionVariant::BC1,
+                &view,
+                level.width(),
+                level.height(),
+                &output,
+                None,
+                Some(offset as u32),
+            );
+            offset += crate::dds::layout::level_len(level.width(), level.height(), DdsFormat::BC1);
+            textures.push(texture);
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            compressor.compress(&mut pass);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, bytes as u64);
+        queue.submit(std::iter::once(encoder.finish()));
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        let data = readback.slice(..).get_mapped_range().unwrap().to_vec();
+        data
+    }
+
+    /// The acceptance test of #424's byte identity: the processor's tile
+    /// (level 0 uploaded, the chain built by the mip shader, every level in
+    /// one submission) is byte for byte the tile the GPU path wrote before
+    /// (the CPU's chain, each level uploaded and compressed by the same
+    /// kernel), for a full 4096 chain, a truncated one, odd and non-square
+    /// sizes and the sub-block tail, on one processor, back to back, so the
+    /// kept resources and their re-sizing are covered too.
+    #[test]
+    #[ignore] // Requires GPU hardware
+    fn the_gpu_chain_encodes_as_the_cpu_chain_did() {
+        let Some((device, queue, compressor)) = gpu_resources_or_skip() else {
+            eprintln!("Skipping: no usable GPU");
+            return;
+        };
+        let mut reference =
+            block_compression::GpuBlockCompressor::new(device.clone(), queue.clone());
+        let mut processor = WgpuTileProcessor::new(device.clone(), queue.clone(), compressor);
+        let full = |w, h| crate::dds::layout::full_chain_levels(w, h) as usize;
+        for (w, h, levels) in [
+            (4096, 4096, full(4096, 4096)),
+            (4096, 4096, 5),
+            (4096, 4096, full(4096, 4096)),
+            (64, 64, full(64, 64)),
+            (1001, 777, full(1001, 777)),
+            (37, 23, full(37, 23)),
+            (256, 64, full(256, 64)),
+            (6, 6, 2),
+        ] {
+            let image = varied(w, h);
+            let expected =
+                cpu_chain_on_the_gpu_kernel(&device, &queue, &mut reference, &image, levels);
+            let mut payload = vec![0; expected.len()];
+            processor
+                .process(
+                    image,
+                    DdsFormat::BC1,
+                    levels,
+                    Instant::now() + Duration::from_secs(60),
+                    &mut GpuTileTiming::default(),
+                    &mut payload,
+                )
+                .unwrap_or_else(|e| panic!("{w}x{h}, {levels} levels: {e}"));
+            let differ = payload
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(differ, 0, "{w}x{h}, {levels} levels: bytes differ");
         }
     }
 }

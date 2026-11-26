@@ -38,9 +38,10 @@ struct StageWindows {
     /// Encoded tiles past the cap.
     unsampled: u64,
     queue_wait: LatencyWindow,
-    downsample: LatencyWindow,
     upload: LatencyWindow,
     gpu: LatencyWindow,
+    /// Only the tiles that carried a mip time (#424).
+    gpu_mips: LatencyWindow,
     /// Only the tiles that carried a kernel time (#476).
     gpu_kernel: LatencyWindow,
     readback: LatencyWindow,
@@ -54,10 +55,13 @@ struct StageWindows {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuSample {
     pub queue_wait: Option<LatencySummary>,
-    pub downsample: Option<LatencySummary>,
     pub upload: Option<LatencySummary>,
     pub gpu: Option<LatencySummary>,
-    /// The GPU's own time for each tile's compute passes, from timestamp
+    /// The GPU's own time for each tile's mip chain, from timestamp queries
+    /// (#424): as [`gpu_kernel`](Self::gpu_kernel), and also without the
+    /// tiles of one level, which build no level.
+    pub gpu_mips: Option<LatencySummary>,
+    /// The GPU's own time for each tile's BC1 kernel, from timestamp
     /// queries (#476): `None` when no tile of the sample had one, as on a
     /// device without timestamp queries. Its count can be below the
     /// tiles' when some tiles' timestamps could not be read.
@@ -161,9 +165,11 @@ impl GpuEncodeStats {
         }
         w.recorded += 1;
         w.queue_wait.record(micros(timing.queue_wait));
-        w.downsample.record(micros(timing.downsample));
         w.upload.record(micros(timing.upload));
         w.gpu.record(micros(timing.gpu));
+        if let Some(mips) = timing.gpu_mips {
+            w.gpu_mips.record(micros(mips));
+        }
         if let Some(kernel) = timing.gpu_kernel {
             w.gpu_kernel.record(micros(kernel));
         }
@@ -222,9 +228,9 @@ impl GpuEncodeStats {
         w.recorded = 0;
         let sample = GpuSample {
             queue_wait: w.queue_wait.take(),
-            downsample: w.downsample.take(),
             upload: w.upload.take(),
             gpu: w.gpu.take(),
+            gpu_mips: w.gpu_mips.take(),
             gpu_kernel: w.gpu_kernel.take(),
             readback: w.readback.take(),
             process: w.process.take(),
@@ -254,10 +260,10 @@ impl GpuEncodeStats {
         };
         let (total_p50_ms, total_p95_ms, total_max_ms) = fig(s.total);
         let (queue_wait_p50_ms, queue_wait_p95_ms, queue_wait_max_ms) = fig(s.queue_wait);
-        let (downsample_p50_ms, downsample_p95_ms, downsample_max_ms) = fig(s.downsample);
         let (upload_p50_ms, upload_p95_ms, upload_max_ms) = fig(s.upload);
         let (gpu_p50_ms, gpu_p95_ms, gpu_max_ms) = fig(s.gpu);
         // Zero, with `gpu_kernel` saying why, when no tile had one.
+        let (gpu_mips_p50_ms, gpu_mips_p95_ms, gpu_mips_max_ms) = fig(s.gpu_mips);
         let (gpu_kernel_p50_ms, gpu_kernel_p95_ms, gpu_kernel_max_ms) = fig(s.gpu_kernel);
         // The tiles that carried a kernel time, of `tiles`.
         let gpu_kernel_tiles = s.gpu_kernel.map_or(0, |k| k.count as u64);
@@ -283,9 +289,6 @@ impl GpuEncodeStats {
             queue_wait_p50_ms,
             queue_wait_p95_ms,
             queue_wait_max_ms,
-            downsample_p50_ms,
-            downsample_p95_ms,
-            downsample_max_ms,
             upload_p50_ms,
             upload_p95_ms,
             upload_max_ms,
@@ -294,6 +297,9 @@ impl GpuEncodeStats {
             gpu_max_ms,
             gpu_kernel = s.kernel_timing(),
             gpu_kernel_tiles,
+            gpu_mips_p50_ms,
+            gpu_mips_p95_ms,
+            gpu_mips_max_ms,
             gpu_kernel_p50_ms,
             gpu_kernel_p95_ms,
             gpu_kernel_max_ms,
@@ -366,9 +372,9 @@ mod tests {
     fn timing(scale: u64) -> GpuTileTiming {
         GpuTileTiming {
             queue_wait: ms(scale),
-            downsample: ms(2 * scale),
             upload: ms(3 * scale),
             gpu: ms(4 * scale),
+            gpu_mips: Some(Duration::from_micros(1_500 * scale)),
             gpu_kernel: Some(Duration::from_micros(2_500 * scale)),
             readback: ms(5 * scale),
             process: ms(14 * scale),
@@ -378,6 +384,7 @@ mod tests {
     /// A tile from a device without timestamp queries.
     fn untimed(scale: u64) -> GpuTileTiming {
         GpuTileTiming {
+            gpu_mips: None,
             gpu_kernel: None,
             ..timing(scale)
         }
@@ -400,9 +407,9 @@ mod tests {
         assert_eq!(s.failed, 1);
         let max = |s: Option<LatencySummary>| s.map(|s| (s.max_us, s.count));
         assert_eq!(max(s.queue_wait), Some((2_000, 2)));
-        assert_eq!(max(s.downsample), Some((4_000, 2)));
         assert_eq!(max(s.upload), Some((6_000, 2)));
         assert_eq!(max(s.gpu), Some((8_000, 2)));
+        assert_eq!(max(s.gpu_mips), Some((3_000, 2)));
         assert_eq!(max(s.gpu_kernel), Some((5_000, 2)));
         assert_eq!(max(s.readback), Some((10_000, 2)));
         assert_eq!(max(s.process), Some((28_000, 2)));
@@ -444,6 +451,26 @@ mod tests {
         let kernel = s.gpu_kernel.expect("two tiles had a kernel time");
         assert_eq!((kernel.count, kernel.max_us), (2, 7_500));
         assert_eq!(s.kernel_timing(), "timestamps");
+    }
+
+    /// A tile of one level builds no level on the GPU (#424): it has a
+    /// kernel time and no mip time, and the mip window holds the others.
+    #[test]
+    fn the_mip_time_is_summarised_over_the_tiles_that_built_a_level() {
+        let stats = GpuEncodeStats::default();
+        stats.record_encoded(&timing(1), ms(16));
+        stats.record_encoded(
+            &GpuTileTiming {
+                gpu_mips: None,
+                ..timing(2)
+            },
+            ms(31),
+        );
+
+        let s = stats.take_sample().expect("a busy sample");
+        let mips = s.gpu_mips.expect("one tile built levels");
+        assert_eq!((mips.count, mips.max_us), (1, 1_500));
+        assert_eq!(s.gpu_kernel.map(|k| k.count), Some(2));
     }
 
     #[test]
@@ -555,13 +582,14 @@ mod tests {
             ("depth_max", "0"),
             ("total_max_ms", "16.23"),
             ("queue_wait_p50_ms", "1.0"),
-            ("downsample_p95_ms", "2.0"),
             ("upload_max_ms", "3.0"),
             ("gpu_p50_ms", "4.0"),
             ("gpu_kernel", "\"timestamps\""),
             ("gpu_kernel_tiles", "1"),
             ("gpu_kernel_p50_ms", "2.5"),
             ("gpu_kernel_max_ms", "2.5"),
+            ("gpu_mips_p50_ms", "1.5"),
+            ("gpu_mips_max_ms", "1.5"),
             ("readback_p50_ms", "5.0"),
             ("process_p50_ms", "14.0"),
         ] {
@@ -585,6 +613,7 @@ mod tests {
             ("gpu_kernel", "\"unavailable\""),
             ("gpu_kernel_tiles", "0"),
             ("gpu_kernel_p50_ms", "0.0"),
+            ("gpu_mips_p50_ms", "0.0"),
             ("gpu_p50_ms", "4.0"),
         ] {
             assert_eq!(line.get(field).map(String::as_str), Some(value), "{field}");

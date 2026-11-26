@@ -112,7 +112,6 @@ async fn gpu_emits_full_mipmap_chain_for_4096_tile() {
     eprintln!("{sample:#?}");
     assert_eq!((sample.tiles(), sample.failed), (1, 0));
     for (stage, summary) in [
-        ("downsample", sample.downsample),
         ("upload", sample.upload),
         ("gpu", sample.gpu),
         ("readback", sample.readback),
@@ -292,8 +291,8 @@ async fn encode_on(
 }
 
 /// The production wiring of the kernel time (#476): on a device that can
-/// time its kernels, every tile the worker encodes carries a kernel time,
-/// within its `gpu` stage, whatever its size and level count, and so does
+/// time its kernels, every tile the worker encodes carries a kernel time
+/// and a mip time (#424), within its `gpu` stage, whatever its size and level count, and so does
 /// the tile after a failed one, for which the worker made its resources,
 /// kernel timer included, again (#423's `AfterTile`).
 #[tokio::test]
@@ -332,12 +331,19 @@ async fn every_tile_carries_its_kernel_time_on_a_device_with_timestamps() {
             .gpu_kernel
             .unwrap_or_else(|| panic!("{case}: the tile carries a kernel time"));
         let gpu = sample.gpu.expect("the gpu stage");
+        // Every case has levels below level 0, which the GPU builds (#424).
+        let mips = sample
+            .gpu_mips
+            .unwrap_or_else(|| panic!("{case}: the tile carries a mip time"));
         eprintln!(
-            "{case}: kernel {} us within gpu {} us",
-            kernel.max_us, gpu.max_us
+            "{case}: kernel {} us and mips {} us within gpu {} us",
+            kernel.max_us, mips.max_us, gpu.max_us
         );
-        assert_eq!(kernel.count, 1, "{case}");
-        assert!(kernel.max_us <= gpu.max_us, "{case}: kernel within gpu");
+        assert_eq!((kernel.count, mips.count), (1, 1), "{case}");
+        assert!(
+            kernel.max_us + mips.max_us <= gpu.max_us,
+            "{case}: kernel and mips within gpu"
+        );
         assert_eq!(sample.kernel_timing(), "timestamps", "{case}");
     };
 
@@ -358,7 +364,7 @@ async fn every_tile_carries_its_kernel_time_on_a_device_with_timestamps() {
     }
 
     // A tile of the same size that fails: its file is one block longer
-    // than its chain, which the worker fills and then refuses. The worker
+    // than its chain, which the worker refuses before any GPU work. The worker
     // drops its kept resources after it, and the next tile makes them again.
     let mut long = file(1024, 1024, full(1024));
     long.extend_from_slice(&[0; 8]);

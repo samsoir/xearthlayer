@@ -2,10 +2,29 @@
 
 use image::RgbaImage;
 
+/// How a mip level averages each 2×2 block of the level above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MipFilter {
+    /// The stored bytes, averaged and rounded half to even (#394):
+    /// [`MipmapGenerator::downsample_box_2x`].
+    StoredValues,
+    /// R, G and B averaged in linear light, alpha as stored (#467, after
+    /// #458). Implemented on the GPU only (`dds::gpu_mips`), as a tested
+    /// option: no chain uses it until the CPU chain does.
+    LinearLight,
+}
+
 /// Mipmap generator.
 pub struct MipmapGenerator;
 
 impl MipmapGenerator {
+    /// The filter of every mip chain XEarthLayer encodes: the CPU's
+    /// ([`downsample_box_2x`](Self::downsample_box_2x)), and the GPU
+    /// worker's, which follows it (#424, `dds::gpu_mips::gpu_filter`), so a
+    /// tile's levels are the same bytes on either path. #467 changes this
+    /// one value, with the CPU's filter, to switch both.
+    pub const FILTER: MipFilter = MipFilter::StoredValues;
+
     /// Generate full mipmap chain from source image.
     ///
     /// Continues downsampling by 2× until reaching 1×1 or a minimum size.
