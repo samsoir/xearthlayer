@@ -760,7 +760,7 @@ impl NightLitSource {
     /// permit, it looks once more, without waiting, at the road tiles its
     /// wait left out, so roads that came while it queued are drawn (#427).
     async fn generate(&self, name: DdsFilename, layout: &LitLayout) -> Option<Generated> {
-        let size = layout.first_visible;
+        let (size, road_supersample) = (layout.first_visible, layout.road_supersample());
         let found = self.footprint_roads(&name, size, Purpose::Generate).await;
         let asked_roads = RoadsState::of(&found);
         let asked = Instant::now();
@@ -808,8 +808,15 @@ impl NightLitSource {
             let art_record = ArtRecord::default();
             let patterns = |n: &str| art.pattern_recorded(n, &art_record);
             // The tiles' handles are dropped once rastered: the road cache
-            // alone keeps merged roads.
-            let roads = RoadField::raster(&owned, size, &road_tiles, &road_model);
+            // alone keeps merged roads. A texture capped below its density
+            // has its roads rastered at the density and averaged down (#431).
+            let roads = RoadField::raster_supersampled(
+                &owned,
+                size,
+                road_supersample,
+                &road_tiles,
+                &road_model,
+            );
             drop(road_tiles);
             let image = generator.generate(&LitRequest {
                 name: &owned,
@@ -3133,6 +3140,46 @@ mod tests {
                 .await
                 .0;
             assert!(seen.0.load(std::sync::atomic::Ordering::SeqCst));
+        }
+
+        /// Records the size and road field digest of every request it is
+        /// handed, and draws nothing (no encode: the field is the point).
+        #[derive(Default)]
+        struct RoadDigests(std::sync::Mutex<Vec<(u32, u32, u64)>>);
+
+        impl crate::night::LitGenerator for RoadDigests {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                let digest = crate::night::roads::field::tests::field_digest(r.roads);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((r.size, r.roads.size(), digest));
+                image::RgbaImage::new(0, 0)
+            }
+        }
+
+        #[tokio::test]
+        async fn a_capped_texture_gets_its_roads_rastered_at_twice_its_size() {
+            // ZL14 at the full setting: 2048 px, its roads at 4096 (#431).
+            let temp = TempDir::new().unwrap();
+            let name = name_at_zoom(37.20, -122.725, 14);
+            let (source, roads) = source_with_roads(&temp, Some(road_across(&name)));
+            let seen = Arc::new(RoadDigests::default());
+            let source = source.with_generator(seen.clone());
+            let layout = source.layout(&name);
+            assert_eq!((layout.first_visible, layout.road_supersample()), (2048, 2));
+            let _ = source.served_payload(&name, &layout).await;
+            let tiles = roads
+                .footprint(&tiles_of(&source, &name), Purpose::Generate)
+                .await
+                .tiles;
+            let field = |s| {
+                let f = RoadField::raster_supersampled(&name, 2048, s, &tiles, &RoadModel::DEFAULT);
+                assert!(!f.is_empty());
+                crate::night::roads::field::tests::field_digest(&f)
+            };
+            assert_ne!(field(2), field(1));
+            assert_eq!(*seen.0.lock().unwrap(), [(2048, 2048, field(2))]);
         }
 
         #[tokio::test]
