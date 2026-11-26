@@ -224,8 +224,9 @@ impl GpuChain {
 
     /// Builds every level below level 0 with `filter`, one timed pass per
     /// level: each level's kernel time, and the wall time from submit to
-    /// the end of the wait.
-    fn build(&self, gpu: &Gpu, filter: Filter) -> (Vec<Duration>, Duration) {
+    /// the end of the wait; `None` when the timestamps were unusable (the
+    /// levels are built all the same).
+    fn build(&self, gpu: &Gpu, filter: Filter) -> Option<(Vec<Duration>, Duration)> {
         let (pipe, binds) = match filter {
             Filter::Stored => (&self.stored, &self.stored_binds),
             Filter::Linear => (&self.linear, &self.linear_binds),
@@ -394,8 +395,12 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             }
 
             for filter in [Filter::Stored, Filter::Linear] {
-                let runs: Vec<(Vec<Duration>, Duration)> =
-                    (0..21).map(|_| chain.build(&gpu, filter)).collect();
+                let Some(runs): Option<Vec<(Vec<Duration>, Duration)>> =
+                    (0..21).map(|_| chain.build(&gpu, filter)).collect()
+                else {
+                    eprintln!("  {filter:?}: not timed, its timestamps were unusable");
+                    continue;
+                };
                 let runs = &runs[1..];
                 let mut kernel: Vec<Duration> = runs.iter().map(|r| r.0.iter().sum()).collect();
                 let mut wall: Vec<Duration> = runs.iter().map(|r| r.1).collect();

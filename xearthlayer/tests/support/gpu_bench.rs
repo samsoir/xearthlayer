@@ -45,21 +45,10 @@ pub fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 // Labels: every figure is printed with the machine, adapter, driver and build
 // =============================================================================
 
-/// The CPU model, its threads, the kernel and the build profile.
+/// The CPU model, its threads, the operating system and its version, and
+/// the build profile.
 pub fn machine_label() -> String {
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let threads = std::thread::available_parallelism().map_or(0, |n| n.get());
-    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| std::env::consts::OS.to_string());
     let profile = if cfg!(debug_assertions) {
         "DEBUG build (figures meaningless)"
     } else {
@@ -73,9 +62,54 @@ pub fn machine_label() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "?".to_string());
     format!(
-        "{cpu}, {threads} threads, Linux {kernel}, xearthlayer {} at {commit}, {profile}",
+        "{}, {threads} threads, {}, xearthlayer {} at {commit}, {profile}",
+        cpu_model().unwrap_or_else(|| std::env::consts::ARCH.to_string()),
+        os_label(),
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// A command's trimmed standard output, when it ran and succeeded.
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The CPU's model name: `/proc/cpuinfo` on Linux, `sysctl` on macOS.
+fn cpu_model() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        return command_output("sysctl", &["-n", "machdep.cpu.brand_string"]);
+    }
+    std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("model name"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string())
+    })
+}
+
+/// The operating system and, where cheaply known, its version: the kernel
+/// release on Linux, the product version on macOS.
+fn os_label() -> String {
+    let (name, version) = match std::env::consts::OS {
+        "linux" => (
+            "Linux",
+            std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|s| s.trim().to_string()),
+        ),
+        "macos" => ("macOS", command_output("sw_vers", &["-productVersion"])),
+        other => (other, None),
+    };
+    match version {
+        Some(v) => format!("{name} {v}"),
+        None => name.to_string(),
+    }
 }
 
 /// The adapter's name, kind, backend and driver.
@@ -272,7 +306,10 @@ pub fn real_tile() -> Option<(String, RgbaImage)> {
             let bytes = std::fs::read(&path)
                 .map_err(|e| eprintln!("real tile: {}: {e}", path.display()))
                 .ok()?;
-            let chunk = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let chunk = image::load_from_memory(&bytes)
+                .map_err(|e| eprintln!("real tile: {} does not decode: {e}", path.display()))
+                .ok()?
+                .to_rgba8();
             if chunk.dimensions() != (256, 256) {
                 eprintln!("real tile: {} is not 256x256", path.display());
                 return None;
@@ -393,29 +430,105 @@ pub fn ispc_bc1_parallel(image: &RgbaImage, pool: &rayon::ThreadPool) -> Vec<u8>
 /// comparison on one core type: on a hybrid CPU (this laptop's Zen 5 and
 /// Zen 5c cores, 5.2 and 3.3 GHz) the scheduler otherwise moves a thread
 /// to a slow core when the fast ones are busy, which alone costs half again.
+///
+/// `None`, with a note, wherever a pin cannot hold: on an operating system
+/// other than Linux (macOS has no CPU affinity), on a host or process with
+/// one CPU, or when the CPU asked for is not in the process's affinity set.
 pub fn pin_cpu() -> Option<usize> {
-    match std::env::var("XEL_BENCH_PIN_CPU") {
-        Ok(v) if v == "none" => None,
-        Ok(v) => v.parse().ok(),
-        Err(_) => Some(1),
+    let cpu = match std::env::var("XEL_BENCH_PIN_CPU") {
+        Ok(v) if v == "none" => return None,
+        Ok(v) => match v.parse() {
+            Ok(cpu) => cpu,
+            Err(_) => {
+                eprintln!("Note: XEL_BENCH_PIN_CPU={v} is not a CPU number; not pinning");
+                return None;
+            }
+        },
+        Err(_) => 1,
+    };
+    let usable = pinnable(cpu);
+    if let Err(why) = &usable {
+        eprintln!(
+            "Note: not pinning to CPU {cpu}: {why}; one-thread figures are left to the scheduler"
+        );
     }
+    usable.ok().map(|()| cpu)
 }
 
-/// Runs `f` on a thread of its own, pinned to `cpu` when given, so that
-/// threads the caller spawns later do not inherit the pin.
+/// Whether the calling thread could be pinned to `cpu`.
+#[cfg(target_os = "linux")]
+fn pinnable(cpu: usize) -> Result<(), String> {
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 2 {
+        return Err("the process has one CPU".to_string());
+    }
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return Err(format!("past the {} CPUs a set holds", libc::CPU_SETSIZE));
+    }
+    // SAFETY: a zeroed cpu_set_t is a valid empty set; sched_getaffinity
+    // fills it for the calling thread (pid 0), and CPU_ISSET reads it with
+    // `cpu` checked against CPU_SETSIZE above.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) != 0 {
+            return Err(format!(
+                "reading the affinity set: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if !libc::CPU_ISSET(cpu, &set) {
+            return Err("it is not in the process's affinity set".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the calling thread could be pinned to `cpu`: never, off Linux.
+#[cfg(not(target_os = "linux"))]
+fn pinnable(_cpu: usize) -> Result<(), String> {
+    Err(format!(
+        "CPU pinning is Linux only, not {}",
+        std::env::consts::OS
+    ))
+}
+
+/// Pins the calling thread to `cpu`.
+#[cfg(target_os = "linux")]
+fn pin_this_thread(cpu: usize) -> Result<(), String> {
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return Err(format!("past the {} CPUs a set holds", libc::CPU_SETSIZE));
+    }
+    // SAFETY: a zeroed cpu_set_t is a valid empty set, `cpu` is checked
+    // against CPU_SETSIZE above, and CPU_SET and sched_setaffinity only
+    // touch the set and the calling thread (pid 0).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Pins the calling thread to `cpu`: never, off Linux.
+#[cfg(not(target_os = "linux"))]
+fn pin_this_thread(_cpu: usize) -> Result<(), String> {
+    Err(format!(
+        "CPU pinning is Linux only, not {}",
+        std::env::consts::OS
+    ))
+}
+
+/// Runs `f` on a thread of its own, pinned to `cpu` when given and the pin
+/// holds (a note otherwise, and `f` runs unpinned), so that threads the
+/// caller spawns later do not inherit the pin.
 pub fn on_cpu<T: Send>(cpu: Option<usize>, f: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 if let Some(cpu) = cpu {
-                    // SAFETY: a zeroed cpu_set_t is a valid empty set, and
-                    // CPU_SET and sched_setaffinity only touch it and the
-                    // calling thread (pid 0).
-                    unsafe {
-                        let mut set: libc::cpu_set_t = std::mem::zeroed();
-                        libc::CPU_SET(cpu, &mut set);
-                        let ok = libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set);
-                        assert_eq!(ok, 0, "pinning to CPU {cpu}");
+                    if let Err(why) = pin_this_thread(cpu) {
+                        eprintln!("Note: not pinned to CPU {cpu}: {why}; running unpinned");
                     }
                 }
                 f()
@@ -483,11 +596,10 @@ impl Gpu {
         })
     }
 
-    /// Whether the device has timestamp queries.
+    /// Whether kernel time can be measured on the device: it has timestamp
+    /// queries and a usable timestamp period, as production decides.
     pub fn has_timestamps(&self) -> bool {
-        self.device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        KernelTimer::available(&self.device, &self.queue)
     }
 
     /// `image` as a sampled RGBA8 texture, as the production path uploads
@@ -606,26 +718,34 @@ impl Gpu {
     /// Records `passes` compute passes, each timed by timestamps, with
     /// `record` filling pass `i`; submits and waits. Returns each pass's
     /// kernel time and the wall time from submit to the end of the wait.
-    /// Panics on a device without timestamp queries: check
-    /// [`has_timestamps`](Self::has_timestamps) first.
+    ///
+    /// The passes always run, so what they write is there to read back;
+    /// the figures are `None`, with a note, when no timer can be built on
+    /// the device (check [`has_timestamps`](Self::has_timestamps) first) or
+    /// the timestamps came back unusable.
     pub fn timed_passes(
         &self,
         passes: u32,
         mut record: impl FnMut(&mut wgpu::ComputePass<'_>, u32),
-    ) -> (Vec<Duration>, Duration) {
-        let timer = KernelTimer::new(&self.device, &self.queue, passes).expect("timestamp queries");
+    ) -> Option<(Vec<Duration>, Duration)> {
+        let timer = KernelTimer::new(&self.device, &self.queue, passes);
+        if timer.is_none() {
+            eprintln!("  Note: no kernel timer for {passes} passes on this device; untimed");
+        }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         for i in 0..passes {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("bench-pass"),
-                timestamp_writes: Some(timer.pass_writes(i)),
+                timestamp_writes: timer.as_ref().map(|t| t.pass_writes(i)),
             });
             record(&mut pass, i);
         }
-        timer.resolve(&mut encoder, passes);
+        if let Some(timer) = &timer {
+            timer.resolve(&mut encoder, passes);
+        }
         let t = Instant::now();
         let index = self.queue.submit(std::iter::once(encoder.finish()));
-        let mapped = timer.map(passes);
+        let mapped = timer.as_ref().map(|timer| timer.map(passes));
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(index),
@@ -633,8 +753,14 @@ impl Gpu {
             })
             .expect("the GPU finishes within 60 s");
         let wall = t.elapsed();
-        let kernels = timer.read(&mapped, passes).expect("readable timestamps");
-        (kernels, wall)
+        let (timer, mapped) = (timer?, mapped?);
+        match timer.read(&mapped, passes) {
+            Ok(kernels) => Some((kernels, wall)),
+            Err(e) => {
+                eprintln!("  Note: unusable timestamps ({e:?}); this run is not timed");
+                None
+            }
+        }
     }
 }
 

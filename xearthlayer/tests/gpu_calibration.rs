@@ -29,7 +29,11 @@
 //! `XEL_BENCH_BURST` tiles per burst (default 32), `XEL_BENCH_BURSTS`
 //! bursts back to back (default 3) and `XEL_BENCH_STREAM_POOL` images
 //! cloned beforehand for the GPU's stream while ISPC is timed (default 96,
-//! 6 GiB). Images are always cloned before they are timed.
+//! 6 GiB). `XEL_BENCH_ISPC_BURST` sets the ISPC burst on every thread
+//! (default four tiles a thread). Images are always cloned before they are
+//! timed, and each is 64 MiB: the ISPC burst holds all of its images at
+//! once, 8 GiB by default on 32 threads, so lower it on a host with less
+//! memory to spare.
 
 #[path = "support/gpu_bench.rs"]
 #[allow(dead_code)]
@@ -265,12 +269,18 @@ fn calibrate_the_encode_pipelines() {
     }
 
     eprintln!("\n== ISPC, {threads} threads ==");
-    let images: Vec<RgbaImage> = (0..threads * 4).map(|_| source.clone()).collect();
-    let (wall, lat) = run_burst(&ispc, images, threads);
-    let rate = (threads * 4) as f64 / wall.as_secs_f64();
+    // Every image of the burst is cloned before it is timed, 64 MiB each:
+    // four a thread is 8 GiB on 32 threads (`XEL_BENCH_ISPC_BURST`).
+    let ispc_burst: usize = env_or("XEL_BENCH_ISPC_BURST", threads * 4).max(1);
     eprintln!(
-        "  burst of {}: {:.1} ms, {rate:.1} tiles/s; tile {}",
-        threads * 4,
+        "  holding {ispc_burst} images, {:.1} GiB",
+        (ispc_burst * source.as_raw().len()) as f64 / f64::from(1u32 << 30)
+    );
+    let images: Vec<RgbaImage> = (0..ispc_burst).map(|_| source.clone()).collect();
+    let (wall, lat) = run_burst(&ispc, images, threads);
+    let rate = ispc_burst as f64 / wall.as_secs_f64();
+    eprintln!(
+        "  burst of {ispc_burst}: {:.1} ms, {rate:.1} tiles/s; tile {}",
         ms(wall),
         fig(summary(&lat))
     );

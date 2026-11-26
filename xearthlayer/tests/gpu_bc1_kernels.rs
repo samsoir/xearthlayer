@@ -166,14 +166,15 @@ impl Native {
 }
 
 /// Runs `kernel` on every level of `levels`, timing it, and returns its
-/// figures and its decoded error.
+/// figures and its decoded error; `None` when a level's timestamps were
+/// unusable (`Gpu::timed_passes` says why).
 fn run_kernel(
     gpu: &Gpu,
     kernel: Kernel,
     levels: &[RgbaImage],
     bc: &mut GpuBlockCompressor,
     native: &Native,
-) -> KernelRun {
+) -> Option<KernelRun> {
     let mut run = KernelRun::default();
     let (mut sum, mut n) = (0.0, 0.0);
     for (i, level) in levels.iter().enumerate() {
@@ -182,7 +183,7 @@ fn run_kernel(
         let (_texture, view) = gpu.texture(level);
         let out = gpu.storage("bench-blocks", blocks * 8);
         let reps = reps_for(blocks);
-        let (mut times, _wall) = match kernel {
+        let timed = match kernel {
             Kernel::BlockCompression => gpu.timed_passes(reps, |pass, _| {
                 bc.add_compression_task(CompressionVariant::BC1, &view, w, h, &out, None, None);
                 bc.compress(pass);
@@ -219,6 +220,7 @@ fn run_kernel(
                 })
             }
         };
+        let (mut times, _wall) = timed?;
         run.levels.push((w, blocks, median(&mut times)));
         let bytes = gpu.read(&out, blocks * 8);
         let ispc = ispc_bc1(level);
@@ -237,7 +239,7 @@ fn run_kernel(
         n += c;
     }
     run.chain = psnr_of(sum, n);
-    run
+    Some(run)
 }
 
 #[test]
@@ -335,7 +337,10 @@ fn bc1_kernels_throughput_and_quality() {
                 run_kernel(&gpu, kernel, &levels[..1], &mut bc, &native);
             }
             for kernel in Kernel::ALL {
-                let run = run_kernel(&gpu, kernel, levels, &mut bc, &native);
+                let Some(run) = run_kernel(&gpu, kernel, levels, &mut bc, &native) else {
+                    eprintln!("  {}: skipped, its timestamps were unusable", kernel.name());
+                    continue;
+                };
                 run.print(kernel.name());
                 run.print_levels();
             }
