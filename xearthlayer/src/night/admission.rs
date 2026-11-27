@@ -23,6 +23,8 @@
 //! - A waiter whose future is dropped leaves the queue; one dropped after
 //!   it was admitted but before it saw its permit gives the permit back. No
 //!   permit is ever lost.
+//! - Once closed (shutdown), pre-generations waiting are refused and new
+//!   ones are refused at once; reads are admitted as before.
 //!
 //! [`Admission`] is the decision alone, pure; [`GenerationPermits`] puts it
 //! behind an async permit.
@@ -82,6 +84,7 @@ pub(crate) struct Admission {
     next: u64,
     queue: BTreeMap<(GenerationClass, u64), Ticket>,
     places: HashMap<Ticket, (GenerationClass, u64)>,
+    closed: bool,
 }
 
 impl Admission {
@@ -92,6 +95,7 @@ impl Admission {
             next: 0,
             queue: BTreeMap::new(),
             places: HashMap::new(),
+            closed: false,
         }
     }
 
@@ -101,8 +105,12 @@ impl Admission {
         order
     }
 
-    /// Queues a waiter of `class`.
+    /// Queues a waiter of `class`; `None` when refused (a pre-generation
+    /// once closed).
     pub(crate) fn enqueue(&mut self, class: GenerationClass) -> Option<Ticket> {
+        if self.closed && class == GenerationClass::Pregeneration {
+            return None;
+        }
         let order = self.order();
         let ticket = order;
         self.queue.insert((class, order), ticket);
@@ -155,6 +163,22 @@ impl Admission {
             }
             _ => false,
         }
+    }
+
+    /// Refuses every pre-generation waiting, and every later one: the
+    /// tickets refused.
+    pub(crate) fn close(&mut self) -> Vec<Ticket> {
+        self.closed = true;
+        let refused: Vec<_> = self
+            .queue
+            .iter()
+            .filter(|((class, _), _)| *class == GenerationClass::Pregeneration)
+            .map(|(_, &ticket)| ticket)
+            .collect();
+        for &ticket in &refused {
+            self.cancel(ticket);
+        }
+        refused
     }
 
     /// Waiters of `class` now.
@@ -252,6 +276,16 @@ impl GenerationPermits {
                 class,
             }),
             _ => None,
+        }
+    }
+
+    /// Refuses pre-generations from now on, those waiting included.
+    pub(crate) fn close(&self) {
+        let mut s = lock(&self.state);
+        for ticket in s.admission.close() {
+            if let Some(tx) = s.answers.remove(&ticket) {
+                let _ = tx.send(None);
+            }
         }
     }
 
@@ -468,6 +502,21 @@ mod tests {
         assert_eq!(admitted_after(&mut a, 1), [(next, TailRead)]);
     }
 
+    #[test]
+    fn closing_refuses_pregenerations_only() {
+        let mut a = Admission::new(0);
+        let pregen = a.enqueue(Pregeneration).unwrap();
+        let read = a.enqueue(TailRead).unwrap();
+        assert_eq!(a.close(), [pregen]);
+        assert_eq!(a.enqueue(Pregeneration), None);
+        let head = a.enqueue(HeadRead).unwrap();
+        assert_eq!(
+            admitted_after(&mut a, 3),
+            [(head, HeadRead), (read, TailRead)]
+        );
+        assert_eq!(a.free(), 1, "the refused one took none");
+    }
+
     // The async permit.
 
     async fn poll_once<F: std::future::Future + Unpin>(f: &mut F) -> std::task::Poll<F::Output> {
@@ -547,5 +596,21 @@ mod tests {
         let permit = pregen_wait.await.unwrap();
         assert_eq!(permit.class(), HeadRead);
         assert!(poll_once(&mut later_wait).await.is_pending());
+    }
+
+    #[tokio::test]
+    async fn a_closed_permit_set_refuses_pregenerations_and_admits_reads() {
+        let permits = GenerationPermits::new(1);
+        let held = permits.hold_all().await;
+        let pregen = LoadPriority::new(Pregeneration);
+        let mut waiting = Box::pin(permits.acquire(&pregen));
+        assert!(poll_once(&mut waiting).await.is_pending());
+        permits.close();
+        assert!(waiting.await.is_none(), "refused while waiting");
+        assert!(permits.acquire(&pregen).await.is_none(), "and from now on");
+        drop(held);
+        let read = LoadPriority::new(TailRead);
+        assert!(permits.acquire(&read).await.is_some());
+        assert_eq!(permits.free(), 1, "every permit came back");
     }
 }

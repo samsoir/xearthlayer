@@ -16,6 +16,7 @@ pub mod layout;
 pub(crate) mod math;
 pub(crate) mod payloads;
 pub mod prefs;
+pub(crate) mod pregen;
 pub mod recipe;
 pub(crate) mod retry;
 pub mod roads;

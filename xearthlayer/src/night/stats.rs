@@ -73,6 +73,35 @@ pub enum PayloadLookup {
     Loaded,
 }
 
+/// What one pre-generation did (#433), once it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PregenOutcome {
+    /// It generated the payload.
+    Generated,
+    /// The small levels were in memory already: nothing loaded.
+    InMemory,
+    /// Loaded from the lit disk tier into memory: nothing generated.
+    OnDisk,
+    /// A read's load of the footprint was in flight: it joined it.
+    Joined,
+    /// Nothing to keep: a recipe unreadable, generation failed, or refused
+    /// at shutdown.
+    Black,
+}
+
+impl PregenOutcome {
+    /// Its name in the debug lines.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Generated => "generated",
+            Self::InMemory => "memory",
+            Self::OnDisk => "disk",
+            Self::Joined => "joined",
+            Self::Black => "black",
+        }
+    }
+}
+
 /// Entries and bytes of each part of the payload memory now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PayloadOccupancy {
@@ -208,6 +237,16 @@ pub struct LitStatsSnapshot {
     pub write_backs_skipped: [u64; 5],
     /// Write-backs dropped because as many as the bound were pending.
     pub write_backs_dropped: u64,
+    /// Footprints queued for pre-generation (#433).
+    pub pregen_queued: u64,
+    /// Footprints not queued for pre-generation: the queue was full.
+    pub pregen_dropped: u64,
+    /// Pre-generations taken off the queue to run.
+    pub pregen_started: u64,
+    /// Pre-generations still queued at shutdown, which never ran.
+    pub pregen_cancelled: u64,
+    /// Pre-generations that ran, by [`PregenOutcome`].
+    pub pregenerations: [u64; 5],
     /// See [`PayloadLookup::Hit`], by [`PayloadPart`]: head, tail.
     pub payload_hits: [u64; 2],
     /// See [`PayloadLookup::Joined`], by part.
@@ -242,6 +281,10 @@ impl LitStatsSnapshot {
 
     pub fn generation_class(&self, class: GenerationClass) -> u64 {
         self.generation_classes[class as usize]
+    }
+
+    pub fn pregenerations(&self, outcome: PregenOutcome) -> u64 {
+        self.pregenerations[outcome as usize]
     }
 
     pub fn write_backs_skipped(&self, skip: WriteBackSkip) -> u64 {
@@ -304,6 +347,11 @@ impl LitStatsSnapshot {
             roads_ready_at_permit: self.roads_ready_at_permit - earlier.roads_ready_at_permit,
             write_backs_skipped: each(self.write_backs_skipped, earlier.write_backs_skipped),
             write_backs_dropped: self.write_backs_dropped - earlier.write_backs_dropped,
+            pregen_queued: self.pregen_queued - earlier.pregen_queued,
+            pregen_dropped: self.pregen_dropped - earlier.pregen_dropped,
+            pregen_started: self.pregen_started - earlier.pregen_started,
+            pregen_cancelled: self.pregen_cancelled - earlier.pregen_cancelled,
+            pregenerations: each(self.pregenerations, earlier.pregenerations),
             payload_hits: each(self.payload_hits, earlier.payload_hits),
             payload_joins: each(self.payload_joins, earlier.payload_joins),
             payload_misses: each(self.payload_misses, earlier.payload_misses),
@@ -338,6 +386,8 @@ pub struct LitWindow {
     /// The most write-backs in flight at once, waiting for their permit
     /// or writing.
     pub write_backs_pending_peak: u64,
+    /// The most footprints queued for pre-generation at once.
+    pub pregen_queue_peak: u64,
 }
 
 impl LitWindow {
@@ -495,6 +545,13 @@ pub struct LitStats {
     roads_ready_at_permit: AtomicU64,
     write_backs_skipped: Tally<5>,
     write_backs_dropped: AtomicU64,
+    pregen_queued: AtomicU64,
+    pregen_dropped: AtomicU64,
+    pregen_started: AtomicU64,
+    pregen_cancelled: AtomicU64,
+    pregenerations: Tally<5>,
+    /// Footprints queued for pre-generation.
+    pregen_queue: Gauge,
     payload_hits: Tally<2>,
     payload_joins: Tally<2>,
     payload_misses: Tally<2>,
@@ -594,6 +651,36 @@ impl LitStats {
         }
     }
 
+    /// A footprint queued for pre-generation.
+    pub fn record_pregen_queued(&self) {
+        add(&self.pregen_queued);
+        self.pregen_queue.arrive();
+    }
+
+    /// A footprint not queued: the queue was full.
+    pub fn record_pregen_dropped(&self) {
+        add(&self.pregen_dropped);
+    }
+
+    /// A queued footprint taken off the queue to run.
+    pub fn record_pregen_started(&self) {
+        add(&self.pregen_started);
+        self.pregen_queue.leave();
+    }
+
+    /// `n` queued footprints cleared at shutdown.
+    pub fn record_pregen_cancelled(&self, n: usize) {
+        for _ in 0..n {
+            add(&self.pregen_cancelled);
+            self.pregen_queue.leave();
+        }
+    }
+
+    /// A pre-generation that ran ended with `outcome`.
+    pub fn record_pregen(&self, outcome: PregenOutcome) {
+        self.pregenerations.add(outcome as usize);
+    }
+
     pub fn record_write_back_skipped(&self, skip: WriteBackSkip) {
         self.write_backs_skipped.add(skip as usize);
     }
@@ -609,6 +696,11 @@ impl LitStats {
             roads_ready_at_permit: get(&self.roads_ready_at_permit),
             write_backs_skipped: self.write_backs_skipped.get(),
             write_backs_dropped: get(&self.write_backs_dropped),
+            pregen_queued: get(&self.pregen_queued),
+            pregen_dropped: get(&self.pregen_dropped),
+            pregen_started: get(&self.pregen_started),
+            pregen_cancelled: get(&self.pregen_cancelled),
+            pregenerations: self.pregenerations.get(),
             payload_hits: self.payload_hits.get(),
             payload_joins: self.payload_joins.get(),
             payload_misses: self.payload_misses.get(),
@@ -645,6 +737,7 @@ impl LitStats {
             disk_permit_wait: samples.disk_permit_wait.take(),
             generations_waiting_peak: self.generations_waiting.take_peak(),
             write_backs_pending_peak: self.write_backs_pending.take_peak(),
+            pregen_queue_peak: self.pregen_queue.take_peak(),
         };
         let idle = summary.delta == LitStatsSnapshot::default()
             && summary.reads.iter().all(Option::is_none)
@@ -718,6 +811,16 @@ impl LitStats {
             write_back_skipped_road_sources_changed = skipped(WriteBackSkip::RoadSourcesChanged),
             write_back_skipped_art_failed = skipped(WriteBackSkip::ArtFailed),
             write_backs_dropped = d.write_backs_dropped,
+            pregen_queued = d.pregen_queued,
+            pregen_dropped = d.pregen_dropped,
+            pregen_started = d.pregen_started,
+            pregen_cancelled = d.pregen_cancelled,
+            pregen_generated = d.pregenerations(PregenOutcome::Generated),
+            pregen_skipped_memory = d.pregenerations(PregenOutcome::InMemory),
+            pregen_skipped_disk = d.pregenerations(PregenOutcome::OnDisk),
+            pregen_joined = d.pregenerations(PregenOutcome::Joined),
+            pregen_black = d.pregenerations(PregenOutcome::Black),
+            pregen_queue_peak = w.pregen_queue_peak,
             payload_head_hits = d.payload_hits(head),
             payload_head_joins = d.payload_joins(head),
             payload_head_misses = d.payload_misses(head),
@@ -817,6 +920,7 @@ mod tests {
             s.write_backs_skipped.len()
         );
         assert_eq!(DiskMiss::NoFingerprint as usize + 1, s.disk_misses.len());
+        assert_eq!(PregenOutcome::Black as usize + 1, s.pregenerations.len());
         for parts in [
             s.payload_hits,
             s.payload_joins,
@@ -898,6 +1002,35 @@ mod tests {
         assert_eq!(of(GenerationClass::TailRead), None);
         let pregen = of(GenerationClass::Pregeneration).unwrap();
         assert_eq!((pregen.count, pregen.max_us), (2, 9_000));
+    }
+
+    #[test]
+    fn pregenerations_are_counted_from_queue_to_outcome_and_the_queue_peaks() {
+        let s = LitStats::default();
+        for _ in 0..3 {
+            s.record_pregen_queued();
+        }
+        s.record_pregen_dropped();
+        s.record_pregen_started();
+        s.record_pregen(PregenOutcome::Generated);
+        s.record_pregen_started();
+        s.record_pregen(PregenOutcome::OnDisk);
+        s.record_pregen_cancelled(1);
+        let snap = s.snapshot();
+        assert_eq!(
+            (
+                snap.pregen_queued,
+                snap.pregen_dropped,
+                snap.pregen_started,
+                snap.pregen_cancelled
+            ),
+            (3, 1, 2, 1)
+        );
+        assert_eq!(snap.pregenerations, [1, 0, 1, 0, 0]);
+        assert_eq!(s.pregen_queue.now(), 0, "every queued one left");
+        let w = s.take_window().unwrap();
+        assert_eq!(w.pregen_queue_peak, 3);
+        s.log_summary(PayloadOccupancy::default());
     }
 
     #[test]

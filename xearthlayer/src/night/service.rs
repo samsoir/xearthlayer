@@ -12,8 +12,10 @@
 //! uploads included: X-Plane's own objects light the ground there. With a
 //! road service attached, roads light footprints too: the probe
 //! counts a footprint whose glow reach holds a road as lit, and generation
-//! rasters the roads into the texture. `LitStats` counts what serving did
-//! and logs `Night lighting: summary` every minute.
+//! rasters the roads into the texture. A source made shared
+//! ([`NightLitSource::shared`]) also pre-generates every footprint its probe
+//! commits lit, in the background, behind every read (#433). `LitStats`
+//! counts what serving did and logs `Night lighting: summary` every minute.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +37,7 @@ use super::layout::minimal_black_dds;
 use super::payloads::{
     PayloadMemory, Uncached, Wanted, LIT_HEAD_CACHE_BYTES, LIT_TAIL_CACHE_BYTES,
 };
+use super::pregen::{PregenQueue, Queued, MAX_QUEUED_PREGENERATIONS};
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{crosses_footprint, reach_deg, RoadField};
 use super::roads::merge::MergedRoads;
@@ -43,8 +46,8 @@ use super::roads::service::{
 };
 use super::roads::RoadModel;
 use super::stats::{
-    DiskMiss, GenerationRecord, LitStats, PayloadLookup, ProbeAnswer, ProbeRecord, ReadOutcome,
-    WriteBackSkip,
+    DiskMiss, GenerationRecord, LitStats, PayloadLookup, PregenOutcome, ProbeAnswer, ProbeRecord,
+    ReadOutcome, WriteBackSkip,
 };
 use super::{
     check_entry, entry_header, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
@@ -74,6 +77,10 @@ pub trait LitTextureSource: Send + Sync {
     fn wants_dsf_hints(&self) -> bool {
         false
     }
+
+    /// The session is ending: stop background work (pre-generation, #433)
+    /// without waiting for it. Reads are still answered. Must not block.
+    fn shutdown(&self) {}
 }
 
 /// Serves the minimal black DDS for every lit name.
@@ -372,6 +379,12 @@ pub struct NightLitSource {
     /// Admitted by priority (#433): reads of the first visible level, then
     /// reads of the small levels, then pre-generations.
     generations: GenerationPermits,
+    /// Footprints committed lit, waiting for pre-generation (#433).
+    pregens: PregenQueue,
+    /// This source, once made shared ([`Self::shared`]): what the
+    /// pre-generation workers hold between footprints, so they never keep
+    /// the source alive. Dangling (no pre-generation) until then.
+    this: Weak<NightLitSource>,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
     /// Lit payloads on disk, from the cache layer; None when caching is off.
@@ -490,6 +503,8 @@ impl NightLitSource {
         disk_permits: LitDiskPermits,
     ) -> Self {
         let stats = Arc::new(LitStats::default());
+        let generations =
+            lit_generation_permits(std::thread::available_parallelism().map_or(1, |n| n.get()));
         Self {
             recipes: Arc::new(SessionRecipes::new(store)),
             art,
@@ -501,9 +516,12 @@ impl NightLitSource {
                 LIT_TAIL_CACHE_BYTES,
                 Arc::clone(&stats),
             )),
-            generations: GenerationPermits::new(lit_generation_permits(
-                std::thread::available_parallelism().map_or(1, |n| n.get()),
-            )),
+            generations: GenerationPermits::new(generations),
+            // One pre-generation in flight per permit: enough to use every
+            // permit no read wants, and pre-generations share the lit disk
+            // permits with reads no more than that.
+            pregens: PregenQueue::new(MAX_QUEUED_PREGENERATIONS, generations),
+            this: Weak::new(),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
             disk: None,
@@ -515,6 +533,27 @@ impl NightLitSource {
             summary_started: AtomicBool::new(false),
             road_sources_logged: DashSet::new(),
         }
+    }
+
+    /// The source, shared, with pre-generation on (#433): each footprint its
+    /// probe commits lit is queued and generated in the background, behind
+    /// every read, so the read X-Plane makes later is a memory hit. Build it
+    /// with the `with_*` methods first. A source not made shared this way
+    /// never pre-generates: the workers must outlive the probe that queued
+    /// them, and hold the source only weakly between footprints.
+    pub fn shared(self) -> Arc<Self> {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
+            ..self
+        })
+    }
+
+    /// At most `bound` pre-generations queued instead of
+    /// [`MAX_QUEUED_PREGENERATIONS`].
+    #[cfg(test)]
+    fn with_pregeneration_bound(mut self, bound: usize) -> Self {
+        self.pregens = self.pregens.with_bound(bound);
+        self
     }
 
     /// Overall lit brightness (`night.brightness`, 0.5 to 1.5 in config).
@@ -1071,6 +1110,9 @@ impl NightLitSource {
             }
         };
         let (lit, committed) = self.commit(key, answer.is_lit());
+        if committed && lit {
+            self.queue_pregeneration(name);
+        }
         self.stats.record_probe(&ProbeRecord {
             road_wait,
             permit_wait,
@@ -1098,6 +1140,61 @@ impl NightLitSource {
             "Night lighting: lit probe"
         );
         lit
+    }
+
+    /// Queues `name`, just committed lit, for pre-generation, starting a
+    /// worker when fewer than allowed run; dropped (counted) when the queue
+    /// is full. Nothing on a source not made shared, or outside a runtime.
+    fn queue_pregeneration(&self, name: &DdsFilename) {
+        if self.this.strong_count() == 0 {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if let Queued::Yes { start_worker: true } = self.pregens.push(name.clone(), &self.stats) {
+            runtime.spawn(pregenerate_queued(self.this.clone()));
+        }
+    }
+
+    /// Pre-generates `name`'s payload as a read of its small levels loads
+    /// it, waiting for its generation permit behind every read: through the
+    /// footprint's one load, so a read arriving meanwhile joins it (and
+    /// raises it to its own class) and never generates it again, and a
+    /// footprint whose small levels are in memory loads nothing. A payload
+    /// on the lit disk tier is loaded, not generated: a disk lookup is
+    /// cheap next to a generation, and the later read is then a memory hit,
+    /// not a disk lookup on the read's path. What is kept follows the read's
+    /// rules: the small levels in memory, the first visible level not
+    /// (no read reached it), the write-back as for any generation.
+    async fn pregenerate(&self, name: &DdsFilename) -> PregenOutcome {
+        let layout = self.layout(name);
+        let from_disk = AtomicBool::new(false);
+        let load =
+            |priority| self.load_or_generate(name.clone(), layout.clone(), &from_disk, priority);
+        let served = self
+            .payloads
+            .serve(
+                (name.row, name.col, name.zoom),
+                &layout,
+                Wanted::only(PayloadPart::Tail),
+                GenerationClass::Pregeneration,
+                load,
+            )
+            .await;
+        let outcome = pregen_outcome(
+            served.lookup(),
+            !served.parts.is_empty(),
+            from_disk.load(Ordering::Relaxed),
+        );
+        debug!(
+            row = name.row,
+            col = name.col,
+            zoom = name.zoom,
+            outcome = outcome.label(),
+            "Night lighting: lit pre-generation"
+        );
+        outcome
     }
 
     /// The committed answer of [`Self::commit`] alone.
@@ -1136,6 +1233,34 @@ impl NightLitSource {
         }
         let (stats, payloads) = (Arc::downgrade(&self.stats), Arc::downgrade(&self.payloads));
         runtime.spawn(log_summaries(stats, payloads));
+    }
+}
+
+/// A pre-generation worker: pre-generates queued footprints, one at a
+/// time, until none is left, the queue is closed or the source is gone. It
+/// holds the source only while it runs one.
+async fn pregenerate_queued(this: Weak<NightLitSource>) {
+    loop {
+        let Some(source) = this.upgrade() else {
+            return;
+        };
+        let Some(name) = source.pregens.next(&source.stats) else {
+            return;
+        };
+        let outcome = source.pregenerate(&name).await;
+        source.stats.record_pregen(outcome);
+    }
+}
+
+/// What a pre-generation did, from how its tail was found (`lookup`),
+/// whether it has a payload and whether it was read from the disk tier.
+fn pregen_outcome(lookup: PayloadLookup, payload: bool, from_disk: bool) -> PregenOutcome {
+    match (lookup, payload, from_disk) {
+        (PayloadLookup::Hit, _, _) => PregenOutcome::InMemory,
+        (PayloadLookup::Joined, _, _) => PregenOutcome::Joined,
+        (PayloadLookup::Loaded, false, _) => PregenOutcome::Black,
+        (PayloadLookup::Loaded, true, true) => PregenOutcome::OnDisk,
+        (PayloadLookup::Loaded, true, false) => PregenOutcome::Generated,
     }
 }
 
@@ -1282,6 +1407,14 @@ impl LitTextureSource for NightLitSource {
 
     fn wants_dsf_hints(&self) -> bool {
         self.roads.is_some()
+    }
+
+    /// Closes the pre-generation queue (what it held never runs) and
+    /// refuses pre-generations waiting for a permit; one already generating
+    /// finishes (at most one per permit, as a read's would) and is kept.
+    fn shutdown(&self) {
+        self.pregens.close(&self.stats);
+        self.generations.close();
     }
 }
 
@@ -4062,6 +4195,282 @@ mod tests {
                 1,
                 "admitted as the read that joined it"
             );
+        }
+
+        // Pre-generation on probe (#433).
+
+        fn key_of(name: &DdsFilename) -> (u32, u32, u8) {
+            (name.row, name.col, name.zoom)
+        }
+
+        /// Waits until `done` holds for the source's counters: background
+        /// work, a generation among it, with a generous guard (a debug
+        /// build's encode under a loaded test run takes seconds).
+        async fn settled(
+            source: &NightLitSource,
+            done: impl Fn(&crate::night::stats::LitStatsSnapshot) -> bool,
+        ) -> crate::night::stats::LitStatsSnapshot {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let snap = source.stats.snapshot();
+                if done(&snap) {
+                    return snap;
+                }
+                assert!(Instant::now() < deadline, "never counted: {snap:?}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        #[test]
+        fn a_pregenerations_outcome_follows_how_its_small_levels_were_found() {
+            use PayloadLookup::{Hit, Joined, Loaded};
+            assert_eq!(pregen_outcome(Hit, true, false), PregenOutcome::InMemory);
+            assert_eq!(pregen_outcome(Joined, true, false), PregenOutcome::Joined);
+            assert_eq!(pregen_outcome(Joined, false, false), PregenOutcome::Joined);
+            assert_eq!(pregen_outcome(Loaded, true, true), PregenOutcome::OnDisk);
+            assert_eq!(
+                pregen_outcome(Loaded, true, false),
+                PregenOutcome::Generated
+            );
+            assert_eq!(pregen_outcome(Loaded, false, false), PregenOutcome::Black);
+        }
+
+        #[tokio::test]
+        async fn a_footprint_probed_lit_is_pregenerated_and_read_from_memory() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone()).shared();
+            let name = lit_name();
+            let layout = source.layout(&name);
+            assert_eq!(source.size(&name).await, layout.total_len);
+            let snap = settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 1).await;
+            assert_eq!((snap.pregen_queued, snap.pregen_started), (1, 1));
+            assert_eq!(snap.generation_class(GenerationClass::Pregeneration), 1);
+            assert_eq!(snap.reads, [0; 7], "no read yet");
+            let key = key_of(&name);
+            assert!(source.payloads.contains(PayloadPart::Tail, key));
+            assert!(
+                !source.payloads.contains(PayloadPart::Head, key),
+                "no read reached the first visible level"
+            );
+            let tail = layout.part_range(PayloadPart::Tail);
+            let bytes = source.read(&name, tail.start, 4096).await;
+            assert!(bytes.iter().any(|&b| b != 0));
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.reads(ReadOutcome::MemoryHit), 1);
+            assert_eq!(calls(&white), 1, "generated once, before the read");
+        }
+
+        #[tokio::test]
+        async fn a_source_not_shared_does_not_pregenerate() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone());
+            let name = lit_name();
+            assert_eq!(source.size(&name).await, source.layout(&name).total_len);
+            tokio::task::yield_now().await;
+            assert_eq!(source.stats.snapshot().pregen_queued, 0);
+            assert_eq!(calls(&white), 0);
+        }
+
+        #[tokio::test]
+        async fn every_permit_held_and_a_pregeneration_queued_the_next_permit_goes_to_a_read() {
+            let (_t, source) = fixture();
+            let order = Arc::new(Order::default());
+            let source = source.with_generator(order.clone()).shared();
+            let layout = LitLayout::new(16, 4);
+            let probed = lit_name();
+            let read = DdsFilename {
+                col: probed.col + 16,
+                ..probed.clone()
+            };
+            let mut held = source.generations.hold_all().await;
+            assert_eq!(source.size(&probed).await, layout.total_len);
+            settled(&source, |_| {
+                source.generations.waiting(GenerationClass::Pregeneration) == 1
+            })
+            .await;
+            let ((_, outcome), ()) = tokio::join!(
+                source.served_parts(&read, &layout, small_levels(&layout)),
+                async {
+                    settled(&source, |_| source.stats.generations_waiting.now() == 2).await;
+                    held.pop();
+                }
+            );
+            assert_eq!(outcome, ReadOutcome::Generated);
+            // The pre-generation takes the read's permit once it is done.
+            drop(held);
+            settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 1).await;
+            assert_eq!(
+                *order.0.lock().unwrap(),
+                [read.col, probed.col],
+                "the read first"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_read_arriving_during_a_pregeneration_of_its_footprint_generates_nothing() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone()).shared();
+            let name = lit_name();
+            let layout = source.layout(&name);
+            let held = source.generations.hold_all().await;
+            assert_eq!(source.size(&name).await, layout.total_len);
+            settled(&source, |_| {
+                source.generations.waiting(GenerationClass::Pregeneration) == 1
+            })
+            .await;
+            let (bytes, ()) =
+                tokio::join!(source.read(&name, layout.payload_start(), 4096), async {
+                    // The read joined the pre-generation's load and raised it.
+                    settled(&source, |_| {
+                        source.generations.waiting(GenerationClass::HeadRead) == 1
+                    })
+                    .await;
+                    drop(held);
+                });
+            assert!(bytes.iter().any(|&b| b != 0));
+            let snap = settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 1).await;
+            assert_eq!(snap.reads(ReadOutcome::Joined), 1);
+            assert_eq!(calls(&white), 1, "one generation");
+            assert_eq!(
+                snap.generation_class(GenerationClass::HeadRead),
+                1,
+                "admitted as the read"
+            );
+            let key = key_of(&name);
+            assert!(
+                source.payloads.contains(PayloadPart::Head, key),
+                "the read's"
+            );
+            assert!(source.payloads.contains(PayloadPart::Tail, key));
+        }
+
+        #[tokio::test]
+        async fn a_pregeneration_of_a_footprint_in_memory_loads_nothing() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone()).shared();
+            let name = lit_name();
+            let layout = source.layout(&name);
+            source
+                .served_parts(&name, &layout, small_levels(&layout))
+                .await;
+            assert_eq!(source.size(&name).await, layout.total_len);
+            let snap = settled(&source, |s| s.pregenerations(PregenOutcome::InMemory) == 1).await;
+            assert_eq!(snap.generations(), 1, "the read's alone");
+            assert_eq!(calls(&white), 1);
+        }
+
+        #[tokio::test]
+        async fn a_pregeneration_of_a_footprint_on_disk_loads_it_and_generates_nothing() {
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let name = lit_name();
+            let layout = LitLayout::new(16, 4);
+            let first = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(d.clone());
+            first.served_payload(&name, &layout).await;
+            settled(&first, |s| s.disk_writes == 1).await;
+
+            let second = Arc::new(White::default());
+            let source = source_in(&temp)
+                .with_generator(second.clone())
+                .with_disk_cache(d.clone())
+                .shared();
+            assert_eq!(source.size(&name).await, layout.total_len);
+            let snap = settled(&source, |s| s.pregenerations(PregenOutcome::OnDisk) == 1).await;
+            assert_eq!((snap.disk_hits, snap.generations()), (1, 0));
+            assert_eq!(calls(&second), 0);
+            let tail = layout.part_range(PayloadPart::Tail);
+            source.read(&name, tail.start, 4096).await;
+            assert_eq!(source.stats.snapshot().reads(ReadOutcome::MemoryHit), 1);
+        }
+
+        #[tokio::test]
+        async fn a_pregenerated_payload_is_written_to_disk() {
+            let temp = TempDir::new().unwrap();
+            let d = disk();
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(d.clone())
+                .shared();
+            let name = lit_name();
+            source.size(&name).await;
+            settled(&source, |s| s.disk_writes == 1).await;
+            let fp = source.fingerprint(&name).await.unwrap();
+            let entry = d.get(&crate::night::lit_cache_key(&name)).await.unwrap();
+            let layout = source.layout(&name);
+            assert!(crate::night::check_entry(entry.unwrap(), &fp, layout.payload_len()).is_ok());
+        }
+
+        #[tokio::test]
+        async fn pregenerations_past_the_bound_are_dropped_and_counted() {
+            // On this one-thread runtime no worker runs before the test
+            // awaits: the queue holds all it can, and the rest are dropped.
+            const BOUND: usize = 3;
+            const PAST: usize = 2;
+            let (_t, source) = fixture();
+            let source = source
+                .with_generator(Arc::new(White::default()))
+                .with_pregeneration_bound(BOUND)
+                .shared();
+            for i in 0..(BOUND + PAST) as u32 {
+                source.queue_pregeneration(&small_name(i));
+            }
+            let snap = source.stats.snapshot();
+            assert_eq!(
+                (snap.pregen_queued, snap.pregen_dropped),
+                (BOUND as u64, PAST as u64)
+            );
+            assert_eq!(source.pregens.len(), BOUND);
+            let snap = settled(&source, |s| {
+                s.pregenerations(PregenOutcome::Generated) == BOUND as u64
+            })
+            .await;
+            assert_eq!(snap.pregen_started, BOUND as u64);
+            assert_eq!(
+                source.stats.take_window().unwrap().pregen_queue_peak,
+                BOUND as u64
+            );
+        }
+
+        #[tokio::test]
+        async fn shutdown_with_pregenerations_queued_runs_none_of_them() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone()).shared();
+            let held = source.generations.hold_all().await;
+            let workers = held.len();
+            let queued = workers + 3;
+            for i in 0..queued as u32 {
+                source.queue_pregeneration(&small_name(i));
+            }
+            // Every worker has taken one and waits for a permit.
+            settled(&source, |_| {
+                source.generations.waiting(GenerationClass::Pregeneration) == workers
+            })
+            .await;
+            source.shutdown();
+            let snap = settled(&source, |s| {
+                s.pregenerations(PregenOutcome::Black) == workers as u64
+            })
+            .await;
+            assert_eq!(snap.pregen_cancelled, (queued - workers) as u64);
+            assert_eq!(snap.generations(), 0);
+            assert_eq!(calls(&white), 0, "none ran");
+            settled(&source, |_| source.pregens.running() == 0).await;
+            source.queue_pregeneration(&small_name(99));
+            assert_eq!(source.pregens.len(), 0, "nothing is queued any more");
+            // Reads are still served, with the permits back.
+            drop(held);
+            let layout = LitLayout::new(18, 4);
+            let (_, outcome) = source
+                .served_parts(&small_name(0), &layout, small_levels(&layout))
+                .await;
+            assert_eq!(outcome, ReadOutcome::Generated);
         }
 
         #[tokio::test]

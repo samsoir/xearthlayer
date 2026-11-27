@@ -191,6 +191,9 @@ pub struct MountManager {
     night_lighting: crate::night::NightLighting,
     /// Overall lit brightness multiplier (`night.brightness`).
     night_brightness: f64,
+    /// The ortho mount's lit source, told to stop its background work
+    /// before the mount comes down.
+    lit_source: Option<Arc<dyn crate::night::LitTextureSource>>,
 }
 
 impl MountManager {
@@ -215,6 +218,7 @@ impl MountManager {
             night_enabled: false,
             night_lighting: crate::night::NightLighting::Off,
             night_brightness: crate::night::DEFAULT_NIGHT_BRIGHTNESS,
+            lit_source: None,
         }
     }
 
@@ -262,6 +266,7 @@ impl MountManager {
         ortho_mount: &Path,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
         let source = self.night_lit_source(index, disk, ortho_mount);
+        self.lit_source = source.clone();
         self.night_lighting = if source.is_some() {
             crate::night::NightLighting::Lit
         } else {
@@ -324,7 +329,8 @@ impl MountManager {
         if let Some(disk) = disk {
             source = source.with_disk_cache(disk);
         }
-        Some(Arc::new(source))
+        // Shared, so it pre-generates what its probe answers lit (#433).
+        Some(source.shared())
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -755,6 +761,11 @@ impl MountManager {
     /// Sessions are unmounted in reverse order of mounting.
     /// Patches are unmounted last (they were mounted first).
     pub fn unmount_all(&mut self) {
+        // Background lit work stops first: nothing it would do is wanted.
+        if let Some(source) = self.lit_source.take() {
+            source.shutdown();
+        }
+
         // Collect keys to unmount (reverse order for clean shutdown)
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
@@ -1129,6 +1140,37 @@ mod tests {
             "roads are attached, so the filesystem should send DSF hints"
         );
         assert_eq!(manager.night_lighting(), crate::night::NightLighting::Lit);
+    }
+
+    #[test]
+    fn unmounting_tells_the_lit_source_to_stop_its_background_work() {
+        #[derive(Default)]
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl crate::night::LitTextureSource for Counting {
+            fn size<'a>(
+                &'a self,
+                _: &'a crate::fuse::DdsFilename,
+            ) -> futures::future::BoxFuture<'a, u64> {
+                Box::pin(async { 0 })
+            }
+            fn read<'a>(
+                &'a self,
+                _: &'a crate::fuse::DdsFilename,
+                _: u64,
+                _: u32,
+            ) -> futures::future::BoxFuture<'a, bytes::Bytes> {
+                Box::pin(async { bytes::Bytes::new() })
+            }
+            fn shutdown(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let source = Arc::new(Counting::default());
+        let mut manager = MountManager::new();
+        manager.lit_source = Some(source.clone());
+        manager.unmount_all();
+        manager.unmount_all();
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -79,6 +79,13 @@ impl Wanted {
         Self([true; 2])
     }
 
+    /// `part` alone.
+    pub(crate) fn only(part: PayloadPart) -> Self {
+        let mut wanted = Self::default();
+        wanted.0[part as usize] = true;
+        wanted
+    }
+
     pub(crate) fn contains(self, part: PayloadPart) -> bool {
         self.0[part as usize]
     }
@@ -666,6 +673,12 @@ mod tests {
         let (pregen, read) = tokio::join!(pregen, joined);
         assert_eq!(pregen.lookup(), PayloadLookup::Loaded);
         assert_eq!(read.lookup(), PayloadLookup::Joined);
+    }
+
+    #[test]
+    fn only_wants_one_part() {
+        assert_eq!(Wanted::only(PayloadPart::Tail), tail_only());
+        assert_eq!(Wanted::only(PayloadPart::Head), head_only());
     }
 
     #[tokio::test]
