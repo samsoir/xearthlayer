@@ -305,11 +305,17 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// rename failed. The name still ends in `.tmp`, which `cache clear`
 /// accepts in a region (`layout::holds_only_cache_entries`) and the index
 /// scan skips (it reads `*.cache` only), as it did the old name.
+///
+/// A temp file left by a crash between its creation and its rename is
+/// removed at the next start's index scan, once its process is gone.
 fn temp_path_for(path: &std::path::Path) -> PathBuf {
     let n = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.{n}.tmp", std::process::id()));
-    path.with_file_name(name)
+    let entry = path.file_name().unwrap_or_default();
+    path.with_file_name(crate::cache::layout::temp_file_name(
+        entry,
+        std::process::id(),
+        n,
+    ))
 }
 
 /// Writes `parts`, in order, as the file at `path`: to a temp file of its
