@@ -293,10 +293,48 @@ impl DiskCacheProvider {
     }
 }
 
+/// Writes `parts`, in order, as the file at `path`: to a sibling `.tmp`
+/// file, renamed over `path` once every part is written, so a reader never
+/// sees a torn file at the live path. The temp file is removed on any
+/// failure. Creates the parent directory (the region's, on its first
+/// write). Not fsynced before the rename, as this tier's writes never were
+/// (see `docs/dev/cache-integrity-design.md`). Blocking I/O.
+fn write_parts(path: &std::path::Path, parts: &[Bytes]) -> std::io::Result<()> {
+    use std::io::Write;
+    let temp_path = path.with_extension("tmp");
+    let written = (|| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(&temp_path)?;
+        for part in parts {
+            file.write_all(part)?;
+        }
+        Ok(())
+    })();
+    match written.and_then(|()| std::fs::rename(&temp_path, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
+}
+
 impl Cache for DiskCacheProvider {
     fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+        self.set_parts(key, vec![value])
+    }
+
+    /// The parts are written to the file one after another, never joined
+    /// into one buffer, in one blocking task.
+    fn set_parts(
+        &self,
+        key: &str,
+        parts: Vec<Bytes>,
+    ) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         let path = self.key_path(key);
-        let size = value.len() as u64;
+        let size = parts.iter().map(|p| p.len() as u64).sum::<u64>();
         let key_owned = key.to_string();
 
         Box::pin(async move {
@@ -308,20 +346,10 @@ impl Cache for DiskCacheProvider {
                 "Disk cache write starting"
             );
 
-            // Ensure parent directory exists (creates region dir on first write)
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(ServiceCacheError::Io)?;
-            }
-
-            // Write atomically via temp file
-            let temp_path = path.with_extension("tmp");
-            tokio::fs::write(&temp_path, &value)
+            let target = path.clone();
+            tokio::task::spawn_blocking(move || write_parts(&target, &parts))
                 .await
-                .map_err(ServiceCacheError::Io)?;
-            tokio::fs::rename(&temp_path, &path)
-                .await
+                .map_err(|e| ServiceCacheError::Io(std::io::Error::other(e)))?
                 .map_err(ServiceCacheError::Io)?;
 
             // Update LRU index after successful write
@@ -576,6 +604,38 @@ mod tests {
         provider.set(key, entry.clone()).await.unwrap();
 
         assert_eq!(provider.get(key).await.unwrap(), Some(entry));
+    }
+
+    #[tokio::test]
+    async fn an_entry_written_in_parts_is_their_concatenation() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+        let (header, payload) = (Bytes::from_static(b"XELL"), Bytes::from(vec![7u8; 64]));
+        provider
+            .set_parts(key, vec![header.clone(), payload.clone()])
+            .await
+            .unwrap();
+        let joined = Bytes::from([&header[..], &payload[..]].concat());
+        assert_eq!(provider.get(key).await.unwrap(), Some(joined.clone()));
+        assert_eq!(provider.size_bytes(), joined.len() as u64);
+        let path = provider.key_path(key);
+        assert!(!path.with_extension("tmp").exists(), "renamed into place");
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_leaves_no_temp_file_and_no_entry() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+        // A directory where the entry goes: the rename over it fails.
+        let path = provider.key_path(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        let parts = vec![Bytes::from_static(b"XELL"), Bytes::from(vec![7u8; 64])];
+        assert!(provider.set_parts(key, parts).await.is_err());
+        assert!(!path.with_extension("tmp").exists());
+        assert_eq!(provider.entry_count(), 0);
     }
 
     #[tokio::test]

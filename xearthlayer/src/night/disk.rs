@@ -89,12 +89,21 @@ pub fn lit_cache_key(name: &DdsFilename) -> String {
     format!("lit:{}:{}:{}", name.zoom, name.row, name.col)
 }
 
-/// The bytes stored for `payload`, stamped with `fp`.
-pub fn encode_entry(fp: &LitFingerprint, payload: &[u8]) -> Bytes {
-    let mut out = BytesMut::with_capacity(ENTRY_HEADER_LEN + payload.len());
+/// The header of the entry of a `payload_len`-byte payload stamped with
+/// `fp`: the entry is this header, then the payload. Written apart from the
+/// payload ([`crate::cache::Cache::set_parts`]), the payload is not copied.
+pub fn entry_header(fp: &LitFingerprint, payload_len: usize) -> Bytes {
+    let mut out = BytesMut::with_capacity(ENTRY_HEADER_LEN);
     out.put_slice(LIT_ENTRY_MAGIC);
     out.put_slice(&fp.0);
-    out.put_u64_le(payload.len() as u64);
+    out.put_u64_le(payload_len as u64);
+    out.freeze()
+}
+
+/// The bytes stored for `payload`, stamped with `fp`, in one buffer.
+pub fn encode_entry(fp: &LitFingerprint, payload: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(ENTRY_HEADER_LEN + payload.len());
+    out.put_slice(&entry_header(fp, payload.len()));
     out.put_slice(payload);
     out.freeze()
 }
@@ -169,6 +178,16 @@ mod tests {
         assert_eq!(
             check_entry(entry, &fp(1), 7).as_deref(),
             Ok(&b"payload"[..])
+        );
+    }
+
+    #[test]
+    fn an_entry_is_its_header_then_its_payload() {
+        let header = entry_header(&fp(1), 7);
+        assert_eq!(header.len(), ENTRY_HEADER_LEN);
+        assert_eq!(
+            encode_entry(&fp(1), b"payload"),
+            Bytes::from([&header[..], b"payload"].concat())
         );
     }
 

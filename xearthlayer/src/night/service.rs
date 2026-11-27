@@ -46,7 +46,7 @@ use super::stats::{
     WriteBackSkip,
 };
 use super::{
-    check_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
+    check_entry, entry_header, footprint_fingerprint, lit_cache_key, session_fingerprint, ArtDoubt,
     ArtRecord, FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, LitParts,
     PayloadPart, Recipe, RecipeStore, TextureSettingSource,
 };
@@ -711,14 +711,16 @@ impl NightLitSource {
         let Some(pending) = self.stats.write_back(MAX_PENDING_WRITE_BACKS) else {
             return Ok(payload.clone());
         };
-        let entry = encode_entry(fp, payload);
+        // The header and the payload are written as two slices: the payload
+        // is not copied into the entry.
+        let entry = vec![entry_header(fp, payload.len()), payload.clone()];
         let payload = payload.clone();
         let disk_io = self.disk_io.clone();
         tokio::spawn(async move {
             let Some(_permit) = disk_io.acquire().await else {
                 return;
             };
-            let written = disk.set(&key, entry).await;
+            let written = disk.set_parts(&key, entry).await;
             if let Err(e) = &written {
                 debug!(error = %e, key, "Night lighting: lit disk write failed");
             }
@@ -3557,6 +3559,8 @@ mod tests {
             gets: std::sync::atomic::AtomicUsize,
             sets: std::sync::atomic::AtomicUsize,
             gate: Option<Arc<tokio::sync::Semaphore>>,
+            /// The parts of every value written in parts, in order.
+            written_parts: std::sync::Mutex<Vec<Vec<Bytes>>>,
         }
 
         impl Recorded {
@@ -3566,6 +3570,7 @@ mod tests {
                     gets: Default::default(),
                     sets: Default::default(),
                     gate,
+                    written_parts: Default::default(),
                 })
             }
 
@@ -3590,6 +3595,17 @@ mod tests {
                     };
                     self.inner.set(&key, value).await
                 })
+            }
+
+            fn set_parts(
+                &self,
+                key: &str,
+                parts: Vec<Bytes>,
+            ) -> futures::future::BoxFuture<'_, Result<(), crate::cache::ServiceCacheError>>
+            {
+                self.written_parts.lock().unwrap().push(parts.clone());
+                let joined = Bytes::from(parts.concat());
+                self.set(key, joined)
             }
 
             fn get(
@@ -3834,6 +3850,38 @@ mod tests {
             let key = (name.row, name.col, name.zoom);
             assert!(source.payloads.contains(PayloadPart::Head, key));
             assert!(source.payloads.contains(PayloadPart::Tail, key));
+        }
+
+        #[tokio::test]
+        async fn a_write_back_writes_the_header_and_the_generated_payload_as_two_slices() {
+            let temp = TempDir::new().unwrap();
+            let disk = Recorded::new(None);
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            let name = small_name(0);
+            let layout = LitLayout::new(18, 4);
+            let (parts, _) = source.served_parts(&name, &layout, Wanted::whole()).await;
+            counted(&source, |s| s.disk_writes == 1).await;
+            let written = disk.written_parts.lock().unwrap().clone();
+            assert_eq!(written.len(), 1);
+            let [header, payload] = &written[0][..] else {
+                panic!("{} parts", written[0].len());
+            };
+            assert_eq!(header.len(), 44);
+            assert_eq!(payload.len() as u64, layout.payload_len());
+            let served_head = parts.get(PayloadPart::Head).unwrap();
+            assert_eq!(
+                payload.as_ptr(),
+                served_head.as_ptr(),
+                "the generated buffer itself, not a copy"
+            );
+            let fp = source.fingerprint(&name).await.unwrap();
+            let entry = disk.get(&crate::night::lit_cache_key(&name)).await.unwrap();
+            assert_eq!(
+                crate::night::check_entry(entry.unwrap(), &fp, layout.payload_len()),
+                Ok(payload.clone())
+            );
         }
 
         #[tokio::test]

@@ -140,6 +140,25 @@ pub trait Cache: Send + Sync {
     /// - Cache is shutting down
     fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>>;
 
+    /// Store the value made of `parts`, in order, as [`Cache::set`] would
+    /// store their concatenation.
+    ///
+    /// For values built of pieces kept apart, such as a header and a
+    /// payload: a provider that can write the pieces as they are overrides
+    /// this, and the value is never copied into one buffer. The default
+    /// joins them (one copy) and calls `set`.
+    fn set_parts(
+        &self,
+        key: &str,
+        parts: Vec<Bytes>,
+    ) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+        let mut value = bytes::BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
+        for part in &parts {
+            value.extend_from_slice(part);
+        }
+        self.set(key, value.freeze())
+    }
+
     /// Retrieve a value by key.
     ///
     /// # Arguments
