@@ -288,7 +288,10 @@ can run at once (two disk permits): with one shared `.tmp`, the second
 writer truncated the first writer's file, a short file was published, a
 reader's length check discarded it, and the second rename failed. The names
 still end in `.tmp`, which `cache clear` and the content checks in
-`cache::layout` accept and the startup index scan (`*.cache` only) ignores.
+`cache::layout` accept. Unlike the old shared name, a unique temp file left
+by a crash between create and rename is never overwritten, so the startup
+scan (`LruIndex::populate_from_disk`) removes temp files whose process id
+(`cache::layout::temp_file_pid`) is not its own, and keeps its own.
 This write is atomic (a reader never observes a torn file at the live path) but
 does **not** call `sync_all()` before the rename, so invariant 4's
 durability half is not currently enforced for this tier. This is a
