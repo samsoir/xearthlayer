@@ -181,8 +181,8 @@ The adapter-specific tests need to be in a live mount test that reads through a
 real mount to exercise filesystem operations (lookup, attributes, virtual DDS read,
 directory listing).  These tests run for each backend.
 
-The `tests/macfuse_smoke.rs` test is turned into a live mount test parameterized
-by backend to allow it to run on Linux and macOS.
+The `tests/fuse_smoke.rs` (renamed from `tests/macfuse_smoke.rs`) test is turned
+into a live mount test parameterized by backend.
 
 For implementation on Linux, `fuse3` live mount tests can run on CI runners. The
 runners provide `/dev/fuse` in their `ubuntu-latest` kernels, and CI installs
