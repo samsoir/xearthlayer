@@ -463,7 +463,8 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/executor/demand.rs` | DemandTracker and DemandGuard (demand jobs in flight, pause state) |
 | `xearthlayer/src/executor/lane_sizing.rs` | LaneSizing - prefetch lane pools from `prefetch.capacity_share`, blocking-pool cap |
 | `xearthlayer/src/tasks/cached_tile_probe.rs` | CachedTileProbeTask - prefetch-lane admission cache re-check |
-| `xearthlayer/src/metrics/latency.rs` | LatencyWindow - per-sample FUSE latency median, p95, max |
+| `xearthlayer/src/metrics/latency.rs` | LatencyWindow - per-sample FUSE latency median, p95, max; LatencyHistogram - fixed-memory, mergeable |
+| `xearthlayer/src/metrics/recent.rs` | RecentDemandRing and RecentFuseDemand - FUSE demand over the last five samples for the dashboard's latency line (#481) |
 | `xearthlayer/src/prefetch/state.rs` | PrefetchState and resolve_state - dashboard state by precedence |
 | `xearthlayer/src/executor/daemon.rs` | ExecutorDaemon - background job processor |
 | `xearthlayer/src/executor/client.rs` | DdsClient trait and ChannelDdsClient |
