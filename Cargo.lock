@@ -4833,7 +4833,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 dependencies = [
  "axum",
  "bcdec_rs",
@@ -4890,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-cli"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 dependencies = [
  "atty",
  "chrono",
@@ -4918,7 +4918,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-package"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 dependencies = [
  "chrono",
  "semver",
@@ -4926,7 +4926,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-publish"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 dependencies = [
  "chrono",
  "clap",
@@ -4938,7 +4938,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-publisher"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 dependencies = [
  "chrono",
  "csscolorparser",
