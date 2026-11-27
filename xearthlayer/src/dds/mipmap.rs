@@ -50,6 +50,26 @@ static LINEAR_TO_SRGB: LazyLock<Box<[u8]>> = LazyLock::new(|| {
         .collect()
 });
 
+/// [`SRGB_TO_LINEAR`] as u32, so the four values of a block add with no
+/// conversion.
+static SRGB_TO_LINEAR_WIDE: LazyLock<[u32; 256]> =
+    LazyLock::new(|| std::array::from_fn(|v| u32::from(SRGB_TO_LINEAR[v])));
+
+const SUM_TABLE_LEN: usize = 1 << 18;
+
+/// [`LINEAR_TO_SRGB`] indexed by the sum of four linear values, the rounding
+/// of their mean ([`quarter_half_to_even`]) folded in: one load where the
+/// filter did rounding arithmetic and a load. A sum is at most `4 * 65535`;
+/// the table is 2^18 entries (256 KiB) so that masking a sum to 18 bits
+/// needs no bounds check, and the unreachable tail is clamped to white.
+static SUM_TO_SRGB: LazyLock<Box<[u8; SUM_TABLE_LEN]>> = LazyLock::new(|| {
+    (0..SUM_TABLE_LEN as u32)
+        .map(|sum| LINEAR_TO_SRGB[(quarter_half_to_even(sum) as usize).min(usize::from(u16::MAX))])
+        .collect::<Box<[u8]>>()
+        .try_into()
+        .expect("the table has SUM_TABLE_LEN entries")
+});
+
 /// The filter's decode table: every sRGB byte as 16-bit linear light. The
 /// GPU's linear-light shader reads the same table (`dds::gpu_mips`).
 pub(crate) fn srgb_to_linear_table() -> &'static [u16; 256] {
@@ -249,23 +269,24 @@ const CHANNELS: usize = 4;
 
 /// One output row of [`MipmapGenerator::downsample_box_2x`] from its two
 /// source rows: no per-pixel bounds checks (#389). R, G and B go to linear
-/// light through [`SRGB_TO_LINEAR`] and back through [`LINEAR_TO_SRGB`].
+/// light through [`SRGB_TO_LINEAR_WIDE`] and back through [`SUM_TO_SRGB`],
+/// which takes the sum of four and returns the sRGB byte of their mean.
 /// An odd last source pixel has no partner and is ignored (the output row
 /// sets how many pixels are written).
 #[inline(always)]
 fn downsample_row(out: &mut [u8], top: &[u8], bottom: &[u8]) {
-    let to_linear = &*SRGB_TO_LINEAR;
-    let to_srgb = &*LINEAR_TO_SRGB;
+    let to_linear = &*SRGB_TO_LINEAR_WIDE;
+    let to_srgb = &**SUM_TO_SRGB;
     for ((pixel, t), b) in out
         .chunks_exact_mut(CHANNELS)
         .zip(top.chunks_exact(2 * CHANNELS))
         .zip(bottom.chunks_exact(2 * CHANNELS))
     {
         for c in 0..3 {
-            let light = |v: u8| u32::from(to_linear[usize::from(v)]);
+            let light = |v: u8| to_linear[usize::from(v)];
             let sum = light(t[c]) + light(t[c + CHANNELS]) + light(b[c]) + light(b[c + CHANNELS]);
-            // The mean of four u16 values is a u16.
-            pixel[c] = to_srgb[quarter_half_to_even(sum) as usize];
+            // A sum is below 2^18; the table folds in the rounded mean.
+            pixel[c] = to_srgb[sum as usize & (SUM_TABLE_LEN - 1)];
         }
         let alpha = [t[3], t[7], b[3], b[7]].map(u32::from);
         // The mean of four bytes is a byte.
@@ -565,6 +586,28 @@ mod tests {
             assert_eq!(
                 quarter_half_to_even(sum),
                 round_half_to_even_quarter(sum),
+                "sum {sum}"
+            );
+        }
+    }
+
+    /// The filter's own tables are the shared ones, widened or folded: the
+    /// u32 decode table holds the u16 table's values, and the encode table
+    /// indexed by a sum of four holds, for every sum four 16-bit values can
+    /// make, what rounding the mean and encoding it gives.
+    #[test]
+    fn the_filter_tables_are_the_shared_tables_widened_and_folded() {
+        for v in 0..=u8::MAX {
+            assert_eq!(
+                SRGB_TO_LINEAR_WIDE[usize::from(v)],
+                u32::from(SRGB_TO_LINEAR[usize::from(v)]),
+                "byte {v}"
+            );
+        }
+        for sum in 0..=4 * u32::from(u16::MAX) {
+            assert_eq!(
+                SUM_TO_SRGB[sum as usize],
+                LINEAR_TO_SRGB[quarter_half_to_even(sum) as usize],
                 "sum {sum}"
             );
         }

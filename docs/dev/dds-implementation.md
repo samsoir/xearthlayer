@@ -174,11 +174,15 @@ A 4096×4096 tile carries the full chain, 13 levels down to 1×1:
 `MipmapGenerator::downsample_box_2x` (`dds/mipmap.rs`) builds each level from
 the one above with a 2×2 box filter in linear light, on raw RGBA bytes (#389).
 R, G and B are sRGB-encoded, so each value is taken to 16-bit linear light
-through a 256-entry table (IEC 61966-2-1, rounded to nearest), the four are
-added, and the sum `s` becomes its mean rounded half to even,
-`(s + 1 + ((s >> 2) & 1)) >> 2` (#394), which a 65,536-entry table takes back
-to the nearest sRGB byte. Alpha is coverage, not light: the mean of its stored
-values, rounded the same way. An odd last row or column of the source is
+through a 256-entry table (IEC 61966-2-1, rounded to nearest, held as u32 so
+the four add with no conversion) and the four are added. The sum `s` indexes a
+262,144-entry (256 KiB) table that holds the sRGB byte of its mean rounded
+half to even, `(s + 1 + ((s >> 2) & 1)) >> 2` (#394), looked up in the
+65,536-entry table of the nearest sRGB byte per 16-bit linear value: one load
+for the rounding and the encode. Both are derived from the two shared tables
+(`the_filter_tables_are_the_shared_tables_widened_and_folded` checks every
+sum), which the GPU shader reads unchanged. Alpha is coverage, not light: the
+mean of its stored values, rounded the same way. An odd last row or column of the source is
 dropped.
 
 **Why linear light**: averaging the stored sRGB
@@ -204,9 +208,10 @@ light of every level of a 4096 chain within half a step of the source's. A
 sum of four whites (or of 1020 for alpha) averages to white, so opaque stays
 opaque.
 
-The whole 4096×4096 chain takes about 14 to 15 ms on one core (release build,
-Ryzen 7 9800X3D, `time_the_4096_mip_chain`, glibc's default malloc; the table
-below), against 4.7 ms for the stored-value average and about 42 ms for the
+The whole 4096×4096 chain takes 12.91 to 13.08 ms in place on one core
+(release build, Ryzen 7 9800X3D, `time_the_4096_mip_chain`, glibc's default
+malloc; the table below), against 4.7 ms for the stored-value average and
+about 42 ms for the
 ISPC encode of the tile. The CPU backends,
 ISPC and software, use it through `MipmapStream`, and so does a GPU tile that
 falls back to ISPC.
@@ -220,21 +225,25 @@ chain: the chain holds level 0's buffer, not level 0 and level 1, and no
 level gets a buffer of its own (each step copies its first two source rows,
 32 KiB for a 4096 level). The reason is the allocator. On glibc XEarthLayer
 sets `M_MMAP_THRESHOLD` to 1 MiB unless the environment overrides it (#227), so the buffers of levels 1 to 3
-(16, 4 and 1 MiB) were each a fresh mapping faulting in its pages. `time_the_4096_mip_chain` on a noise tile, median of 21 runs, same
-machine, one thread:
+(16, 4 and 1 MiB) were each a fresh mapping faulting in its pages. `time_the_4096_mip_chain` on a noise tile, median of 21 runs, two runs per
+cell, same machine, one thread:
 
 | malloc | allocating | in place |
 |--------|-----------:|---------:|
-| glibc default | 14.4 ms | 15.2 ms |
-| `MALLOC_MMAP_THRESHOLD_=1048576` (XEarthLayer's default on glibc) | 18.4 ms | 15.2 ms |
+| glibc default | 13.30 to 13.32 ms | 12.91 to 13.08 ms |
+| `MALLOC_MMAP_THRESHOLD_=1048576` (XEarthLayer's default on glibc) | 16.78 to 16.81 ms | 12.90 to 12.93 ms |
 
 On six real tiles (Apple imagery, the same filter in a benchmark outside
-this repository) with the threshold set, the chain fell from 16.2 to 17.4 ms
-to 13.1 to 13.6 ms. With glibc's default the two forms were level on real
-tiles (13.1 to 13.7 ms), and on the noise tile in place is 0.8 ms slower (the
-test's 4096 to 2048 step: 11.1 ms allocating, 11.6 ms in place). Run the test
-with the variable set to see the gain. Figures of one
-machine are a reference, not a promise.
+this repository) in place, with the threshold set, the chain takes 12.05 to
+12.44 ms; allocating it took 14.90 to 15.42 ms with the folded table and
+16.38 to 17.38 ms with the two shared tables of #467. With
+glibc's default malloc the in-place chain on the same tiles takes 12.09 to
+12.51 ms. Run the test with the variable set to see the gain over allocating.
+Figures of one machine are a reference, not a promise.
+
+Before the folded table (the two shared tables, `quarter_half_to_even` per
+channel) the in-place chain took 14.87 to 15.11 ms on the noise tile with
+either malloc setting, and 13.01 to 13.56 ms on the six real tiles.
 
 **Measured and not built:**
 
@@ -243,10 +252,13 @@ machine are a reference, not a promise.
   water tiles gain (54 to 80% uniform blocks; 13.3 to 7.4 ms on the one with
   80%).
 - A smaller encode table: 13% slower in an earlier measurement.
-- Folding the rounding into a 256 KiB encode table with a u32 decode table:
-  1.2 to 1.8 ms faster on the six real tiles (allocating form, glibc's
-  default malloc; not measured together with the in-place chain), not taken
-  (one lever, a small change).
+- An opaque shortcut: when the alpha of all four texels is 255, write 255
+  without averaging. On the six real tiles, whose alpha is all 255, the
+  in-place chain takes 11.05 to 11.61 ms with the threshold set (11.09 to
+  11.67 ms with glibc's default) against 12.05 to 12.44 ms (12.09 to 12.51 ms)
+  without it. On the noise tile, whose alpha is random, it gains nothing
+  (`time_the_4096_mip_chain` in place 12.73 to 12.90 ms against 12.90 to
+  12.93 ms). Not built.
 
 The GPU worker builds its levels on the GPU with the same filter and the same
 two tables (`MipmapGenerator::FILTER`, `dds/gpu_mips.rs`), byte for byte, so
