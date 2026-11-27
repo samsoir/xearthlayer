@@ -263,10 +263,11 @@ impl MountManager {
         &mut self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        memory: Option<crate::night::LitMemoryBudget>,
         ortho_mount: &Path,
         demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
-        let source = self.night_lit_source(index, disk, ortho_mount, demand);
+        let source = self.night_lit_source(index, disk, memory, ortho_mount, demand);
         self.lit_source = source.clone();
         self.night_lighting = if source.is_some() {
             crate::night::NightLighting::Lit
@@ -283,7 +284,9 @@ impl MountManager {
 
     /// The lit source for this installation, or `None` (black) when the
     /// X-Plane installation behind the scenery path cannot be found. `disk`
-    /// is the lit disk tier, `None` when caching is off. `ortho_mount` is
+    /// is the lit disk tier, `None` when caching is off. `memory` is its
+    /// payload memory, the session's share of `cache.memory_size` (the
+    /// source's floor when `None`). `ortho_mount` is
     /// XEL's own mount point, which the road service must not read back.
     /// `demand` is `true` while ortho demand is in flight; pre-generation
     /// waits for it to clear.
@@ -293,6 +296,7 @@ impl MountManager {
         &self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        memory: Option<crate::night::LitMemoryBudget>,
         ortho_mount: &Path,
         demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
@@ -335,6 +339,9 @@ impl MountManager {
         }
         if let Some(demand) = demand {
             source = source.with_demand_gate(demand);
+        }
+        if let Some(memory) = memory {
+            source = source.with_memory_budget(memory);
         }
         // Shared, so it pre-generates what its probe answers lit (#433).
         Some(source.shared())
@@ -653,6 +660,7 @@ impl MountManager {
             if let Some(source) = self.resolve_night_lit_source(
                 &index_for_prefetch,
                 service.lit_disk_cache(),
+                service.lit_memory_budget(),
                 &mountpoint,
                 service.demand_in_flight(),
             ) {
@@ -1139,6 +1147,7 @@ mod tests {
         let source = manager.resolve_night_lit_source(
             &OrthoUnionIndex::default(),
             None,
+            Some(crate::night::LitMemoryBudget::FLOOR),
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
             None,
         );
@@ -1191,6 +1200,7 @@ mod tests {
 
         let source = manager.resolve_night_lit_source(
             &OrthoUnionIndex::default(),
+            None,
             None,
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
             None,

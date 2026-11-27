@@ -34,10 +34,8 @@ use super::generator::{
     CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, RecipeLookup,
 };
 use super::layout::minimal_black_dds;
-use super::payloads::{
-    PayloadMemory, Uncached, Wanted, LIT_HEAD_CACHE_BYTES, LIT_TAIL_CACHE_BYTES,
-};
-use super::pregen::{pregen_workers, PregenQueue, Queued, MAX_QUEUED_PREGENERATIONS};
+use super::payloads::{LitMemoryBudget, PayloadMemory, Uncached, Wanted};
+use super::pregen::{pregen_bound, pregen_workers, PregenQueue, Queued};
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{crosses_footprint, reach_deg, RoadField};
 use super::roads::merge::MergedRoads;
@@ -516,15 +514,18 @@ impl NightLitSource {
             lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
             payloads: Arc::new(PayloadMemory::new(
-                LIT_HEAD_CACHE_BYTES,
-                LIT_TAIL_CACHE_BYTES,
+                LitMemoryBudget::FLOOR.head,
+                LitMemoryBudget::FLOOR.tail,
                 Arc::clone(&stats),
             )),
             generations: GenerationPermits::new(generations),
             // One pre-generation in flight per permit but one: a permit is
             // always left to reads, and pre-generations share the lit disk
             // permits with reads no more than that.
-            pregens: PregenQueue::new(MAX_QUEUED_PREGENERATIONS, pregen_workers(generations)),
+            pregens: PregenQueue::new(
+                pregen_bound(LitMemoryBudget::FLOOR.tail),
+                pregen_workers(generations),
+            ),
             demand: None,
             this: Weak::new(),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
@@ -562,8 +563,8 @@ impl NightLitSource {
         self
     }
 
-    /// At most `bound` pre-generations queued instead of
-    /// [`MAX_QUEUED_PREGENERATIONS`].
+    /// At most `bound` pre-generations queued instead of the budget's
+    /// ([`pregen_bound`]).
     #[cfg(test)]
     fn with_pregeneration_bound(mut self, bound: usize) -> Self {
         self.pregens = self.pregens.with_bound(bound);
@@ -586,6 +587,20 @@ impl NightLitSource {
     /// ones back to it.
     pub fn with_disk_cache(mut self, disk: Arc<dyn Cache>) -> Self {
         self.disk = Some(disk);
+        self
+    }
+
+    /// Keep `budget` of payloads in memory instead of
+    /// [`LitMemoryBudget::FLOOR`] (the session's share of
+    /// `cache.memory_size`, `service::memory_budgets`), and queue at most
+    /// as many pre-generations as its tail memory allows ([`pregen_bound`]).
+    pub fn with_memory_budget(mut self, budget: LitMemoryBudget) -> Self {
+        self.payloads = Arc::new(PayloadMemory::new(
+            budget.head,
+            budget.tail,
+            Arc::clone(&self.stats),
+        ));
+        self.pregens = self.pregens.with_bound(pregen_bound(budget.tail));
         self
     }
 
@@ -4453,6 +4468,41 @@ mod tests {
             let entry = d.get(&crate::night::lit_cache_key(&name)).await.unwrap();
             let layout = source.layout(&name);
             assert!(crate::night::check_entry(entry.unwrap(), &fp, layout.payload_len()).is_ok());
+        }
+
+        #[test]
+        fn a_source_holds_the_floor_until_given_a_budget() {
+            let (_t, source) = fixture();
+            assert_eq!(source.payloads.budget(), LitMemoryBudget::FLOOR);
+            assert_eq!(
+                source.pregens.bound(),
+                crate::night::pregen::MAX_QUEUED_PREGENERATIONS
+            );
+        }
+
+        #[test]
+        fn a_memory_budget_sizes_the_payload_memory_and_the_pregeneration_bound() {
+            let tail = crate::night::layout::tail_len(crate::night::layout::FIRST_VISIBLE_ZL16);
+            let budget = LitMemoryBudget {
+                tail: 600 * tail,
+                head: 7 * 524_288,
+            };
+            let (_t, source) = fixture();
+            let source = source.with_memory_budget(budget);
+            assert_eq!(source.payloads.budget(), budget);
+            assert_eq!(source.pregens.bound(), 300, "half the tails it holds");
+            let large = LitMemoryBudget {
+                tail: 1 << 32,
+                head: 1 << 33,
+            };
+            let (_t, source) = fixture();
+            let source = source.with_memory_budget(large);
+            assert_eq!(source.payloads.budget(), large);
+            assert_eq!(
+                source.pregens.bound(),
+                crate::night::pregen::MAX_QUEUED_PREGENERATIONS,
+                "at most the cap"
+            );
         }
 
         #[tokio::test]

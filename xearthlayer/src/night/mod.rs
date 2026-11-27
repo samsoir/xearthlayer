@@ -38,6 +38,7 @@ pub use laminar::{
     ArtDoubt, ArtDoubtKind, ArtFiles, ArtRecord, DiskArtFiles, LaminarArt, LitPattern, LitTerrain,
 };
 pub use layout::{minimal_black_dds, LitLayout, LitParts, PayloadPart};
+pub use payloads::LitMemoryBudget;
 pub use prefs::{
     FixedTextureSetting, StartupTextureSetting, TextureSettingSource, FULL_TEXTURE_SETTING,
 };

@@ -9,7 +9,8 @@
 //!
 //! Rules:
 //!
-//! - At most [`MAX_QUEUED_PREGENERATIONS`] wait; one past them is dropped,
+//! - At most [`pregen_bound`] wait (half the ZL16 tails the tail memory
+//!   holds, at most [`MAX_QUEUED_PREGENERATIONS`]); one past them is dropped,
 //!   and the read of its footprint generates as it would have without
 //!   pre-generation.
 //! - As many run at once as there are workers, one fewer than the
@@ -27,8 +28,9 @@ use super::payloads::LIT_TAIL_CACHE_BYTES;
 use super::stats::LitStats;
 use crate::fuse::DdsFilename;
 
-/// Most pre-generations waiting at once: about half as many as the tail
-/// memory holds ZL16 tails (1,151 in [`LIT_TAIL_CACHE_BYTES`]). A
+/// Most pre-generations waiting at once, whatever the tail memory: at most
+/// about half as many as the tail memory holds ZL16 tails
+/// ([`pregen_bound`]; 1,151 in the floor's [`LIT_TAIL_CACHE_BYTES`]). A
 /// pre-generation's tail waits in memory until X-Plane reads it; a queue
 /// longer than that memory would evict the tails it pre-generated first
 /// before they are read, and those reads would generate them again. The
@@ -41,9 +43,22 @@ use crate::fuse::DdsFilename;
 /// pre-generation. Each entry is a texture name, a few dozen bytes.
 pub(crate) const MAX_QUEUED_PREGENERATIONS: usize = 512;
 
+/// The floor's tail memory holds twice the cap: no budget lowers the bound
+/// below it ([`LitMemoryBudget::FLOOR`](super::payloads::LitMemoryBudget::FLOOR)
+/// is the least tail memory).
 const _: () = assert!(
     2 * MAX_QUEUED_PREGENERATIONS as u64 * tail_len(FIRST_VISIBLE_ZL16) <= LIT_TAIL_CACHE_BYTES
 );
+
+/// Most pre-generations waiting at once with `tail_bytes` of tail memory:
+/// half as many as it holds ZL16 tails, at most
+/// [`MAX_QUEUED_PREGENERATIONS`], and at least one.
+pub(crate) fn pregen_bound(tail_bytes: u64) -> usize {
+    let half = tail_bytes / (2 * tail_len(FIRST_VISIBLE_ZL16));
+    usize::try_from(half)
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_QUEUED_PREGENERATIONS)
+}
 
 /// Pre-generation workers for `permits` generation permits: one fewer, at
 /// least one (there are at least 2 permits). A pre-generation admitted
@@ -145,9 +160,14 @@ impl PregenQueue {
     }
 
     /// The same queue, holding at most `bound`.
-    #[cfg(test)]
     pub(crate) fn with_bound(self, bound: usize) -> Self {
         Self { bound, ..self }
+    }
+
+    /// Most footprints waiting at once.
+    #[cfg(test)]
+    pub(crate) fn bound(&self) -> usize {
+        self.bound
     }
 
     /// Footprints waiting now.
@@ -176,6 +196,21 @@ mod tests {
             map_type: "BI".into(),
             kind: TextureKind::Lit,
         }
+    }
+
+    #[test]
+    fn the_bound_is_half_the_tails_the_tail_memory_holds_at_most_the_cap() {
+        let tail = tail_len(FIRST_VISIBLE_ZL16);
+        assert_eq!(
+            pregen_bound(LIT_TAIL_CACHE_BYTES),
+            MAX_QUEUED_PREGENERATIONS
+        );
+        assert_eq!(pregen_bound(600 * tail), 300);
+        assert_eq!(pregen_bound(601 * tail), 300, "whole tails only");
+        assert_eq!(pregen_bound(2 * 512 * tail), 512);
+        assert_eq!(pregen_bound(2 * 512 * tail - 1), 511);
+        assert_eq!(pregen_bound(u64::MAX), MAX_QUEUED_PREGENERATIONS);
+        assert_eq!(pregen_bound(0), 1, "never none");
     }
 
     #[test]

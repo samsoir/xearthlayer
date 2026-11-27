@@ -39,18 +39,46 @@ use super::stats::{LitStats, PayloadLookup, PayloadOccupancy};
 
 const MIB: u64 = 1024 * 1024;
 
-/// Memory for the tails: 1,151 ZL16 tails (174,776 bytes each), more than
-/// the 1,006 ZL16 textures of the KCCR flight of 2026-11-14 (167.7 MiB).
+/// The floor's memory for the tails: 1,151 ZL16 tails (174,776 bytes
+/// each), more than the 1,006 ZL16 textures of the KCCR flight of
+/// 2026-11-14 (167.7 MiB). No budget gives the tails less
+/// ([`LitMemoryBudget::FLOOR`]).
 pub(crate) const LIT_TAIL_CACHE_BYTES: u64 = 192 * MIB;
 
-/// Memory for the heads: 128 ZL16 first visible levels (524,288 bytes
-/// each); that flight read 44.
+/// The floor's memory for the heads: 128 ZL16 first visible levels
+/// (524,288 bytes each); that flight read 44. No budget gives the heads
+/// less.
 pub(crate) const LIT_HEAD_CACHE_BYTES: u64 = 64 * MIB;
 
-/// Memory for generated visible levels, both parts: as before the split.
+/// The floor's memory for generated visible levels, both parts: as before
+/// the split.
 pub(crate) const LIT_PAYLOAD_CACHE_BYTES: u64 = LIT_TAIL_CACHE_BYTES + LIT_HEAD_CACHE_BYTES;
 
 const _: () = assert!(LIT_PAYLOAD_CACHE_BYTES == 256 * MIB);
+
+/// Night lighting's payload memory, per part, in bytes: decided once per
+/// session from `cache.memory_size` (`service::memory_budgets`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LitMemoryBudget {
+    /// The levels below the first visible one.
+    pub tail: u64,
+    /// The first visible level.
+    pub head: u64,
+}
+
+impl LitMemoryBudget {
+    /// The least night lighting is given: [`LIT_TAIL_CACHE_BYTES`] and
+    /// [`LIT_HEAD_CACHE_BYTES`].
+    pub const FLOOR: Self = Self {
+        tail: LIT_TAIL_CACHE_BYTES,
+        head: LIT_HEAD_CACHE_BYTES,
+    };
+
+    /// Both parts.
+    pub fn total(&self) -> u64 {
+        self.tail.saturating_add(self.head)
+    }
+}
 
 /// A footprint: `(row, col, zoom)`.
 pub(crate) type FootprintKey = (u32, u32, u8);
@@ -192,6 +220,16 @@ impl PayloadMemory {
             head: part_cache(PayloadPart::Head, head_bytes, Arc::clone(&stats)),
             tail: part_cache(PayloadPart::Tail, tail_bytes, stats),
             loads: DashMap::new(),
+        }
+    }
+
+    /// The bytes each part may hold.
+    #[cfg(test)]
+    pub(crate) fn budget(&self) -> LitMemoryBudget {
+        let cap = |part| self.cache(part).policy().max_capacity().unwrap_or(0);
+        LitMemoryBudget {
+            tail: cap(PayloadPart::Tail),
+            head: cap(PayloadPart::Head),
         }
     }
 

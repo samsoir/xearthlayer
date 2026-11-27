@@ -464,6 +464,16 @@ impl XEarthLayerService {
         self.cache_layer.as_ref().and_then(|cl| cl.lit_disk_cache())
     }
 
+    /// Night lighting's payload memory, its share of `cache.memory_size`
+    /// (#432).
+    ///
+    /// `None` when night lighting is off, or without the cache layer.
+    pub fn lit_memory_budget(&self) -> Option<crate::night::LitMemoryBudget> {
+        self.cache_layer
+            .as_ref()
+            .and_then(|cl| cl.lit_memory_budget())
+    }
+
     /// Shutdown the cache layer gracefully.
     ///
     /// This stops the GC daemon and flushes pending operations.
