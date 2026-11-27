@@ -21,16 +21,28 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use super::layout::{tail_len, FIRST_VISIBLE_ZL16};
+use super::payloads::LIT_TAIL_CACHE_BYTES;
 use super::stats::LitStats;
 use crate::fuse::DdsFilename;
 
-/// Most pre-generations waiting at once. A scene load in the flight of
-/// 2026-11-26 generated 300 to 1,200 lit textures, all probed before they
-/// were read: 2,048 holds the largest with room for a second load beginning
-/// before it drains. At about 20 ms a generation on 3 permits a full queue
-/// drains in about 14 s; past it probes are outpacing generation by more
-/// than a scene load. Each entry is a texture name, a few dozen bytes.
-pub(crate) const MAX_QUEUED_PREGENERATIONS: usize = 2048;
+/// Most pre-generations waiting at once: about half as many as the tail
+/// memory holds ZL16 tails (1,151 in [`LIT_TAIL_CACHE_BYTES`]). A
+/// pre-generation's tail waits in memory until X-Plane reads it; a queue
+/// longer than that memory would evict the tails it pre-generated first
+/// before they are read, and those reads would generate them again. The
+/// other half is for the tails X-Plane has read and comes back to. A
+/// capped zoom's tail is larger (2048 px first visible level: 4 times), so
+/// a queue of those holds proportionally fewer before evicting; the bound
+/// is set for ZL16, the zoom of every installed night package. A scene load
+/// in the flight of 2026-11-26 generated 300 to 1,200 lit textures: past
+/// the bound, a footprint is dropped and generated when read, as before
+/// pre-generation. Each entry is a texture name, a few dozen bytes.
+pub(crate) const MAX_QUEUED_PREGENERATIONS: usize = 512;
+
+const _: () = assert!(
+    2 * MAX_QUEUED_PREGENERATIONS as u64 * tail_len(FIRST_VISIBLE_ZL16) <= LIT_TAIL_CACHE_BYTES
+);
 
 /// What queueing one footprint did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

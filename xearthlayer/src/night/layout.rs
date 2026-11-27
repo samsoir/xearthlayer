@@ -60,6 +60,15 @@ fn is_static_zeros(bytes: &Bytes) -> bool {
     zeros.start <= range.start && range.end <= zeros.end
 }
 
+/// Bytes of a payload's tail (#432): the levels below a first visible level
+/// of `first_visible` px, down to 1 x 1. Const, so bounds counted in tails
+/// can be checked at compile time.
+pub const fn tail_len(first_visible: u32) -> u64 {
+    let s = first_visible;
+    (layout::chain_len(s, s, full_chain_levels(s, s), LIT_FORMAT)
+        - layout::level_len(s, s, LIT_FORMAT)) as u64
+}
+
 /// The shape of one lit DDS: the levels above the first visible one (the
 /// `blank_levels`, all black but the last, which X-Plane uploads), then the
 /// visible ones.
@@ -181,13 +190,12 @@ impl LitLayout {
     }
 
     /// Bytes of `part` of the visible levels (#432): the first visible level
-    /// for the head, every level below it for the tail.
+    /// for the head, every level below it for the tail ([`tail_len`]).
     pub fn part_len(&self, part: PayloadPart) -> u64 {
         let size = self.first_visible;
-        let head = layout::level_len(size, size, LIT_FORMAT) as u64;
         match part {
-            PayloadPart::Head => head,
-            PayloadPart::Tail => self.payload_len() - head,
+            PayloadPart::Head => layout::level_len(size, size, LIT_FORMAT) as u64,
+            PayloadPart::Tail => tail_len(size),
         }
     }
 
@@ -762,6 +770,21 @@ mod tests {
                 "ZL{zoom} t = {t}"
             );
             assert!(first <= MAX_FIRST_VISIBLE_BELOW_ZL16, "ZL{zoom} t = {t}");
+        }
+    }
+
+    #[test]
+    fn a_tail_is_every_visible_level_below_the_first() {
+        assert_eq!(tail_len(FIRST_VISIBLE_ZL16), 174_776);
+        for zoom in 12..=22u8 {
+            for t in 0..=4u8 {
+                let l = LitLayout::new(zoom, t);
+                assert_eq!(
+                    l.part_len(PayloadPart::Head) + tail_len(l.first_visible),
+                    l.payload_len(),
+                    "ZL{zoom} t = {t}"
+                );
+            }
         }
     }
 
