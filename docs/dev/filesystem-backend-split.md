@@ -269,6 +269,8 @@ pub enum MountError {
 /// When a panic unwinds, `MountSession` `Drop` handles the unmounting and
 /// must not panic.
 pub trait MountBackend: Send + Sync {
+    // Ensure that a folder exists, creating it as necessary.
+    fn prepare_mountpoint(&self, mountpoint: &Path) -> Result<(), MountError>;
     /// Mount `fs` according to `req`, returning a handle to the live mount.
     /// `fs` must arrive fully wired: past `Arc<dyn UnionFilesystem>` nothing
     /// can add to it — the builders consume and rebuild a concrete type the
@@ -278,6 +280,8 @@ pub trait MountBackend: Send + Sync {
     /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
     /// no runtime, and must not panic.
     fn recover_stale(&self, mountpoint: &Path) -> bool;
+    /// Backend-specific information about the mount.
+    fn describe(mountpoint: &Path) -> Vec(String);
 }
 ```
 
@@ -373,6 +377,9 @@ The mount-table operations that move into the backend with `system/unmount.rs`
 and rewriting them would change tested teardown behavior, not platform-ness.
 They too are transitional — every one of their cfgs names a fact that belongs to
 exactly one future backend.
+
+The macOS specific code in `system/macfuse.rs` and `system/mount_folder.rs`
+move to the `fuse3` `unmount.rs`.
 
 ### Union Filesystem
 
