@@ -241,6 +241,30 @@ texture setting. A layout that shrank the visible level with the setting
 2026-10-18 and moved the cut-out (the uploaded top was black then) 2x
 farther out per notch.
 
+**Below ZL16 (#431).** Fixed in metres, the first visible level doubles per
+zoom level below 16: 4096 px at ZL14 and 8192 px at ZL12 and ZL13 at t = 4,
+16 to 64 times a ZL16 generation's work and memory, with an uploaded top of
+up to 16384 px. Below ZL16 it is capped at `MAX_FIRST_VISIBLE_BELOW_ZL16`
+(2048 px). That changes ZL12 to ZL14 at t = 3 and 4 only (at t <= 2,
+`MAX_TOP_LEVEL` already held them to 2048 px or less); ZL15 and every zoom
+from 16 up keep their layouts byte for byte. On a capped texture the lit
+layer starts farther from the aircraft, by the factor its density fell, and
+steps where it meets ZL16. The Laminar pattern is sampled at the capped size,
+but the road glow is not: the raster floors a glow's sigma at one texel, so
+at 15 to 60 m texels lamps would spread into thick lines. A capped texture's
+road field is rastered at the uncapped density, at most twice the linear
+size (`LitLayout::road_supersample()`), in bands of 128 output rows (one
+band of samples, 4 MiB for a 2048 px texture), and each 2 x 2 block of
+samples is averaged into its texel (`RoadField::raster_supersampled`); the
+profile enters the light linearly, so the mean is the linear-light mean.
+The probe keeps the reach at the output size, which is never narrower, so it
+still never answers dark where the generator lights. Capped textures change
+length, so their old disk entries fail the length check; their fingerprint
+also hashes the supersample (only when above 1, so every other fingerprint
+is unchanged), because at ZL12 to 14 t = 2 and t = 3 or 4 give the same
+length with different roads. No packaged world has lit textures below ZL16
+yet.
+
 **Uploaded top.** X-Plane loads a texture's top level only for the
 textures nearest the aircraft, and shows it over the whole texture,
 under its 3D scenery. In the flight of 2026-11-14 at KCCR it fully read
@@ -644,9 +668,17 @@ Inside:
 - **Memo.** The first committed `has_light` answer for a footprint wins
   (`entry().or_insert`), so two probes that finish differently cannot give
   `size` and `read` different lengths.
-- **Coalescing.** Concurrent requests for one footprint share one
-  generation through moka's `try_get_with` on the payload cache, which is
-  the lit path's own (R8). The key is `(row, col, zoom)` with no settings
+- **Coalescing.** Concurrent requests for one footprint share one load
+  (`night/payloads.rs`, #432): a `DashMap` of `OnceCell` load slots keyed by
+  footprint. A read whose parts are not all in memory joins the load in
+  flight, or checks the caches again under the slot's entry lock and only
+  then starts one; the load keeps its parts and leaves the map with no await
+  between, so a later read finds either the load or what it kept. A read
+  joining a load keeps the parts it wants itself, so a head read joining a
+  tail read's load is still one generation. If the read running a load is
+  dropped, a waiting read runs its own; the orphaned generation is bounded by
+  the permits and its result is discarded. The memory caches are the lit
+  path's own (R8). The key is `(row, col, zoom)` with no settings
   fingerprint, because `night.brightness` and the texture setting are
   fixed for the session. A failed generation is not cached, nor a payload
   generated while one of its road tiles was still building (see Road
@@ -655,8 +687,28 @@ Inside:
   Generation reads all the recipes of its field first; if one cannot be
   read it returns no payload (not cached) and the read serves full-size
   black, so a payload is never built with a tile missing.
-- **CPU budget.** A semaphore of `(cores / 8).clamp(2, 4)` permits bounds
-  concurrent generations, which run on the blocking pool. Generation,
+- **CPU budget.** `(cores / 8).clamp(2, 4)` generation permits bound
+  concurrent generations, which run on the blocking pool. They are admitted
+  by priority (`night/admission.rs`, #433), not first come first served:
+  reads that reach the first visible level (the nearest textures), then
+  reads of the smaller levels only, then pre-generations, first come first
+  served within a class. A read that joins a load in flight raises the
+  load's class. On a flight on 2026-11-26 a read in a scene load waited
+  0.4 to 1.1 s, mostly for a permit (p95 223 to 582 ms, up to 21 waiting),
+  against about 20 ms median generation.
+- **Pre-generation** (`night/pregen.rs`, #433). When the probe first commits
+  a footprint lit, the footprint is queued for a background load of its
+  smaller levels at the pre-generation class: nothing when they are in
+  memory, a lit disk tier read when it holds a valid entry, else a
+  generation with the usual write-back. It moves the work to `stat` time,
+  overlapping X-Plane's DSF loading; on that flight every footprint the
+  probe answered lit was read, so it is not wasted. The queue holds at most
+  `MAX_QUEUED_PREGENERATIONS` (2048, the largest scene load seen was about
+  1,200), more dropped and counted, with one worker per generation permit
+  holding the source only weakly. A read arriving meanwhile joins the load
+  and raises it. Only a source built with `NightLitSource::shared()` does
+  this (the mount manager's); `LitTextureSource::shutdown()`, called first
+  in `MountManager::unmount_all`, closes the queue without waiting. Generation,
   probe, disk (2, for the lit disk tier's fingerprint, read and
   write-back) and road extract permits (2, see Road lights) are not added
   to `LaneSizing::blocking_threads_required()`. They sit inside
@@ -665,8 +717,21 @@ Inside:
   plus road extract permits are at most a third of the headroom (10 of 10,
   so the night share is fully used). This keeps `executor` free of a
   dependency on `night`.
-- **Cache.** Reads go memory (256 MB, bounded by bytes, least recently used
-  evicted first), then disk, then generate. LRU, not moka's default TinyLFU
+- **Cache.** Reads go memory, then disk, then generate. The memory cache
+  holds each payload as two parts (#432), separate allocations: the first
+  visible level (head, `LIT_HEAD_CACHE_BYTES` 64 MiB) and the levels below
+  it (tail, `LIT_TAIL_CACHE_BYTES` 192 MiB, about 1,150 ZL16 tails), each
+  bounded by bytes, least recently used evicted first. The tail is kept on
+  every load; the head only when a read reaches it. X-Plane reads the small
+  levels first and most textures never read the head (44 of 1,006 on
+  2026-11-14), and with whole payloads in one 256 MB cache every scene load
+  on 2026-11-26 evicted 340 to 1,300 payloads within a minute, sending a
+  quarter to a half of cruise reads back to disk for minutes after. A read
+  is composed from the parts its range overlaps by `LitLayout::read_lit`. A
+  head read after a tail-only load reads the disk tier, or generates again
+  for a memory-only payload; in the rare case where the payload's art or
+  road sources changed in between, its head and tail come from two
+  generations. LRU, not moka's default TinyLFU
   (#387): TinyLFU admits a new entry only if it is read more often than the
   one it would evict, and a payload just generated has been read once, so
   once the cache was full it was refused and the next read of the texture,
@@ -690,7 +755,10 @@ Inside:
   payload built from the old one. A mismatch is a miss: the payload is
   regenerated and overwrites the entry, so package updates, X-Plane
   updates and brightness changes need no cache clear. Write-back is
-  fire-and-forget, only for payloads built from a complete set of recipes
+  fire-and-forget, at most `MAX_PENDING_WRITE_BACKS` (16) pending (more are
+  dropped and counted; the payload is still served and kept in memory),
+  writing the header and the generated payload as two slices
+  (`Cache::set_parts`, no copy of the payload), only for payloads built from a complete set of recipes
   (black is never
   written), and never for a payload one of whose own Laminar art lookups
   met a doubt (#435): a file given up on after I/O errors, or a file the
@@ -730,34 +798,36 @@ the metrics system and the dashboard shows nothing of it. The line has:
   included): `dark` (the minimal DDS), `blank` (header or the black levels
   above the payload), `memory` (a payload already in the memory cache),
   `joined` (a read that waited on another read's load of the same payload),
-  `disk`, `generated` and `black`. A memory hit is a `try_get_with` call
-  whose load did not run on a payload that was cached before the call
-  (`contains_key`, which leaves the LRU order alone); a load that did not
-  run on a payload that was not cached is a join. A larger cache would
-  have saved a memory hit, never a join.
+  `disk`, `generated` and `black`. A memory hit is a read whose every
+  wanted part was in memory; a read that waited on a load in flight is a
+  join. A larger cache would have saved a memory hit, never a join.
 - **Probes** by the source of the committed answer (`recipe` first, then
   `road`, then `dark`), with probe permit wait and, with road lights on,
   road wait, which only a probe its recipe left dark has (#428). A probe
   that finds another probe's answer after its permit wait records its
   permit wait but no answer.
 - **Generations**: count and black generations; permit wait and generation
-  time, timed apart; `generations_waiting_peak`; road state (complete,
+  time, timed apart; count and permit wait by class (`head_read`,
+  `tail_read`, `pregeneration`); `generations_waiting_peak`; road state (complete,
   timed out, failed); `roads_ready_at_permit`, generations whose roads had
   timed out but were all ready once the permit was held (#427).
 - **Write-backs skipped**, one reason per payload in this order:
   `roads_late` (kept nowhere), then `no_fingerprint`, `road_failed` and
   `art_failed` (each kept in memory only; `art_failed` means one of the
   payload's own art lookups met a doubt, see the lit disk tier).
-- **Payload cache**: hits, joins, misses, `payload_hit_rate` (true hits
-  over all lookups), size evictions (an `eviction_listener`; setting one
-  turns on moka's per-key lock for inserts, which the per-key coalescing
-  already made uncontended), entries and weighted size.
+- **Pre-generations**: queued, dropped at the bound, started, cancelled at
+  shutdown, and by outcome (`generated`, `skipped_memory`, `skipped_disk`,
+  `joined`, `black`), with the queue peak.
+- **Payload cache**, per part (`payload_head_*`, `payload_tail_*`): hits,
+  joins, misses, hit rate (true hits over all lookups), size evictions (an
+  `eviction_listener`), entries and bytes; `payload_entries` and
+  `payload_bytes` are both parts together.
 - **Lit disk tier**: hits; misses by reason (`absent`, `error`, `corrupt`,
   `fingerprint`, `length`, `no_fingerprint`; `disk::check_entry` says why
   an entry is rejected); `disk_hit_rate` over the lookups that could hit
   (no-fingerprint lookups and read errors left out); writes and write
   failures; `write_backs_pending_peak`, counted from before the write-back
-  is spawned; and the lookup's disk permit wait.
+  is spawned; `write_backs_dropped` at the bound; and the lookup's disk permit wait.
 
 The per-event lines carry the same split: `lit texture generated` has
 `permit_wait_ms` beside `ms`, `lit probe` has `answer` and `road_wait_ms`,
