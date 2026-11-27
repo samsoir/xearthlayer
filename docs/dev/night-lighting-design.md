@@ -725,9 +725,22 @@ Inside:
   dependency on `night`.
 - **Cache.** Reads go memory, then disk, then generate. The memory cache
   holds each payload as two parts (#432), separate allocations: the first
-  visible level (head, `LIT_HEAD_CACHE_BYTES` 64 MiB) and the levels below
-  it (tail, `LIT_TAIL_CACHE_BYTES` 192 MiB, about 1,150 ZL16 tails), each
-  bounded by bytes, least recently used evicted first. The tail is kept on
+  visible level (head) and the levels below it (tail), each bounded by
+  bytes, least recently used evicted first. Their size is a share of
+  `cache.memory_size` (`memory_budgets` in `service/cache_layer.rs`), taken
+  out of it as the lit disk tier takes 5% of `cache.disk_size`: 15% for
+  night lighting, the ortho memory tier keeping 85%, the tail the larger of
+  40% of the share and 192 MiB, the head the rest. Below about 1.67 GiB,
+  where 15% is under 256 MiB, night lighting keeps the floor (192 MiB tail,
+  about 1,150 ZL16 tails, and 64 MiB head) on top and ortho keeps all of
+  `cache.memory_size`. Both parts only grow with `cache.memory_size`. A
+  fixed 256 MiB was too small: over the Bay Area on 2026-11-27 X-Plane read
+  the head of 623 of 1,197 lit textures and returned to 20 to 47 distinct
+  heads a minute in cruise; the 64 MiB head budget held about 150 (53% head
+  hit rate), and once about 1,500 textures had been read the tail evicted
+  too. That scene needed about 300 MiB of heads and 185 MB of tails, and
+  dense cities need more. With an 8 GB memory cache the share is about
+  1.29 GB (515 MB tail, 773 MB head). The tail is kept on
   every load; the head only when a read reaches it. X-Plane reads the small
   levels first and most textures never read the head (44 of 1,006 on
   2026-11-14), and with whole payloads in one 256 MB cache every scene load
