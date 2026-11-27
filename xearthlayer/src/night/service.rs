@@ -1450,7 +1450,9 @@ impl LitTextureSource for NightLitSource {
 
     /// Closes the pre-generation queue (what it held never runs) and
     /// refuses pre-generations waiting for a permit; one already generating
-    /// finishes (at most one per permit, as a read's would) and is kept.
+    /// finishes (at most one per permit, as a read's would) and is kept. A
+    /// read joining a refused pre-generation's load reads black that once
+    /// (see [`GenerationPermits::close`] for why that is acceptable).
     fn shutdown(&self) {
         self.pregens.close(&self.stats);
         self.generations.close();

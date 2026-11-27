@@ -280,6 +280,17 @@ impl GenerationPermits {
     }
 
     /// Refuses pre-generations from now on, those waiting included.
+    ///
+    /// A read that joins a pre-generation's load after it was refused, in
+    /// the moment between `close` and the load leaving the in-flight map,
+    /// shares that load's answer: black, for that one read. A read that
+    /// joined before `close` raised the waiter to its own class, and is not
+    /// refused. This is acceptable because it happens only at unmount, to
+    /// at most one read per footprint whose pre-generation was waiting:
+    /// the size is unchanged (R7), the black payload is kept nowhere, and
+    /// X-Plane's next read of the level (if the session goes on that long)
+    /// loads it again. Retrying the load for such a read would add a path
+    /// that only shutdown takes, to save a texture nobody will look at.
     pub(crate) fn close(&self) {
         let mut s = lock(&self.state);
         for ticket in s.admission.close() {
