@@ -308,7 +308,9 @@ is about 9% of the light), and no road lights covered the hand-off yet.
 
 **Mips in linear light.** The chain below the first visible level is
 averaged in linear light (`lit_chain`, #363), not by averaging stored
-values as the ortho encoder does. Lit art is bright points on black, and a
+values as the ortho encoder did then. The ortho encoder now averages in
+linear light too, but `lit_chain` stays separate (f32, gamma 2.2, bytes
+versioned with the generator). Lit art is bright points on black, and a
 stored-value average counts a lit texel beside dark ones at a fraction of
 its light. Measured on a ZL16 texture over Mexico City, the stored-value
 chain kept 82% of the light at the first coarser level, 53% at the third

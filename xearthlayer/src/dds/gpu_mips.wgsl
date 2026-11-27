@@ -12,14 +12,14 @@
 // its block average is that edge texel's. The byte is written as itself
 // over 255, which the store converts back to the same byte.
 //
-// `mip_stored` averages the stored bytes, rounding half to even (#394):
-// byte for byte `downsample_box_2x`, the CPU chain's filter.
+// `mip_stored` averages the stored bytes, rounding half to even (#394): the
+// CPU chain's filter before #467. Not used by any chain.
 //
 // `mip_linear` averages R, G and B in 16-bit linear light (#467): each byte
 // through a 256-entry decode table, the four summed and rounded half to
 // even, then a 65,536-entry encode table (four bytes to a word) back to a
-// byte. Alpha keeps the stored average. Not used until the CPU chain uses
-// the same filter.
+// byte. Alpha keeps the stored average. Byte for byte `downsample_box_2x`,
+// the CPU chain's filter, with the CPU's own tables.
 
 struct Params {
     width: u32,
@@ -52,7 +52,7 @@ fn block(texel: vec2<u32>) -> Block {
 }
 
 // The average of four values from their sum, rounded half to even: the
-// CPU's `block_average`, for any sum.
+// CPU's `quarter_half_to_even`, for any sum.
 fn average4(sum: vec4<u32>) -> vec4<u32> {
     let one = vec4<u32>(1u);
     let two = vec4<u32>(2u);

@@ -65,6 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Imagery
+
+- **Distant terrain no longer turns darker**: Each texture's smaller levels, which X-Plane shows for terrain further away, were built by averaging the stored colour values, which loses light wherever neighbouring pixels differ: black beside white became a dark grey with a fifth of the light instead of half. Towns, rock, coastlines and snow therefore grew darker and flatter towards the horizon, towns by 1.5 percentage points of brightness on average and up to a fifth at the fourth level. The levels are now averaged as light. Forests, fields and water look as before. Tiles already in the disk cache keep their old levels until they are replaced. To have them rebuilt as they are next needed, delete the `dds` folder of your provider in the cache directory while XEarthLayer is not running: the tiles are built again from the downloaded imagery still in the cache, and only what is missing there is downloaded again (`xearthlayer cache clear` deletes the downloaded imagery too).
+
 #### Packaging
 
 - **The `.deb` installs on Ubuntu 26.04 and Debian 13** ([#353](https://github.com/samsoir/xearthlayer/issues/353)): The package required `libfuse3-3`, the libfuse runtime library, which these releases replace with `libfuse3-4`, so `apt` refused to install it. XEarthLayer never used that library: it talks to the kernel's FUSE device itself and only runs `fusermount3` to mount without root. The package now requires `fuse3`, which provides `fusermount3` on every Debian and Ubuntu release, as the RPM and Arch packages already did.

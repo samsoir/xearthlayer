@@ -9,12 +9,12 @@
 //! uploaded.
 //!
 //! The chain is byte for byte the CPU's: [`gpu_filter`] is
-//! [`MipmapGenerator::FILTER`], and the shader's stored-value filter is
-//! [`MipmapGenerator::downsample_box_2x`] (round half to even, #394; an odd
-//! last row or column dropped), with each level padded to whole blocks by
-//! repeating its edge, as `pad_to_block_multiple` pads a level for the
-//! CPU's kernels. The linear-light filter (#467) is here as a tested
-//! option, used by no chain until the CPU's filter is.
+//! [`MipmapGenerator::FILTER`], and the shader's linear-light filter (#467)
+//! is [`MipmapGenerator::downsample_box_2x`] (the CPU's own tables, round
+//! half to even, #394; an odd last row or column dropped), with each level
+//! padded to whole blocks by repeating its edge, as `pad_to_block_multiple`
+//! pads a level for the CPU's kernels. The stored-value filter, the one
+//! before #467, is here as a tested option, used by no chain.
 //!
 //! The pure parts, tested by value: the chain's geometry ([`chain_plan`]),
 //! the upload's layout ([`upload_row_bytes`], [`write_level0`]), the filter
@@ -25,7 +25,7 @@
 use image::RgbaImage;
 
 use crate::dds::layout::{self, BLOCK_DIM};
-use crate::dds::mipmap::{MipFilter, MipmapGenerator};
+use crate::dds::mipmap::{self, MipFilter, MipmapGenerator};
 use crate::dds::DdsFormat;
 
 /// The shader: `mip_stored` and `mip_linear`.
@@ -42,8 +42,8 @@ const READ_BACK: wgpu::TextureUsages = if cfg!(test) {
 const WORKGROUP: u32 = 8;
 
 /// The filter of the GPU worker's chain: the CPU chain's, always, so a tile
-/// is the same bytes on either path and a switch of filter (#467) moves
-/// both at once. The one place the GPU's filter is decided.
+/// is the same bytes on either path and a switch of filter moves both at
+/// once. The one place the GPU's filter is decided.
 pub(crate) const fn gpu_filter() -> MipFilter {
     MipmapGenerator::FILTER
 }
@@ -166,7 +166,8 @@ pub(crate) fn write_level0(
 }
 
 /// The linear-light filter's tables (#467): an sRGB byte to 16-bit linear,
-/// and 16-bit linear to the nearest byte.
+/// and 16-bit linear to the nearest byte. They are the CPU chain's tables
+/// (`dds::mipmap`), so the shader averages with the values the CPU does.
 pub(crate) struct SrgbTables {
     pub decode: Vec<u32>,
     pub encode: Vec<u8>,
@@ -174,26 +175,11 @@ pub(crate) struct SrgbTables {
 
 impl SrgbTables {
     pub(crate) fn new() -> Self {
-        fn to_linear(v: f64) -> f64 {
-            if v <= 0.04045 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        fn to_srgb(v: f64) -> f64 {
-            if v <= 0.003_130_8 {
-                v * 12.92
-            } else {
-                1.055 * v.powf(1.0 / 2.4) - 0.055
-            }
-        }
-        let decode = (0..256)
-            .map(|b| (to_linear(f64::from(b) / 255.0) * 65535.0).round() as u32)
+        let decode = mipmap::srgb_to_linear_table()
+            .iter()
+            .map(|&v| u32::from(v))
             .collect();
-        let encode = (0..65536)
-            .map(|v| (to_srgb(f64::from(v) / 65535.0) * 255.0).round() as u8)
-            .collect();
+        let encode = mipmap::linear_to_srgb_table().to_vec();
         Self { decode, encode }
     }
 
@@ -429,11 +415,10 @@ mod tests {
     #[test]
     fn the_gpu_chain_uses_the_cpu_chains_filter() {
         assert_eq!(gpu_filter(), MipmapGenerator::FILTER);
-        // The CPU implements stored values only: until #467 changes both,
-        // so is the GPU's.
-        assert_eq!(gpu_filter(), MipFilter::StoredValues);
-        assert_eq!(gpu_filter().entry_point(), "mip_stored");
-        assert_eq!(MipFilter::LinearLight.entry_point(), "mip_linear");
+        // The CPU averages in linear light (#467), so the GPU does.
+        assert_eq!(gpu_filter(), MipFilter::LinearLight);
+        assert_eq!(gpu_filter().entry_point(), "mip_linear");
+        assert_eq!(MipFilter::StoredValues.entry_point(), "mip_stored");
     }
 
     /// The shader compiles, with no GPU: naga, the compiler wgpu runs on
@@ -702,9 +687,9 @@ mod tests {
             .collect()
     }
 
-    /// The linear-light filter on the CPU, the shader's reference (#467):
-    /// R, G and B through the tables, alpha as stored, half to even.
-    fn downsample_linear(source: &RgbaImage, t: &SrgbTables) -> RgbaImage {
+    /// The stored-value filter on the CPU, the reference for the shader's
+    /// unused option: every channel's stored bytes, half to even (#394).
+    fn downsample_stored(source: &RgbaImage) -> RgbaImage {
         let average4 = |sum: u32| (sum + 1 + ((sum >> 2) & 1)) >> 2;
         let (w, h) = (source.width() / 2, source.height() / 2);
         RgbaImage::from_fn(w, h, |x, y| {
@@ -715,12 +700,7 @@ mod tests {
                 source.get_pixel(2 * x + 1, 2 * y + 1),
             ];
             image::Rgba(std::array::from_fn(|c| {
-                if c == 3 {
-                    average4(p.iter().map(|q| u32::from(q[3])).sum()) as u8
-                } else {
-                    let sum = p.iter().map(|q| t.decode[q[c] as usize]).sum();
-                    t.encode[average4(sum) as usize]
-                }
+                average4(p.iter().map(|q| u32::from(q[c])).sum()) as u8
             }))
         })
     }
@@ -730,12 +710,11 @@ mod tests {
     fn cpu_chain(image: &RgbaImage, filter: MipFilter) -> Vec<RgbaImage> {
         let levels = layout::full_chain_levels(image.width(), image.height()) as usize;
         let chain = match filter {
-            MipFilter::StoredValues => MipmapGenerator::generate_chain_with_count(image, levels),
-            MipFilter::LinearLight => {
-                let t = SrgbTables::new();
+            MipFilter::LinearLight => MipmapGenerator::generate_chain_with_count(image, levels),
+            MipFilter::StoredValues => {
                 let mut chain = vec![image.clone()];
                 while chain.len() < levels {
-                    let next = downsample_linear(chain.last().unwrap(), &t);
+                    let next = downsample_stored(chain.last().unwrap());
                     chain.push(next);
                 }
                 chain
@@ -748,8 +727,8 @@ mod tests {
     }
 
     /// The shader's chain, padding included, is the CPU's byte for byte,
-    /// with either filter: the stored-value filter against
-    /// `downsample_box_2x`, the linear-light one against its reference
+    /// with either filter: the linear-light filter against
+    /// `downsample_box_2x`, the stored-value one against its reference
     /// above, on the 4096 tile, odd sizes, non-square ones and a single
     /// row.
     #[test]

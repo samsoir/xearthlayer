@@ -86,7 +86,7 @@ pub enum CompressorBackend {
 }
 ```
 
-- `Image`: Fused `MipmapStream` loop -- iterate levels, compress each, drop immediately
+- `Image`: Fused `MipmapStream` loop -- borrow each level, compress it, build the next over it
 - `Mipmap`: Pass owned source image to GPU worker -- one channel round-trip per tile
 
 ### Channel-Based GPU Worker
@@ -175,8 +175,9 @@ The mip shader is byte-identical to `downsample_box_2x` at every level,
 padding included (#394's round half to even, odd sizes truncated as on the
 CPU), checked on both GPUs for 4096 tiles and odd and sub-block sizes. Its
 filter follows the CPU chain's (`MipmapGenerator::FILTER`, `MipFilter`), so
-the two paths change together: today stored values; #467's linear light is a
-tested shader variant nothing wires yet. The shader's uniform buffers are
+the two paths change together: linear light since #467, with the CPU chain's
+own tables; the stored-value filter it replaced stays as a tested shader
+variant nothing wires. The shader's uniform buffers are
 written through the queue, never mapped at creation, so rebuilding resources
 on a destroyed device fails tiles (and #420 fails the GPU) rather than
 panicking.
@@ -312,25 +313,24 @@ Each lane has its own `GpuEncodeStats` and its own `GPU encode sample` line, wit
 
 ## Memory Optimization
 
-### MipmapStream Iterator
+### MipmapStream
 
-`MipmapStream` yields one mipmap level at a time, eliminating intermediate clones:
+`MipmapStream` lends one mipmap level at a time and builds each in the
+buffer of the previous one, so no level after the first gets a buffer of
+its own:
 
 ```rust
-pub struct MipmapStream {
-    base: RgbaImage,
-    current_level: u8,
-}
-
-impl Iterator for MipmapStream {
-    type Item = (u8, RgbaImage);
+impl MipmapStream {
+    pub fn new(image: RgbaImage, count: usize) -> Self;
+    pub fn next_level(&mut self) -> Option<&RgbaImage>;
 }
 ```
 
-- Stores only base image + downsampling state
-- Each `next()` yields one level with no clones
-- Memory footprint: ~64 MB (base) + ~32 MB (current level) max
-- Proper cleanup in `Drop` if iteration is interrupted early
+- Owns the source image; the first call lends it, each later call writes the
+  next level over it (`MipmapGenerator::downsample_box_2x_in_place`)
+- The level is valid until the next call; it is not an `Iterator`
+- Memory footprint: the base image's buffer (~64 MB for a 4096 tile), held
+  until the stream is dropped, plus a copy of two source rows per step
 
 ### GPU Path Zero-Clone
 
@@ -465,7 +465,7 @@ No changes to task, executor, or job code. The compressor is injected via the ex
 | `dds/gpu_channel.rs` | `GpuEncoderChannel` (implements `MipmapCompressor`), the worker loop (`spawn_tile_worker`), `TileProcessor` and `WgpuTileProcessor`, `GpuTileTiming` |
 | `dds/gpu_stats.rs` | `GpuEncodeStats`: stage windows, failures, queue depth, the `GPU encode sample` line |
 | `tests/gpu_pipeline_stress.rs` | Ignored GPU benchmark: lone tiles and bursts on the production chain, with the ISPC reference |
-| `dds/mipmap.rs` | `MipmapStream` iterator |
+| `dds/mipmap.rs` | `MipmapStream` (lends levels, built in place) |
 | `dds/encoder.rs` | `DdsEncoder`, `CompressorBackend` dispatch |
 | `service/builder.rs` | Compressor construction and wiring |
 | `config/keys.rs` | `TextureCompressor`, `TextureGpuDevice` config keys |

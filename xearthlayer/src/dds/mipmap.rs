@@ -1,17 +1,85 @@
 //! Mipmap chain generation for DDS textures.
 
+use std::sync::LazyLock;
+
 use image::RgbaImage;
 
 /// How a mip level averages each 2×2 block of the level above it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MipFilter {
-    /// The stored bytes, averaged and rounded half to even (#394):
-    /// [`MipmapGenerator::downsample_box_2x`].
+    /// The stored bytes, averaged and rounded half to even (#394): the
+    /// filter before #467. Implemented on the GPU only (`dds::gpu_mips`),
+    /// as a tested option: no chain uses it.
     StoredValues,
-    /// R, G and B averaged in linear light, alpha as stored (#467, after
-    /// #458). Implemented on the GPU only (`dds::gpu_mips`), as a tested
-    /// option: no chain uses it until the CPU chain does.
+    /// R, G and B averaged in linear light, alpha as stored (#467):
+    /// [`MipmapGenerator::downsample_box_2x`].
     LinearLight,
+}
+
+/// White in the 16-bit linear light the filter averages in.
+const LINEAR_WHITE: f64 = u16::MAX as f64;
+
+/// sRGB value (0 to 1) to linear light (0 to 1), IEC 61966-2-1.
+fn srgb_decode(v: f64) -> f64 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light (0 to 1) to sRGB value (0 to 1), IEC 61966-2-1.
+fn srgb_encode(l: f64) -> f64 {
+    if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Every sRGB byte as 16-bit linear light, rounded to nearest.
+static SRGB_TO_LINEAR: LazyLock<[u16; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|v| (srgb_decode(v as f64 / 255.0) * LINEAR_WHITE).round() as u16)
+});
+
+/// Every 16-bit linear light value as the nearest sRGB byte. 16 bits, not
+/// fewer: near black one sRGB step is only about 20 of 65,535 linear steps.
+static LINEAR_TO_SRGB: LazyLock<Box<[u8]>> = LazyLock::new(|| {
+    (0..=u16::MAX)
+        .map(|l| (srgb_encode(f64::from(l) / LINEAR_WHITE) * 255.0).round() as u8)
+        .collect()
+});
+
+/// [`SRGB_TO_LINEAR`] as u32, so the four values of a block add with no
+/// conversion.
+static SRGB_TO_LINEAR_WIDE: LazyLock<[u32; 256]> =
+    LazyLock::new(|| std::array::from_fn(|v| u32::from(SRGB_TO_LINEAR[v])));
+
+const SUM_TABLE_LEN: usize = 1 << 18;
+
+/// [`LINEAR_TO_SRGB`] indexed by the sum of four linear values, the rounding
+/// of their mean ([`quarter_half_to_even`]) folded in: one load where the
+/// filter did rounding arithmetic and a load. A sum is at most `4 * 65535`;
+/// the table is 2^18 entries (256 KiB) so that masking a sum to 18 bits
+/// needs no bounds check, and the unreachable tail is clamped to white.
+static SUM_TO_SRGB: LazyLock<Box<[u8; SUM_TABLE_LEN]>> = LazyLock::new(|| {
+    (0..SUM_TABLE_LEN as u32)
+        .map(|sum| LINEAR_TO_SRGB[(quarter_half_to_even(sum) as usize).min(usize::from(u16::MAX))])
+        .collect::<Box<[u8]>>()
+        .try_into()
+        .expect("the table has SUM_TABLE_LEN entries")
+});
+
+/// The filter's decode table: every sRGB byte as 16-bit linear light. The
+/// GPU's linear-light shader reads the same table (`dds::gpu_mips`).
+pub(crate) fn srgb_to_linear_table() -> &'static [u16; 256] {
+    &SRGB_TO_LINEAR
+}
+
+/// The filter's encode table: every 16-bit linear light value as the
+/// nearest sRGB byte. The GPU's linear-light shader reads the same table.
+pub(crate) fn linear_to_srgb_table() -> &'static [u8] {
+    &LINEAR_TO_SRGB
 }
 
 /// Mipmap generator.
@@ -23,9 +91,8 @@ impl MipmapGenerator {
     /// does not read it: a test (`the_filter_describes_the_cpu_chain`)
     /// holds the value to what the chain does. The GPU worker's chain
     /// reads it (#424, `dds::gpu_mips::gpu_filter`), so a tile's levels are
-    /// the same bytes on either path. #467 changes this one value, with the
-    /// CPU's filter, to switch both.
-    pub const FILTER: MipFilter = MipFilter::StoredValues;
+    /// the same bytes on either path. Linear light since #467.
+    pub const FILTER: MipFilter = MipFilter::LinearLight;
 
     /// Generate full mipmap chain from source image.
     ///
@@ -85,89 +152,150 @@ impl MipmapGenerator {
         crate::dds::layout::full_chain_levels(width, height) as usize
     }
 
-    /// Downsample image by 2× using box filter (simple average).
+    /// Downsample image by 2× using a box filter in linear light.
     ///
-    /// Each output pixel is the average of a 2×2 block of input pixels, per
-    /// channel, alpha included: `(a + b + c + d) / 4` rounded to the nearest
-    /// step, ties to even ([`block_average`], #394), so the chain does not
-    /// darken or brighten level by level. An odd last column or row has no
-    /// partner and is dropped, so a `w×h` source gives `w/2 × h/2` (a 1-wide
-    /// or 1-high source gives an empty image).
+    /// Each output pixel is the average of a 2×2 block of input pixels.
+    /// R, G and B are sRGB-encoded, so they are averaged as light: each value
+    /// is taken to 16-bit linear light (IEC 61966-2-1, rounded to nearest),
+    /// the four are averaged and the mean is taken back to the nearest sRGB
+    /// byte. Averaging the stored values instead loses light wherever
+    /// neighbours differ (black beside white gives 128, about a fifth of the
+    /// light, where half the light is 188), so towns, rock, coast and snow
+    /// grew darker with every level. Alpha is
+    /// coverage, not light, and keeps the mean of its stored values. Each
+    /// mean is rounded half to even ([`quarter_half_to_even`], #394), so the
+    /// rounding has no bias to accumulate down the chain.
+    /// An odd last column or row has no partner and is dropped, so a `w×h`
+    /// source gives `w/2 × h/2` (a 1-wide or 1-high source gives an empty
+    /// image).
     ///
-    /// Works on the raw RGBA bytes, one output row at a time and in three
-    /// passes, with no per-pixel bounds checks (#389, #394):
+    /// Works on the raw RGBA bytes, one output row at a time, each output
+    /// pixel from a pair of pixels of each of its two source rows, with no
+    /// per-pixel bounds checks (#389), in [`downsample_row`]. The output is
+    /// the only allocation. Cost of the whole chain of a 4096×4096 tile in
+    /// this allocating form, one thread, release build, glibc's default
+    /// malloc, Ryzen 7 9800X3D: about 14 ms, against 4.7 ms for the
+    /// stored-value average it replaced (`time_the_4096_mip_chain`).
     ///
-    /// 1. the row's two source rows are added byte by byte into a `u16`
-    ///    scratch row (a plain element-wise loop the compiler vectorises);
-    /// 2. each 2×2 block's sum, per channel, is the sum of two neighbouring
-    ///    entries of that row, one pixel (4 entries) apart, written to a
-    ///    second `u16` scratch row with an entry per output byte;
-    /// 3. that row is averaged into the output byte by byte by
-    ///    [`block_average`], again a plain element-wise loop the compiler
-    ///    vectorises.
-    ///
-    /// The rounding is a pass of its own because, folded into pass 2, the
-    /// compiler vectorises it across the one-pixel stride with so many
-    /// shuffles that the 4096×4096 chain took twice as long as with the
-    /// truncating average it replaced; as its own pass it adds about a tenth.
-    ///
-    /// The two scratch rows are the only allocations besides the output:
-    /// `Vec<u16>`s with an entry per byte of a source row (less an odd last
-    /// pixel) and per byte of an output row, allocated once per call and
-    /// reused for every row. Both encoder backends run this through
-    /// [`MipmapStream`] for every level of every tile.
+    /// The CPU backends, ISPC and software, run the same arithmetic through
+    /// [`MipmapStream`] for every level of every tile, in place
+    /// ([`downsample_box_2x_in_place`](Self::downsample_box_2x_in_place)). The GPU worker builds
+    /// its levels in a shader with the same filter and tables
+    /// (`dds::gpu_mips`, [`Self::FILTER`]).
     pub(crate) fn downsample_box_2x(source: &RgbaImage) -> RgbaImage {
-        const CHANNELS: usize = 4;
-
         let new_width = source.width() / 2;
         let new_height = source.height() / 2;
         if new_width == 0 || new_height == 0 {
-            // `chunks_exact` refuses a zero chunk size.
             return RgbaImage::new(new_width, new_height);
         }
 
         let src_row = source.width() as usize * CHANNELS;
         let out_row = new_width as usize * CHANNELS;
         let mut output = vec![0u8; out_row * new_height as usize];
-        // Column sums of the source pixels that have a horizontal partner:
-        // an odd last source pixel is left out here, as the halved width
-        // requires.
-        let mut column_sums = vec![0u16; 2 * out_row];
-        // The 2×2 block sums of one output row, an entry per output byte.
-        let mut block_sums = vec![0u16; out_row];
 
-        // `chunks_exact` drops an odd last source row, as the halved height
-        // requires.
+        // `chunks_exact` drops an odd last source row, as the halved
+        // dimensions require.
         for (out, rows) in output
             .chunks_exact_mut(out_row)
             .zip(source.as_raw().chunks_exact(2 * src_row))
         {
             let (top, bottom) = rows.split_at(src_row);
-            for ((sum, &t), &b) in column_sums.iter_mut().zip(top).zip(bottom) {
-                *sum = u16::from(t) + u16::from(b);
-            }
-
-            for (block, pair) in block_sums
-                .chunks_exact_mut(CHANNELS)
-                .zip(column_sums.chunks_exact(2 * CHANNELS))
-            {
-                for c in 0..CHANNELS {
-                    block[c] = pair[c] + pair[c + CHANNELS];
-                }
-            }
-
-            for (byte, &sum) in out.iter_mut().zip(&block_sums) {
-                *byte = block_average(sum);
-            }
+            downsample_row(out, top, bottom);
         }
 
         RgbaImage::from_raw(new_width, new_height, output)
             .expect("output buffer is sized from the halved dimensions")
     }
+
+    /// [`downsample_box_2x`](Self::downsample_box_2x), the same bytes,
+    /// written over the start of the source's own buffer, which is cut to
+    /// the new length (`truncate`, not `shrink_to_fit`: the buffer stays
+    /// held to the end of the chain, so a chain holds level 0's buffer
+    /// instead of level 0 and level 1, and no level gets a buffer of its
+    /// own). The one allocation is a copy of the first two source rows
+    /// (32 KiB for a 4096 level), for row 0.
+    ///
+    /// The point is the allocator, not the arithmetic. With
+    /// `M_MMAP_THRESHOLD` at 1 MiB (XEarthLayer's setting on glibc unless
+    /// the environment overrides it, #227) the buffers of levels 1 to 3 of a 4096 tile (16, 4 and 1 MiB)
+    /// were each a new mapping whose pages fault in on first write.
+    /// `time_the_4096_mip_chain` (a noise tile) with that threshold: 18.4 ms
+    /// allocating, 15.2 ms in place; with glibc's default malloc, which
+    /// serves the levels from the heap, 14.4 ms allocating and 15.2 ms in
+    /// place. Real tiles, the same filter in a benchmark outside this
+    /// repository: 16.2 to 17.4 ms down to 13.1 to 13.6 ms with the
+    /// threshold, 13.1 to 13.7 ms either way without it.
+    ///
+    /// Output row `y` is `out_row = 4 * (w / 2)` bytes at `y * out_row`; its
+    /// source rows start at `2 * y * 4 * w`. Since `out_row <= 2 * w` (equal
+    /// to half a source row for even `w`, less for odd `w`), the output row
+    /// ends at `(y + 1) * out_row <= (y + 1) * 2 * w`, which is at most
+    /// `2 * y * 4 * w` for every `y >= 1`. So every row after the first lies
+    /// wholly before its source rows and the two are split apart with
+    /// `split_at_mut`; row 0 overlaps its own source rows and is built from
+    /// a copy of them.
+    pub(crate) fn downsample_box_2x_in_place(image: &mut RgbaImage) {
+        let new_width = image.width() / 2;
+        let new_height = image.height() / 2;
+        let src_row = image.width() as usize * CHANNELS;
+        let out_row = new_width as usize * CHANNELS;
+
+        let mut raw = std::mem::replace(image, RgbaImage::new(0, 0)).into_raw();
+        if new_width == 0 || new_height == 0 {
+            raw.clear();
+        } else {
+            // Row 0: its output bytes overlap its own source rows.
+            let rows = raw[..2 * src_row].to_vec();
+            let (top, bottom) = rows.split_at(src_row);
+            downsample_row(&mut raw[..out_row], top, bottom);
+
+            for y in 1..new_height as usize {
+                let (done, rest) = raw.split_at_mut(2 * y * src_row);
+                let (top, rest) = rest.split_at(src_row);
+                downsample_row(
+                    &mut done[y * out_row..(y + 1) * out_row],
+                    top,
+                    &rest[..src_row],
+                );
+            }
+            raw.truncate(out_row * new_height as usize);
+        }
+        *image = RgbaImage::from_raw(new_width, new_height, raw)
+            .expect("buffer is cut to the halved dimensions");
+    }
 }
 
-/// The average of a 2×2 block's four channel values, from their sum
-/// (`0..=1020`), rounded to the nearest step with ties to even (#394).
+const CHANNELS: usize = 4;
+
+/// One output row of [`MipmapGenerator::downsample_box_2x`] from its two
+/// source rows: no per-pixel bounds checks (#389). R, G and B go to linear
+/// light through [`SRGB_TO_LINEAR_WIDE`] and back through [`SUM_TO_SRGB`],
+/// which takes the sum of four and returns the sRGB byte of their mean.
+/// An odd last source pixel has no partner and is ignored (the output row
+/// sets how many pixels are written).
+#[inline(always)]
+fn downsample_row(out: &mut [u8], top: &[u8], bottom: &[u8]) {
+    let to_linear = &*SRGB_TO_LINEAR_WIDE;
+    let to_srgb = &**SUM_TO_SRGB;
+    for ((pixel, t), b) in out
+        .chunks_exact_mut(CHANNELS)
+        .zip(top.chunks_exact(2 * CHANNELS))
+        .zip(bottom.chunks_exact(2 * CHANNELS))
+    {
+        for c in 0..3 {
+            let light = |v: u8| to_linear[usize::from(v)];
+            let sum = light(t[c]) + light(t[c + CHANNELS]) + light(b[c]) + light(b[c + CHANNELS]);
+            // A sum is below 2^18; the table folds in the rounded mean.
+            pixel[c] = to_srgb[sum as usize & (SUM_TABLE_LEN - 1)];
+        }
+        let alpha = [t[3], t[7], b[3], b[7]].map(u32::from);
+        // The mean of four bytes is a byte.
+        pixel[3] = quarter_half_to_even(alpha.iter().sum()) as u8;
+    }
+}
+
+/// `sum / 4`, a 2×2 block's mean from its sum, rounded to the nearest step
+/// with ties to even (#394).
 ///
 /// The sum leaves a remainder of 0, 1, 2 or 3 over 4 about equally often on
 /// imagery, and each level is built from the one above, so any bias in this
@@ -179,31 +307,33 @@ impl MipmapGenerator {
 ///
 /// `(sum >> 2) & 1` is the quotient's parity, so adding it to `sum + 1`
 /// carries into the quotient exactly for a remainder of 3, or of 2 with an
-/// odd quotient. Alpha goes through it too, and an opaque block stays
-/// opaque: 1020 gives 255.
+/// odd quotient. An opaque block stays opaque: an alpha sum of 1020 gives
+/// 255, and a linear sum of four whites gives white.
 #[inline(always)]
-const fn block_average(sum: u16) -> u8 {
-    ((sum + 1 + ((sum >> 2) & 1)) >> 2) as u8
+const fn quarter_half_to_even(sum: u32) -> u32 {
+    (sum + 1 + ((sum >> 2) & 1)) >> 2
 }
 
-/// Streaming mipmap generator that yields one level at a time.
+/// Streaming mipmap generator that lends one level at a time.
 ///
-/// Takes ownership of the source image and produces mipmap levels
-/// incrementally. Each call to `next()` returns the next downsampled
-/// level. The previous level is consumed during downsampling, so only
-/// one uncompressed level is held in memory at a time.
+/// Takes ownership of the source image and builds the levels in its buffer:
+/// each [`next_level`](Self::next_level) after the first writes the next
+/// level over the start of the previous one
+/// ([`MipmapGenerator::downsample_box_2x_in_place`]), so the previous level
+/// is gone once the next is lent.
 ///
 /// # Memory
 ///
-/// Peak memory is the size of the current level plus the downsampled
-/// output — roughly 1.25× the current level, not the entire chain.
+/// One buffer, the size of level 0, held until the stream is dropped: the
+/// chain never holds a second level, and after the first no level is a new
+/// allocation.
 pub struct MipmapStream {
-    /// The next image to yield (or downsample from).
-    current: Option<RgbaImage>,
-    /// Number of levels remaining to yield.
+    /// The level lent last, or the source before the first call.
+    image: RgbaImage,
+    /// Number of levels remaining to lend.
     remaining: usize,
-    /// Whether the first (original) image has been yielded.
-    yielded_first: bool,
+    /// Whether the first (original) image has been lent.
+    lent_first: bool,
 }
 
 impl MipmapStream {
@@ -212,48 +342,33 @@ impl MipmapStream {
     /// # Arguments
     ///
     /// * `image` - Source image (ownership transferred, no clone)
-    /// * `count` - Total number of mipmap levels to yield (including the original)
+    /// * `count` - Total number of mipmap levels to lend (including the original)
     pub fn new(image: RgbaImage, count: usize) -> Self {
         Self {
-            current: if count > 0 { Some(image) } else { None },
+            image,
             remaining: count,
-            yielded_first: false,
+            lent_first: false,
         }
     }
-}
 
-impl Iterator for MipmapStream {
-    type Item = RgbaImage;
-
-    fn next(&mut self) -> Option<RgbaImage> {
+    /// The next level, largest first: the source on the first call, then
+    /// each half the size of the last. `None` after `count` levels, or when
+    /// the last was not both wider and higher than 1. The level is valid
+    /// until the next call.
+    pub fn next_level(&mut self) -> Option<&RgbaImage> {
         if self.remaining == 0 {
             return None;
         }
-
-        let current = self.current.take()?;
-
-        if !self.yielded_first {
-            // First call: yield the original image (moved, not cloned)
-            self.yielded_first = true;
-            self.remaining -= 1;
-
-            // Prepare next level if we need more
-            if self.remaining > 0 && current.width() > 1 && current.height() > 1 {
-                self.current = Some(MipmapGenerator::downsample_box_2x(&current));
+        if self.lent_first {
+            if self.image.width() <= 1 || self.image.height() <= 1 {
+                self.remaining = 0;
+                return None;
             }
-
-            return Some(current);
+            MipmapGenerator::downsample_box_2x_in_place(&mut self.image);
         }
-
-        // Subsequent calls: yield the pre-computed downsample
+        self.lent_first = true;
         self.remaining -= 1;
-
-        // Prepare the next level if we need more
-        if self.remaining > 0 && current.width() > 1 && current.height() > 1 {
-            self.current = Some(MipmapGenerator::downsample_box_2x(&current));
-        }
-
-        Some(current)
+        Some(&self.image)
     }
 }
 
@@ -265,23 +380,51 @@ mod tests {
     /// one: round half to even, by its definition, in exact arithmetic on the
     /// rational `sum / 4 = q + r/4` (no bit tricks, so it is independent of
     /// the formula the fast path uses).
-    fn round_half_to_even_quarter(sum: u16) -> u8 {
+    fn round_half_to_even_quarter(sum: u32) -> u32 {
         let (q, r) = (sum / 4, sum % 4);
         // r/4 against 1/2, compared as 2r against 4.
-        let rounded = match (2 * r).cmp(&4) {
+        match (2 * r).cmp(&4) {
             std::cmp::Ordering::Less => q,
             std::cmp::Ordering::Greater => q + 1,
             std::cmp::Ordering::Equal if q % 2 == 0 => q,
             std::cmp::Ordering::Equal => q + 1,
-        };
-        u8::try_from(rounded).expect("a sum of four bytes averages to a byte")
+        }
     }
 
-    /// The per-pixel `downsample_box_2x` that the raw-slice loop replaced
-    /// (#389), kept as the independent reference the fast path must match
-    /// byte for byte. Since #394 each block average is rounded half to even
-    /// by [`round_half_to_even_quarter`], the definition, where the fast path
-    /// uses a bit trick.
+    /// sRGB value (0 to 1) to linear light (0 to 1), IEC 61966-2-1, written
+    /// out here so the tests do not lean on the production curve.
+    fn iec_decode(v: f64) -> f64 {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// Linear light (0 to 1) to sRGB value (0 to 1), IEC 61966-2-1.
+    fn iec_encode(l: f64) -> f64 {
+        if l <= 0.003_130_8 {
+            l * 12.92
+        } else {
+            1.055 * l.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    /// An sRGB byte as linear light in 1/65535 steps, rounded to nearest.
+    fn linear_steps(byte: u8) -> u32 {
+        (iec_decode(f64::from(byte) / 255.0) * 65535.0).round() as u32
+    }
+
+    /// Linear light in 1/65535 steps as the nearest sRGB byte.
+    fn nearest_byte(steps: u32) -> u8 {
+        (iec_encode(f64::from(steps) / 65535.0) * 255.0).round() as u8
+    }
+
+    /// The definition of the filter, pixel by pixel: R, G and B of each 2×2
+    /// block averaged as light, each value taken to 16-bit linear light, the
+    /// mean rounded half to even and taken to the nearest sRGB byte; alpha
+    /// the stored values' mean rounded half to even (#394). The fast path
+    /// must match it byte for byte.
     fn downsample_box_2x_reference(source: &RgbaImage) -> RgbaImage {
         let new_width = source.width() / 2;
         let new_height = source.height() / 2;
@@ -290,18 +433,21 @@ mod tests {
 
         for y in 0..new_height {
             for x in 0..new_width {
-                // Average 2×2 block
-                let p00 = source.get_pixel(x * 2, y * 2);
-                let p10 = source.get_pixel(x * 2 + 1, y * 2);
-                let p01 = source.get_pixel(x * 2, y * 2 + 1);
-                let p11 = source.get_pixel(x * 2 + 1, y * 2 + 1);
-
+                let block = [
+                    source.get_pixel(x * 2, y * 2),
+                    source.get_pixel(x * 2 + 1, y * 2),
+                    source.get_pixel(x * 2, y * 2 + 1),
+                    source.get_pixel(x * 2 + 1, y * 2 + 1),
+                ];
                 let avg = image::Rgba(std::array::from_fn(|c| {
-                    round_half_to_even_quarter(
-                        p00[c] as u16 + p10[c] as u16 + p01[c] as u16 + p11[c] as u16,
-                    )
+                    if c == 3 {
+                        let sum = block.iter().map(|p| u32::from(p[c])).sum();
+                        round_half_to_even_quarter(sum) as u8
+                    } else {
+                        let sum = block.iter().map(|p| linear_steps(p[c])).sum();
+                        nearest_byte(round_half_to_even_quarter(sum))
+                    }
                 }));
-
                 output.put_pixel(x, y, avg);
             }
         }
@@ -337,18 +483,6 @@ mod tests {
         let len = width as usize * height as usize * 4;
         let bytes = noise_bytes(seed).filter(|&b| b != 255).take(len).collect();
         RgbaImage::from_raw(width, height, bytes).expect("buffer sized for the image")
-    }
-
-    /// The mean of each channel over every pixel of `image`, in steps.
-    fn channel_means(image: &RgbaImage) -> [f64; 4] {
-        let mut sums = [0u64; 4];
-        for pixel in image.as_raw().chunks_exact(4) {
-            for (sum, &value) in sums.iter_mut().zip(pixel) {
-                *sum += u64::from(value);
-            }
-        }
-        let pixels = f64::from(image.width()) * f64::from(image.height());
-        sums.map(|sum| sum as f64 / pixels)
     }
 
     fn solid(width: u32, height: u32, colour: [u8; 4]) -> RgbaImage {
@@ -444,16 +578,36 @@ mod tests {
     }
 
     /// The fast path's average is round half to even of `sum / 4` for every
-    /// sum four bytes can make, all 1021 of `0..=1020`, against the
-    /// definition.
+    /// sum four 16-bit linear values can make, `0..=4 * 65535` (which
+    /// covers the 1021 sums of four alpha bytes), against the definition.
     #[test]
     fn the_block_average_rounds_half_to_even_for_every_sum() {
-        let sums = 0..=4 * u16::from(u8::MAX);
-        assert_eq!(sums.len(), 1021);
-        for sum in sums {
+        for sum in 0..=4 * u32::from(u16::MAX) {
             assert_eq!(
-                block_average(sum),
+                quarter_half_to_even(sum),
                 round_half_to_even_quarter(sum),
+                "sum {sum}"
+            );
+        }
+    }
+
+    /// The filter's own tables are the shared ones, widened or folded: the
+    /// u32 decode table holds the u16 table's values, and the encode table
+    /// indexed by a sum of four holds, for every sum four 16-bit values can
+    /// make, what rounding the mean and encoding it gives.
+    #[test]
+    fn the_filter_tables_are_the_shared_tables_widened_and_folded() {
+        for v in 0..=u8::MAX {
+            assert_eq!(
+                SRGB_TO_LINEAR_WIDE[usize::from(v)],
+                u32::from(SRGB_TO_LINEAR[usize::from(v)]),
+                "byte {v}"
+            );
+        }
+        for sum in 0..=4 * u32::from(u16::MAX) {
+            assert_eq!(
+                SUM_TO_SRGB[sum as usize],
+                LINEAR_TO_SRGB[quarter_half_to_even(sum) as usize],
                 "sum {sum}"
             );
         }
@@ -462,17 +616,27 @@ mod tests {
     /// [`MipmapGenerator::FILTER`] describes the CPU chain, which does not
     /// read it: the chain's levels are what the filter it names gives,
     /// computed here by its definition. A filter the CPU does not implement
-    /// fails here, until the CPU chain implements it (#467).
+    /// fails here.
     #[test]
     fn the_filter_describes_the_cpu_chain() {
         let source = noise(64, 48, 7);
         let chain = MipmapGenerator::generate_chain_with_count(&source, 4);
         for (level, pair) in chain.windows(2).enumerate() {
             let expected = match MipmapGenerator::FILTER {
-                MipFilter::StoredValues => downsample_box_2x_reference(&pair[0]),
-                MipFilter::LinearLight => panic!("the CPU chain does not average in linear light"),
+                MipFilter::LinearLight => downsample_box_2x_reference(&pair[0]),
+                MipFilter::StoredValues => panic!("the CPU chain does not average stored values"),
             };
             assert_same_image(&pair[1], &expected, &format!("level {}", level + 1));
+        }
+    }
+
+    /// Every byte survives the way to linear light and back, so a uniform
+    /// colour keeps its value at every level.
+    #[test]
+    fn every_byte_round_trips_through_linear_light() {
+        for v in 0..=u8::MAX {
+            let light = SRGB_TO_LINEAR[usize::from(v)];
+            assert_eq!(LINEAR_TO_SRGB[usize::from(light)], v, "byte {v}");
         }
     }
 
@@ -541,37 +705,73 @@ mod tests {
         let count = MipmapGenerator::full_chain_count(4096, 4096);
 
         let mut expected = source.clone();
+        let mut stream = MipmapStream::new(source, count);
         let mut levels = 0;
-        for (level, actual) in MipmapStream::new(source, count).enumerate() {
-            if level > 0 {
+        while let Some(actual) = stream.next_level() {
+            if levels > 0 {
                 expected = downsample_box_2x_reference(&expected);
             }
-            assert_same_image(&actual, &expected, &format!("level {level}"));
+            assert_same_image(actual, &expected, &format!("level {levels}"));
             levels += 1;
         }
         assert_eq!(levels, 13);
     }
 
+    /// The mean light of each of R, G and B, and the mean stored alpha, over
+    /// every pixel of `image`, expressed in sRGB steps (the light's mean
+    /// encoded back), so a drift reads in the steps a viewer sees.
+    fn light_means(image: &RgbaImage) -> [f64; 4] {
+        let means = channel_light_sums(image);
+        let pixels = f64::from(image.width()) * f64::from(image.height());
+        std::array::from_fn(|c| {
+            let mean = means[c] / pixels;
+            if c == 3 {
+                mean
+            } else {
+                iec_encode(mean) * 255.0
+            }
+        })
+    }
+
+    /// Per channel, the sum over every pixel of its linear light (R, G, B)
+    /// or its stored value (alpha).
+    fn channel_light_sums(image: &RgbaImage) -> [f64; 4] {
+        let mut sums = [0f64; 4];
+        for pixel in image.as_raw().chunks_exact(4) {
+            for (c, (sum, &value)) in sums.iter_mut().zip(pixel).enumerate() {
+                *sum += if c == 3 {
+                    f64::from(value)
+                } else {
+                    iec_decode(f64::from(value) / 255.0)
+                };
+            }
+        }
+        sums
+    }
+
     /// The chain must not change the brightness of a tile with distance
-    /// (#394): at every level of a 4096×4096 chain, each channel's mean stays
-    /// within half a step of the source's. A truncating average loses 0.375
-    /// of a step a level and fails at level 2; rounding half up gains 0.125
-    /// a level and fails at level 4 or 5; rounding half to even does not
-    /// drift.
+    /// (#394): at every level of a 4096×4096
+    /// chain, the mean light of R, G and B, encoded back to sRGB, stays
+    /// within half a step of the source's, and so does the mean alpha.
+    /// Averaging the stored sRGB values instead loses light wherever
+    /// neighbours differ: on this noise level 1 is already about 17 steps
+    /// darker.
     ///
-    /// The source's bytes are uniform over `0..=254`, so its channel means
-    /// are close to a whole step. The 1×1 level is one pixel, a whole step,
-    /// and a source mean half way between two steps would leave it half a
-    /// step off however the chain rounds.
+    /// The source's bytes are uniform over `0..=254`, so the stored alpha
+    /// mean is close to a whole step. The 1×1 level is one pixel, a whole
+    /// step, and a source mean half way between two steps would leave it
+    /// half a step off however the chain rounds.
     #[test]
-    fn every_level_keeps_the_source_mean_within_half_a_step() {
+    fn every_level_keeps_the_source_light_within_half_a_step() {
         let source = noise_with_whole_step_mean(4096, 4096, 394);
-        let source_means = channel_means(&source);
+        let source_means = light_means(&source);
         let count = MipmapGenerator::full_chain_count(4096, 4096);
 
+        let mut stream = MipmapStream::new(source, count);
         let mut levels = 0;
-        for (level, image) in MipmapStream::new(source, count).enumerate() {
-            let means = channel_means(&image);
+        while let Some(image) = stream.next_level() {
+            let level = levels;
+            let means = light_means(image);
             for c in 0..4 {
                 let drift = means[c] - source_means[c];
                 assert!(
@@ -589,23 +789,64 @@ mod tests {
         assert_eq!(levels, 13);
     }
 
+    /// Half black and half white is half the light, sRGB 188, not the 128
+    /// that averaging the stored values gives (about a fifth of the light).
+    #[test]
+    fn a_black_and_white_block_averages_to_half_the_light() {
+        let downsampled = MipmapGenerator::downsample_box_2x(&checkerboard_4x4());
+        for pixel in downsampled.pixels() {
+            assert_eq!(pixel.0, [188, 188, 188, 255]);
+        }
+    }
+
+    /// The 16-bit linear steps cost at most one step against averaging in
+    /// exact f64 light: noise of every value, against the exact mean.
+    #[test]
+    fn downsample_is_within_one_step_of_the_exact_light_average() {
+        let source = noise(256, 256, 5);
+        let downsampled = MipmapGenerator::downsample_box_2x(&source);
+        for y in 0..downsampled.height() {
+            for x in 0..downsampled.width() {
+                for c in 0..3 {
+                    let light: f64 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                        .iter()
+                        .map(|&(dx, dy)| {
+                            let v = source.get_pixel(2 * x + dx, 2 * y + dy)[c];
+                            iec_decode(f64::from(v) / 255.0)
+                        })
+                        .sum::<f64>()
+                        / 4.0;
+                    let exact = iec_encode(light) * 255.0;
+                    let got = f64::from(downsampled.get_pixel(x, y)[c]);
+                    assert!(
+                        (got - exact).abs() <= 1.0,
+                        "({x}, {y}) channel {c}: {got} against exact {exact:.3}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Pins where each 2×2 block's average lands and which source pixels feed
     /// it, independent of the reference: a 7×5 source (odd in both directions,
-    /// so the last column and row are dropped) with every channel a different
-    /// linear ramp. Each block sum is a multiple of 4, so the expected values
-    /// hold whatever the rounding of the average.
+    /// so the last column and row are dropped). R, G and B are uniform within
+    /// each block, so its average is that colour however the light is
+    /// averaged, and differ from block to block (and in the dropped column and
+    /// row); alpha is a linear ramp whose block sums are multiples of 4, so
+    /// the expected values hold whatever the rounding of the average.
     #[test]
     fn downsample_puts_each_block_average_at_its_own_position() {
         let mut source = RgbaImage::new(7, 5);
         for y in 0..5u32 {
             for x in 0..7u32 {
+                let (bx, by) = (x / 2, y / 2);
                 source.put_pixel(
                     x,
                     y,
                     image::Rgba([
-                        (40 * x) as u8,
-                        (40 * y) as u8,
-                        (20 * x + 20 * y + 10) as u8,
+                        (40 * bx + 10) as u8,
+                        (60 * by + 20) as u8,
+                        (30 * bx + 50 * by + 5) as u8,
                         (250 - 10 * x - 30 * y) as u8,
                     ]),
                 );
@@ -617,16 +858,20 @@ mod tests {
         assert_eq!(downsampled.dimensions(), (3, 2));
         #[rustfmt::skip]
         let expected: Vec<u8> = vec![
-            20, 20, 30, 230,   100, 20, 70, 210,    180, 20, 110, 190,
-            20, 100, 70, 170,  100, 100, 110, 150,  180, 100, 150, 130,
+            10, 20, 5, 230,    50, 20, 35, 210,    90, 20, 65, 190,
+            10, 80, 55, 170,   50, 80, 85, 150,    90, 80, 115, 130,
         ];
         assert_eq!(downsampled.as_raw(), &expected);
     }
 
-    /// Release-build timing of the full 4096×4096 chain, new against the
-    /// per-pixel reference, single thread. The two alternate run by run so
-    /// both see the same machine load. Run with `cargo test --release -p
-    /// xearthlayer --lib time_the_4096_mip_chain -- --ignored --nocapture`.
+    /// Release-build timing of the full 4096×4096 chain, the raw-slice
+    /// filter and its in-place form against the per-pixel reference, single
+    /// thread. The three alternate run by run so all see the same machine
+    /// load. Run with `cargo test --release -p xearthlayer --lib
+    /// time_the_4096_mip_chain -- --ignored --nocapture`. The in-place gain
+    /// shows only with `MALLOC_MMAP_THRESHOLD_=1048576` in front of the
+    /// command, XEarthLayer's own setting on glibc (#227): glibc's default
+    /// threshold adapts upward and serves the levels from the heap anyway.
     #[test]
     #[ignore]
     fn time_the_4096_mip_chain() {
@@ -645,12 +890,28 @@ mod tests {
             std::hint::black_box(&level);
             (chain, first)
         };
+        // The same, in place: each run gets its own copy of the source, made
+        // before the clock starts.
+        let run_in_place = || {
+            let mut level = source.clone();
+            let started = std::time::Instant::now();
+            MipmapGenerator::downsample_box_2x_in_place(&mut level);
+            let first = started.elapsed();
+            while level.width() > 1 && level.height() > 1 {
+                MipmapGenerator::downsample_box_2x_in_place(&mut level);
+            }
+            let chain = started.elapsed();
+            std::hint::black_box(&level);
+            (chain, first)
+        };
 
         let mut reference = Vec::with_capacity(RUNS);
         let mut raw = Vec::with_capacity(RUNS);
+        let mut in_place = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
             reference.push(run(downsample_box_2x_reference));
             raw.push(run(MipmapGenerator::downsample_box_2x));
+            in_place.push(run_in_place());
         }
         let summary = |runs: &[(std::time::Duration, std::time::Duration)]| {
             let mut chain: Vec<_> = runs.iter().map(|r| r.0).collect();
@@ -665,9 +926,10 @@ mod tests {
             )
         };
         println!(
-            "4096 chain, {RUNS} runs each: reference {}; raw slices {}",
+            "4096 chain, {RUNS} runs each: reference {}; raw slices {}; in place {}",
             summary(&reference),
-            summary(&raw)
+            summary(&raw),
+            summary(&in_place)
         );
     }
 
@@ -714,9 +976,8 @@ mod tests {
 
         let downsampled = MipmapGenerator::downsample_box_2x(&source);
 
-        // Each pixel should be gray (average of black and white)
-        // Some pixels have 2 black + 2 white = gray (127-128)
-        // Others might have different ratios
+        // Each 2x2 block holds 2 black and 2 white pixels: gray (188 in
+        // linear light, see a_black_and_white_block_averages_to_half_the_light)
         for pixel in downsampled.pixels() {
             // Should be some shade of gray
             assert_eq!(pixel[0], pixel[1]);
@@ -825,19 +1086,25 @@ mod tests {
         );
     }
 
+    /// Every level a stream lends, copied out.
+    fn stream_levels(image: RgbaImage, count: usize) -> Vec<RgbaImage> {
+        let mut stream = MipmapStream::new(image, count);
+        let mut levels = Vec::new();
+        while let Some(level) = stream.next_level() {
+            levels.push(level.clone());
+        }
+        levels
+    }
+
     #[test]
     fn test_mipmap_stream_yields_correct_count() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 5);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 5);
         assert_eq!(levels.len(), 5);
     }
 
     #[test]
     fn test_mipmap_stream_dimensions_halve_each_level() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 5);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 5);
 
         assert_eq!(levels[0].dimensions(), (256, 256));
         assert_eq!(levels[1].dimensions(), (128, 128));
@@ -850,16 +1117,14 @@ mod tests {
     fn test_mipmap_stream_first_yield_matches_source_dimensions() {
         let image = RgbaImage::new(4096, 4096);
         let mut stream = MipmapStream::new(image, 3);
-        let first = stream.next().unwrap();
+        let first = stream.next_level().unwrap();
         assert_eq!(first.dimensions(), (4096, 4096));
     }
 
     #[test]
     fn test_mipmap_stream_terminates_early_at_1x1() {
-        let image = RgbaImage::new(4, 4);
         // Request 10 levels but only 3 are possible (4 -> 2 -> 1)
-        let stream = MipmapStream::new(image, 10);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(4, 4), 10);
 
         assert_eq!(levels.len(), 3);
         assert_eq!(levels[0].dimensions(), (4, 4));
@@ -869,9 +1134,7 @@ mod tests {
 
     #[test]
     fn test_mipmap_stream_single_level() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 1);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 1);
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].dimensions(), (256, 256));
@@ -885,7 +1148,7 @@ mod tests {
         }
 
         let mut stream = MipmapStream::new(image, 2);
-        let first = stream.next().unwrap();
+        let first = stream.next_level().unwrap();
 
         // First level should have the same pixel data as the source
         for pixel in first.pixels() {
@@ -898,10 +1161,61 @@ mod tests {
 
     #[test]
     fn test_mipmap_stream_zero_count_yields_nothing() {
-        let image = RgbaImage::new(256, 256);
-        let stream = MipmapStream::new(image, 0);
-        let levels: Vec<RgbaImage> = stream.collect();
+        let levels = stream_levels(RgbaImage::new(256, 256), 0);
         assert_eq!(levels.len(), 0);
+    }
+
+    #[test]
+    fn a_stream_that_has_ended_stays_ended() {
+        let mut stream = MipmapStream::new(RgbaImage::new(2, 2), 5);
+        assert!(stream.next_level().is_some());
+        assert!(stream.next_level().is_some());
+        assert!(stream.next_level().is_none());
+        assert!(stream.next_level().is_none());
+    }
+
+    const IN_PLACE_SHAPES: [(u32, u32); 12] = [
+        (7, 5),
+        (5, 7),
+        (2, 2),
+        (1, 4),
+        (4, 1),
+        (3, 3),
+        (1, 1),
+        (2, 1),
+        (9, 2),
+        (256, 256),
+        (64, 16),
+        (130, 66),
+    ];
+
+    #[test]
+    fn in_place_is_byte_for_byte_the_allocating_downsample() {
+        for (w, h) in IN_PLACE_SHAPES {
+            let source = noise(w, h, u64::from(w) * 1000 + u64::from(h));
+            let expected = MipmapGenerator::downsample_box_2x(&source);
+            let mut actual = source.clone();
+            MipmapGenerator::downsample_box_2x_in_place(&mut actual);
+            assert_same_image(&actual, &expected, &format!("{w}x{h}"));
+        }
+    }
+
+    #[test]
+    fn the_levels_of_a_stream_are_the_levels_of_generate_chain_with_count() {
+        for (w, h) in IN_PLACE_SHAPES {
+            for count in [0, 1, 2, 3, 5, 20] {
+                let source = noise(w, h, 7 + u64::from(w) + u64::from(h) * 31);
+                let expected = MipmapGenerator::generate_chain_with_count(&source, count);
+                // `generate_chain_with_count` always holds the source, so a
+                // count of 0 gives one level where the stream gives none.
+                let expected = &expected[..expected.len().min(count)];
+                let actual = stream_levels(source, count);
+                assert_eq!(actual.len(), expected.len(), "{w}x{h} count {count}");
+                for (level, (a, e)) in actual.iter().zip(expected).enumerate() {
+                    assert_same_image(a, e, &format!("{w}x{h} count {count} level {level}"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -958,10 +1272,12 @@ mod tests {
 
         let avg = downsampled.get_pixel(0, 0);
 
-        // Average: R=(0+100+0+0)/4=25, G=(0+0+100+0)/4=25, B=(0+0+0+100)/4=25
-        assert_eq!(avg[0], 25);
-        assert_eq!(avg[1], 25);
-        assert_eq!(avg[2], 25);
+        // Each channel is 100 in one pixel and 0 in three: a quarter of the
+        // light of sRGB 100 (0.1274 linear, a quarter 0.0319) is sRGB 50,
+        // not the 25 that averaging the stored values gives.
+        assert_eq!(avg[0], 50);
+        assert_eq!(avg[1], 50);
+        assert_eq!(avg[2], 50);
         assert_eq!(avg[3], 255);
     }
 }

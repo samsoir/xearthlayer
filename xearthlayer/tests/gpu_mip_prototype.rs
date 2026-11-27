@@ -2,14 +2,16 @@
 //! compute shader (`support/mip_box.wgsl`) that builds each level from the
 //! one above with a 2x2 box filter, in two variants:
 //!
-//! - **stored values**, rounded half to even as #394 rounds: checked byte
-//!   for byte against `MipmapGenerator::downsample_box_2x` (through the
-//!   public `generate_chain_with_count`), on the 4096 test images and on
-//!   odd sizes;
-//! - **linear light**, as #467 proposes after #458 (16-bit linear sums, a
-//!   256-entry decode table, half-to-even rounding, a 65,536-entry encode
-//!   table): checked against a CPU reference of the same filter written
-//!   here, as #467 is not implemented yet.
+//! - **stored values**, rounded half to even as #394 rounds: the CPU
+//!   chain's filter before #467, timed only here, since the production
+//!   CPU chain no longer averages stored values (`dds::gpu_mips` tests it
+//!   against a reference of its own);
+//! - **linear light**, the CPU chain's filter since #467 (16-bit linear
+//!   sums, a 256-entry decode table, half-to-even rounding, a 65,536-entry
+//!   encode table): checked byte for byte against
+//!   `MipmapGenerator::downsample_box_2x` (through the public
+//!   `generate_chain_with_count`) and against a CPU reference of the same
+//!   filter written here, on the 4096 test images and on odd sizes.
 //!
 //! It reports the time per tile of the whole chain on each GPU (kernel time
 //! from timestamp queries, and wall time from submit to the end of the
@@ -82,7 +84,7 @@ impl Tables {
     }
 }
 
-/// The CPU's `block_average`: four values' average from their sum, half to
+/// The CPU's `quarter_half_to_even`: four values' average from their sum, half to
 /// even.
 fn average4(sum: u32) -> u32 {
     (sum + 1 + ((sum >> 2) & 1)) >> 2
@@ -320,9 +322,11 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             for _ in 0..11 {
                 let source = img.clone();
                 let t = Instant::now();
-                let levels: usize = MipmapStream::new(source, 13)
-                    .map(|l| l.width() as usize)
-                    .sum();
+                let mut stream = MipmapStream::new(source, 13);
+                let mut levels = 0usize;
+                while let Some(level) = stream.next_level() {
+                    levels += level.width() as usize;
+                }
                 samples.push(t.elapsed());
                 std::hint::black_box(levels);
             }
@@ -333,7 +337,7 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             (stored, linear)
         });
         eprintln!(
-            "  {name}: stored-value chain (MipmapStream) {:.2} ms; linear-light reference \
+            "  {name}: linear-light chain (MipmapStream) {:.2} ms; linear-light reference \
              (unoptimised, per pixel) {:.2} ms",
             ms(stored),
             ms(linear)
@@ -361,16 +365,16 @@ fn gpu_mip_chain_against_the_cpu_chain() {
             let chain = GpuChain::new(&gpu, w, h, &tables);
             let levels = chain.dims.len();
             chain.upload(&gpu, &img);
+            // The production CPU chain averages in linear light (#467), so
+            // it is the linear shader it is held against; the stored-value
+            // shader is only timed here.
             if levels > 1 {
-                chain.build(&gpu, Filter::Stored);
+                chain.build(&gpu, Filter::Linear);
             }
             let cpu = MipmapGenerator::generate_chain_with_count(&img, levels);
             match first_difference(&chain.read(&gpu), &cpu) {
-                None => eprintln!("  {w}x{h} ({levels} levels): stored GPU chain identical"),
-                Some(d) => eprintln!("  {w}x{h}: stored GPU chain DIFFERS: {d}"),
-            }
-            if levels > 1 {
-                chain.build(&gpu, Filter::Linear);
+                None => eprintln!("  {w}x{h} ({levels} levels): linear GPU chain identical"),
+                Some(d) => eprintln!("  {w}x{h}: linear GPU chain DIFFERS: {d}"),
             }
             match first_difference(&chain.read(&gpu), &linear_chain(&img, levels, &tables)) {
                 None => eprintln!("  {w}x{h}: linear GPU chain identical to the CPU reference"),
@@ -382,13 +386,12 @@ fn gpu_mip_chain_against_the_cpu_chain() {
         for (name, img) in &images {
             eprintln!("  -- {name}, 4096 x 4096, 13 levels --");
             chain.upload(&gpu, img);
-            chain.build(&gpu, Filter::Stored);
+            chain.build(&gpu, Filter::Linear);
             let cpu = MipmapGenerator::generate_chain_with_count(img, 13);
             match first_difference(&chain.read(&gpu), &cpu) {
-                None => eprintln!("  stored: identical to downsample_box_2x at every level"),
-                Some(d) => eprintln!("  stored: DIFFERS: {d}"),
+                None => eprintln!("  linear: identical to downsample_box_2x at every level"),
+                Some(d) => eprintln!("  linear: DIFFERS: {d}"),
             }
-            chain.build(&gpu, Filter::Linear);
             match first_difference(&chain.read(&gpu), &linear_chain(img, 13, &tables)) {
                 None => eprintln!("  linear: identical to the CPU reference at every level"),
                 Some(d) => eprintln!("  linear: DIFFERS: {d}"),
