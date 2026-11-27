@@ -273,14 +273,6 @@ pub enum PayloadPart {
 impl PayloadPart {
     /// Both, in file order.
     pub const ALL: [Self; 2] = [Self::Head, Self::Tail];
-
-    /// Its name in the debug lines.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Head => "head",
-            Self::Tail => "tail",
-        }
-    }
 }
 
 /// The parts of a lit payload a read is served from, each present or not.
