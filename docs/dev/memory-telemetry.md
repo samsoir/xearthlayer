@@ -59,7 +59,7 @@ mebibyte", not necessarily "nothing".
 | Field | Source | Meaning |
 |-------|--------|---------|
 | `uptime_s` | `AggregatedState::uptime()` | Whole seconds since the metrics daemon started, which is effectively service start. Use it as the x-axis. |
-| `rss_mb` | `MemoryProbe` → sum of `Rss:` in `/proc/self/smaps` | Physical pages currently held. **Excludes anything the kernel has swapped out.** |
+| `rss_mb` | `MemoryProbe` → `/proc/self/status` `VmRSS:` on Linux (the same pass as `anon_mb`, so the two describe one instant, #471); `memory-stats` elsewhere | Physical pages currently held. **Excludes anything the kernel has swapped out.** |
 | `vm_mb` | `MemoryProbe` → sum of `Size:` in `/proc/self/smaps` | Total mapped address space. Counts anonymous mappings whether resident or paged out. |
 | `swap_mb` | `MemoryProbe` → `/proc/self/status` `VmSwap:` | Anonymous memory swapped out to disk. **This is the field that actually caught #209**: at the moment of the kill, `rss_mb` alone read a healthy 9.3 GB while `swap_mb` would have read 54.7 GB. `0` means **not readable on this platform**, not "nothing swapped" — same convention as `threads`. Linux-only; read in the same `/proc/self/status` pass as `threads`, so it costs no extra file open. |
 | `anon_mb` | `/proc/self/status` `RssAnon:` | Anonymous resident memory. **`anon_mb + swap_mb` is the committed footprint — the number to quote.** It is what the OOM killer scores and what a system monitor shows. Prefer it to `vm_mb`; see below. |
