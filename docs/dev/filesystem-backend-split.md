@@ -197,8 +197,8 @@ runners provide `/dev/fuse` in their `ubuntu-latest` kernels, and CI installs
 `fuse3` and not `libfuse3-dev`, allowing `mount_with_unprivileged` to work.
 
 For implementation on macOS, the live mount tests can run only on a user's
-machine (macFUSE is a kext; hosted runners cannot load it — run via `make
-verify-macos`).
+machine. Hosted macOS runners cannot approve the FSKit extension ("macFUSE
+(local)") under File System Extenstions. Run via `make verify-macos`).
 
 This means green CI exercises the `LinuxFuse` adapter; the `MacFuse` adapter is
 covered by `make verify-macos` and the regression flight, both run on a local
@@ -352,9 +352,10 @@ stays platform-neutral.
 | Policy decision | Linux | macOS |
 |---|---|---|
 | Open flags reported for virtual DDS files | `FOPEN_DIRECT_IO` — every `read()` reaches the handler, so the FUSE read counters are exact and the page cache never holds a second copy of a tile | `0` — X-Plane `mmap`s texture files and macFUSE faults with `EXC_BAD_ACCESS` when a `direct_io` file is mapped, so virtual DDS is served through the page cache and the read counters under-report (#204) |
-| Mount API call | `Session::mount_with_unprivileged` — routes the mount through the setuid `fusermount3` helper; `mount(2)` itself is privileged (the method needs the `unprivileged` crate feature) | `Session::mount` — macFUSE's own `mount_macfuse` helper is setuid, so the plain call is already unprivileged |
+| Mount API call | `Session::mount_with_unprivileged` — routes the mount through the setuid `fusermount3` helper; `mount(2)` itself is privileged (the method needs the `unprivileged` crate feature) | `MFMount` transport (fuse3 `dlopen`s macFUSE's `MFMount.framework`) |
 | `volname` mount option | not set | set, so Finder shows a meaningful volume name |
 | `FileAttr` fields | — | `crtime` (creation time) and `flags` (BSD file flags) exist only in macFUSE's `FileAttr`; the core supplies the values in `FileAttributes`, and the policy owns the `FileAttr` constructor outright — `file_attr(&FileAttributes, ino)` is the crate's only `FileAttr` literal. |
+| Transport Choice | N/A | `MacFuseBackend::FsKit` |
 
 Because the contract's `open` returns a bare `u64` file handle, the open flags
 are the adapter's decision, keyed on the `FsNode` variant: a `VirtualDds` node
