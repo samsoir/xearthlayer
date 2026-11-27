@@ -51,8 +51,16 @@ This is largely a code reorganization with no user-visible changes.
 
 ### Non-Goals
 
-1. **Implementation of new backends** - This project is viewed as a prerequisite before any new backend implementation.
-2. **Changes to existing Linux and macOS backends** - These operate as they did before with only the code changes needed to adapt to the new architecture.  That is, we keep one shared fuse3 translation and add only thin per-OS adapters and a FusePlatform policy.
+1. **Implementation of new backends** - This project is viewed as a prerequisite
+   before any new backend implementation.
+2. **Changes to existing Linux and macOS backends** - These operate as they did
+   before as a shared "Linux-like" backend with only the code changes needed to
+   adapt to the new architecture.  That is, we keep one shared fuse3 translation
+   and add only thin per-OS adapters and a FusePlatform policy.  This implies
+   that there will be temporary `cfg` within this backend, to be removed when
+   split into two new backends (LinuxFuse and FsKit) as described in this
+   architecture.  This work would be done as a follow-on effort that closely
+   follows this one.
 
 ---
 
