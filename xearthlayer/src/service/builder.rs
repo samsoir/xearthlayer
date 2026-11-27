@@ -342,12 +342,13 @@ mod tests {
         drop(components.encoder);
         drop(components.prefetch_encoder);
 
-        // The worker must end within a reasonable bound. If it doesn't, GPU
-        // resources are leaked and the process will hang.
+        // The worker must end. The bound is a guard against a hang, not a
+        // measurement: dropping the device can take seconds on a discrete
+        // GPU (5 s timed out once on a discrete NVIDIA GPU, #471).
         let ended = worker_handle
-            .wait(std::time::Duration::from_secs(5))
+            .wait(std::time::Duration::from_secs(30))
             .await
-            .expect("GPU worker should complete within 5s after channel close");
+            .expect("GPU worker should complete within 30s after channel close");
         assert!(ended.is_ok(), "GPU worker should not panic during shutdown");
     }
 

@@ -132,7 +132,7 @@ pub struct ScenerySystemWidget<'a> {
     health: Option<&'a HealthSnapshot>,
     history: Option<&'a SceneryHistory>,
     tile_progress: &'a [RegionProgressEntry],
-    latency: Option<FuseLatencyWidget<'a>>,
+    latency: Option<FuseLatencyWidget>,
 }
 
 impl<'a> ScenerySystemWidget<'a> {
@@ -148,7 +148,7 @@ impl<'a> ScenerySystemWidget<'a> {
     }
 
     /// FUSE generation latency, rendered on the last row below the columns.
-    pub fn with_latency(mut self, latency: FuseLatencyWidget<'a>) -> Self {
+    pub fn with_latency(mut self, latency: FuseLatencyWidget) -> Self {
         self.latency = Some(latency);
         self
     }
@@ -461,7 +461,7 @@ mod tests {
     use super::*;
     use crate::ui::widgets::FuseLatencyWidget;
     use std::time::Duration;
-    use xearthlayer::metrics::LatencySummary;
+    use xearthlayer::metrics::{DemandCounts, LatencySummary, RecentFuseDemand};
 
     fn render(widget: ScenerySystemWidget<'_>, height: u16) -> String {
         let area = Rect::new(0, 0, 120, height);
@@ -486,8 +486,16 @@ mod tests {
             max_us: 3_900_000,
             count: 40,
         };
-        let latency = FuseLatencyWidget::new(Some(&summary), Duration::from_secs(10))
-            .with_cache_served(97, 3);
+        let recent = RecentFuseDemand {
+            latency: Some(summary),
+            counts: DemandCounts {
+                cached: 97,
+                generated: 3,
+                timeouts: 0,
+            },
+            since_last_wait: Some(Duration::ZERO),
+        };
+        let latency = FuseLatencyWidget::new(recent, Duration::from_secs(10));
         let out = render(ScenerySystemWidget::new(&snapshot).with_latency(latency), 7);
 
         let last = out.lines().last().unwrap();

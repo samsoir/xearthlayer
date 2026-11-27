@@ -15,7 +15,7 @@ use crate::config::defaults::{
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
-use crate::metrics::TelemetrySnapshot;
+use crate::metrics::{RecentFuseDemand, TelemetrySnapshot};
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
 };
@@ -875,8 +875,7 @@ impl MountManager {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
-            fuse_latency: None,
-            fuse_session_latency: None,
+            fuse_recent: RecentFuseDemand::default(),
             fuse_session_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,
@@ -959,9 +958,9 @@ impl MountManager {
             // Lane gauges: each service runs its own lanes, and only the
             // consolidated service has real values. Latency is not summable,
             // so take the first sample present rather than a blend.
-            total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
-            total.fuse_session_latency =
-                total.fuse_session_latency.or(snapshot.fuse_session_latency);
+            if total.fuse_recent == RecentFuseDemand::default() {
+                total.fuse_recent = snapshot.fuse_recent;
+            }
             total.fuse_session_timeouts += snapshot.fuse_session_timeouts;
             total.demand_in_flight += snapshot.demand_in_flight;
             total.prefetch_paused |= snapshot.prefetch_paused;

@@ -653,27 +653,46 @@ The lane fields (#296) are the no-harm instrument:
   admission, by a full group or by the demand pause, which is where work sits
   while demand has the lane paused.
 
-The TUI shows the same latency over the whole session instead of one sample, so
-the line is not blank at cruise, where most samples have no generations. The
-median, 95th percentile and maximum come from a fixed-size log-spaced histogram
-(about 5% relative width, 1 ms to 10 minutes, longer waits in the top bucket;
-the maximum and count are exact) fed by the same FUSE waits as the per-sample
-window, and the timeout count is the session total, shown when non-zero. The
-line's colour comes from the most recent sample that had generations, held
-across empty samples, so one early stall does not keep it red all flight. The
-log fields above are unchanged.
+The TUI shows the same latency over the recent past instead of one sample
+(#481): the Scenery System pane's latency line describes the last five closed
+samples plus the open one, so at least 5 minutes once the session is that long
+and at most 6. A line over the whole session froze on the cold start for the
+rest of a flight that went well; one over a single sample would be blank at
+cruise, where most samples have no generations. The window rolls on the
+daemon's own 60 s sample, with no second clock: `metrics/recent.rs`
+`RecentDemandRing` keeps each sample's waits as a fixed-size log-spaced
+histogram (about 5% relative width, 1 ms to 10 minutes, longer waits in the top
+bucket; the maximum and count are exact) and merges the histograms bucket by
+bucket, because sample summaries cannot be combined into percentiles. It also
+keeps the cumulative counters at each sample's start, so the window's cached
+share and timeouts are differences. The daemon publishes the result as
+`RecentFuseDemand` with the time since the session's last wait, and the line
+is drawn from it alone:
+
+- With waits in the window, the median, 95th percentile and maximum are the
+  window's, coloured against the generation timeout: red once a wait outlasts
+  it, amber when the p95 or maximum is past half of it, green otherwise.
+- With none, it reads `none waited in 5 min (last 40 min ago)` in green.
+- Timeouts in the window are amber, with the session's count beside them when
+  it is larger (`2 timeouts (5 session)`). Once they leave the window the
+  session's count stays in the line's neutral style (`1 timeout (session)`).
+
+The log fields above are unchanged, and the session's latency figures are
+not kept: a flight's are read from its `Prefetch sample` lines.
 
 The latency figures cover generations only: a cache hit never waits on a lane,
 and counting it would swamp the percentiles with near-zero waits. That leaves
 the line empty on a well-prefetched flight, which reads as a broken component,
-so it also shows the session cached share: FUSE requests served from the memory
-or DDS disk cache, over those plus FUSE generations (`fuse_jobs_submitted`).
-Requests coalesced onto an in-flight job and all prefetch traffic are excluded.
-The share is a whole percent, shown as `>99%` when some request was generated
-but the rounded value would read 100. It uses the line's neutral style, so it
-never competes with the amber or red of the latency figures. With no FUSE
-request yet the line reads `no FUSE requests yet`; with requests but no
-generations it reads `no FUSE generations yet │ 100% cached`.
+so it also shows the window's cached share: FUSE requests served from the
+memory or DDS disk cache, over those plus FUSE generations
+(`fuse_jobs_submitted`). Requests coalesced onto an in-flight job and all
+prefetch traffic are excluded. The share is a whole percent, shown as `>99%`
+when some request was generated but the rounded value would read 100, and left
+out when the window had no request. It uses the line's neutral style, so it
+never competes with the amber or red of the latency figures. Before the first
+wait the line uses the session's counts: with no FUSE request yet it reads `no
+FUSE requests yet`; with requests but no generations it reads `no FUSE
+generations yet │ 100% cached`.
 
 To compare prefetch on and off, run the same route with `prefetch.enabled = true`
 and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and

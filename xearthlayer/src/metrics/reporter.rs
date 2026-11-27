@@ -201,8 +201,7 @@ impl MetricsReporter for TuiReporter {
             total_encode_time_ms: state.encode_time_us / 1000,
 
             // Lane metrics
-            fuse_latency: state.fuse_latency,
-            fuse_session_latency: state.fuse_session_latency,
+            fuse_recent: state.fuse_recent,
             fuse_session_timeouts: state.fuse_session_timeouts,
             demand_in_flight: state.demand_in_flight,
             prefetch_paused: state.prefetch_paused,
@@ -255,12 +254,20 @@ mod tests {
     #[test]
     fn test_tui_reporter_carries_lane_state() {
         let mut state = create_test_state();
-        state.fuse_latency = Some(crate::metrics::LatencySummary {
-            median_us: 40_000,
-            p95_us: 90_000,
-            max_us: 120_000,
-            count: 7,
-        });
+        state.fuse_recent = crate::metrics::RecentFuseDemand {
+            latency: Some(crate::metrics::LatencySummary {
+                median_us: 40_000,
+                p95_us: 90_000,
+                max_us: 120_000,
+                count: 7,
+            }),
+            counts: crate::metrics::DemandCounts {
+                cached: 30,
+                generated: 7,
+                timeouts: 1,
+            },
+            since_last_wait: Some(Duration::from_secs(12)),
+        };
         state.demand_in_flight = 3;
         state.prefetch_paused = true;
         state.prefetch_lane_load = 0.25;
@@ -269,7 +276,7 @@ mod tests {
 
         let snapshot = TuiReporter::new().report(&state, &TimeSeriesHistory::default());
 
-        assert_eq!(snapshot.fuse_latency, state.fuse_latency);
+        assert_eq!(snapshot.fuse_recent, state.fuse_recent);
         assert_eq!(snapshot.demand_in_flight, 3);
         assert!(snapshot.prefetch_paused);
         assert_eq!(snapshot.prefetch_lane_load, 0.25);

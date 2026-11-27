@@ -138,54 +138,62 @@ impl ProcessMemoryProbe {
         Self
     }
 
-    /// Reads OS thread count and swapped-out anonymous memory in one pass
-    /// over `/proc/self/status`.
-    ///
-    /// Linux-only and best-effort: `memory-stats` does not expose either
-    /// value, and hand-rolling mach FFI for macOS is not worth the risk on a
-    /// blocking CI platform. Thread count is tracked because tokio's blocking
-    /// pool (default 512 threads) is implicated in issue #209; swap is
-    /// tracked because it is the field that actually caught #209 — see
-    /// `MemorySample::swap_bytes`.
-    ///
-    /// Both fields are read from the same file read so the file is only
-    /// opened once per sample.
-    #[cfg(target_os = "linux")]
-    fn linux_status_fields() -> (Option<u64>, Option<u64>, Option<u64>) {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return (None, None, None);
+    /// Reads `/proc/self/status` once. Linux-only and best-effort; elsewhere
+    /// every field is `None`. `cfg!`, not `#[cfg]`, so the parser is compiled
+    /// and linted on every platform.
+    fn linux_status_fields() -> StatusFields {
+        if !cfg!(target_os = "linux") {
+            return StatusFields::default();
+        }
+        std::fs::read_to_string("/proc/self/status")
+            .map(|status| StatusFields::parse(&status))
+            .unwrap_or_default()
+    }
+}
+
+/// The fields the probe takes from one read of `/proc/self/status`.
+///
+/// `memory-stats` exposes none of thread count, swap or anonymous memory, and
+/// hand-rolling mach FFI for macOS is not worth the risk on a blocking CI
+/// platform. Thread count is tracked because tokio's blocking pool (default
+/// 512 threads) is implicated in issue #209; swap because it is the field that
+/// actually caught #209 (see `MemorySample::swap_bytes`).
+///
+/// Resident memory (`VmRSS`) is read here too, and preferred to `memory-stats`'
+/// figure, so that it and `RssAnon` come from the same instant: two reads let
+/// an allocation in between make anonymous memory exceed resident (#471).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StatusFields {
+    threads: Option<u64>,
+    swap_bytes: Option<u64>,
+    anon_bytes: Option<u64>,
+    rss_bytes: Option<u64>,
+}
+
+impl StatusFields {
+    fn parse(status: &str) -> Self {
+        // Memory lines read like "VmSwap:      0 kB": the value is in kB per
+        // the /proc/self/status contract.
+        let kb = |value: &str| {
+            value
+                .trim()
+                .strip_suffix("kB")
+                .and_then(|kb| kb.trim().parse::<u64>().ok())
+                .map(|kb| kb * 1024)
         };
-
-        let mut threads = None;
-        let mut swap_bytes = None;
-        let mut anon_bytes = None;
-
+        let mut fields = Self::default();
         for line in status.lines() {
             if let Some(value) = line.strip_prefix("Threads:") {
-                threads = value.trim().parse().ok();
+                fields.threads = value.trim().parse().ok();
             } else if let Some(value) = line.strip_prefix("VmSwap:") {
-                // Format is like "      0 kB" - strip the "kB" suffix, then
-                // the value is already in kB per the /proc/self/status contract.
-                swap_bytes = value
-                    .trim()
-                    .strip_suffix("kB")
-                    .and_then(|kb| kb.trim().parse::<u64>().ok())
-                    .map(|kb| kb * 1024);
+                fields.swap_bytes = kb(value);
             } else if let Some(value) = line.strip_prefix("RssAnon:") {
-                anon_bytes = value
-                    .trim()
-                    .strip_suffix("kB")
-                    .and_then(|kb| kb.trim().parse::<u64>().ok())
-                    .map(|kb| kb * 1024);
+                fields.anon_bytes = kb(value);
+            } else if let Some(value) = line.strip_prefix("VmRSS:") {
+                fields.rss_bytes = kb(value);
             }
         }
-
-        (threads, swap_bytes, anon_bytes)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn linux_status_fields() -> (Option<u64>, Option<u64>, Option<u64>) {
-        (None, None, None)
+        fields
     }
 }
 
@@ -198,9 +206,14 @@ impl MemoryProbe for ProcessMemoryProbe {
         });
 
         let stats = memory_stats::memory_stats()?;
-        let (threads, swap_bytes, anon_bytes) = Self::linux_status_fields();
+        let StatusFields {
+            threads,
+            swap_bytes,
+            anon_bytes,
+            rss_bytes,
+        } = Self::linux_status_fields();
         Some(MemorySample {
-            rss_bytes: stats.physical_mem as u64,
+            rss_bytes: rss_bytes.unwrap_or(stats.physical_mem as u64),
             vm_bytes: stats.virtual_mem as u64,
             threads,
             swap_bytes,
@@ -561,6 +574,37 @@ mod tests {
             a.mmapped_bytes
         );
         drop(tiles);
+    }
+
+    /// Every field comes from the one text, so resident and anonymous memory
+    /// describe the same instant (#471: `memory-stats` read resident memory
+    /// in a separate pass, and tests allocating in between made anonymous
+    /// exceed it).
+    #[test]
+    fn status_fields_come_from_one_read_of_the_status_text() {
+        let status = "Name:\txearthlayer\n\
+                      VmRSS:\t  204800 kB\n\
+                      RssAnon:\t  153600 kB\n\
+                      RssFile:\t   51200 kB\n\
+                      VmSwap:\t    1024 kB\n\
+                      Threads:\t214\n";
+        assert_eq!(
+            StatusFields::parse(status),
+            StatusFields {
+                threads: Some(214),
+                swap_bytes: Some(1024 * 1024),
+                anon_bytes: Some(153_600 * 1024),
+                rss_bytes: Some(204_800 * 1024),
+            }
+        );
+    }
+
+    #[test]
+    fn status_fields_missing_from_the_text_are_none() {
+        assert_eq!(
+            StatusFields::parse("Name:\txearthlayer\nVmSwap:\tgarbage\n"),
+            StatusFields::default()
+        );
     }
 
     /// `anon_bytes` is what makes committed memory readable without arithmetic.
