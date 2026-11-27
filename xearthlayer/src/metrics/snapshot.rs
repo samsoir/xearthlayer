@@ -5,7 +5,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use super::latency::LatencySummary;
+use super::recent::RecentFuseDemand;
 
 /// A point-in-time snapshot of pipeline metrics.
 ///
@@ -141,11 +141,10 @@ pub struct TelemetrySnapshot {
     pub total_encode_time_ms: u64,
 
     // === Lane metrics (#296) ===
-    /// FUSE generation latency of the most recent 60 s sample that had any,
-    /// cache hits excluded. Held across empty samples; `None` until one closes.
-    pub fuse_latency: Option<LatencySummary>,
-    /// FUSE generation latency since start. `None` until the first generation.
-    pub fuse_session_latency: Option<LatencySummary>,
+    /// FUSE demand over the recent window (#481): latency of the waits for a
+    /// generation (cache hits excluded), cached share, timeouts, and the time
+    /// since the last wait.
+    pub fuse_recent: RecentFuseDemand,
     /// FUSE requests abandoned at the timeout since start.
     pub fuse_session_timeouts: usize,
     /// FUSE demand jobs in flight
@@ -212,8 +211,7 @@ impl Default for TelemetrySnapshot {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
-            fuse_latency: None,
-            fuse_session_latency: None,
+            fuse_recent: RecentFuseDemand::default(),
             fuse_session_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,

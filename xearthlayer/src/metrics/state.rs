@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::latency::LatencySummary;
+use super::recent::RecentFuseDemand;
 
 // =============================================================================
 // Ring Buffer
@@ -340,12 +340,9 @@ pub struct AggregatedState {
     pub prefetch_lane_running: usize,
     /// Prefetch lane jobs held waiting for admission (gauge, #296).
     pub prefetch_lane_queued: usize,
-    /// The most recent closed sample that had FUSE generations. Empty samples
-    /// leave it alone; the TUI colours the latency line from it.
-    pub fuse_latency: Option<LatencySummary>,
-    /// FUSE generation latency since start, filled when the state is
-    /// published. The TUI shows these figures.
-    pub fuse_session_latency: Option<LatencySummary>,
+    /// FUSE demand over the last few samples, filled when the state is
+    /// published. The TUI's latency line shows it (#481).
+    pub fuse_recent: RecentFuseDemand,
     /// FUSE requests abandoned at the timeout since start.
     pub fuse_session_timeouts: usize,
     /// Total regions promoted via the normal completion path (counter).
@@ -436,8 +433,7 @@ impl AggregatedState {
             prefetch_lane_load: 0.0,
             prefetch_lane_running: 0,
             prefetch_lane_queued: 0,
-            fuse_latency: None,
-            fuse_session_latency: None,
+            fuse_recent: RecentFuseDemand::default(),
             fuse_session_timeouts: 0,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
