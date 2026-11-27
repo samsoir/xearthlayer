@@ -194,8 +194,8 @@ town was 21% darker than in linear light. Uniform areas such as forest, fields
 and water barely change. Distant terrain is shown from these levels, so it
 grew darker and flatter towards the horizon.
 
-The tables are 16 bits wide because near black one sRGB step is only about 20
-of 65,535 linear steps. The quantisation costs at most one step against an
+Linear light is held in 16 bits because near black one sRGB step is only about
+20 of 65,535 linear steps. The quantisation costs at most one step against an
 exact average in f64 (`downsample_is_within_one_step_of_the_exact_light_average`);
 every byte round-trips through both tables, so a uniform colour keeps its value
 at every level.
