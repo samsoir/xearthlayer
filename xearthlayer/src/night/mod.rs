@@ -7,6 +7,7 @@
 //! but still serves black pixels. Phase 2b generates the light, in the
 //! `generator` module behind the `LitGenerator` trait.
 
+pub(crate) mod admission;
 pub mod disk;
 pub mod footprint;
 pub mod generator;

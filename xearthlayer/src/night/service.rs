@@ -25,6 +25,7 @@ use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
 use tracing::{debug, warn};
 
+use super::admission::{GenerationClass, GenerationPermits, LoadPriority};
 use super::disk::TileDsfs;
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{
@@ -368,7 +369,9 @@ pub struct NightLitSource {
     /// the levels below it apart (#432). In an `Arc` so the summary task can
     /// hold it weakly.
     payloads: Arc<PayloadMemory>,
-    generations: tokio::sync::Semaphore,
+    /// Admitted by priority (#433): reads of the first visible level, then
+    /// reads of the small levels, then pre-generations.
+    generations: GenerationPermits,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
     /// Lit payloads on disk, from the cache layer; None when caching is off.
@@ -498,7 +501,7 @@ impl NightLitSource {
                 LIT_TAIL_CACHE_BYTES,
                 Arc::clone(&stats),
             )),
-            generations: tokio::sync::Semaphore::new(lit_generation_permits(
+            generations: GenerationPermits::new(lit_generation_permits(
                 std::thread::available_parallelism().map_or(1, |n| n.get()),
             )),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
@@ -590,7 +593,8 @@ impl NightLitSource {
     /// then generation), which concurrent reads share whatever parts they
     /// want. A failure is not kept, nor a payload whose roads were late: the
     /// next read generates again. See [`PayloadMemory`] for which parts a
-    /// load keeps.
+    /// load keeps. A read that reaches the first visible level waits for a
+    /// generation permit ahead of one that does not (#433).
     async fn served_parts(
         &self,
         name: &DdsFilename,
@@ -598,10 +602,12 @@ impl NightLitSource {
         wanted: Wanted,
     ) -> (LitParts, ReadOutcome) {
         let from_disk = AtomicBool::new(false);
-        let load = || self.load_or_generate(name.clone(), layout.clone(), &from_disk);
+        let class = GenerationClass::of_read(wanted.contains(PayloadPart::Head));
+        let load =
+            |priority| self.load_or_generate(name.clone(), layout.clone(), &from_disk, priority);
         let served = self
             .payloads
-            .serve((name.row, name.col, name.zoom), layout, wanted, load)
+            .serve((name.row, name.col, name.zoom), layout, wanted, class, load)
             .await;
         for part in PayloadPart::ALL {
             if let Some(lookup) = served.lookups[part as usize] {
@@ -648,15 +654,16 @@ impl NightLitSource {
     /// the session. `Err` is a payload not to keep in memory: black, or
     /// generated while a road tile was late. Without a disk tier this is
     /// `generate`. Sets `from_disk` when the payload is read from the disk
-    /// tier.
+    /// tier. `priority` is the load's, for its generation permit.
     async fn load_or_generate(
         &self,
         name: DdsFilename,
         layout: LitLayout,
         from_disk: &AtomicBool,
+        priority: Arc<LoadPriority>,
     ) -> Result<Bytes, Uncached> {
         let Some(disk) = self.disk.clone() else {
-            return memory_only(self.generate(name, &layout).await);
+            return memory_only(self.generate(name, &layout, &priority).await);
         };
         let key = lit_cache_key(&name);
         // The disk permit covers the fingerprint and the read, and is released
@@ -692,7 +699,7 @@ impl NightLitSource {
             return Ok(payload);
         }
         let (row, col, zoom) = (name.row, name.col, name.zoom);
-        let generated = self.generate(name, &layout).await;
+        let generated = self.generate(name, &layout, &priority).await;
         let changed = generated
             .as_ref()
             .and_then(|g| road_sources_changed(&road_dsfs, &g.read_from));
@@ -840,16 +847,23 @@ impl NightLitSource {
     /// the road raster is generation work and runs under it. Holding the
     /// permit, it looks once more, without waiting, at the road tiles its
     /// wait left out, so roads that came while it queued are drawn (#427).
-    async fn generate(&self, name: DdsFilename, layout: &LitLayout) -> Option<Generated> {
+    /// The permit is admitted by `priority`'s class (#433); `None` (black,
+    /// nothing generated) when it is refused.
+    async fn generate(
+        &self,
+        name: DdsFilename,
+        layout: &LitLayout,
+        priority: &LoadPriority,
+    ) -> Option<Generated> {
         let (size, road_supersample) = (layout.first_visible, layout.road_supersample());
         let found = self.footprint_roads(&name, size, Purpose::Generate).await;
         let asked_roads = RoadsState::of(&found);
         let asked = Instant::now();
-        let _permit = {
+        let permit = {
             let _waiting = self.stats.generations_waiting.enter();
-            self.generations.acquire().await.ok()?
+            self.generations.acquire(priority).await?
         };
-        let permit_wait = asked.elapsed();
+        let (class, permit_wait) = (permit.class(), asked.elapsed());
         let found = match &self.roads {
             Some(roads) if asked_roads != RoadsState::Complete => {
                 let tiles = self.road_tiles(&name, size);
@@ -939,6 +953,7 @@ impl NightLitSource {
                     zoom = name.zoom,
                     ms = started.elapsed().as_millis() as u64,
                     permit_wait_ms = permit_wait.as_millis() as u64,
+                    class = class.label(),
                     road_segments = road.segments,
                     road_raster_us = road.raster_us,
                     road_texels = road.lit_texels,
@@ -964,7 +979,9 @@ impl NightLitSource {
                 None
             }
         };
+        drop(permit);
         self.stats.record_generation(&GenerationRecord {
+            class,
             permit_wait,
             generation: started.elapsed(),
             roads: asked_roads,
@@ -2718,8 +2735,7 @@ mod tests {
             // generation times out on them at once.
             let tiles = tiles_of(&source, &name);
             deadlines_passed(&roads, &tiles, Purpose::Generate);
-            let all = source.generations.available_permits() as u32;
-            let held = source.generations.acquire_many(all).await.unwrap();
+            let held = source.generations.hold_all().await;
             let layout = LitLayout::new(16, 4);
             let ((payload, outcome), ()) =
                 tokio::join!(source.served_payload(&name, &layout), async {
@@ -3641,8 +3657,7 @@ mod tests {
             // The probe answered first, so each read goes straight to the
             // payload in its first poll.
             assert_eq!(source.size(&name).await, source.layout(&name).total_len);
-            let all = source.generations.available_permits() as u32;
-            let held = source.generations.acquire_many(all).await.unwrap();
+            let held = source.generations.hold_all().await;
             // The first read runs the load and waits for a generation permit;
             // the second, polled next, finds the load in flight and joins it.
             let (first, second, ()) = tokio::join!(
@@ -3947,8 +3962,7 @@ mod tests {
             let source = source.with_generator(white.clone());
             let name = lit_name();
             let layout = LitLayout::new(16, 4);
-            let all = source.generations.available_permits() as u32;
-            let held = source.generations.acquire_many(all).await.unwrap();
+            let held = source.generations.hold_all().await;
             // The small levels' read runs the load and waits for a permit;
             // the first visible level's, polled next, joins it.
             let ((_, small), (head, joined), ()) = tokio::join!(
@@ -3968,6 +3982,86 @@ mod tests {
             let key = (name.row, name.col, name.zoom);
             assert!(source.payloads.contains(PayloadPart::Head, key));
             assert!(source.payloads.contains(PayloadPart::Tail, key));
+        }
+
+        // Generation permits by priority (#433).
+
+        /// Lights every texel white and records the column of every
+        /// footprint it generates, in order.
+        #[derive(Default)]
+        struct Order(std::sync::Mutex<Vec<u32>>);
+
+        impl crate::night::generator::LitGenerator for Order {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.lock().unwrap().push(r.name.col);
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn a_free_permit_goes_to_a_first_visible_level_read_before_a_small_level_read() {
+            let (_t, source) = fixture();
+            let order = Arc::new(Order::default());
+            let source = source.with_generator(order.clone());
+            let layout = LitLayout::new(18, 4);
+            let (small, near) = (small_name(0), small_name(1));
+            let mut held = source.generations.hold_all().await;
+            // The small levels' read queues first.
+            let ((_, small_read), (_, near_read), ()) = tokio::join!(
+                source.served_parts(&small, &layout, small_levels(&layout)),
+                source.served_parts(&near, &layout, first_visible(&layout)),
+                async {
+                    counted(&source, |_| source.stats.generations_waiting.now() == 2).await;
+                    held.pop();
+                }
+            );
+            assert_eq!(
+                (small_read, near_read),
+                (ReadOutcome::Generated, ReadOutcome::Generated)
+            );
+            assert_eq!(*order.0.lock().unwrap(), [near.col, small.col]);
+            let snap = source.stats.snapshot();
+            assert_eq!(snap.generation_class(GenerationClass::HeadRead), 1);
+            assert_eq!(snap.generation_class(GenerationClass::TailRead), 1);
+        }
+
+        #[tokio::test]
+        async fn a_first_visible_level_read_joining_a_small_level_reads_load_raises_it() {
+            let (_t, source) = fixture();
+            let order = Arc::new(Order::default());
+            let source = source.with_generator(order.clone());
+            let layout = LitLayout::new(18, 4);
+            let (shared, other) = (small_name(0), small_name(1));
+            let mut held = source.generations.hold_all().await;
+            // `shared`'s small levels queue first, then `other`'s; the read
+            // of `shared`'s first visible level joins the first load and
+            // takes it ahead of `other`'s.
+            let ((_, first), (_, second), (_, joined), ()) = tokio::join!(
+                source.served_parts(&shared, &layout, small_levels(&layout)),
+                source.served_parts(&other, &layout, small_levels(&layout)),
+                source.served_parts(&shared, &layout, first_visible(&layout)),
+                async {
+                    counted(&source, |_| source.stats.generations_waiting.now() == 2).await;
+                    held.pop();
+                }
+            );
+            assert_eq!(
+                (first, second, joined),
+                (
+                    ReadOutcome::Generated,
+                    ReadOutcome::Generated,
+                    ReadOutcome::Joined
+                )
+            );
+            assert_eq!(*order.0.lock().unwrap(), [shared.col, other.col]);
+            assert_eq!(
+                source
+                    .stats
+                    .snapshot()
+                    .generation_class(GenerationClass::HeadRead),
+                1,
+                "admitted as the read that joined it"
+            );
         }
 
         #[tokio::test]
@@ -4245,8 +4339,7 @@ mod tests {
             const HELD: Duration = Duration::from_millis(200);
             let (_t, source) = fixture();
             let source = source.with_generator(Arc::new(White::default()));
-            let all = source.generations.available_permits() as u32;
-            let held = source.generations.acquire_many(all).await.unwrap();
+            let held = source.generations.hold_all().await;
             let (name, layout) = (lit_name(), LitLayout::new(16, 4));
             let ((payload, _), ()) =
                 tokio::join!(source.served_payload(&name, &layout), async move {
@@ -4279,8 +4372,7 @@ mod tests {
             // The roads are still building past their generate deadline.
             let tiles = tiles_of(&source, &name);
             deadlines_passed(&roads, &tiles, Purpose::Generate);
-            let all = source.generations.available_permits() as u32;
-            let held = source.generations.acquire_many(all).await.unwrap();
+            let held = source.generations.hold_all().await;
             let layout = LitLayout::new(16, 4);
             let ((payload, _), ()) = tokio::join!(source.served_payload(&name, &layout), async {
                 // Past the generation's road wait: it now waits for a permit.

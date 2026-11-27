@@ -16,6 +16,7 @@ use std::time::Duration;
 use moka::notification::RemovalCause;
 use tracing::debug;
 
+use super::admission::GenerationClass;
 use super::disk::EntryReject;
 use super::layout::PayloadPart;
 use super::service::RoadsState;
@@ -157,6 +158,8 @@ pub enum WriteBackSkip {
 /// What one generation did, recorded once when it ends.
 #[derive(Debug, Clone, Copy)]
 pub struct GenerationRecord {
+    /// The class its permit was admitted as (#433).
+    pub class: GenerationClass,
     /// From asking for a generation permit to holding one.
     pub permit_wait: Duration,
     /// From holding the permit to the payload (or its failure).
@@ -195,6 +198,8 @@ pub struct LitStatsSnapshot {
     pub probes: [u64; 3],
     /// Generations by their road tiles: complete, timed out, failed.
     pub generation_roads: [u64; 3],
+    /// Generations by the [`GenerationClass`] their permit was admitted as.
+    pub generation_classes: [u64; 3],
     /// Generations that gave no payload (served black).
     pub generations_black: u64,
     /// Generations whose roads timed out and were all ready at the permit.
@@ -233,6 +238,10 @@ impl LitStatsSnapshot {
 
     pub fn generation_roads(&self, roads: RoadsState) -> u64 {
         self.generation_roads[roads as usize]
+    }
+
+    pub fn generation_class(&self, class: GenerationClass) -> u64 {
+        self.generation_classes[class as usize]
     }
 
     pub fn write_backs_skipped(&self, skip: WriteBackSkip) -> u64 {
@@ -290,6 +299,7 @@ impl LitStatsSnapshot {
             reads: each(self.reads, earlier.reads),
             probes: each(self.probes, earlier.probes),
             generation_roads: each(self.generation_roads, earlier.generation_roads),
+            generation_classes: each(self.generation_classes, earlier.generation_classes),
             generations_black: self.generations_black - earlier.generations_black,
             roads_ready_at_permit: self.roads_ready_at_permit - earlier.roads_ready_at_permit,
             write_backs_skipped: each(self.write_backs_skipped, earlier.write_backs_skipped),
@@ -314,6 +324,8 @@ pub struct LitWindow {
     /// Read latency by [`ReadOutcome`], probe included.
     pub reads: [Option<LatencySummary>; 7],
     pub generation_permit_wait: Option<LatencySummary>,
+    /// The same waits by the class each permit was admitted as.
+    pub generation_permit_wait_by_class: [Option<LatencySummary>; 3],
     pub generation: Option<LatencySummary>,
     /// Probe waits for road tiles: probes of footprints their recipe left
     /// dark, with road lights only.
@@ -332,6 +344,10 @@ impl LitWindow {
     pub fn read(&self, outcome: ReadOutcome) -> Option<LatencySummary> {
         self.reads[outcome as usize]
     }
+
+    pub fn generation_permit_wait_of(&self, class: GenerationClass) -> Option<LatencySummary> {
+        self.generation_permit_wait_by_class[class as usize]
+    }
 }
 
 /// The samples of one window, taken out whole under the lock and
@@ -340,6 +356,7 @@ impl LitWindow {
 struct Samples {
     reads: [LatencyWindow; 7],
     generation_permit_wait: LatencyWindow,
+    generation_permit_wait_by_class: [LatencyWindow; 3],
     generation: LatencyWindow,
     probe_road_wait: LatencyWindow,
     probe_permit_wait: LatencyWindow,
@@ -473,6 +490,7 @@ pub struct LitStats {
     reads: Tally<7>,
     probes: Tally<3>,
     generation_roads: Tally<3>,
+    generation_classes: Tally<3>,
     generations_black: AtomicU64,
     roads_ready_at_permit: AtomicU64,
     write_backs_skipped: Tally<5>,
@@ -515,6 +533,7 @@ impl LitStats {
 
     pub fn record_generation(&self, g: &GenerationRecord) {
         self.generation_roads.add(g.roads as usize);
+        self.generation_classes.add(g.class as usize);
         if !g.payload {
             add(&self.generations_black);
         }
@@ -524,6 +543,8 @@ impl LitStats {
         if let Ok(mut w) = self.window.lock() {
             w.samples
                 .generation_permit_wait
+                .record(micros(g.permit_wait));
+            w.samples.generation_permit_wait_by_class[g.class as usize]
                 .record(micros(g.permit_wait));
             w.samples.generation.record(micros(g.generation));
         }
@@ -583,6 +604,7 @@ impl LitStats {
             reads: self.reads.get(),
             probes: self.probes.get(),
             generation_roads: self.generation_roads.get(),
+            generation_classes: self.generation_classes.get(),
             generations_black: get(&self.generations_black),
             roads_ready_at_permit: get(&self.roads_ready_at_permit),
             write_backs_skipped: self.write_backs_skipped.get(),
@@ -614,6 +636,9 @@ impl LitStats {
             delta,
             reads: std::array::from_fn(|i| samples.reads[i].take()),
             generation_permit_wait: samples.generation_permit_wait.take(),
+            generation_permit_wait_by_class: std::array::from_fn(|i| {
+                samples.generation_permit_wait_by_class[i].take()
+            }),
             generation: samples.generation.take(),
             probe_road_wait: samples.probe_road_wait.take(),
             probe_permit_wait: samples.probe_permit_wait.take(),
@@ -649,6 +674,9 @@ impl LitStats {
         let skipped = |s: WriteBackSkip| d.write_backs_skipped(s);
         let miss = |m: DiskMiss| d.disk_misses(m);
         let (head, tail) = (PayloadPart::Head, PayloadPart::Tail);
+        let class = |c: GenerationClass| d.generation_class(c);
+        let class_wait = |c: GenerationClass| ms(w.generation_permit_wait_of(c));
+        use GenerationClass::{HeadRead, Pregeneration, TailRead};
         debug!(
             reads_dark = d.reads(ReadOutcome::Dark),
             reads_blank = d.reads(ReadOutcome::Blank),
@@ -672,6 +700,12 @@ impl LitStats {
             generations = d.generations(),
             generations_black = d.generations_black,
             generation_permit_wait_ms = ms(w.generation_permit_wait),
+            generations_head_read = class(HeadRead),
+            generations_tail_read = class(TailRead),
+            generations_pregeneration = class(Pregeneration),
+            generation_permit_wait_head_read_ms = class_wait(HeadRead),
+            generation_permit_wait_tail_read_ms = class_wait(TailRead),
+            generation_permit_wait_pregeneration_ms = class_wait(Pregeneration),
             generation_ms = ms(w.generation),
             generations_waiting_peak = w.generations_waiting_peak,
             roads_complete = d.generation_roads(RoadsState::Complete),
@@ -750,6 +784,7 @@ mod tests {
 
     fn generation(roads: RoadsState, payload: bool) -> GenerationRecord {
         GenerationRecord {
+            class: GenerationClass::TailRead,
             permit_wait: 3 * MS,
             generation: 40 * MS,
             roads,
@@ -770,6 +805,13 @@ mod tests {
         );
         assert_eq!(ProbeAnswer::Dark as usize + 1, s.probes.len());
         assert_eq!(RoadsState::Failed as usize + 1, s.generation_roads.len());
+        assert_eq!(
+            GenerationClass::Pregeneration as usize + 1,
+            s.generation_classes.len()
+        );
+        for (i, class) in GenerationClass::ALL.into_iter().enumerate() {
+            assert_eq!(class as usize, i);
+        }
         assert_eq!(
             WriteBackSkip::ArtFailed as usize + 1,
             s.write_backs_skipped.len()
@@ -835,6 +877,27 @@ mod tests {
         let w = s.take_window().unwrap();
         assert_eq!(w.generation_permit_wait.unwrap().count, 3);
         assert_eq!(w.generation.unwrap().max_us, 40_000);
+    }
+
+    #[test]
+    fn generation_permit_waits_are_timed_by_class() {
+        let s = LitStats::default();
+        let at = |class, wait| GenerationRecord {
+            class,
+            permit_wait: wait,
+            ..generation(RoadsState::Complete, true)
+        };
+        s.record_generation(&at(GenerationClass::HeadRead, MS));
+        s.record_generation(&at(GenerationClass::Pregeneration, 7 * MS));
+        s.record_generation(&at(GenerationClass::Pregeneration, 9 * MS));
+        assert_eq!(s.snapshot().generation_classes, [1, 0, 2]);
+        let w = s.take_window().unwrap();
+        assert_eq!(w.generation_permit_wait.unwrap().count, 3, "all of them");
+        let of = |c| w.generation_permit_wait_of(c);
+        assert_eq!(of(GenerationClass::HeadRead).unwrap().max_us, 1_000);
+        assert_eq!(of(GenerationClass::TailRead), None);
+        let pregen = of(GenerationClass::Pregeneration).unwrap();
+        assert_eq!((pregen.count, pregen.max_us), (2, 9_000));
     }
 
     #[test]

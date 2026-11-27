@@ -21,6 +21,9 @@
 //! - Concurrent loads of one footprint are one load, whichever parts their
 //!   reads want: a read that misses joins the load in flight, and keeps the
 //!   parts it wants from it.
+//! - A load has the most urgent [`GenerationClass`] of the callers sharing
+//!   it (#433): a caller that joins raises it, so a read joining a
+//!   pre-generation's load waits for a permit as a read.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +33,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use moka::policy::EvictionPolicy;
 
+use super::admission::{GenerationClass, LoadPriority};
 use super::layout::{LitLayout, LitParts, PayloadPart};
 use super::stats::{LitStats, PayloadLookup, PayloadOccupancy};
 
@@ -114,10 +118,15 @@ impl From<Result<Bytes, Uncached>> for Loaded {
     }
 }
 
-/// One load in flight; whichever read runs it, the others wait for its
-/// value. Should the read running it be dropped, a waiting read runs its
-/// own load in its place (`OnceCell`'s rule).
-type LoadSlot = Arc<tokio::sync::OnceCell<Loaded>>;
+/// One load in flight; whichever caller runs it, the others wait for its
+/// value. Should the caller running it be dropped, a waiting one runs its
+/// own load in its place (`OnceCell`'s rule), with the same priority.
+struct Load {
+    value: tokio::sync::OnceCell<Loaded>,
+    priority: Arc<LoadPriority>,
+}
+
+type LoadSlot = Arc<Load>;
 
 /// What [`PayloadMemory::serve`] found for one read.
 #[derive(Debug, Clone)]
@@ -214,20 +223,23 @@ impl PayloadMemory {
         }
     }
 
-    /// The parts of `key`'s payload a read wanting `wanted` is served from:
-    /// from memory when they are all there, else from the footprint's load
-    /// (`load`, run unless another read's load is in flight, which this
-    /// read joins). The load keeps the tail and, when this read wants it,
-    /// the head; a read joining it keeps the head it wants itself.
+    /// The parts of `key`'s payload a caller of `class` wanting `wanted`
+    /// is served from: from memory when they are all there, else from the
+    /// footprint's load (`load`, run unless another caller's load is in
+    /// flight, which this one joins, raising it to `class`). The load keeps
+    /// the tail and, when this caller wants it, the head; a caller joining
+    /// it keeps the head it wants itself. `load` is handed the load's
+    /// priority, for its generation permit.
     pub(crate) async fn serve<F, Fut>(
         &self,
         key: FootprintKey,
         layout: &LitLayout,
         wanted: Wanted,
+        class: GenerationClass,
         load: F,
     ) -> Served
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(Arc<LoadPriority>) -> Fut,
         Fut: Future<Output = Result<Bytes, Uncached>>,
     {
         let cached = self.cached(key, wanted);
@@ -246,7 +258,10 @@ impl PayloadMemory {
             };
         }
         let slot = match self.loads.entry(key) {
-            dashmap::Entry::Occupied(e) => Arc::clone(e.get()),
+            dashmap::Entry::Occupied(e) => {
+                e.get().priority.raise(class);
+                Arc::clone(e.get())
+            }
             dashmap::Entry::Vacant(e) => {
                 // A load that finished since kept its parts before leaving
                 // the map: what it kept is seen here.
@@ -257,14 +272,19 @@ impl PayloadMemory {
                         lookups: lookups(false),
                     };
                 }
-                Arc::clone(e.insert(LoadSlot::default()).value())
+                let load = Load {
+                    value: tokio::sync::OnceCell::new(),
+                    priority: Arc::new(LoadPriority::new(class)),
+                };
+                Arc::clone(e.insert(Arc::new(load)).value())
             }
         };
         let ran = AtomicBool::new(false);
         let loaded = slot
+            .value
             .get_or_init(|| async {
                 ran.store(true, Ordering::Relaxed);
-                let loaded = Loaded::from(load().await);
+                let loaded = Loaded::from(load(Arc::clone(&slot.priority)).await);
                 // No await from here to the slot leaving the map: the parts
                 // are kept before any later read can miss the slot.
                 if let (true, Some(payload)) = (loaded.keep, &loaded.payload) {
@@ -357,6 +377,7 @@ fn part_cache(part: PayloadPart, max_bytes: u64, stats: Arc<LitStats>) -> PartCa
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use GenerationClass::{HeadRead, Pregeneration, TailRead};
 
     /// A ZL18 layout: a 256 px first visible level (32,768 bytes) and a
     /// 10,936-byte tail.
@@ -400,7 +421,8 @@ mod tests {
     /// Serves `wanted` of `row`, counting loads into `loads`.
     async fn serve(m: &PayloadMemory, row: u32, wanted: Wanted, loads: &AtomicUsize) -> Served {
         let l = layout();
-        m.serve(key(row), &l, wanted, || async {
+        let class = GenerationClass::of_read(wanted.contains(PayloadPart::Head));
+        m.serve(key(row), &l, wanted, class, |_| async {
             loads.fetch_add(1, Ordering::SeqCst);
             Ok(payload(&l))
         })
@@ -539,8 +561,10 @@ mod tests {
         let l = layout();
         let whole = payload(&l);
         let given = whole.clone();
-        m.serve(key(0), &l, Wanted::whole(), || async { Ok(given) })
-            .await;
+        m.serve(key(0), &l, Wanted::whole(), HeadRead, |_| async {
+            Ok(given)
+        })
+        .await;
         let (head, tail) = (
             m.get(PayloadPart::Head, key(0)).unwrap(),
             m.get(PayloadPart::Tail, key(0)).unwrap(),
@@ -569,7 +593,7 @@ mod tests {
         for given in [Some(payload(&l)), None] {
             let lit = given.is_some();
             let served = m
-                .serve(key(0), &l, Wanted::whole(), || async {
+                .serve(key(0), &l, Wanted::whole(), HeadRead, |_| async {
                     Err(Uncached(given))
                 })
                 .await;
@@ -584,7 +608,7 @@ mod tests {
         let (m, loads) = (memory(4, 4), AtomicUsize::new(0));
         let l = layout();
         let (release, released) = tokio::sync::oneshot::channel::<()>();
-        let tail_read = m.serve(key(0), &l, tail_only(), || async {
+        let tail_read = m.serve(key(0), &l, tail_only(), TailRead, |_| async {
             loads.fetch_add(1, Ordering::SeqCst);
             released.await.unwrap();
             Ok(payload(&l))
@@ -609,11 +633,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_joining_a_load_raises_its_priority_to_the_reads_class() {
+        let m = memory(4, 4);
+        let l = layout();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (seen_tx, seen) = tokio::sync::oneshot::channel::<Arc<LoadPriority>>();
+        let whole = payload(&l);
+        let pregen = m.serve(
+            key(0),
+            &l,
+            tail_only(),
+            Pregeneration,
+            |priority| async move {
+                seen_tx.send(priority).ok().unwrap();
+                released.await.unwrap();
+                Ok(whole)
+            },
+        );
+        let joined = async {
+            let priority = seen.await.unwrap();
+            assert_eq!(priority.class(), Pregeneration);
+            let loads = AtomicUsize::new(0);
+            let read = serve(&m, 0, head_only(), &loads);
+            futures::pin_mut!(read);
+            assert!(futures::poll!(&mut read).is_pending(), "joined");
+            assert_eq!(priority.class(), HeadRead);
+            release.send(()).unwrap();
+            let served = read.await;
+            assert_eq!(loads.load(Ordering::SeqCst), 0, "no load of its own");
+            served
+        };
+        let (pregen, read) = tokio::join!(pregen, joined);
+        assert_eq!(pregen.lookup(), PayloadLookup::Loaded);
+        assert_eq!(read.lookup(), PayloadLookup::Joined);
+    }
+
+    #[tokio::test]
     async fn a_dropped_load_leaves_the_next_read_to_load() {
         let (m, loads) = (memory(4, 4), AtomicUsize::new(0));
         let l = layout();
         {
-            let pending = m.serve(key(0), &l, tail_only(), std::future::pending);
+            let pending = m.serve(key(0), &l, tail_only(), TailRead, |_| {
+                std::future::pending()
+            });
             futures::pin_mut!(pending);
             assert!(futures::poll!(pending).is_pending());
         }
