@@ -271,14 +271,16 @@ impl SignalWatch {
                     if signal == Signal::Hangup {
                         detach_terminal();
                     }
-                    if let Some(flag) = &shutdown {
-                        flag.store(true, Ordering::SeqCst);
-                    }
                     lock(&first).get_or_insert(signal);
                     {
                         let mut last = lock(&last);
                         let count = last.map_or(0, |(count, _)| count);
                         *last = Some((count + 1, signal));
+                    }
+                    // Recorded first, so whoever sees the flag can read the
+                    // signal that raised it (#471).
+                    if let Some(flag) = &shutdown {
+                        flag.store(true, Ordering::SeqCst);
                     }
                     let Some((action, queue)) = active.request(action(signal, interrupts)) else {
                         // Nothing to protect: behave as if no handler existed.
