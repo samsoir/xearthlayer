@@ -49,6 +49,10 @@ pub struct PopulateStats {
     pub files_indexed: u64,
     /// Number of files skipped (not parseable).
     pub skipped_unparseable: u64,
+    /// Temp files of another process's writes removed: left by a crash
+    /// between a write's creation and its rename (see
+    /// [`crate::cache::layout::temp_file_name`]).
+    pub orphaned_temps_removed: u64,
     /// Total size in bytes.
     pub total_bytes: u64,
 }
@@ -335,6 +339,8 @@ impl LruIndex {
             // Shared atomics for aggregating stats across parallel tasks
             let files_indexed = AtomicU64::new(0);
             let skipped_unparseable = AtomicU64::new(0);
+            let orphaned_temps_removed = AtomicU64::new(0);
+            let pid = std::process::id();
             let total_bytes = AtomicU64::new(0);
 
             region_dirs.par_iter().for_each(|region_dir| {
@@ -365,6 +371,16 @@ impl LruIndex {
                             continue;
                         }
                     };
+
+                    // Another process's temp file is an orphan: nothing
+                    // renames it now. This process's may be a write in
+                    // progress, and names that do not parse are left.
+                    if crate::cache::layout::temp_file_pid(filename).is_some_and(|p| p != pid) {
+                        if std::fs::remove_file(&path).is_ok() {
+                            orphaned_temps_removed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
 
                     let key = match LruIndex::filename_to_key(filename) {
                         Some(k) => k,
@@ -411,6 +427,7 @@ impl LruIndex {
             PopulateStats {
                 files_indexed: files_indexed.load(Ordering::Relaxed),
                 skipped_unparseable: skipped_unparseable.load(Ordering::Relaxed),
+                orphaned_temps_removed: orphaned_temps_removed.load(Ordering::Relaxed),
                 total_bytes: total_bytes.load(Ordering::Relaxed),
             }
         })
@@ -427,6 +444,7 @@ impl LruIndex {
         tracing::debug!(
             files = stats.files_indexed,
             skipped = stats.skipped_unparseable,
+            orphaned_temps_removed = stats.orphaned_temps_removed,
             total_size_mb = stats.total_bytes / 1_000_000,
             avg_size_kb = avg_size_kb,
             "LRU index populated from disk (parallel scan)"
@@ -768,6 +786,41 @@ mod tests {
         assert_eq!(stats.files_indexed, 1);
         assert_eq!(stats.skipped_unparseable, 2);
         assert_eq!(index.entry_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn populate_from_disk_removes_other_processes_temp_files_only() {
+        let temp_dir = TempDir::new().unwrap();
+        write_region_cache_file(temp_dir.path(), "tile:15:100:200", 1000);
+        let entry = key_to_full_path(temp_dir.path(), "tile:15:100:200");
+        let region_dir = entry.parent().unwrap().to_path_buf();
+        let temp = |pid| {
+            let name = crate::cache::layout::temp_file_name(entry.file_name().unwrap(), pid, 3);
+            region_dir.join(name)
+        };
+        let ours = std::process::id();
+        let (orphan, own) = (temp(ours.wrapping_add(1)), temp(ours));
+        let (old_style, unrelated) = (
+            region_dir.join("tile_15_100_200.tmp"),
+            region_dir.join("notes.txt"),
+        );
+        for path in [&orphan, &own, &old_style, &unrelated] {
+            std::fs::write(path, b"half").unwrap();
+        }
+
+        let index = LruIndex::new(temp_dir.path().to_path_buf());
+        let stats = index.populate_from_disk().await.unwrap();
+
+        assert!(!orphan.exists(), "another process's temp file is removed");
+        assert!(own.exists(), "this process's may be a write in progress");
+        assert!(
+            old_style.exists() && unrelated.exists(),
+            "names that do not parse stay"
+        );
+        assert!(entry.exists());
+        assert_eq!(stats.orphaned_temps_removed, 1);
+        assert_eq!((stats.files_indexed, index.entry_count()), (1, 1));
+        assert_eq!(stats.skipped_unparseable, 3, "the three left");
     }
 
     #[tokio::test]

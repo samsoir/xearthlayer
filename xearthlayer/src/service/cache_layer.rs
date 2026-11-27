@@ -66,6 +66,7 @@ use crate::cache::{
 };
 use crate::config::{DEFAULT_DDS_DISK_RATIO, DEFAULT_DISK_CACHE_SIZE, DEFAULT_MEMORY_CACHE_SIZE};
 use crate::metrics::MetricsClient;
+use crate::night::LitMemoryBudget;
 use crate::service::config::ServiceConfig;
 use crate::service::error::ServiceError;
 
@@ -111,6 +112,71 @@ pub fn disk_budgets(disk_size: u64, dds_ratio: f64, night_enabled: bool) -> Disk
         dds,
         chunk: rest.saturating_sub(dds),
         lit,
+    }
+}
+
+/// Night lighting's share of `cache.memory_size`, in percent, taken out of
+/// it once the share reaches [`LitMemoryBudget::FLOOR`] (#432).
+pub const LIT_MEMORY_SHARE_PERCENT: u64 = 15;
+
+/// The tails' share of night lighting's memory above the floor, in
+/// percent; the heads take the rest.
+pub const LIT_TAIL_SHARE_PERCENT: u64 = 40;
+
+/// Memory budgets, in bytes: the ortho memory tier's and night lighting's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudgets {
+    /// The ortho memory tier.
+    pub ortho: u64,
+    /// Night lighting's payload memory; `None` when night lighting is off.
+    pub lit: Option<LitMemoryBudget>,
+}
+
+/// `percent` of `bytes`, rounded down, for any `bytes`.
+fn percent_of(bytes: u64, percent: u64) -> u64 {
+    (u128::from(bytes) * u128::from(percent) / 100) as u64
+}
+
+/// Memory budgets for `memory_size` (`cache.memory_size`), XEL's total
+/// memory cache.
+///
+/// - Night lighting off: the ortho tier gets all of it.
+/// - Night lighting on, its share ([`LIT_MEMORY_SHARE_PERCENT`]) below
+///   [`LitMemoryBudget::FLOOR`]'s total (`memory_size` below about
+///   1.67 GiB): night lighting gets the floor on top, and the ortho tier
+///   still gets all of `memory_size`, as before the share.
+/// - At or above it: the share is taken out of `memory_size`, the ortho
+///   tier gets the rest, and the share is split [`LIT_TAIL_SHARE_PERCENT`]
+///   tail, the rest head, the tail never below the floor's (so up to a
+///   share of 480 MiB the tail stays at the floor's and the head takes the
+///   rest). The floor's two parts sum to the share at the crossover, so
+///   neither part is ever below its floor value, and both only grow with
+///   `memory_size`.
+///
+/// Across the crossover the ortho tier falls from all of `memory_size` to
+/// 85% of it: below, night lighting is added on top; above, taken out.
+pub fn memory_budgets(memory_size: u64, night_enabled: bool) -> MemoryBudgets {
+    if !night_enabled {
+        return MemoryBudgets {
+            ortho: memory_size,
+            lit: None,
+        };
+    }
+    let floor = LitMemoryBudget::FLOOR;
+    let share = percent_of(memory_size, LIT_MEMORY_SHARE_PERCENT);
+    if share < floor.total() {
+        return MemoryBudgets {
+            ortho: memory_size,
+            lit: Some(floor),
+        };
+    }
+    let tail = percent_of(share, LIT_TAIL_SHARE_PERCENT).max(floor.tail);
+    MemoryBudgets {
+        ortho: memory_size - share,
+        lit: Some(LitMemoryBudget {
+            tail,
+            head: share - tail,
+        }),
     }
 }
 
@@ -299,6 +365,10 @@ pub struct CacheLayer {
     /// Memory cache bridge (implements executor::MemoryCache).
     memory_bridge: Arc<MemoryCacheBridge>,
 
+    /// Night lighting's payload memory, decided with the memory tier's;
+    /// `None` when night lighting is off.
+    lit_memory: Option<LitMemoryBudget>,
+
     /// The disk tiers; `None` when disk caching is off.
     disk: Option<DiskTiers>,
 }
@@ -307,7 +377,9 @@ impl CacheLayer {
     /// Create a new cache layer with the given configuration.
     ///
     /// This method:
-    /// 1. Creates memory cache service
+    /// 1. Creates memory cache service, sized by [`memory_budgets`]: all of
+    ///    `cache.memory_size`, or with night lighting on and its share at or
+    ///    above the floor, what night lighting's share leaves
     /// 2. When disk caching is on (`ServiceConfig::disk_cache_enabled`):
     ///    - computes disk budgets: night lighting's 5% first (only when
     ///      enabled), then DDS/chunk from `dds_disk_ratio` of the rest
@@ -337,16 +409,33 @@ impl CacheLayer {
         let memory_size = config
             .cache_memory_size()
             .unwrap_or(DEFAULT_MEMORY_CACHE_SIZE) as u64;
+        // Night lighting's memory comes out of `cache.memory_size` above
+        // its floor (#432); `--no-cache` keeps both, as it keeps memory.
+        let memory_budgets = memory_budgets(memory_size, config.night_enabled());
+        match memory_budgets.lit {
+            Some(lit) => info!(
+                memory_size,
+                ortho_memory_bytes = memory_budgets.ortho,
+                lit_tail_bytes = lit.tail,
+                lit_head_bytes = lit.head,
+                "Memory budgets: ortho memory tier and night lighting"
+            ),
+            None => info!(
+                memory_size,
+                ortho_memory_bytes = memory_budgets.ortho,
+                "Memory budgets: ortho memory tier (night lighting off)"
+            ),
+        }
 
         // Memory cache service (with metrics for self-reporting size)
         let memory_config =
-            ServiceCacheConfig::memory(memory_size, None).with_metrics(metrics.clone());
+            ServiceCacheConfig::memory(memory_budgets.ortho, None).with_metrics(metrics.clone());
         let memory_service = CacheService::start(memory_config)
             .await
             .map_err(|e| ServiceError::CacheError(format!("Memory cache start failed: {}", e)))?;
 
         info!(
-            max_size_bytes = memory_size,
+            max_size_bytes = memory_budgets.ortho,
             "Memory cache service started in CacheLayer"
         );
 
@@ -364,8 +453,15 @@ impl CacheLayer {
         Ok(Self {
             memory_service,
             memory_bridge,
+            lit_memory: memory_budgets.lit,
             disk,
         })
+    }
+
+    /// Night lighting's payload memory this session (see
+    /// [`memory_budgets`]); `None` when night lighting is off.
+    pub fn lit_memory_budget(&self) -> Option<LitMemoryBudget> {
+        self.lit_memory
     }
 
     /// Whether the disk tiers run this session (`false` with `--no-cache`).
@@ -1209,6 +1305,163 @@ mod tests {
                 disk_budgets(10_000_000, DEFAULT_DDS_DISK_RATIO, night)
             );
         }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The smallest `cache.memory_size` whose share reaches the floor.
+    fn crossover() -> u64 {
+        let floor = LitMemoryBudget::FLOOR.total();
+        // ceil(floor * 100 / 15): the share, rounded down, first reaches it.
+        let m = (floor * 100).div_ceil(LIT_MEMORY_SHARE_PERCENT);
+        assert!(percent_of(m - 1, LIT_MEMORY_SHARE_PERCENT) < floor);
+        assert!(percent_of(m, LIT_MEMORY_SHARE_PERCENT) >= floor);
+        m
+    }
+
+    #[test]
+    fn night_off_gives_the_ortho_tier_all_of_the_memory_size() {
+        for m in [0, 1, 512 * MIB, 8_590_000_000, u64::MAX] {
+            assert_eq!(
+                memory_budgets(m, false),
+                MemoryBudgets {
+                    ortho: m,
+                    lit: None
+                }
+            );
+        }
+    }
+
+    /// #432: below about 1.67 GiB night lighting keeps its floor on top,
+    /// and the ortho tier is as it was before the share.
+    #[test]
+    fn below_the_crossover_night_lighting_gets_the_floor_on_top() {
+        let floor = Some(LitMemoryBudget::FLOOR);
+        assert_eq!(
+            LitMemoryBudget::FLOOR,
+            LitMemoryBudget {
+                tail: 192 * MIB,
+                head: 64 * MIB
+            }
+        );
+        for m in [0, 1, 1_000_000, 512 * MIB, 1024 * MIB, crossover() - 1] {
+            assert_eq!(
+                memory_budgets(m, true),
+                MemoryBudgets {
+                    ortho: m,
+                    lit: floor
+                },
+                "memory_size {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_the_crossover_the_floor_is_taken_out_of_the_memory_size() {
+        let m = crossover();
+        let b = memory_budgets(m, true);
+        let lit = b.lit.unwrap();
+        assert_eq!(lit.tail, LitMemoryBudget::FLOOR.tail);
+        assert_eq!(lit.head, percent_of(m, 15) - 192 * MIB);
+        assert!(lit.head >= LitMemoryBudget::FLOOR.head);
+        assert_eq!(b.ortho + lit.total(), m);
+    }
+
+    /// Up to a share of 480 MiB (40% of it is the floor's tail) the tail
+    /// stays at the floor's and the head takes the rest; above, 40/60.
+    #[test]
+    fn above_the_crossover_the_tail_is_forty_percent_never_below_the_floor() {
+        let m = 3 * 1024 * MIB; // share 460.8 MiB: 40% would be 184.3 MiB
+        let lit = memory_budgets(m, true).lit.unwrap();
+        assert_eq!(lit.tail, 192 * MIB);
+        assert_eq!(lit.head, percent_of(m, 15) - 192 * MIB);
+
+        let m = 8_590_000_000; // the brief's example
+        let b = memory_budgets(m, true);
+        let lit = b.lit.unwrap();
+        assert_eq!(b.ortho, 7_301_500_000);
+        assert_eq!(lit.tail, 515_400_000);
+        assert_eq!(lit.head, 773_100_000);
+    }
+
+    #[test]
+    fn above_the_crossover_ortho_and_lit_are_the_memory_size() {
+        let mut m = crossover();
+        while m < u64::MAX / 3 {
+            let b = memory_budgets(m, true);
+            let lit = b.lit.unwrap();
+            assert_eq!(b.ortho as u128 + lit.total() as u128, m as u128, "{m}");
+            m = m * 3 + 7;
+        }
+        let b = memory_budgets(u64::MAX, true);
+        let lit = b.lit.unwrap();
+        assert_eq!(b.ortho as u128 + lit.total() as u128, u64::MAX as u128);
+        assert_eq!(lit.tail, percent_of(percent_of(u64::MAX, 15), 40));
+    }
+
+    /// Neither part ever drops below its floor value, and neither shrinks
+    /// as the memory size grows, across the crossover and 480 MiB share.
+    #[test]
+    fn lit_parts_never_drop_below_the_floor_and_only_grow() {
+        let floor = LitMemoryBudget::FLOOR;
+        let edges = [crossover(), (480 * MIB * 100).div_ceil(15)];
+        let mut sizes: Vec<u64> = (0..=64).map(|i| i * 64 * MIB).collect();
+        for e in edges {
+            sizes.extend((e - 3)..=(e + 3));
+        }
+        sizes.extend([1 << 40, 1 << 50, u64::MAX / 2, u64::MAX]);
+        sizes.sort_unstable();
+        let mut last = floor;
+        for m in sizes {
+            let lit = memory_budgets(m, true).lit.unwrap();
+            assert!(
+                lit.tail >= floor.tail && lit.head >= floor.head,
+                "{m}: {lit:?}"
+            );
+            assert!(
+                lit.tail >= last.tail && lit.head >= last.head,
+                "{m}: {lit:?} after {last:?}"
+            );
+            last = lit;
+        }
+    }
+
+    /// The layer sizes its memory tier by the budgets, and hands night
+    /// lighting its part; `--no-cache` changes neither.
+    #[tokio::test]
+    async fn the_memory_tier_is_what_night_lighting_leaves() {
+        let m = 4 * 1024 * MIB;
+        for disk in [true, false] {
+            let temp_dir = tempdir().unwrap();
+            let config = ServiceConfig::builder()
+                .cache_directory(temp_dir.path().to_path_buf())
+                .cache_memory_size(m as usize)
+                .cache_disk_size(10_000_000)
+                .disk_cache_enabled(disk)
+                .disk_gc_interval(3600)
+                .night_enabled(true)
+                .build();
+            let layer = CacheLayer::new(&config, "test", create_test_metrics())
+                .await
+                .unwrap();
+            let b = memory_budgets(m, true);
+            assert_eq!(layer.raw_memory_cache().max_size_bytes(), b.ortho);
+            assert_eq!(layer.lit_memory_budget(), b.lit);
+            assert!(b.ortho < m);
+            layer.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn night_off_gives_the_memory_tier_all_and_night_lighting_none() {
+        let temp_dir = tempdir().unwrap();
+        let config = create_test_config(temp_dir.path().to_path_buf());
+        let layer = CacheLayer::new(&config, "test", create_test_metrics())
+            .await
+            .unwrap();
+        assert_eq!(layer.raw_memory_cache().max_size_bytes(), 1_000_000);
+        assert_eq!(layer.lit_memory_budget(), None);
+        layer.shutdown().await;
     }
 
     #[tokio::test]

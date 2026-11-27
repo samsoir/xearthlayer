@@ -13,6 +13,11 @@
 //! division. Lit texels are counted once, after drawing. The profile (one
 //! `f32` per texel) is allocated when the first segment reaches the grid,
 //! so a texture with no road nearby costs no heap at all.
+//!
+//! A texture whose first visible level was capped below its density (#431,
+//! `LitLayout::road_supersample`) has its roads rastered at up to twice its
+//! linear resolution, band by band, and each texel is the mean of its
+//! samples: lamps and roads keep their width on the ground.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,7 +40,9 @@ const COS_REACH_FLOOR: f64 = 0.087_155_742_747_658_17; // cos 85 degrees
 /// so lamps reach further only by a sigma floor wider than every class's.
 /// Cheap and allocation free: only the footprint's edges are needed. The
 /// raster culls with it and the has-light probe must use it too, so the two
-/// cannot disagree.
+/// cannot disagree. A supersampled raster culls with the reach at its
+/// sample size, never wider than the texture's, which the probe keeps: the
+/// probe may answer lit where the raster draws nothing, never the reverse.
 pub fn reach_deg(name: &DdsFilename, size: u32, model: &RoadModel) -> f64 {
     let fp = Footprint::from_name(name);
     let metres_per_degree = EARTH_RADIUS_M.to_radians();
@@ -134,30 +141,123 @@ impl RoadField {
         tiles: &[Arc<MergedRoads>],
         model: &RoadModel,
     ) -> Self {
+        Self::raster_supersampled(name, size, 1, tiles, model)
+    }
+
+    /// [`Self::raster`] with `supersample` x `supersample` samples per texel
+    /// (#431): the roads are rastered at `size * supersample` texels a side
+    /// and each texel is the mean of its samples. The generator scales a
+    /// profile value linearly into the light it adds (in linear light), so
+    /// the mean of the samples is the linear-light mean of their light. A
+    /// glow's sigma is never below a texel's ground size, so a texture
+    /// whose first visible level was capped below its density would widen
+    /// its lamps and roads; rastered at the density and averaged down, they
+    /// keep their width on the ground. 1 (or 0) is [`Self::raster`] itself.
+    ///
+    /// Drawn in bands of [`SUPERSAMPLE_BAND_ROWS`] texel rows, each band's
+    /// samples averaged into the profile before the next is drawn, so no
+    /// whole raster at the sample size is held: beside the `size * size`
+    /// profile (16 MiB at 2048 px), one band of samples (4 MiB for a 2048
+    /// px texture at 2, against 64 MiB for the whole 4096 px raster) and
+    /// the sample grid's per-row and per-column tables (about 200 KiB).
+    /// A chain near two bands is visited by both, and its segments counted
+    /// in both. The has-light probe and the road tiles keep the reach of the
+    /// texture's own size, wider than the samples' (a texel is larger), so
+    /// they never leave out a road the raster draws.
+    pub fn raster_supersampled(
+        name: &DdsFilename,
+        size: u32,
+        supersample: u32,
+        tiles: &[Arc<MergedRoads>],
+        model: &RoadModel,
+    ) -> Self {
         let started = Instant::now();
         if size == 0 {
             return Self::empty(size);
         }
+        let s = supersample.max(1);
         let fp = Footprint::from_name(name);
-        let reach = reach_deg(name, size, model);
-        // Built when the first tile with a chain near the footprint turns up.
-        let mut canvas: Option<Canvas> = None;
-        let mut pts: Vec<(f64, f64)> = Vec::new();
-        let mut segments = 0usize;
-        for tile in tiles {
-            // The chains near the footprint and its reach, in the tile's
-            // own longitudes; a tile across the antimeridian is drawn
-            // `shift` degrees over, beside the footprint.
+        let samples = size * s;
+        let mut drawer = Drawer {
+            tiles,
+            model,
+            reach: reach_deg(name, samples, model),
+            pts: Vec::new(),
+            segments: 0,
+        };
+        let profile = if s == 1 {
+            // One band, the whole grid, built when the first tile with a
+            // chain near the footprint turns up.
+            let mut canvas = None;
+            drawer.draw(&fp, &mut canvas, || {
+                Canvas::new(Grid::new(name, size), 0..size as usize)
+            });
+            canvas.map(|c| c.profile)
+        } else {
+            drawer.draw_supersampled(name, &fp, size, s)
+        };
+        let Some(profile) = profile else {
+            return Self::empty(size);
+        };
+        // Texels above zero, counted once when drawing is done.
+        let lit_texels = profile.iter().filter(|&&v| v > 0.0).count();
+        Self {
+            size,
+            // A window can reach the grid without lighting a texel.
+            profile: if lit_texels == 0 { Vec::new() } else { profile },
+            stats: RoadFieldStats {
+                segments: drawer.segments,
+                raster_us: started.elapsed().as_micros() as u64,
+                lit_texels,
+            },
+        }
+    }
+}
+
+/// Texel rows a supersampled raster draws at a time (#431): 128 rows of a
+/// 2048 px texture at 2 samples a side are 256 sample rows of 4096, 4 MiB.
+/// Smaller bands hold less but visit the chains near a band edge more
+/// often: over a dense ZL14 tile (`capped_road_field_timing`) 64 rows took
+/// about 6% more than 128 and 32 rows about 20%, while 256 gained nothing.
+pub const SUPERSAMPLE_BAND_ROWS: u32 = 128;
+
+/// What a raster draws with, and what it counts.
+struct Drawer<'a> {
+    tiles: &'a [Arc<MergedRoads>],
+    model: &'a RoadModel,
+    /// [`reach_deg`] at the size the chains are drawn at.
+    reach: f64,
+    /// A chain's points in Mercator metres, reused from chain to chain.
+    pts: Vec<(f64, f64)>,
+    segments: usize,
+}
+
+impl Drawer<'_> {
+    /// Draws every chain of the tiles near `window` (a footprint, or a band
+    /// of one) and its reach onto `canvas`, built by `make` when the first
+    /// such chain turns up.
+    fn draw(&mut self, window: &Footprint, canvas: &mut Option<Canvas>, make: impl Fn() -> Canvas) {
+        let Self {
+            tiles,
+            model,
+            reach,
+            pts,
+            segments,
+        } = self;
+        for tile in tiles.iter() {
+            // The chains near the window and its reach, in the tile's own
+            // longitudes; a tile across the antimeridian is drawn `shift`
+            // degrees over, beside the footprint.
             let RoadWindow {
                 shift,
                 south,
                 west,
                 north,
                 east,
-            } = RoadWindow::new(&fp, reach, tile.tile.1);
+            } = RoadWindow::new(window, *reach, tile.tile.1);
             let mut northings: Option<Northings> = None;
             tile.for_each_chain_near(south, west, north, east, |chain| {
-                let canvas = canvas.get_or_insert_with(|| Canvas::new(Grid::new(name, size)));
+                let canvas = canvas.get_or_insert_with(&make);
                 let ys = northings.get_or_insert_with(|| Northings::new(&chain, south, north));
                 let p = model.classes[chain.class().index()];
                 pts.clear();
@@ -169,34 +269,64 @@ impl RoadField {
                             (mercator(0.0, lon + shift).0, ys.at(step, lat))
                         }),
                 );
-                segments += pts.len().saturating_sub(1);
+                *segments += pts.len().saturating_sub(1);
                 match model.lamps {
-                    None => canvas.draw_glow(&pts, p),
+                    None => canvas.draw_glow(pts, p),
                     Some(l) => {
                         let first = chain.points().next().unwrap_or_default();
-                        canvas.draw_lamps(&pts, chain_key(first), &l, p);
+                        canvas.draw_lamps(pts, chain_key(first), &l, p);
                     }
                 }
             });
         }
-        let Some(canvas) = canvas else {
-            return Self::empty(size);
-        };
-        let lit_texels = canvas.lit();
-        Self {
-            size,
-            // A window can reach the grid without lighting a texel.
-            profile: if lit_texels == 0 {
-                Vec::new()
-            } else {
-                canvas.profile
-            },
-            stats: RoadFieldStats {
-                segments,
-                raster_us: started.elapsed().as_micros() as u64,
-                lit_texels,
-            },
+    }
+
+    /// The `size * size` profile of the footprint `fp` of `name`, each
+    /// texel the mean of its `s` x `s` samples, drawn band by band; `None`
+    /// when no chain is near the footprint (no grid, no buffer).
+    fn draw_supersampled(
+        &mut self,
+        name: &DdsFilename,
+        fp: &Footprint,
+        size: u32,
+        s: u32,
+    ) -> Option<Vec<f32>> {
+        let any_near = self.tiles.iter().any(|tile| {
+            let w = RoadWindow::new(fp, self.reach, tile.tile.1);
+            let mut near = false;
+            tile.for_each_chain_near(w.south, w.west, w.north, w.east, |_| near = true);
+            near
+        });
+        if !any_near {
+            return None;
         }
+        let (size, s) = (size as usize, s as usize);
+        let samples = size * s;
+        let band = SUPERSAMPLE_BAND_ROWS as usize * s;
+        let mut canvas = Some(Canvas::new(Grid::new(name, samples as u32), 0..0));
+        let mut profile: Option<Vec<f32>> = None;
+        for r0 in (0..samples).step_by(band) {
+            let rows = r0..(r0 + band).min(samples);
+            let c = canvas.as_mut().expect("built above");
+            c.start_band(rows.clone());
+            // The band between its sample rows' centres: a chain within
+            // reach of a sample is within reach of that box.
+            let window = Footprint {
+                north: c.grid.lats[rows.start],
+                south: c.grid.lats[rows.end - 1],
+                ..*fp
+            };
+            self.draw(&window, &mut canvas, || {
+                unreachable!("the canvas is built before the bands")
+            });
+            let c = canvas.as_ref().expect("built above");
+            if !c.drawn {
+                continue;
+            }
+            let out = profile.get_or_insert_with(|| vec![0f32; size * size]);
+            c.mean_into(out, size, s);
+        }
+        Some(profile.unwrap_or_default())
     }
 }
 
@@ -257,6 +387,8 @@ fn cos_lat_of(y: f64) -> f64 {
 /// them.
 struct Grid {
     size: usize,
+    /// Per row, degrees, descending (north row first).
+    lats: Vec<f64>,
     /// Per column, ascending.
     xs: Vec<f64>,
     /// Per row, descending (north row first).
@@ -290,6 +422,7 @@ impl Grid {
             inv_texel: texel.iter().map(|t| 1.0 / t).collect(),
             inv_dx: inverse(dx),
             inv_dy: inverse((ys[0] - ys[last]) / last.max(1) as f64),
+            lats,
             xs,
             ys,
             cos,
@@ -347,25 +480,60 @@ fn lamp_positions(pts: &[(f64, f64)], key: i64, l: &LampParams, mut f: impl FnMu
     }
 }
 
-/// A grid and the profile drawn on it (allocated by the first draw that
-/// reaches the grid).
+/// A grid and the profile drawn on its rows `rows` (allocated by the first
+/// draw that reaches them): every row, or one band of a supersampled raster.
 struct Canvas {
     grid: Grid,
+    rows: std::ops::Range<usize>,
+    /// `rows.len()` rows of `grid.size`, the first of them row `rows.start`.
     profile: Vec<f32>,
+    /// Whether a draw has reached the rows since the band started.
+    drawn: bool,
 }
 
 impl Canvas {
-    fn new(grid: Grid) -> Self {
+    fn new(grid: Grid, rows: std::ops::Range<usize>) -> Self {
         Self {
             grid,
+            rows,
             profile: Vec::new(),
+            drawn: false,
         }
     }
 
-    /// Texels above zero, counted once when drawing is done rather than
-    /// on every draw.
-    fn lit(&self) -> usize {
-        self.profile.iter().filter(|&&v| v > 0.0).count()
+    /// Clears the canvas for the band `rows`, keeping its buffer (a band
+    /// is never longer than the first).
+    fn start_band(&mut self, rows: std::ops::Range<usize>) {
+        if self.drawn {
+            self.profile.fill(0.0);
+        }
+        self.rows = rows;
+        self.drawn = false;
+    }
+
+    /// Writes the mean of each `s` x `s` block of samples of the band into
+    /// the texel of `out` (a `size` x `size` profile) it covers: the band's
+    /// rows `s * i` to `s * i + s - 1` are texel row `i`. Samples are added
+    /// row by row, west first, then scaled by `1 / s^2`.
+    fn mean_into(&self, out: &mut [f32], size: usize, s: usize) {
+        let width = self.grid.size;
+        let scale = 1.0 / (s * s) as f32;
+        let first = self.rows.start / s;
+        for (k, band_rows) in self.profile[..self.rows.len() * width]
+            .chunks_exact(s * width)
+            .enumerate()
+        {
+            let row = &mut out[(first + k) * size..(first + k + 1) * size];
+            for (j, texel) in row.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                for sample_row in band_rows.chunks_exact(width) {
+                    for &v in &sample_row[s * j..s * j + s] {
+                        sum += v;
+                    }
+                }
+                *texel = sum * scale;
+            }
+        }
     }
 
     /// The class glow along each segment of a polyline.
@@ -410,12 +578,14 @@ impl Canvas {
         let j1 = partition_from(&g.xs, col(xmax) + 1.0, |x| x <= xmax);
         let i0 = partition_from(&g.ys, row(ymax), |y| y > ymax);
         let i1 = partition_from(&g.ys, row(ymin) + 1.0, |y| y >= ymin);
+        let (i0, i1) = (i0.max(self.rows.start), i1.min(self.rows.end));
         if j0 >= j1 || i0 >= i1 {
             return;
         }
         if self.profile.is_empty() {
-            self.profile = vec![0f32; g.size * g.size];
+            self.profile = vec![0f32; self.rows.len() * g.size];
         }
+        self.drawn = true;
         let seg = Segment::new(a, b);
         let sigma = (sigma_m, 1.0 / sigma_m);
         for i in i0..i1 {
@@ -437,7 +607,8 @@ impl Canvas {
         let (a, (vx, vy)) = (seg.a, seg.v);
         let dy = g.ys[i] - a.1;
         let along_y = dy * vy;
-        let row = &mut self.profile[i * g.size..(i + 1) * g.size];
+        let at = (i - self.rows.start) * g.size;
+        let row = &mut self.profile[at..at + g.size];
         // Branch and table free, so it vectorises: every texel of the window
         // computes its value (0 out of reach) and keeps the larger. Inside
         // the core `u` is 0 and the fall-off exactly 1, so the core needs no
@@ -928,8 +1099,8 @@ pub(crate) mod tests {
         let n = name_at_zoom(46.5, 6.5, 16);
         for size in [64u32, 200] {
             let (mut fast, mut slow) = (
-                Canvas::new(Grid::new(&n, size)),
-                Canvas::new(Grid::new(&n, size)),
+                Canvas::new(Grid::new(&n, size), 0..size as usize),
+                Canvas::new(Grid::new(&n, size), 0..size as usize),
             );
             let g = &fast.grid;
             let (x0, x1) = (g.xs[0], g.xs[g.size - 1]);
@@ -956,8 +1127,9 @@ pub(crate) mod tests {
                 fast.stamp(a, b, hw, sigma, p.intensity);
                 stamp_everywhere(&mut slow, (a, b), hw, sigma, p.intensity);
             }
-            assert!(fast.lit() > 0);
-            assert_eq!(fast.lit(), slow.lit(), "{size} px");
+            let lit = |c: &Canvas| c.profile.iter().filter(|&&v| v > 0.0).count();
+            assert!(lit(&fast) > 0);
+            assert_eq!(lit(&fast), lit(&slow), "{size} px");
             let differ = fast
                 .profile
                 .iter()
@@ -1320,7 +1492,7 @@ pub(crate) mod tests {
     }
 
     /// FNV-1a over the bits of every texel of `f`.
-    fn field_digest(f: &RoadField) -> u64 {
+    pub(crate) fn field_digest(f: &RoadField) -> u64 {
         (0..f.size())
             .flat_map(|i| (0..f.size()).map(move |j| (i, j)))
             .fold(0xcbf2_9ce4_8422_2325u64, |h, (i, j)| {
@@ -1347,6 +1519,133 @@ pub(crate) mod tests {
             "{:016x}",
             field_digest(&f)
         );
+    }
+
+    #[test]
+    fn lamps_are_drawn_byte_for_byte_as_before_the_supersampled_raster() {
+        // Digests taken before the supersampled raster (#431): a raster at
+        // one sample per texel draws exactly what it drew.
+        for (zoom, size, want) in [
+            (16, 512, 0x2514_c5c1_f65c_0b83u64),
+            (14, 256, 0x8564_acec_7479_07a5),
+        ] {
+            let n = name_at_zoom(46.5, 6.5, zoom);
+            let roads = [street_grid_over(&n, 150.0), crossing(&n)];
+            let f = RoadField::raster(&n, size, &roads, &RoadModel::DEFAULT);
+            assert!(f.stats.lit_texels > size as usize * 8, "{:?}", f.stats);
+            let got = field_digest(&f);
+            assert_eq!(got, want, "ZL{zoom} {size} px: {got:016x}");
+        }
+    }
+
+    /// Roads over a ZL14 texture that span the bands of a supersampled
+    /// raster: a street grid, a motorway north to south and a diagonal
+    /// corner to corner.
+    fn roads_across_bands(n: &DdsFilename) -> Vec<Arc<MergedRoads>> {
+        let f = Footprint::from_name(n);
+        let diagonal = merged(
+            (46, 6),
+            &[(
+                30,
+                vec![
+                    (f.west - 0.01, f.north + 0.01),
+                    (f.east + 0.01, f.south - 0.01),
+                ],
+            )],
+        );
+        vec![street_grid_over(n, 400.0), crossing(n), diagonal]
+    }
+
+    /// The `size` x `size` means of each 2 x 2 block of `fine`, added row
+    /// by row, west first.
+    fn mean_of_blocks(fine: &RoadField, size: u32) -> Vec<f32> {
+        (0..size)
+            .flat_map(|i| (0..size).map(move |j| (i, j)))
+            .map(|(i, j)| {
+                let sum = fine.at(2 * i, 2 * j)
+                    + fine.at(2 * i, 2 * j + 1)
+                    + fine.at(2 * i + 1, 2 * j)
+                    + fine.at(2 * i + 1, 2 * j + 1);
+                sum * 0.25
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_supersampled_raster_is_the_mean_of_the_raster_at_twice_the_size() {
+        // A capped ZL14 texture: its roads rastered at twice its size and
+        // averaged, texel for texel and bit for bit, in bands or not.
+        let n = name_at_zoom(46.5, 6.5, 14);
+        let size = 256;
+        assert!(size >= 2 * SUPERSAMPLE_BAND_ROWS, "several bands");
+        let roads = roads_across_bands(&n);
+        for model in [RoadModel::DEFAULT, GLOW] {
+            let fine = RoadField::raster(&n, 2 * size, &roads, &model);
+            let want = mean_of_blocks(&fine, size);
+            let got = RoadField::raster_supersampled(&n, size, 2, &roads, &model);
+            assert_eq!(got.size(), size);
+            let lit = want.iter().filter(|&&v| v > 0.0).count();
+            assert!(lit > size as usize * 8, "{lit} lit");
+            assert_eq!(got.stats.lit_texels, lit);
+            let differ = (0..size)
+                .flat_map(|i| (0..size).map(move |j| (i, j)))
+                .filter(|&(i, j)| got.at(i, j).to_bits() != want[(i * size + j) as usize].to_bits())
+                .count();
+            assert_eq!(differ, 0, "lamps {}", model.lamps.is_some());
+        }
+    }
+
+    #[test]
+    fn a_supersampled_road_is_narrower_than_one_rastered_at_the_capped_size() {
+        // ZL14 at the full setting: capped to 2048 px, 13 m texels at
+        // 46.5 N, wider than a motorway's 10 m sigma; its 4096 px samples
+        // are 6.6 m.
+        let n = name_at_zoom(46.5, 6.5, 14);
+        let layout = crate::night::LitLayout::new(14, 4);
+        let (size, s) = (layout.first_visible, layout.road_supersample());
+        assert_eq!((size, s), (2048, 2));
+        let roads = [crossing(&n)];
+        for model in [RoadModel::DEFAULT, GLOW] {
+            let wide = RoadField::raster(&n, size, &roads, &model);
+            let fine = RoadField::raster_supersampled(&n, size, s, &roads, &model);
+            let light = |f: &RoadField| -> f64 {
+                (0..size)
+                    .filter_map(|i| f.row(i))
+                    .flatten()
+                    .map(|&v| f64::from(v))
+                    .sum()
+            };
+            let lamps = model.lamps.is_some();
+            assert!(fine.stats.lit_texels > 0, "lamps {lamps}");
+            assert!(
+                fine.stats.lit_texels < wide.stats.lit_texels,
+                "lamps {lamps}: {} lit against {}",
+                fine.stats.lit_texels,
+                wide.stats.lit_texels
+            );
+            assert!(light(&fine) < light(&wide), "lamps {lamps}");
+        }
+    }
+
+    #[test]
+    fn supersampling_by_one_is_the_raster() {
+        let n = name_at_zoom(46.5, 6.5, 16);
+        let roads = [street_grid_over(&n, 150.0), crossing(&n)];
+        let once = RoadField::raster_supersampled(&n, 256, 1, &roads, &RoadModel::DEFAULT);
+        let raster = RoadField::raster(&n, 256, &roads, &RoadModel::DEFAULT);
+        assert_eq!(field_digest(&once), field_digest(&raster));
+    }
+
+    #[test]
+    fn a_supersampled_raster_without_a_road_near_is_empty_and_allocates_nothing() {
+        let n = name_at_zoom(46.5, 6.5, 14);
+        let far = merged((47, 6), &[(100, vec![(6.5, 47.9), (6.6, 47.9)])]);
+        for tiles in [vec![], vec![far]] {
+            let f = RoadField::raster_supersampled(&n, 256, 2, &tiles, &RoadModel::DEFAULT);
+            assert!(f.is_empty() && !f.allocated());
+            assert_eq!(f.size(), 256);
+            assert!(f.row(0).is_none());
+        }
     }
 
     #[test]
@@ -1430,7 +1729,7 @@ pub(crate) mod tests {
         // One lamp (the chain is shorter than the spacing) on a texel centre:
         // its value there and three texels east, and that distance.
         let draw = |l: LampParams| {
-            let mut c = Canvas::new(Grid::new(&n, 512));
+            let mut c = Canvas::new(Grid::new(&n, 512), 0..512);
             let at = (c.grid.xs[256], c.grid.ys[256]);
             c.draw_lamps(&[at, at], 0, &l, p);
             let metres = (c.grid.xs[259] - c.grid.xs[256]) * c.grid.cos[256];
@@ -1632,6 +1931,51 @@ pub(crate) mod tests {
                     field.stats.segments, field.stats.lit_texels
                 );
                 assert!(!field.is_empty());
+            }
+        }
+    }
+
+    /// Release-build timing of a capped ZL14 texture (2048 px at the full
+    /// setting, #431) over a dense urban tile: its roads at 2048 px, at 2048
+    /// px supersampled by 2 (in bands), and at 4096 px in one piece; run
+    /// with `cargo test --release -p xearthlayer --lib
+    /// capped_road_field_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn capped_road_field_timing() {
+        let n = name_at_zoom(46.5, 6.5, 14);
+        let f = Footprint::from_name(&n);
+        let mut c = Chains::new();
+        // The whole tile at a 207 m pitch, and the footprint at 80 m.
+        street_grid(&mut c, (0.0, 1.0), (0.0, 1.0), 207.0, 0);
+        let rel = |v: f64, o: i32| (v - f64::from(o)) as f32;
+        street_grid(
+            &mut c,
+            (rel(f.south, 46), rel(f.north, 46)),
+            (rel(f.west, 6), rel(f.east, 6)),
+            80.0,
+            0,
+        );
+        let chains = c.len();
+        let tile = [merge_tile((46, 6), c)];
+        println!("chains in the tile: {chains}");
+        for (label, model) in [("glow", GLOW), ("lamps", RoadModel::DEFAULT)] {
+            let runs: [(&str, u32, u32); 3] = [
+                ("2048 px", 2048, 1),
+                ("2048 px x2", 2048, 2),
+                ("4096 px", 4096, 1),
+            ];
+            for (raster, size, s) in runs {
+                for pass in ["cold", "warm"] {
+                    let started = std::time::Instant::now();
+                    let field = RoadField::raster_supersampled(&n, size, s, &tile, &model);
+                    let ms = started.elapsed().as_secs_f64() * 1e3;
+                    println!(
+                        "ZL14 {raster} {label} {pass}: {ms:.1} ms, segments {}, lit texels {}",
+                        field.stats.segments, field.stats.lit_texels
+                    );
+                    assert!(!field.is_empty());
+                }
             }
         }
     }

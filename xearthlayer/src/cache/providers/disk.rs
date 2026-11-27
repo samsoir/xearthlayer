@@ -293,10 +293,82 @@ impl DiskCacheProvider {
     }
 }
 
+/// Numbers each write's temp file, so concurrent writes in this process
+/// never share one.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// A temp path of its own for one write of `path`, beside it:
+/// `{file name}.{pid}.{n}.tmp`. Two writes of one key are possible at once
+/// (a lit head read regenerating while a small-level load's write-back is
+/// pending, #432); sharing one temp name, the second `create` truncated the
+/// first's file, the first rename published it short, and the second
+/// rename failed. The name still ends in `.tmp`, which `cache clear`
+/// accepts in a region (`layout::holds_only_cache_entries`) and the index
+/// scan skips (it reads `*.cache` only), as it did the old name.
+///
+/// A temp file left by a crash between its creation and its rename is
+/// removed at the next start's index scan, once its process is gone.
+fn temp_path_for(path: &std::path::Path) -> PathBuf {
+    let n = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let entry = path.file_name().unwrap_or_default();
+    path.with_file_name(crate::cache::layout::temp_file_name(
+        entry,
+        std::process::id(),
+        n,
+    ))
+}
+
+/// Writes `parts`, in order, as the file at `path`: to a temp file of its
+/// own beside it ([`temp_path_for`]), renamed over `path` once every part
+/// is written, so a reader never sees a torn file at the live path. The
+/// temp file is removed on any failure. Creates the parent directory (the
+/// region's, on its first write). Not fsynced before the rename, as this
+/// tier's writes never were (see `docs/dev/cache-integrity-design.md`).
+/// Blocking I/O.
+fn write_parts(path: &std::path::Path, parts: &[Bytes]) -> std::io::Result<()> {
+    let temp_path = temp_path_for(path);
+    let written = write_temp(path, &temp_path, parts);
+    match written.and_then(|()| std::fs::rename(&temp_path, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
+}
+
+/// The first step of [`write_parts`]: `parts` written to `temp_path`, the
+/// parent directory of `path` created first.
+fn write_temp(
+    path: &std::path::Path,
+    temp_path: &std::path::Path,
+    parts: &[Bytes],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(temp_path)?;
+    for part in parts {
+        file.write_all(part)?;
+    }
+    Ok(())
+}
+
 impl Cache for DiskCacheProvider {
     fn set(&self, key: &str, value: Bytes) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
+        self.set_parts(key, vec![value])
+    }
+
+    /// The parts are written to the file one after another, never joined
+    /// into one buffer, in one blocking task.
+    fn set_parts(
+        &self,
+        key: &str,
+        parts: Vec<Bytes>,
+    ) -> BoxFuture<'_, Result<(), ServiceCacheError>> {
         let path = self.key_path(key);
-        let size = value.len() as u64;
+        let size = parts.iter().map(|p| p.len() as u64).sum::<u64>();
         let key_owned = key.to_string();
 
         Box::pin(async move {
@@ -308,20 +380,10 @@ impl Cache for DiskCacheProvider {
                 "Disk cache write starting"
             );
 
-            // Ensure parent directory exists (creates region dir on first write)
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(ServiceCacheError::Io)?;
-            }
-
-            // Write atomically via temp file
-            let temp_path = path.with_extension("tmp");
-            tokio::fs::write(&temp_path, &value)
+            let target = path.clone();
+            tokio::task::spawn_blocking(move || write_parts(&target, &parts))
                 .await
-                .map_err(ServiceCacheError::Io)?;
-            tokio::fs::rename(&temp_path, &path)
-                .await
+                .map_err(|e| ServiceCacheError::Io(std::io::Error::other(e)))?
                 .map_err(ServiceCacheError::Io)?;
 
             // Update LRU index after successful write
@@ -576,6 +638,121 @@ mod tests {
         provider.set(key, entry.clone()).await.unwrap();
 
         assert_eq!(provider.get(key).await.unwrap(), Some(entry));
+    }
+
+    /// The `*.tmp` files in the directory of `path`.
+    fn temp_files_beside(path: &std::path::Path) -> usize {
+        std::fs::read_dir(path.parent().unwrap())
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn each_write_of_one_path_has_a_temp_file_of_its_own_beside_it() {
+        let path = std::path::Path::new("/cache/night/+37-123/lit_16_25312_10528.cache");
+        let (a, b) = (temp_path_for(path), temp_path_for(path));
+        assert_ne!(a, b);
+        for temp in [&a, &b] {
+            assert_eq!(temp.parent(), path.parent());
+            let name = temp.file_name().unwrap().to_str().unwrap();
+            assert!(name.starts_with("lit_16_25312_10528.cache."), "{name}");
+            assert!(name.ends_with(".tmp"), "{name}");
+        }
+    }
+
+    #[test]
+    fn two_interleaved_writes_of_one_path_leave_one_complete_entry_and_no_temp_file() {
+        // The first write's file is written, then the second's, before
+        // either is renamed: with one shared temp name the second truncated
+        // the first's, the first rename published the second's bytes so
+        // far, and the second rename found no file.
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("+37-123").join("lit_16_25312_10528.cache");
+        let first = vec![Bytes::from(vec![1u8; 4096]), Bytes::from(vec![2u8; 4096])];
+        let second = vec![Bytes::from(vec![3u8; 8192])];
+        let (temp_a, temp_b) = (temp_path_for(&path), temp_path_for(&path));
+        write_temp(&path, &temp_a, &first).unwrap();
+        write_temp(&path, &temp_b, &second).unwrap();
+        std::fs::rename(&temp_a, &path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            [&first[0][..], &first[1][..]].concat()
+        );
+        std::fs::rename(&temp_b, &path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            &second[0][..],
+            "the later write, whole"
+        );
+        assert_eq!(temp_files_beside(&path), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_of_one_key_leave_one_complete_entry_and_no_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+        let entry = |b: u8| Bytes::from([b"XELL".as_slice(), &vec![b; 1 << 16]].concat());
+        let writes = (0..8u8).map(|b| {
+            let provider = Arc::clone(&provider);
+            async move { provider.set(key, entry(b)).await }
+        });
+        for written in futures::future::join_all(writes).await {
+            written.unwrap();
+        }
+        let stored = provider.get(key).await.unwrap().expect("an entry");
+        assert!((0..8u8).any(|b| stored == entry(b)), "one write's, whole");
+        assert_eq!(temp_files_beside(&provider.key_path(key)), 0);
+    }
+
+    #[test]
+    fn a_leftover_temp_file_is_a_cache_entry_to_clear_and_none_to_index() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("+37-123").join("tile_12_1_2.cache");
+        let leftover = temp_path_for(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&leftover, b"half").unwrap();
+        assert!(crate::cache::layout::holds_only_cache_entries(
+            path.parent().unwrap()
+        ));
+        let name = leftover.file_name().unwrap().to_str().unwrap();
+        assert_eq!(LruIndex::filename_to_key(name), None);
+    }
+
+    #[tokio::test]
+    async fn an_entry_written_in_parts_is_their_concatenation() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+        let (header, payload) = (Bytes::from_static(b"XELL"), Bytes::from(vec![7u8; 64]));
+        provider
+            .set_parts(key, vec![header.clone(), payload.clone()])
+            .await
+            .unwrap();
+        let joined = Bytes::from([&header[..], &payload[..]].concat());
+        assert_eq!(provider.get(key).await.unwrap(), Some(joined.clone()));
+        assert_eq!(provider.size_bytes(), joined.len() as u64);
+        let path = provider.key_path(key);
+        assert_eq!(temp_files_beside(&path), 0, "renamed into place");
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_leaves_no_temp_file_and_no_entry() {
+        let temp = TempDir::new().unwrap();
+        let provider = lit_provider(&temp);
+        let key = "lit:16:25312:10528";
+        // A directory where the entry goes: the rename over it fails.
+        let path = provider.key_path(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        let parts = vec![Bytes::from_static(b"XELL"), Bytes::from(vec![7u8; 64])];
+        assert!(provider.set_parts(key, parts).await.is_err());
+        assert_eq!(temp_files_beside(&path), 0);
+        assert_eq!(provider.entry_count(), 0);
     }
 
     #[tokio::test]

@@ -277,11 +277,22 @@ transient disk error) now also degrades to a logged miss rather than
 propagating as `Err` to the caller: the tile regenerates from the next tier
 up instead of failing the request outright.
 
-`set()` on this provider performs its own async atomic write — a
-`tokio::fs::write` to a sibling `.tmp` path followed by `tokio::fs::rename`
-— rather than calling `io::write_atomic`, which takes a synchronous
-`std::fs::File` and would block the async runtime if called directly. This
-write is atomic (a reader never observes a torn file at the live path) but
+`set()` on this provider performs its own atomic write rather than calling
+`io::write_atomic`. Since #432 it is `set_parts` with one part: one
+`spawn_blocking` task writes the parts one after another to a temp file of
+its own beside the entry, `{file}.{pid}.{n}.tmp` from a process-wide
+counter, then renames it into place, removing the temp file on any failure.
+The lit tier writes its header and payload as two parts, so the payload is
+never copied. Each write has its own temp file because two writes of one key
+can run at once (two disk permits): with one shared `.tmp`, the second
+writer truncated the first writer's file, a short file was published, a
+reader's length check discarded it, and the second rename failed. The names
+still end in `.tmp`, which `cache clear` and the content checks in
+`cache::layout` accept. Unlike the old shared name, a unique temp file left
+by a crash between create and rename is never overwritten, so the startup
+scan (`LruIndex::populate_from_disk`) removes temp files whose process id
+(`cache::layout::temp_file_pid`) is not its own, and keeps its own.
+This write is atomic (a reader never observes a torn file at the live path) but
 does **not** call `sync_all()` before the rename, so invariant 4's
 durability half is not currently enforced for this tier. This is a
 pre-existing asymmetry with the other three caches, not something this
