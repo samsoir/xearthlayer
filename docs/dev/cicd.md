@@ -290,6 +290,7 @@ The human gates that close these holes:
 |---------|--------|------|
 | `make verify` | fmt, clippy, unit and integration tests | Every commit; both CI platforms |
 | `make verify-macos` | `make verify` plus live macFUSE mount tests | Before promoting a release to stable, on real Apple Silicon |
+| `make check-casks` | The four Homebrew casks through `brew style` and `brew audit --strict` (CI runs it too) | After changing a cask template, on a Mac with Homebrew |
 | `make integration-tests` | `#[ignore]`d integration tests | Manually, on real hardware |
 
 ## Version Propagation
@@ -380,6 +381,25 @@ runner followed by `--version` of the binary that cask installs. That install go
 through Homebrew's quarantine, so it fails for a release that was not notarized. The
 pre-release casks exclude one audit, `github_prerelease_version`, which rejects any
 version whose GitHub release is marked pre-release; tracking those is their purpose.
+
+**The casks are checked before the release is published.** The tap's audit runs only
+after `publish` has pushed, in another repository, and nothing in the release run
+looks at its result: 0.5.1-beta.3 and beta.4 published casks it rejected, because a
+newer Homebrew had started applying RuboCop's `Layout/LineLength` (118 characters) to
+cask comments, and the stable templates' header comment carried the rendered
+SHA-256. So `scripts/homebrew/check-casks.sh` (`make check-casks`) renders all four
+templates, the stable ones at the version's base and the pre-release ones at the
+version, into a scratch tap of its own name (`xel-check/casks`, so a maintainer's
+installed `xearthlayer/tap` is never touched), and runs the tap's `brew style` and
+`brew audit --cask --strict` on them, without `--online`. It is a step of the
+`Verify (macOS)` job in `ci.yml`, `release-test.yml` and `release.yml`, so a template
+change or a new Homebrew rule fails a pull request, and on a tag it fails
+`verify-macos` and with it `package-macos` and `publish`, before anything is public.
+The online audits (the download, the GitHub release) and the install smoke test still
+run only in the tap, since they need the published release. `make test-scripts` also
+checks every rendered line against the 118-character limit on Linux, as RuboCop
+counts it (a line made long only by a URI running to its end is allowed), and
+template comments never name the placeholders, which the renderer would substitute.
 
 To test a cask change locally before a tag exists, render into a checkout of the tap,
 link the checkout under `$(brew --repository)/Library/Taps/xearthlayer/homebrew-tap`

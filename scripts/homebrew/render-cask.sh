@@ -45,6 +45,8 @@ fi
 template="$(dirname "$0")/../../pkg/homebrew/${token}.rb.tmpl"
 mkdir -p "$out_dir"
 out="$out_dir/${token}.rb"
+# The templates' placeholders. Template comments never name them, or the
+# rendered comment would carry a 64-character hash past Homebrew's line limit.
 sed -e "s|@VERSION@|$version|g" -e "s|@SHA256@|$sha256|g" -e "s|@REPO@|$repo|g" "$template" > "$out"
 if grep -q '@[A-Z0-9]*@' "$out"; then
     echo "error: unreplaced placeholder in $out" >&2

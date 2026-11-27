@@ -82,6 +82,13 @@ jobs:
       - name: Run make verify
         run: make verify
 
+      # The casks the release pushes to the tap, checked as the tap's Audit
+      # workflow checks them (brew style, brew audit --strict) before anything
+      # is published. The tap's audit runs only after the push, in another
+      # repository, so 0.5.1-beta.3 and beta.4 published casks it rejected.
+      - name: Check Homebrew casks
+        run: scripts/homebrew/check-casks.sh
+
   # Build the release binaries once for reuse across Linux tarballs and Debian packages
   build-binary:
     name: Build Release Binary
