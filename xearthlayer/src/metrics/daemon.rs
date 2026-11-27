@@ -1201,8 +1201,29 @@ mod tests {
     /// fields, returning them in emission order. Uses only
     /// `tracing`/`tracing-subscriber`, both already direct dependencies of
     /// this crate (see Cargo.toml), so no new dependency is introduced.
+    ///
+    /// A callsite caches its interest, and while at most one dispatcher is
+    /// registered tracing-core computes it from the registering thread's own
+    /// default. When a capture was the one dispatcher and a thread with no
+    /// subscriber reached "Memory sample" first (a daemon logs one on its
+    /// first tick, in every `MetricsSystem` test), the callsite cached
+    /// `Interest::never` for every thread and the capture missed its event
+    /// (#471). Two dispatchers kept for the life of the test process,
+    /// interested in nothing, end that mode, so every interest is computed
+    /// from every live dispatcher, a capture included; the same cure as
+    /// `night::test_log::LogCapture`.
     fn capture_events<F: FnOnce()>(f: F) -> Vec<std::collections::HashMap<String, String>> {
+        use tracing::subscriber::NoSubscriber;
+        use tracing::Dispatch;
         use tracing_subscriber::layer::SubscriberExt;
+
+        static KEEP: std::sync::OnceLock<[Dispatch; 2]> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| {
+            [
+                Dispatch::new(NoSubscriber::default()),
+                Dispatch::new(NoSubscriber::default()),
+            ]
+        });
 
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let layer = RecordingLayer {
@@ -1214,6 +1235,24 @@ mod tests {
         captured
     }
 
+    /// A capture sees its event when a thread with no subscriber reached the
+    /// callsite first, as the daemon of every `MetricsSystem` test does with
+    /// "Memory sample" on its first tick (#471). Run alone, nothing else
+    /// registers a dispatcher, which is the case that failed.
+    #[test]
+    fn a_capture_sees_a_callsite_a_thread_with_no_subscriber_reached_first() {
+        fn emit() {
+            tracing::info!("capture probe");
+        }
+
+        let events = capture_events(|| {
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+
+        assert_eq!(events.len(), 1, "{events:?}");
+    }
+
     /// Like [`find_memory_sample`], but panics with what *was* captured.
     ///
     /// A bare `.expect` on the lookup cannot distinguish "no events at all"
@@ -1222,12 +1261,9 @@ mod tests {
     /// absence is why one observed failure here taught us nothing.
     ///
     /// Read the message before theorising. `0 event(s) captured: []` means the
-    /// capture harness; anything else means `log_memory_sample` itself. Two
-    /// theories about the harness were investigated and **refuted** by
-    /// experiment, so do not spend time on them again: `with_default` installs
-    /// a thread-local subscriber and nothing in this test binary installs a
-    /// global one, and a probe of 16 threads by 2,000 iterations against a
-    /// single shared callsite dropped none of its 32,000 captures.
+    /// capture harness; anything else means `log_memory_sample` itself. The
+    /// harness failure of #471 was a callsite's cached interest, settled in
+    /// [`capture_events`].
     fn expect_memory_sample(
         events: &[std::collections::HashMap<String, String>],
     ) -> &std::collections::HashMap<String, String> {
