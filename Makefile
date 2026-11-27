@@ -224,8 +224,12 @@ test-scripts: ## Run the release script tests (bash, against fake macOS tools)
 	@echo "$(BLUE)Running release script tests...$(NC)"
 	@scripts/macos/tests/run.sh
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -x scripts/macos/*.sh scripts/macos/tests/*.sh scripts/macos/tests/fakes/fake-tool; \
+		shellcheck -x scripts/macos/*.sh scripts/macos/tests/*.sh scripts/macos/tests/fakes/fake-tool scripts/homebrew/*.sh; \
 	else echo "$(YELLOW)shellcheck not installed; skipped$(NC)"; fi
+
+.PHONY: check-casks
+check-casks: ## Render the Homebrew casks and run brew style and brew audit on them (macOS only)
+	@scripts/homebrew/check-casks.sh
 
 .PHONY: verify-macos
 verify-macos: ## Full macOS verification: verify + live macFUSE smoke tests (macOS only)
