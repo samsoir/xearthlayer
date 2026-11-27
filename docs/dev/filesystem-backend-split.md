@@ -138,6 +138,11 @@ and moves to `common/core.rs` unchanged:
 - the geo filter (`resolve_lazy_geo`)
 - the water-mask guard in `lookup` (#68): return `ENOENT` when the `.png`
   exists so X-Plane falls back to it instead of a generated virtual DDS
+- while `lit_source.wants_dsf_hints()` is on (read once into `dsf_hints` in
+  `with_lit_source`), `lookup` and `open` of a real `Earth nav
+  data/<block>/<tile>.dsf` call `lit_source.dsf_seen(lat, lon)`
+  `(dsf_tile_of_path)`. That's how the road service learns which DSFs X-Plane is
+  loading.
 
 The core is the sole emitter of the metrics the dashboard reads. In
 particular, per-read latency (`MetricEvent::FuseRead`, from which the daemon
@@ -203,6 +208,9 @@ machine. Hosted macOS runners cannot approve the FSKit extension ("macFUSE
 This means green CI exercises the `LinuxFuse` adapter; the `MacFuse` adapter is
 covered by `make verify-macos` and the regression flight, both run on a local
 machine.
+
+#### Add test for DSF Hints
+Looking up and opening a DSF path should report the hint once, and a non-DSF path never. A backend that missed it would serve everything correctly and silently lose road lights, which no other test would catch.
 
 ### MountBackend ("Live" Mounting)
 
