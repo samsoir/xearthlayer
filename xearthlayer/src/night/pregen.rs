@@ -12,8 +12,9 @@
 //! - At most [`MAX_QUEUED_PREGENERATIONS`] wait; one past them is dropped,
 //!   and the read of its footprint generates as it would have without
 //!   pre-generation.
-//! - As many run at once as there are workers (one per generation permit):
-//!   each takes the next footprint once it is done with its own.
+//! - As many run at once as there are workers, one fewer than the
+//!   generation permits ([`pregen_workers`]): each takes the next footprint
+//!   once it is done with its own, and one permit is always left to reads.
 //! - Once closed (shutdown) nothing queued runs, and nothing is queued.
 //!
 //! The queue is the decision alone; the lit source runs the workers.
@@ -43,6 +44,16 @@ pub(crate) const MAX_QUEUED_PREGENERATIONS: usize = 512;
 const _: () = assert!(
     2 * MAX_QUEUED_PREGENERATIONS as u64 * tail_len(FIRST_VISIBLE_ZL16) <= LIT_TAIL_CACHE_BYTES
 );
+
+/// Pre-generation workers for `permits` generation permits: one fewer, at
+/// least one (there are at least 2 permits). A pre-generation admitted
+/// holds its permit to the end of its generation; with a worker per permit,
+/// a read arriving during a backlog could find every permit so held and wait
+/// out a pre-generation. One fewer always leaves a permit no pre-generation
+/// holds.
+pub(crate) fn pregen_workers(permits: usize) -> usize {
+    permits.saturating_sub(1).max(1)
+}
 
 /// What queueing one footprint did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +176,14 @@ mod tests {
             map_type: "BI".into(),
             kind: TextureKind::Lit,
         }
+    }
+
+    #[test]
+    fn pregenerations_leave_a_permit_to_reads() {
+        assert_eq!(pregen_workers(2), 1);
+        assert_eq!(pregen_workers(3), 2);
+        assert_eq!(pregen_workers(4), 3);
+        assert_eq!(pregen_workers(1), 1, "never none");
     }
 
     #[test]

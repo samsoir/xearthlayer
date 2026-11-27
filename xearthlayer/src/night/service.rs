@@ -37,7 +37,7 @@ use super::layout::minimal_black_dds;
 use super::payloads::{
     PayloadMemory, Uncached, Wanted, LIT_HEAD_CACHE_BYTES, LIT_TAIL_CACHE_BYTES,
 };
-use super::pregen::{PregenQueue, Queued, MAX_QUEUED_PREGENERATIONS};
+use super::pregen::{pregen_workers, PregenQueue, Queued, MAX_QUEUED_PREGENERATIONS};
 use super::retry::{with_retries, READ_RETRIES, READ_RETRY_DELAY};
 use super::roads::field::{crosses_footprint, reach_deg, RoadField};
 use super::roads::merge::MergedRoads;
@@ -517,10 +517,10 @@ impl NightLitSource {
                 Arc::clone(&stats),
             )),
             generations: GenerationPermits::new(generations),
-            // One pre-generation in flight per permit: enough to use every
-            // permit no read wants, and pre-generations share the lit disk
+            // One pre-generation in flight per permit but one: a permit is
+            // always left to reads, and pre-generations share the lit disk
             // permits with reads no more than that.
-            pregens: PregenQueue::new(MAX_QUEUED_PREGENERATIONS, generations),
+            pregens: PregenQueue::new(MAX_QUEUED_PREGENERATIONS, pregen_workers(generations)),
             this: Weak::new(),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
@@ -4437,13 +4437,88 @@ mod tests {
             );
         }
 
+        /// Lights every texel white; a footprint other than `free_col`'s
+        /// first waits until the gate opens, counted as entered.
+        struct Gated {
+            free_col: u32,
+            open: std::sync::Mutex<bool>,
+            opened: std::sync::Condvar,
+            entered: std::sync::atomic::AtomicUsize,
+        }
+
+        impl Gated {
+            fn new(free_col: u32) -> Self {
+                Self {
+                    free_col,
+                    open: std::sync::Mutex::new(false),
+                    opened: std::sync::Condvar::new(),
+                    entered: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn entered(&self) -> usize {
+                self.entered.load(std::sync::atomic::Ordering::SeqCst)
+            }
+
+            fn open(&self) {
+                *self.open.lock().unwrap() = true;
+                self.opened.notify_all();
+            }
+        }
+
+        impl crate::night::generator::LitGenerator for Gated {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                if r.name.col != self.free_col {
+                    self.entered
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let open = self.open.lock().unwrap();
+                    drop(self.opened.wait_while(open, |open| !*open).unwrap());
+                }
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn with_every_worker_pregenerating_a_read_takes_the_free_permit_at_once() {
+            let (_t, source) = fixture();
+            let read = small_name(99);
+            let gated = Arc::new(Gated::new(read.col));
+            let source = source.with_generator(gated.clone()).shared();
+            let permits = source.generations.free();
+            let workers = pregen_workers(permits);
+            for i in 0..(workers + 2) as u32 {
+                source.queue_pregeneration(&small_name(i));
+            }
+            settled(&source, |_| gated.entered() == workers).await;
+            let free = source.generations.free();
+            let layout = LitLayout::new(18, 4);
+            let served = tokio::time::timeout(
+                Duration::from_secs(30),
+                source.served_parts(&read, &layout, small_levels(&layout)),
+            )
+            .await;
+            let still_generating = gated.entered();
+            gated.open();
+            assert_eq!(free, 1, "one permit no pre-generation holds");
+            let (_, outcome) = served.expect("the read never waited for a pre-generation");
+            assert_eq!(outcome, ReadOutcome::Generated);
+            assert_eq!(
+                still_generating, workers,
+                "the pre-generations were still running"
+            );
+            settled(&source, |s| {
+                s.pregenerations(PregenOutcome::Generated) == (workers + 2) as u64
+            })
+            .await;
+        }
+
         #[tokio::test]
         async fn shutdown_with_pregenerations_queued_runs_none_of_them() {
             let (_t, source) = fixture();
             let white = Arc::new(White::default());
             let source = source.with_generator(white.clone()).shared();
             let held = source.generations.hold_all().await;
-            let workers = held.len();
+            let workers = pregen_workers(held.len());
             let queued = workers + 3;
             for i in 0..queued as u32 {
                 source.queue_pregeneration(&small_name(i));
