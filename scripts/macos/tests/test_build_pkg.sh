@@ -57,7 +57,7 @@ test_builds_signs_notarizes_and_staples_the_runtime() {
     assert_contains "$log" "spctl --assess --type install -vv $out"
     assert_contains "$(cat "$FAKE_DIR/distribution.xml")" '<welcome file="welcome.html"'
     assert_eq "$(LC_ALL=C sort "$FAKE_DIR/resources.txt")" \
-        "$(printf '%s\n' LICENSE.txt conclusion.html readme.html welcome.html | LC_ALL=C sort)"
+        "$(printf '%s\n' LICENSE.txt background.png conclusion.html readme.html welcome.html | LC_ALL=C sort)"
     assert_license_is_unwrapped "$FAKE_DIR/resources/LICENSE.txt"
 }
 
@@ -69,7 +69,7 @@ test_publisher_package_has_license_page_only() {
         || fail "build failed"
     assert_contains "$(cat "$FAKE_LOG")" "staged: xearthlayer-publish"
     assert_not_contains "$(cat "$FAKE_DIR/distribution.xml")" "<welcome"
-    assert_eq "$(cat "$FAKE_DIR/resources.txt")" "LICENSE.txt"
+    assert_eq "$(LC_ALL=C sort "$FAKE_DIR/resources.txt")" "$(printf '%s\n' LICENSE.txt background.png)"
     assert_license_is_unwrapped "$FAKE_DIR/resources/LICENSE.txt"
 }
 

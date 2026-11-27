@@ -152,6 +152,21 @@ and checks the result. `xcrun stapler validate` gates in every case. The
 Gatekeeper assessments are disabled, as `sign-and-notarize.sh` does for its
 quarantined run.
 
+Both packages show `pkg/macos/background.png`, the XEarthLayer logo, at the
+bottom of the Installer's sidebar in light and dark mode (`<background>` and
+`<background-darkAqua>`, bottom left, not scaled). It is the website's
+`static/logo.svg` (xearthlayer-website) rendered 200 pixels high, with 40 pixels
+of transparent margin on the left and below, and marked 144 dpi so the Installer
+draws it at half its pixel size (about 117 by 120 points), sharp on Retina
+screens:
+
+```bash
+rsvg-convert -h 200 static/logo.svg -o mark.png
+magick mark.png -background none -gravity northeast -extent 233x240 \
+    -define png:exclude-chunks=date,time,tEXt,zTXt,iTXt \
+    -units PixelsPerInch -density 144 PNG32:pkg/macos/background.png
+```
+
 Stapling is tried up to three times, `MACOS_STAPLE_RETRY_DELAY` seconds apart
 (default 15), because the ticket can lag behind `Accepted`.
 

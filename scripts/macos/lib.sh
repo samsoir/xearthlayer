@@ -146,7 +146,9 @@ render_distribution() {
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
     <title>$title</title>
-${pages}    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+${pages}    <background file="background.png" alignment="bottomleft" scaling="none"/>
+    <background-darkAqua file="background.png" alignment="bottomleft" scaling="none"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
     <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
     <volume-check>
         <allowed-os-versions>

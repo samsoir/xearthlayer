@@ -79,6 +79,7 @@ chmod 755 "$work/root" "$work/root/usr" "$work/root/usr/local" "$work/root/usr/l
 cp "$binary" "$work/root/usr/local/bin/$product"
 chmod 755 "$work/root/usr/local/bin/$product"
 unwrap_paragraphs <"$repo_root/LICENSE" >"$work/resources/LICENSE.txt"
+cp "$repo_root/pkg/macos/background.png" "$work/resources/"
 if [ "$product" = "xearthlayer" ]; then
     cp "$repo_root/pkg/macos/welcome.html" "$repo_root/pkg/macos/readme.html" \
         "$repo_root/pkg/macos/conclusion.html" "$work/resources/"
