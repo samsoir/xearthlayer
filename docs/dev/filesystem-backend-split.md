@@ -255,6 +255,11 @@ pub enum MountError {
 }
 
 /// A platform backend that can mount the union filesystem.
+///
+/// A panic hook never unmounts since it cannot know if the panic is caught
+/// and recovered from gracefully, which would allow the mount to remain.
+/// When a panic unwinds, `MountSession` `Drop` handles the unmounting and
+/// must not panic.
 pub trait MountBackend: Send + Sync {
     /// Mount `fs` according to `req`, returning a handle to the live mount.
     /// `fs` must arrive fully wired: past `Arc<dyn UnionFilesystem>` nothing
@@ -263,27 +268,11 @@ pub trait MountBackend: Send + Sync {
     /// by design.
     fn mount(&self, fs: Arc<dyn UnionFilesystem>, req: MountRequest) -> MountFuture<'_>;
     /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
-    /// no runtime, and must not panic (see the panic-hook contract below).
+    /// no runtime, and must not panic.
     fn recover_stale(&self, mountpoint: &Path) -> bool;
-    /// Force-detach the mount at `path`. Returns `true` if the mountpoint
-    /// ended up unmounted (including the benign already-unmounted case), matching
-    /// `unmount_fuse`. Synchronous, needs no runtime, and must not
-    /// panic.
-    fn force_unmount(&self, path: &Path, force: bool) -> bool;
 }
 ```
 
-The crash path is the panic hook (`panic.rs`), not the `MountManager`. It
-calls `unmount_fuse(path, false)` and, if that fails, `unmount_fuse(path, true)`,
-logging which one worked. Under the split the hook gets a backend with its own
-`select_backend()` call (cheap enough) and calls `force_unmount` the same way:
-graceful first, then forced, reporting the `bool` outcome. `force_unmount`
-returns `bool` so the hook can still say which attempt succeeded.
-
-Both `recover_stale` and `force_unmount` are synchronous, need no runtime, and
-must not panic. A panic inside a panic hook aborts the process with the mount
-still up, so these two are the one place in the backend where that guarantee
-matters.
 ```rust
 /// The mount backend for the OS this binary runs on.
 ///
