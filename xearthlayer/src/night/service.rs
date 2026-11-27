@@ -244,6 +244,37 @@ impl SessionRecipes {
             .map_err(|_| Unreadable)
     }
 
+    /// The identity and region of each recipe of `name`'s field tiles (see
+    /// [`Self::identity`]), or `Unreadable`. Blocking I/O on a store miss.
+    fn identities(&self, name: &DdsFilename) -> Result<Vec<TileRecipeIdentity>, Unreadable> {
+        field_tiles(name)
+            .into_iter()
+            .map(|(lat, lon)| {
+                let (identity, region) = self.identity(lat, lon)?;
+                Ok(((lat, lon), identity, region))
+            })
+            .collect()
+    }
+
+    /// [`Self::identities`] without I/O, when the store holds every one of
+    /// the tiles already (the probe and earlier generations loaded them):
+    /// `None` when it does not, and the blocking call is needed. A tile
+    /// given up on is `Unreadable` here too.
+    fn identities_held(
+        &self,
+        name: &DdsFilename,
+    ) -> Option<Result<Vec<TileRecipeIdentity>, Unreadable>> {
+        let mut held = Vec::new();
+        for (lat, lon) in field_tiles(name) {
+            if self.given_up.contains(&(lat, lon)) {
+                return Some(Err(Unreadable));
+            }
+            let (identity, region) = self.store.loaded_identity_with_region(lat, lon)?;
+            held.push(((lat, lon), identity, region));
+        }
+        Some(Ok(held))
+    }
+
     /// Every recipe the generator can read for `name`, or `Unreadable` when
     /// one of them cannot be read. Blocking I/O.
     fn for_footprint(&self, name: &DdsFilename) -> Result<FootprintRecipes, Unreadable> {
@@ -253,6 +284,10 @@ impl SessionRecipes {
             .collect()
     }
 }
+
+/// A field tile, the identity of its recipe file (`None` for none) and the
+/// region of the package it came from.
+type TileRecipeIdentity = ((i32, i32), Option<FileIdentity>, LedRegion);
 
 /// The tiles whose recipes the generator can read for `name`.
 fn field_tiles(name: &DdsFilename) -> Vec<(i32, i32)> {
@@ -740,10 +775,12 @@ impl NightLitSource {
     /// the road DSF identities in it, or `None` when computing it failed (a
     /// recipe that cannot be loaded among them). Recipe identities are those
     /// taken when each recipe was loaded, so a file replaced mid-session does
-    /// not lend the payload its identity. Road DSF identities are taken once
+    /// not lend the payload its identity; when the store holds them all, they
+    /// are read without a blocking hop. Road DSF identities are taken once
     /// per tile per session, in priority order; a payload is written under
     /// them only when its roads were read from those DSFs (#430). The art
-    /// walk, recipe loads and DSF `stat`s run on the blocking pool; the
+    /// walk, recipe loads (on a store miss) and DSF `stat`s run on the
+    /// blocking pool; the
     /// caller holds a disk permit and none of them takes another.
     async fn fingerprint_with_roads(
         &self,
@@ -766,19 +803,18 @@ impl NightLitSource {
             })
             .await
             .ok()?;
-        let (recipes, owned) = (Arc::clone(&self.recipes), name.clone());
-        let identities = tokio::task::spawn_blocking(move || {
-            field_tiles(&owned)
-                .into_iter()
-                .map(|(lat, lon)| {
-                    let (identity, region) = recipes.identity(lat, lon)?;
-                    Ok(((lat, lon), identity, region))
-                })
-                .collect::<Result<Vec<_>, Unreadable>>()
-        })
-        .await
-        .ok()?
-        .ok()?;
+        // The store usually holds the recipes already (the probe read them):
+        // the blocking hop only on a store miss.
+        let identities = match self.recipes.identities_held(name) {
+            Some(held) => held.ok()?,
+            None => {
+                let (recipes, owned) = (Arc::clone(&self.recipes), name.clone());
+                tokio::task::spawn_blocking(move || recipes.identities(&owned))
+                    .await
+                    .ok()?
+                    .ok()?
+            }
+        };
         // A tile whose identities could not be taken leaves no fingerprint:
         // the payload is then kept in memory only.
         let roads = match &self.roads {
@@ -1421,6 +1457,36 @@ mod tests {
             }
             assert_eq!(source.served_payload(&name, &layout).await.0, None);
             assert_eq!(source.payloads.entry_count(), 0, "nothing cached");
+        }
+
+        #[test]
+        fn recipe_identities_the_store_holds_are_taken_without_a_load() {
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let pkg = temp.path().join("pkg");
+            let recipes = SessionRecipes::new(Arc::new(RecipeStore::new(vec![pkg.clone()])));
+            let name = lit_name();
+            assert_eq!(recipes.identities_held(&name), None, "nothing loaded yet");
+            let loaded = recipes.identities(&name).unwrap();
+            assert!(loaded.iter().any(|(_, identity, _)| identity.is_some()));
+            // Held from here: the file is not read again.
+            std::fs::remove_file(crate::night::recipe_path(&pkg, 37, -123)).unwrap();
+            assert_eq!(recipes.identities_held(&name), Some(Ok(loaded)));
+            let (tile, _, _) = recipes.identities(&name).unwrap()[0];
+            recipes.given_up.insert(tile);
+            assert_eq!(recipes.identities_held(&name), Some(Err(Unreadable)));
+        }
+
+        #[tokio::test]
+        async fn a_fingerprint_from_held_identities_is_the_one_from_a_load() {
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let cold = source_in(&temp).fingerprint(&name).await;
+            let warm = source_in(&temp);
+            warm.recipes.identities(&name).unwrap();
+            assert!(warm.recipes.identities_held(&name).is_some());
+            assert_eq!(warm.fingerprint(&name).await, cold);
+            assert!(cold.is_some());
         }
 
         #[cfg(unix)]

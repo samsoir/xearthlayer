@@ -182,6 +182,17 @@ impl RecipeStore {
         Ok((l.identity, l.region))
     }
 
+    /// `identity_with_region` when the tile is loaded already, without any
+    /// I/O; `None` when it is not (load it from a blocking context). Never
+    /// loads, so it may be asked from an async task.
+    pub fn loaded_identity_with_region(
+        &self,
+        lat: i32,
+        lon: i32,
+    ) -> Option<(Option<FileIdentity>, LedRegion)> {
+        self.cache.get(&(lat, lon)).map(|l| (l.identity, l.region))
+    }
+
     fn loaded(&self, lat: i32, lon: i32) -> std::io::Result<Loaded> {
         self.cache
             .try_get_with((lat, lon), || self.load(lat, lon))
@@ -435,6 +446,27 @@ mod tests {
 
     fn identity_len(store: &RecipeStore) -> u64 {
         store.identity(37, -123).unwrap().unwrap().len
+    }
+
+    #[test]
+    fn a_loaded_identity_is_known_without_reading_the_file() {
+        let temp = TempDir::new().unwrap();
+        let store = RecipeStore::with_regions(vec![(temp.path().to_path_buf(), LedRegion::Eu)]);
+        put(temp.path(), 37, -123, URBAN);
+        assert_eq!(
+            store.loaded_identity_with_region(37, -123),
+            None,
+            "not loaded"
+        );
+        assert_eq!(store.loaded_identity_with_region(38, -123), None);
+        let identity = store.identity_with_region(37, -123).unwrap();
+        store.get(38, -123); // no recipe: absence is loaded too
+        std::fs::remove_file(recipe_path(temp.path(), 37, -123)).unwrap();
+        assert_eq!(store.loaded_identity_with_region(37, -123), Some(identity));
+        assert_eq!(
+            store.loaded_identity_with_region(38, -123),
+            Some((None, LedRegion::Unknown))
+        );
     }
 
     #[test]
