@@ -76,8 +76,12 @@ pub enum PayloadLookup {
 /// What one pre-generation did (#433), once it ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PregenOutcome {
-    /// It generated the payload.
+    /// It generated the payload, kept in memory.
     Generated,
+    /// It generated a payload not to keep (a road tile still building at
+    /// its deadline): served to any read joining it, kept nowhere, so the
+    /// later read generates again.
+    Uncached,
     /// The small levels were in memory already: nothing loaded.
     InMemory,
     /// Loaded from the lit disk tier into memory: nothing generated.
@@ -94,6 +98,7 @@ impl PregenOutcome {
     pub fn label(self) -> &'static str {
         match self {
             Self::Generated => "generated",
+            Self::Uncached => "uncached",
             Self::InMemory => "memory",
             Self::OnDisk => "disk",
             Self::Joined => "joined",
@@ -246,7 +251,7 @@ pub struct LitStatsSnapshot {
     /// Pre-generations still queued at shutdown, which never ran.
     pub pregen_cancelled: u64,
     /// Pre-generations that ran, by [`PregenOutcome`].
-    pub pregenerations: [u64; 5],
+    pub pregenerations: [u64; 6],
     /// See [`PayloadLookup::Hit`], by [`PayloadPart`]: head, tail.
     pub payload_hits: [u64; 2],
     /// See [`PayloadLookup::Joined`], by part.
@@ -549,7 +554,7 @@ pub struct LitStats {
     pregen_dropped: AtomicU64,
     pregen_started: AtomicU64,
     pregen_cancelled: AtomicU64,
-    pregenerations: Tally<5>,
+    pregenerations: Tally<6>,
     /// Footprints queued for pre-generation.
     pregen_queue: Gauge,
     payload_hits: Tally<2>,
@@ -816,6 +821,7 @@ impl LitStats {
             pregen_started = d.pregen_started,
             pregen_cancelled = d.pregen_cancelled,
             pregen_generated = d.pregenerations(PregenOutcome::Generated),
+            pregen_uncached = d.pregenerations(PregenOutcome::Uncached),
             pregen_skipped_memory = d.pregenerations(PregenOutcome::InMemory),
             pregen_skipped_disk = d.pregenerations(PregenOutcome::OnDisk),
             pregen_joined = d.pregenerations(PregenOutcome::Joined),
@@ -1026,7 +1032,7 @@ mod tests {
             ),
             (3, 1, 2, 1)
         );
-        assert_eq!(snap.pregenerations, [1, 0, 1, 0, 0]);
+        assert_eq!(snap.pregenerations, [1, 0, 0, 1, 0, 0]);
         assert_eq!(s.pregen_queue.now(), 0, "every queued one left");
         let w = s.take_window().unwrap();
         assert_eq!(w.pregen_queue_peak, 3);

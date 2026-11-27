@@ -1183,9 +1183,14 @@ impl NightLitSource {
     /// (no read reached it), the write-back as for any generation.
     async fn pregenerate(&self, name: &DdsFilename) -> PregenOutcome {
         let layout = self.layout(name);
-        let from_disk = AtomicBool::new(false);
-        let load =
-            |priority| self.load_or_generate(name.clone(), layout.clone(), &from_disk, priority);
+        let (from_disk, kept) = (AtomicBool::new(false), AtomicBool::new(false));
+        let load = |priority| async {
+            let loaded = self
+                .load_or_generate(name.clone(), layout.clone(), &from_disk, priority)
+                .await;
+            kept.store(loaded.is_ok(), Ordering::Relaxed);
+            loaded
+        };
         let served = self
             .payloads
             .serve(
@@ -1200,6 +1205,7 @@ impl NightLitSource {
             served.lookup(),
             !served.parts.is_empty(),
             from_disk.load(Ordering::Relaxed),
+            kept.load(Ordering::Relaxed),
         );
         debug!(
             row = name.row,
@@ -1276,15 +1282,24 @@ async fn pregenerate_queued(this: Weak<NightLitSource>) {
     }
 }
 
-/// What a pre-generation did, from how its tail was found (`lookup`),
-/// whether it has a payload and whether it was read from the disk tier.
-fn pregen_outcome(lookup: PayloadLookup, payload: bool, from_disk: bool) -> PregenOutcome {
-    match (lookup, payload, from_disk) {
-        (PayloadLookup::Hit, _, _) => PregenOutcome::InMemory,
-        (PayloadLookup::Joined, _, _) => PregenOutcome::Joined,
-        (PayloadLookup::Loaded, false, _) => PregenOutcome::Black,
-        (PayloadLookup::Loaded, true, true) => PregenOutcome::OnDisk,
-        (PayloadLookup::Loaded, true, false) => PregenOutcome::Generated,
+/// What a pre-generation did, one outcome each: from how its tail was
+/// found (`lookup`), whether it has a payload, whether it was read from
+/// the disk tier, and whether its load's payload may be kept (`kept`; only
+/// read for a load it ran). A payload generated but not to keep (roads
+/// late) is no use to the later read, which generates again.
+fn pregen_outcome(
+    lookup: PayloadLookup,
+    payload: bool,
+    from_disk: bool,
+    kept: bool,
+) -> PregenOutcome {
+    match (lookup, payload, kept, from_disk) {
+        (PayloadLookup::Hit, ..) => PregenOutcome::InMemory,
+        (PayloadLookup::Joined, ..) => PregenOutcome::Joined,
+        (PayloadLookup::Loaded, false, ..) => PregenOutcome::Black,
+        (PayloadLookup::Loaded, true, false, _) => PregenOutcome::Uncached,
+        (PayloadLookup::Loaded, true, true, true) => PregenOutcome::OnDisk,
+        (PayloadLookup::Loaded, true, true, false) => PregenOutcome::Generated,
     }
 }
 
@@ -4248,15 +4263,23 @@ mod tests {
         #[test]
         fn a_pregenerations_outcome_follows_how_its_small_levels_were_found() {
             use PayloadLookup::{Hit, Joined, Loaded};
-            assert_eq!(pregen_outcome(Hit, true, false), PregenOutcome::InMemory);
-            assert_eq!(pregen_outcome(Joined, true, false), PregenOutcome::Joined);
-            assert_eq!(pregen_outcome(Joined, false, false), PregenOutcome::Joined);
-            assert_eq!(pregen_outcome(Loaded, true, true), PregenOutcome::OnDisk);
-            assert_eq!(
-                pregen_outcome(Loaded, true, false),
-                PregenOutcome::Generated
-            );
-            assert_eq!(pregen_outcome(Loaded, false, false), PregenOutcome::Black);
+            use PregenOutcome as P;
+            let cases = [
+                ((Hit, true, false, false), P::InMemory),
+                ((Joined, true, false, false), P::Joined),
+                ((Joined, false, false, false), P::Joined),
+                ((Loaded, false, false, false), P::Black),
+                ((Loaded, true, false, false), P::Uncached),
+                ((Loaded, true, false, true), P::Generated),
+                ((Loaded, true, true, true), P::OnDisk),
+            ];
+            for ((lookup, payload, from_disk, kept), want) in cases {
+                assert_eq!(
+                    pregen_outcome(lookup, payload, from_disk, kept),
+                    want,
+                    "{lookup:?} payload {payload} disk {from_disk} kept {kept}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -4567,6 +4590,33 @@ mod tests {
             assert_eq!(source.stats.snapshot().pregen_started, 1);
             demand.send(false).unwrap();
             settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 2).await;
+        }
+
+        #[tokio::test]
+        async fn a_pregeneration_whose_roads_were_late_counts_as_not_kept() {
+            let temp = TempDir::new().unwrap();
+            let name = lit_name();
+            let gate = shut();
+            let roads = roads(
+                xp_install(&temp, Some(road_across(&name))),
+                LONG,
+                LONG,
+                Some(gate.clone()),
+            );
+            let source = source_sharing(&temp, &roads)
+                .with_generator(Arc::new(White::default()))
+                .with_roads(roads.clone());
+            // Each generation times out on its roads, without a wait.
+            let tiles = tiles_of(&source, &name);
+            deadlines_passed(&roads, &tiles, Purpose::Generate);
+            let source = source.shared();
+            assert_eq!(source.size(&name).await, source.layout(&name).total_len);
+            let snap = settled(&source, |s| s.pregenerations.iter().sum::<u64>() == 1).await;
+            assert_eq!(snap.pregenerations(PregenOutcome::Uncached), 1);
+            assert_eq!(snap.pregen_started, 1, "one outcome per pre-generation");
+            assert_eq!(snap.generations(), 1);
+            assert_eq!(source.payloads.entry_count(), 0, "kept nowhere");
+            gate.add_permits(tiles.len());
         }
 
         #[tokio::test]
