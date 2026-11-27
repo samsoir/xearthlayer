@@ -139,17 +139,15 @@ impl ProcessMemoryProbe {
     }
 
     /// Reads `/proc/self/status` once. Linux-only and best-effort; elsewhere
-    /// every field is `None`.
-    #[cfg(target_os = "linux")]
+    /// every field is `None`. `cfg!`, not `#[cfg]`, so the parser is compiled
+    /// and linted on every platform.
     fn linux_status_fields() -> StatusFields {
+        if !cfg!(target_os = "linux") {
+            return StatusFields::default();
+        }
         std::fs::read_to_string("/proc/self/status")
             .map(|status| StatusFields::parse(&status))
             .unwrap_or_default()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn linux_status_fields() -> StatusFields {
-        StatusFields::default()
     }
 }
 
