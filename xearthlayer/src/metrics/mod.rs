@@ -12,6 +12,7 @@ mod event;
 mod latency;
 mod memory_probe;
 mod optional;
+mod recent;
 mod reporter;
 mod snapshot;
 mod state;
@@ -27,6 +28,7 @@ pub use memory_probe::{
     AllocatorSample, MemoryProbe, MemorySample, ProcessMemoryProbe,
 };
 pub use optional::{EncodeGuard, OptionalMetrics};
+pub use recent::{DemandCounts, RecentFuseDemand, RECENT_SAMPLES, RECENT_WINDOW};
 pub use reporter::{MetricsReporter, TuiReporter};
 pub use snapshot::TelemetrySnapshot;
 pub use state::{AggregatedState, RingBuffer, TimeSeriesHistory, DEFAULT_HISTORY_CAPACITY};

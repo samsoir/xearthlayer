@@ -15,7 +15,7 @@ use crate::config::defaults::{
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
-use crate::metrics::TelemetrySnapshot;
+use crate::metrics::{RecentFuseDemand, TelemetrySnapshot};
 use crate::ortho_union::{
     default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
 };
@@ -191,6 +191,9 @@ pub struct MountManager {
     night_lighting: crate::night::NightLighting,
     /// Overall lit brightness multiplier (`night.brightness`).
     night_brightness: f64,
+    /// The ortho mount's lit source, told to stop its background work
+    /// before the mount comes down.
+    lit_source: Option<Arc<dyn crate::night::LitTextureSource>>,
 }
 
 impl MountManager {
@@ -215,6 +218,7 @@ impl MountManager {
             night_enabled: false,
             night_lighting: crate::night::NightLighting::Off,
             night_brightness: crate::night::DEFAULT_NIGHT_BRIGHTNESS,
+            lit_source: None,
         }
     }
 
@@ -259,9 +263,12 @@ impl MountManager {
         &mut self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        memory: Option<crate::night::LitMemoryBudget>,
         ortho_mount: &Path,
+        demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
-        let source = self.night_lit_source(index, disk, ortho_mount);
+        let source = self.night_lit_source(index, disk, memory, ortho_mount, demand);
+        self.lit_source = source.clone();
         self.night_lighting = if source.is_some() {
             crate::night::NightLighting::Lit
         } else {
@@ -277,15 +284,21 @@ impl MountManager {
 
     /// The lit source for this installation, or `None` (black) when the
     /// X-Plane installation behind the scenery path cannot be found. `disk`
-    /// is the lit disk tier, `None` when caching is off. `ortho_mount` is
+    /// is the lit disk tier, `None` when caching is off. `memory` is its
+    /// payload memory, the session's share of `cache.memory_size` (the
+    /// source's floor when `None`). `ortho_mount` is
     /// XEL's own mount point, which the road service must not read back.
+    /// `demand` is `true` while ortho demand is in flight; pre-generation
+    /// waits for it to clear.
     /// Nothing is read from the installation here: the road service lists
     /// its scenery packs on the first DSF hint.
     fn night_lit_source(
         &self,
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
+        memory: Option<crate::night::LitMemoryBudget>,
         ortho_mount: &Path,
+        demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
         let scenery = self.scenery_path.as_ref()?;
         let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
@@ -324,7 +337,14 @@ impl MountManager {
         if let Some(disk) = disk {
             source = source.with_disk_cache(disk);
         }
-        Some(Arc::new(source))
+        if let Some(demand) = demand {
+            source = source.with_demand_gate(demand);
+        }
+        if let Some(memory) = memory {
+            source = source.with_memory_budget(memory);
+        }
+        // Shared, so it pre-generates what its probe answers lit (#433).
+        Some(source.shared())
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -640,7 +660,9 @@ impl MountManager {
             if let Some(source) = self.resolve_night_lit_source(
                 &index_for_prefetch,
                 service.lit_disk_cache(),
+                service.lit_memory_budget(),
                 &mountpoint,
+                service.demand_in_flight(),
             ) {
                 ortho_union_fs = ortho_union_fs.with_lit_source(source);
             }
@@ -755,6 +777,11 @@ impl MountManager {
     /// Sessions are unmounted in reverse order of mounting.
     /// Patches are unmounted last (they were mounted first).
     pub fn unmount_all(&mut self) {
+        // Background lit work stops first: nothing it would do is wanted.
+        if let Some(source) = self.lit_source.take() {
+            source.shutdown();
+        }
+
         // Collect keys to unmount (reverse order for clean shutdown)
         let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
@@ -848,8 +875,7 @@ impl MountManager {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
-            fuse_latency: None,
-            fuse_session_latency: None,
+            fuse_recent: RecentFuseDemand::default(),
             fuse_session_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,
@@ -932,9 +958,9 @@ impl MountManager {
             // Lane gauges: each service runs its own lanes, and only the
             // consolidated service has real values. Latency is not summable,
             // so take the first sample present rather than a blend.
-            total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
-            total.fuse_session_latency =
-                total.fuse_session_latency.or(snapshot.fuse_session_latency);
+            if total.fuse_recent == RecentFuseDemand::default() {
+                total.fuse_recent = snapshot.fuse_recent;
+            }
             total.fuse_session_timeouts += snapshot.fuse_session_timeouts;
             total.demand_in_flight += snapshot.demand_in_flight;
             total.prefetch_paused |= snapshot.prefetch_paused;
@@ -1120,7 +1146,9 @@ mod tests {
         let source = manager.resolve_night_lit_source(
             &OrthoUnionIndex::default(),
             None,
+            Some(crate::night::LitMemoryBudget::FLOOR),
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
+            None,
         );
 
         let source = source.expect("a lit source");
@@ -1129,6 +1157,37 @@ mod tests {
             "roads are attached, so the filesystem should send DSF hints"
         );
         assert_eq!(manager.night_lighting(), crate::night::NightLighting::Lit);
+    }
+
+    #[test]
+    fn unmounting_tells_the_lit_source_to_stop_its_background_work() {
+        #[derive(Default)]
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl crate::night::LitTextureSource for Counting {
+            fn size<'a>(
+                &'a self,
+                _: &'a crate::fuse::DdsFilename,
+            ) -> futures::future::BoxFuture<'a, u64> {
+                Box::pin(async { 0 })
+            }
+            fn read<'a>(
+                &'a self,
+                _: &'a crate::fuse::DdsFilename,
+                _: u64,
+                _: u32,
+            ) -> futures::future::BoxFuture<'a, bytes::Bytes> {
+                Box::pin(async { bytes::Bytes::new() })
+            }
+            fn shutdown(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let source = Arc::new(Counting::default());
+        let mut manager = MountManager::new();
+        manager.lit_source = Some(source.clone());
+        manager.unmount_all();
+        manager.unmount_all();
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1141,7 +1200,9 @@ mod tests {
         let source = manager.resolve_night_lit_source(
             &OrthoUnionIndex::default(),
             None,
+            None,
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
+            None,
         );
 
         assert!(source.is_none());

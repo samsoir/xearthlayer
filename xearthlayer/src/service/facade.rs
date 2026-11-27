@@ -447,11 +447,31 @@ impl XEarthLayerService {
         self.gpu_warning.as_deref()
     }
 
+    /// `true` while any ortho demand job is in flight: the pause state the
+    /// prefetch lane's admission gate reads, for other background work that
+    /// must yield to demand (night lighting's pre-generation, #433). `None`
+    /// without the runtime.
+    pub fn demand_in_flight(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.xearthlayer_runtime
+            .as_ref()
+            .map(|runtime| runtime.demand().subscribe())
+    }
+
     /// The lit disk cache (generated night lighting payloads).
     ///
     /// `None` when caching or night lighting is off.
     pub fn lit_disk_cache(&self) -> Option<Arc<dyn crate::cache::Cache>> {
         self.cache_layer.as_ref().and_then(|cl| cl.lit_disk_cache())
+    }
+
+    /// Night lighting's payload memory, its share of `cache.memory_size`
+    /// (#432).
+    ///
+    /// `None` when night lighting is off, or without the cache layer.
+    pub fn lit_memory_budget(&self) -> Option<crate::night::LitMemoryBudget> {
+        self.cache_layer
+            .as_ref()
+            .and_then(|cl| cl.lit_memory_budget())
     }
 
     /// Shutdown the cache layer gracefully.

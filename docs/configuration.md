@@ -131,7 +131,7 @@ Controls tile caching behavior.
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
-| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
+| `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. With night lighting on, 15% of it (at least 256 MiB, added on top below about 1.7 GiB) goes to night lighting. |
 | `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). With `night.enabled`, 5% goes to the night lighting texture cache first and the rest is split as below. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
 | `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. With `night.enabled` it splits the 95% left after the night lighting share. A value outside 0.0 to 1.0 is refused when the file is read. |
 

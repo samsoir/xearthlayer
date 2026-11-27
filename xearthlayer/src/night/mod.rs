@@ -7,13 +7,16 @@
 //! but still serves black pixels. Phase 2b generates the light, in the
 //! `generator` module behind the `LitGenerator` trait.
 
+pub(crate) mod admission;
 pub mod disk;
 pub mod footprint;
 pub mod generator;
 pub mod laminar;
 pub mod layout;
 pub(crate) mod math;
+pub(crate) mod payloads;
 pub mod prefs;
+pub(crate) mod pregen;
 pub mod recipe;
 pub(crate) mod retry;
 pub mod roads;
@@ -24,8 +27,8 @@ pub mod store;
 pub(crate) mod test_log;
 
 pub use disk::{
-    check_entry, decode_entry_unsized, encode_entry, footprint_fingerprint, lit_cache_key,
-    session_fingerprint, EntryReject, LitFingerprint,
+    check_entry, decode_entry_unsized, encode_entry, entry_header, footprint_fingerprint,
+    lit_cache_key, session_fingerprint, EntryReject, LitFingerprint,
 };
 pub use footprint::Footprint;
 pub use generator::{
@@ -34,7 +37,8 @@ pub use generator::{
 pub use laminar::{
     ArtDoubt, ArtDoubtKind, ArtFiles, ArtRecord, DiskArtFiles, LaminarArt, LitPattern, LitTerrain,
 };
-pub use layout::{minimal_black_dds, LitLayout};
+pub use layout::{minimal_black_dds, LitLayout, LitParts, PayloadPart};
+pub use payloads::LitMemoryBudget;
 pub use prefs::{
     FixedTextureSetting, StartupTextureSetting, TextureSettingSource, FULL_TEXTURE_SETTING,
 };

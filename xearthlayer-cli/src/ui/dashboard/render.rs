@@ -262,14 +262,10 @@ fn render_prefetch_system(
 }
 
 /// The FUSE latency line for the Scenery System pane.
-fn fuse_latency(
-    telemetry: &TelemetrySnapshot,
-    generation_timeout: Duration,
-) -> FuseLatencyWidget<'_> {
-    FuseLatencyWidget::new(telemetry.fuse_session_latency.as_ref(), generation_timeout)
-        .with_recent(telemetry.fuse_latency.as_ref())
-        .with_timeouts(telemetry.fuse_session_timeouts)
-        .with_cache_served(
+fn fuse_latency(telemetry: &TelemetrySnapshot, generation_timeout: Duration) -> FuseLatencyWidget {
+    FuseLatencyWidget::new(telemetry.fuse_recent, generation_timeout)
+        .with_session_timeouts(telemetry.fuse_session_timeouts)
+        .with_session_cache_served(
             telemetry.fuse_memory_cache_hits + telemetry.fuse_dds_disk_cache_hits,
             telemetry.fuse_jobs_submitted,
         )

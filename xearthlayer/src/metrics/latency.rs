@@ -20,12 +20,14 @@ const HIST_RATIO: f64 = 1.05;
 /// anything longer lands in the last bucket.
 const HIST_BUCKETS: usize = 300;
 
-/// Whole-session latency in fixed memory (#296).
+/// Latency in fixed memory, mergeable across samples (#296, #481).
 ///
-/// The per-sample window sorts and discards; a flight lasts hours, so the
-/// session figures come from log-spaced buckets (about 5% relative width)
-/// plus an exact maximum and count. Percentiles are bucket upper bounds,
-/// clamped to the maximum.
+/// The per-sample window sorts and discards, and its summaries cannot be
+/// combined: the median of five medians is not the median of their samples.
+/// This keeps log-spaced buckets (about 5% relative width) plus an exact
+/// maximum and count, so histograms merge bucket by bucket and the merged
+/// percentiles are as good as one histogram fed every value. Percentiles are
+/// bucket upper bounds, clamped to the maximum.
 #[derive(Clone, Debug)]
 pub struct LatencyHistogram {
     buckets: Box<[u64; HIST_BUCKETS]>,
@@ -54,6 +56,15 @@ impl LatencyHistogram {
         self.buckets[index] += 1;
         self.count += 1;
         self.max_us = self.max_us.max(duration_us);
+    }
+
+    /// Adds every value `other` recorded, as if each had been recorded here.
+    pub fn merge(&mut self, other: &LatencyHistogram) {
+        for (mine, theirs) in self.buckets.iter_mut().zip(other.buckets.iter()) {
+            *mine += theirs;
+        }
+        self.count += other.count;
+        self.max_us = self.max_us.max(other.max_us);
     }
 
     /// Figures over everything recorded so far; `None` when nothing was.
@@ -174,6 +185,37 @@ mod tests {
         let s = h.summary().unwrap();
         assert_eq!((s.max_us, s.count), (3_600_000_000, 2));
         assert!(s.p95_us <= s.max_us);
+    }
+
+    #[test]
+    fn merged_histograms_read_as_one_fed_every_value() {
+        let (mut a, mut b, mut whole) = (
+            LatencyHistogram::default(),
+            LatencyHistogram::default(),
+            LatencyHistogram::default(),
+        );
+        for ms in 1..=300u64 {
+            let part = if ms % 3 == 0 { &mut a } else { &mut b };
+            part.record(ms * 1000);
+            whole.record(ms * 1000);
+        }
+        b.record(9_500_000);
+        whole.record(9_500_000);
+        a.merge(&b);
+        assert_eq!(a.summary(), whole.summary());
+    }
+
+    #[test]
+    fn merging_an_empty_histogram_changes_nothing() {
+        let mut h = LatencyHistogram::default();
+        h.record(40_000);
+        let before = h.summary();
+        h.merge(&LatencyHistogram::default());
+        assert_eq!(h.summary(), before);
+
+        let mut empty = LatencyHistogram::default();
+        empty.merge(&LatencyHistogram::default());
+        assert!(empty.summary().is_none());
     }
 
     #[test]

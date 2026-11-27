@@ -55,6 +55,32 @@ pub fn is_region_dir_name(name: &str) -> bool {
         && b[4..7].iter().all(u8::is_ascii_digit)
 }
 
+/// The temp file one write of a disk tier entry goes through before it is
+/// renamed over the entry: `{entry file name}.{pid}.{n}.tmp`, `n` counting
+/// the process's writes, so concurrent writes never share one (see
+/// `providers::disk`). It ends in `.tmp`, which [`holds_only_cache_entries`]
+/// accepts and the index scan, reading `*.cache` only, skips.
+pub fn temp_file_name(entry: &std::ffi::OsStr, pid: u32, n: u64) -> std::ffi::OsString {
+    let mut name = entry.to_os_string();
+    name.push(format!(".{pid}.{n}.tmp"));
+    name
+}
+
+/// The process that wrote the temp file `name` ([`temp_file_name`] of a
+/// `*.cache` entry), or `None` for any other name: an entry, a temp file
+/// of the older `{stem}.tmp` form, anything else.
+pub fn temp_file_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_suffix(".tmp")?;
+    let (rest, n) = rest.rsplit_once('.')?;
+    let (entry, pid) = rest.rsplit_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !(digits(n) && digits(pid) && entry.ends_with(".cache")) {
+        return None;
+    }
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
 /// Whether the region directory `region` holds only what a disk tier
 /// writes: regular files named `*.cache`, or `*.tmp` left by an interrupted
 /// write. No subdirectory, no symbolic link, nothing else. An empty region
@@ -141,6 +167,25 @@ mod tests {
             std::fs::write(dir.path().join(f), b"x").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn a_temp_file_names_the_process_that_wrote_it() {
+        let name = temp_file_name("tile_12_1_2.cache".as_ref(), 4242, 7);
+        assert_eq!(name, "tile_12_1_2.cache.4242.7.tmp");
+        assert_eq!(temp_file_pid(name.to_str().unwrap()), Some(4242));
+        for other in [
+            "tile_12_1_2.cache",
+            "tile_12_1_2.tmp",
+            "tile_12_1_2.cache.tmp",
+            "tile_12_1_2.cache.42.tmp",
+            "tile_12_1_2.cache.x.7.tmp",
+            "tile_12_1_2.cache.42.y.tmp",
+            "notes.4242.7.tmp",
+            "tile_12_1_2.cache.99999999999.7.tmp",
+        ] {
+            assert_eq!(temp_file_pid(other), None, "{other}");
+        }
     }
 
     #[test]
