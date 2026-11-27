@@ -381,6 +381,10 @@ pub struct NightLitSource {
     generations: GenerationPermits,
     /// Footprints committed lit, waiting for pre-generation (#433).
     pregens: PregenQueue,
+    /// `true` while ortho demand is in flight (the prefetch lane's pause
+    /// state): pre-generation starts nothing while it is (R17). `None`
+    /// pre-generates regardless.
+    demand: Option<tokio::sync::watch::Receiver<bool>>,
     /// This source, once made shared ([`Self::shared`]): what the
     /// pre-generation workers hold between footprints, so they never keep
     /// the source alive. Dangling (no pre-generation) until then.
@@ -521,6 +525,7 @@ impl NightLitSource {
             // always left to reads, and pre-generations share the lit disk
             // permits with reads no more than that.
             pregens: PregenQueue::new(MAX_QUEUED_PREGENERATIONS, pregen_workers(generations)),
+            demand: None,
             this: Weak::new(),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
@@ -546,6 +551,15 @@ impl NightLitSource {
             this: this.clone(),
             ..self
         })
+    }
+
+    /// Hold pre-generation while `demand` says ortho demand is in flight
+    /// (`DemandTracker::subscribe`, the pause state the prefetch lane's
+    /// admission gate reads): lit work must not delay ortho (R17). Reads
+    /// are not held.
+    pub fn with_demand_gate(mut self, demand: tokio::sync::watch::Receiver<bool>) -> Self {
+        self.demand = Some(demand);
+        self
     }
 
     /// At most `bound` pre-generations queued instead of
@@ -1238,9 +1252,19 @@ impl NightLitSource {
 
 /// A pre-generation worker: pre-generates queued footprints, one at a
 /// time, until none is left, the queue is closed or the source is gone. It
-/// holds the source only while it runs one.
+/// holds the source only while it runs one. Before taking each, it waits
+/// while ortho demand is in flight (R17), holding only the demand
+/// receiver; a demand job beginning after it took one does not stop that
+/// one, which waits for its permit behind every read. A receiver whose
+/// sender is gone (the runtime stopping) holds nothing back.
 async fn pregenerate_queued(this: Weak<NightLitSource>) {
     loop {
+        let Some(demand) = this.upgrade().map(|source| source.demand.clone()) else {
+            return;
+        };
+        if let Some(mut demand) = demand {
+            let _ = demand.wait_for(|in_flight| !*in_flight).await;
+        }
         let Some(source) = this.upgrade() else {
             return;
         };
@@ -4510,6 +4534,39 @@ mod tests {
                 s.pregenerations(PregenOutcome::Generated) == (workers + 2) as u64
             })
             .await;
+        }
+
+        #[tokio::test]
+        async fn no_pregeneration_starts_while_ortho_demand_is_in_flight() {
+            let (_t, source) = fixture();
+            let (demand, in_flight) = tokio::sync::watch::channel(true);
+            let source = source
+                .with_generator(Arc::new(White::default()))
+                .with_demand_gate(in_flight)
+                .shared();
+            source.queue_pregeneration(&small_name(0));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(source.stats.snapshot().pregen_started, 0, "held");
+            assert_eq!(source.pregens.len(), 1);
+            // Reads are not held.
+            let layout = LitLayout::new(18, 4);
+            let (_, outcome) = source
+                .served_parts(&small_name(1), &layout, small_levels(&layout))
+                .await;
+            assert_eq!(outcome, ReadOutcome::Generated);
+            demand.send(false).unwrap();
+            settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 1).await;
+            // In flight again: the next one waits once more.
+            demand.send(true).unwrap();
+            source.queue_pregeneration(&small_name(2));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(source.stats.snapshot().pregen_started, 1);
+            demand.send(false).unwrap();
+            settled(&source, |s| s.pregenerations(PregenOutcome::Generated) == 2).await;
         }
 
         #[tokio::test]

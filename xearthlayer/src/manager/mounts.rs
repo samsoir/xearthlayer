@@ -264,8 +264,9 @@ impl MountManager {
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
         ortho_mount: &Path,
+        demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
-        let source = self.night_lit_source(index, disk, ortho_mount);
+        let source = self.night_lit_source(index, disk, ortho_mount, demand);
         self.lit_source = source.clone();
         self.night_lighting = if source.is_some() {
             crate::night::NightLighting::Lit
@@ -284,6 +285,8 @@ impl MountManager {
     /// X-Plane installation behind the scenery path cannot be found. `disk`
     /// is the lit disk tier, `None` when caching is off. `ortho_mount` is
     /// XEL's own mount point, which the road service must not read back.
+    /// `demand` is `true` while ortho demand is in flight; pre-generation
+    /// waits for it to clear.
     /// Nothing is read from the installation here: the road service lists
     /// its scenery packs on the first DSF hint.
     fn night_lit_source(
@@ -291,6 +294,7 @@ impl MountManager {
         index: &OrthoUnionIndex,
         disk: Option<Arc<dyn crate::cache::Cache>>,
         ortho_mount: &Path,
+        demand: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
         let scenery = self.scenery_path.as_ref()?;
         let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
@@ -328,6 +332,9 @@ impl MountManager {
         source = source.with_roads(roads);
         if let Some(disk) = disk {
             source = source.with_disk_cache(disk);
+        }
+        if let Some(demand) = demand {
+            source = source.with_demand_gate(demand);
         }
         // Shared, so it pre-generates what its probe answers lit (#433).
         Some(source.shared())
@@ -647,6 +654,7 @@ impl MountManager {
                 &index_for_prefetch,
                 service.lit_disk_cache(),
                 &mountpoint,
+                service.demand_in_flight(),
             ) {
                 ortho_union_fs = ortho_union_fs.with_lit_source(source);
             }
@@ -1132,6 +1140,7 @@ mod tests {
             &OrthoUnionIndex::default(),
             None,
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
+            None,
         );
 
         let source = source.expect("a lit source");
@@ -1184,6 +1193,7 @@ mod tests {
             &OrthoUnionIndex::default(),
             None,
             std::path::Path::new("/nonexistent/zzXEL_ortho"),
+            None,
         );
 
         assert!(source.is_none());

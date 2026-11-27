@@ -447,6 +447,16 @@ impl XEarthLayerService {
         self.gpu_warning.as_deref()
     }
 
+    /// `true` while any ortho demand job is in flight: the pause state the
+    /// prefetch lane's admission gate reads, for other background work that
+    /// must yield to demand (night lighting's pre-generation, #433). `None`
+    /// without the runtime.
+    pub fn demand_in_flight(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.xearthlayer_runtime
+            .as_ref()
+            .map(|runtime| runtime.demand().subscribe())
+    }
+
     /// The lit disk cache (generated night lighting payloads).
     ///
     /// `None` when caching or night lighting is off.
