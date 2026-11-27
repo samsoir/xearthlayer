@@ -817,9 +817,10 @@ impl NightLitSource {
         };
         // A tile whose identities could not be taken leaves no fingerprint:
         // the payload is then kept in memory only.
+        let layout = self.layout(name);
         let roads = match &self.roads {
             Some(roads) => futures::future::join_all(
-                self.road_tiles(name, self.layout(name).first_visible)
+                self.road_tiles(name, layout.first_visible)
                     .into_iter()
                     .map(|tile| async move { Some((tile, roads.identities(tile).await?)) }),
             )
@@ -828,7 +829,10 @@ impl NightLitSource {
             .collect::<Option<Vec<_>>>()?,
             None => Vec::new(),
         };
-        Some((footprint_fingerprint(session, &identities, &roads), roads))
+        Some((
+            footprint_fingerprint(session, &identities, &roads, layout.road_supersample()),
+            roads,
+        ))
     }
 
     /// The generated visible levels of the footprint. Waits for its roads
@@ -1487,6 +1491,54 @@ mod tests {
             assert!(warm.recipes.identities_held(&name).is_some());
             assert_eq!(warm.fingerprint(&name).await, cold);
             assert!(cold.is_some());
+        }
+
+        /// `source_in` at texture setting `t`.
+        fn source_at_setting(temp: &TempDir, t: u8) -> NightLitSource {
+            let source = source_in(temp);
+            NightLitSource {
+                setting: Arc::new(FixedTextureSetting(t)),
+                ..source
+            }
+        }
+
+        #[tokio::test]
+        async fn a_capped_footprint_rastered_at_another_road_density_has_its_own_fingerprint() {
+            // The lit disk key names no setting: at ZL14, t = 2 and t = 4
+            // both serve a 2048 px first visible level, the second with its
+            // roads rastered at twice that (#431). Same length, other pixels.
+            let temp = TempDir::new().unwrap();
+            let name = name_at_zoom(37.20, -122.725, 14);
+            let (low, full) = (LitLayout::new(14, 2), LitLayout::new(14, 4));
+            assert_eq!(low.payload_len(), full.payload_len());
+            assert_ne!(low.road_supersample(), full.road_supersample());
+            let mut at = Vec::new();
+            for t in 2..=4 {
+                at.push(
+                    source_at_setting(&temp, t)
+                        .fingerprint(&name)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_ne!(at[0], at[2], "t = 2 and t = 4");
+            assert_eq!(at[1], at[2], "t = 3 rasters as t = 4");
+        }
+
+        #[tokio::test]
+        async fn an_uncapped_footprint_has_one_fingerprint_at_every_setting() {
+            let temp = TempDir::new().unwrap();
+            let name = name_at(37.20, -122.725);
+            let mut fingerprints = Vec::new();
+            for t in 0..=4 {
+                fingerprints.push(
+                    source_at_setting(&temp, t)
+                        .fingerprint(&name)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert!(fingerprints.windows(2).all(|w| w[0] == w[1]));
         }
 
         #[cfg(unix)]

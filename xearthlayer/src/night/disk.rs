@@ -20,6 +20,9 @@ use crate::fuse::DdsFilename;
 /// Magic (4), fingerprint (32), payload length u64 LE (8).
 const ENTRY_HEADER_LEN: usize = 44;
 
+/// Precedes a road supersampling above 1 in a footprint fingerprint.
+const ROAD_SUPERSAMPLE_TAG: &[u8] = b"road_supersample";
+
 /// The road DSFs of one 1 degree tile, highest priority first.
 pub type TileDsfs = ((i32, i32), Arc<[DsfIdentity]>);
 
@@ -45,10 +48,18 @@ pub fn session_fingerprint(brightness: f64, art: [u8; 32], roads: [u8; 32]) -> [
 /// the road DSFs of each tile, highest priority first (empty without road
 /// lights). The order of tiles does not matter; the order of a tile's DSFs
 /// does, because it decides which roads the merge keeps.
+///
+/// `road_supersample` is the layout's ([`super::LitLayout::road_supersample`]):
+/// the lit disk key names no texture setting, and at ZL12 to ZL14 a 2048 px
+/// first visible level is rastered at one road sample per texel at t = 2 and
+/// at two at t = 3 and 4, the same payload length with other road pixels.
+/// Above 1 it is hashed last, so an entry written at one setting is a miss
+/// at the other.
 pub fn footprint_fingerprint(
     session: [u8; 32],
     recipes: &[((i32, i32), Option<FileIdentity>, LedRegion)],
     roads: &[TileDsfs],
+    road_supersample: u32,
 ) -> LitFingerprint {
     let mut sorted = recipes.to_vec();
     sorted.sort_by_key(|(tile, _, _)| *tile);
@@ -80,6 +91,12 @@ pub fn footprint_fingerprint(
             hasher.update(id.len.to_le_bytes());
             hasher.update(id.mtime_nanos.to_le_bytes());
         }
+    }
+    // Hashed only when above 1, so every fingerprint without it stays the
+    // one written before it was hashed (#431).
+    if road_supersample > 1 {
+        hasher.update(ROAD_SUPERSAMPLE_TAG);
+        hasher.update(road_supersample.to_le_bytes());
     }
     LitFingerprint(hasher.finalize().into())
 }
@@ -251,13 +268,14 @@ mod tests {
             })
         };
         let s = session_fingerprint(1.0, [0; 32], [0; 32]);
-        let base = footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)], &[]);
+        let base = footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)], &[], 1);
         assert_ne!(
             base,
             footprint_fingerprint(
                 session_fingerprint(1.25, [0; 32], [0; 32]),
                 &[((37, -123), id(10), LedRegion::Unknown)],
-                &[]
+                &[],
+                1
             ),
             "brightness"
         );
@@ -266,13 +284,14 @@ mod tests {
             footprint_fingerprint(
                 session_fingerprint(1.0, [1; 32], [0; 32]),
                 &[((37, -123), id(10), LedRegion::Unknown)],
-                &[]
+                &[],
+                1
             ),
             "art"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(s, &[((37, -123), id(11), LedRegion::Unknown)], &[]),
+            footprint_fingerprint(s, &[((37, -123), id(11), LedRegion::Unknown)], &[], 1),
             "recipe size"
         );
         assert_ne!(
@@ -287,13 +306,14 @@ mod tests {
                     }),
                     LedRegion::Unknown
                 )],
-                &[]
+                &[],
+                1
             ),
             "recipe mtime"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(s, &[((37, -123), None, LedRegion::Unknown)], &[]),
+            footprint_fingerprint(s, &[((37, -123), None, LedRegion::Unknown)], &[], 1),
             "recipe removed"
         );
         assert_ne!(
@@ -304,13 +324,14 @@ mod tests {
                     ((37, -123), id(10), LedRegion::Unknown),
                     ((37, -122), None, LedRegion::Unknown)
                 ],
-                &[]
+                &[],
+                1
             ),
             "another tile"
         );
         assert_eq!(
             base,
-            footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)], &[]),
+            footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)], &[], 1),
             "stable"
         );
     }
@@ -323,8 +344,8 @@ mod tests {
         });
         let s = session_fingerprint(1.0, [0; 32], [0; 32]);
         assert_ne!(
-            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Na)], &[]),
-            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Eu)], &[]),
+            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Na)], &[], 1),
+            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Eu)], &[], 1),
         );
     }
 
@@ -341,8 +362,8 @@ mod tests {
             LedRegion::Eu,
         );
         assert_eq!(
-            footprint_fingerprint(s, &[a, b], &[]),
-            footprint_fingerprint(s, &[b, a], &[])
+            footprint_fingerprint(s, &[a, b], &[], 1),
+            footprint_fingerprint(s, &[b, a], &[], 1)
         );
     }
 
@@ -357,24 +378,24 @@ mod tests {
             mtime_nanos: 1,
         };
         let tile = |ids: Vec<DsfIdentity>| ((46, 6), Arc::<[DsfIdentity]>::from(ids));
-        let a = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 2)])]);
-        let b = footprint_fingerprint(s1, &[], &[tile(vec![id("b.dsf", 2), id("a.dsf", 1)])]);
-        let c = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 3)])]);
-        let d = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("c.dsf", 2)])]);
-        let e = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1)])]);
-        let none = footprint_fingerprint(s1, &[], &[tile(vec![])]);
+        let a = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 2)])], 1);
+        let b = footprint_fingerprint(s1, &[], &[tile(vec![id("b.dsf", 2), id("a.dsf", 1)])], 1);
+        let c = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 3)])], 1);
+        let d = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("c.dsf", 2)])], 1);
+        let e = footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1)])], 1);
+        let none = footprint_fingerprint(s1, &[], &[tile(vec![])], 1);
         assert_ne!(a, b, "pack order matters");
         assert_ne!(a, c, "a changed DSF matters");
         assert_ne!(a, d, "another DSF path matters");
         assert_ne!(a, e, "a removed DSF matters");
         assert_ne!(
             none,
-            footprint_fingerprint(s1, &[], &[]),
+            footprint_fingerprint(s1, &[], &[], 1),
             "a tile without DSFs is hashed"
         );
         assert_eq!(
             a,
-            footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 2)])]),
+            footprint_fingerprint(s1, &[], &[tile(vec![id("a.dsf", 1), id("b.dsf", 2)])], 1),
             "stable"
         );
     }
@@ -391,9 +412,64 @@ mod tests {
         };
         let (x, y) = (((46, 6), ids("x.dsf")), ((46, 7), ids("y.dsf")));
         assert_eq!(
-            footprint_fingerprint(s, &[], &[x.clone(), y.clone()]),
-            footprint_fingerprint(s, &[], &[y, x])
+            footprint_fingerprint(s, &[], &[x.clone(), y.clone()], 1),
+            footprint_fingerprint(s, &[], &[y, x], 1)
         );
+    }
+
+    /// Inputs of every kind the fingerprint hashes: a session, a recipe
+    /// with an identity, one without, and a road tile with a DSF.
+    fn pinned_inputs() -> (
+        [u8; 32],
+        Vec<((i32, i32), Option<FileIdentity>, LedRegion)>,
+        Vec<TileDsfs>,
+    ) {
+        let session = session_fingerprint(1.0, [7; 32], [9; 32]);
+        let recipes = vec![
+            (
+                (37, -123),
+                Some(FileIdentity {
+                    len: 4242,
+                    mtime_nanos: 1_700_000_000_000_000_000,
+                }),
+                LedRegion::Na,
+            ),
+            ((37, -122), None, LedRegion::Unknown),
+        ];
+        let roads = vec![(
+            (37, -123),
+            Arc::<[DsfIdentity]>::from(vec![DsfIdentity {
+                path: "Custom Scenery/roads/Earth nav data/+30-130/+37-123.dsf".into(),
+                len: 123_456,
+                mtime_nanos: 1_600_000_000_000_000_000,
+            }]),
+        )];
+        (session, recipes, roads)
+    }
+
+    fn hex(fp: LitFingerprint) -> String {
+        fp.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_fingerprint_without_road_supersampling_is_the_one_before_it_was_hashed() {
+        // Every ZL15+ fingerprint, and every one at t <= 2, raster their
+        // roads at 1 sample per texel: their entries on users' disks stay
+        // hits. The value was taken before road supersampling was hashed.
+        let (s, recipes, roads) = pinned_inputs();
+        assert_eq!(
+            hex(footprint_fingerprint(s, &recipes, &roads, 1)),
+            "cfde24e5c6812d26d63c064e1f450779a7315c99efc224d69c761c197f948862"
+        );
+    }
+
+    #[test]
+    fn road_supersampling_moves_the_fingerprint() {
+        let (s, recipes, roads) = pinned_inputs();
+        let at = |supersample| footprint_fingerprint(s, &recipes, &roads, supersample);
+        assert_ne!(at(2), at(1));
+        assert_ne!(at(2), at(3));
+        assert_eq!(at(2), at(2), "stable");
     }
 
     #[test]
