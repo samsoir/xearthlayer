@@ -2,7 +2,7 @@
 
 **Status:** proposed (2026-11-26), targeting 0.5.2. Part of the
 compute-pipeline plan, [#475](https://github.com/samsoir/xearthlayer/issues/475).
-Not implemented.
+Not implemented; tracked in [#488](https://github.com/samsoir/xearthlayer/issues/488).
 
 **Version:** V4 is the fourth iteration of prefetch. It succeeds the adaptive
 prefetch coordinator ([Adaptive Tile-Based Prefetch](adaptive-prefetch-design.md))
@@ -115,8 +115,9 @@ The feeder replaces the cycle as the thing that submits tiles.
   - telemetry has been stale for longer than the dropout limit (see Telemetry
     dropouts).
 
-  These are pauses, not throughput controls. The network-health condition
-  (see Failed tiles) lowers the depth rather than stopping the feeder.
+  These are pauses, not throughput controls. The line's health (see Failed
+  tiles) lowers the depth rather than stopping the feeder, and provider pushback
+  pauses only the requests to that provider.
 
 ### Telemetry dropouts
 
@@ -144,25 +145,54 @@ V4 separates the ranking from the stream:
 ### Failed tiles and network health
 
 A prefetch job whose chunks fail or time out still completes. Its tile is served
-to no one and isn't cached (#180, #388). V4 handles it in three parts:
+to no one and isn't cached (#180, #388).
+
+The EDDM to LBSF flight's `--debug` log (12:25 to 13:25Z) shows that "a failed
+chunk" covers three different things, and V4 treats each on its own:
+
+| Failure | What it means | On that flight |
+|---|---|---|
+| **Timeout** (and other transport errors) | The line is slow or losing packets. A retry nearly always works | 13,865 timeouts: 13,488 first attempts, and all but 57 of those chunks downloaded in the end |
+| **HTTP 503** (and 429) | The provider is pushing back | 478 chunks lost, nearly all in 13:10 to 13:13Z, right after a prefetch batch of 1,006 tiles, while the Apple token churned (22 refreshes in two minutes) |
+| **HTTP 404** | The provider has no imagery there (#301). Never retried | 2,530 chunks on 76 tiles. Some are sea tiles in `zzXEL_eu-west_ortho`, built from GO2 imagery; others are on land in Turkey and at ZL18 around an airport. Re-requested 4,442 times in the hour |
+
+The packages are built from one provider's imagery, and the user may stream from
+another. So 404s are permanent in places, and they are no sign of network health.
+
+V4's rules:
 
 - **The feeder refills on every completion,** whatever the outcome. A failed job
   frees its place in the lane like any other.
-- **An incomplete tile goes back to the end of its area's backlog,** with an
-  attempt count. An area isn't done until every tile is cached or has run out of
-  attempts. An area with tiles out of attempts becomes `Deferred` under #226's
-  rules (retryable, never `NoCoverage` for indexed tiles), and its tiles are
-  tried again when it next ranks.
-- **Network health lowers the depth.** When chunk failures in a recent window
-  pass a threshold, the feeder lowers the target depth instead of pressing on
-  against a failing network. It restores the depth step by step as failures
-  fall. On the EDDM to LBSF flight, 10,396 of 14,186 chunk timeouts fell in one
-  14-minute window: a storm, not a scattering. A deep stream would have sent
-  more requests into it.
+- **A tile incomplete through timeouts or 503s goes back to the end of its area's
+  backlog,** with an attempt count. An area isn't done until every tile is cached
+  or has run out of attempts. An area with tiles out of attempts becomes
+  `Deferred` under #226's rules (retryable, never `NoCoverage` for indexed tiles),
+  and its tiles are tried again when it next ranks.
+- **A tile incomplete only through 404s is dropped for the session.** Asking again
+  gets the same answer. It doesn't count against its area, which can be done
+  without it. Whether such a tile should be cached, with its missing chunks
+  filled, is a question for the cache rules (#180, #388), not for V4.
+- **The line's health sets the depth.** The signal is the slow tail of chunk
+  latency (a high percentile over a recent window) against chunks downloaded per
+  second, from the download orchestrator. It is not a failure rate:
+  - Timeouts on that flight tracked how much was asked of a slow line. From
+    12:47Z its throughput fell from 100,000–200,000 chunks a minute to
+    20,000–45,000, even in quiet minutes. Before then, minutes of heavy demand
+    (12:46, 12:51) caused 3 and 28 timeouts; after it, the same kind of minute
+    caused 500 to 1,300.
+  - When the slow tail grows while throughput doesn't, the feeder lowers the
+    target depth. It restores the depth step by step as the tail shrinks. More
+    requests in flight on a saturated line only lengthen every request's wait.
+  - The contributor's cold loads ran at 3 tiles/s one evening and 13 to 14 the
+    next, on the same line. The depth has to follow what the line delivers, not
+    a fixed number.
+- **Provider pushback backs off the provider.** A burst of 503s or 429s from a
+  provider pauses the feeder's new requests to it for a short, growing interval,
+  whatever the line's health. A token refresh that coincides is the provider's
+  business (its own refresh lock), not the feeder's.
 
-  The signal is the chunk failure rate over a window, from the download
-  orchestrator (`map_provider_error`'s retryable failures). It isn't a count of
-  failed jobs: one tile's 256 chunks would otherwise count once.
+The same latency tail serves demand: #491 proposes that X-Plane's chunks are
+retried, or sent a second time, while their tile can still make its deadline.
 
 ### Stale work
 
@@ -179,8 +209,9 @@ to no one and isn't cached (#180, #388). V4 handles it in three parts:
   - the feed rate, and the in-flight depth against its target;
   - the yield reason, with its share of the window;
   - telemetry dropouts, with their frozen and yielding time;
-  - tiles returned to the backlog, areas deferred, and the chunk failure rate
-    behind any lowered depth.
+  - tiles returned to the backlog, tiles dropped for 404s, and areas deferred;
+  - the chunk latency tail and chunks per second behind any lowered depth, and
+    provider back-offs with their cause (503 or 429).
 - **The dashboard:** `PrefetchState` keeps its states (Disabled, Paused by
   demand, Holding for takeoff, Ramping, Active, Idle). Its "Deferred (load)",
   which named the removed backpressure deferral, becomes "Yielding", with the
@@ -207,9 +238,14 @@ to no one and isn't cached (#180, #388). V4 handles it in three parts:
 - The telemetry dropout limit (60 s proposed), and whether X-Plane's Web API
   drops out mainly during scene loads, when the sim-state yield already applies.
 - How many attempts a tile gets before its area is deferred.
-- The network-health threshold and window, and how far it lowers the depth.
-  Logs from a timeout storm would settle it; connection speed varies widely
-  between users.
+- The latency percentile and window for the line's health, and how far it
+  lowers the depth. The EDDM to LBSF log shows the shape on a lossy 1 Gbit cable
+  line; a rule that also holds on 5 Gbit fibre needs flights on both.
+- Whether XEL's own connections can congest a home line (up to 1,024 per lane on
+  that flight, before `network.connections`), which the depth control would then
+  have to catch as well. Asked on PR #480.
+- The back-off interval for provider pushback, and whether 404s seen for one
+  provider should be remembered across sessions.
 
 ## References
 
@@ -219,5 +255,7 @@ to no one and isn't cached (#180, #388). V4 handles it in three parts:
 - [Adaptive Tile-Based Prefetch](adaptive-prefetch-design.md): V3, which V4
   succeeds (prefetch box, phases, filters, the no-harm contract).
 - [GPU encoding](gpu-encoding-design.md): the encoder and its lanes (#421–#425).
+- #491: X-Plane's chunks retried within their tile's deadline, from the same
+  latency tail.
 - #296: two executor lanes. #172: the forward-starvation lessons (no caps, no
   silent drops). #226: region retirement. #246: `fuse_pressure`.

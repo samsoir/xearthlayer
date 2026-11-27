@@ -2,7 +2,8 @@
 
 **Status:** proposed (2026-11-26). Part of the compute-pipeline plan,
 [#475](https://github.com/samsoir/xearthlayer/issues/475). It is built on a
-spike measured on one laptop, and is not implemented.
+spike measured on one laptop, and is not implemented; tracked in
+[#489](https://github.com/samsoir/xearthlayer/issues/489).
 
 **Companion:** [Prefetch V4: streaming prefetch](prefetch-v4-streaming-design.md).
 GPU decode only pays off on a steady stream of tiles; V4 is what supplies
