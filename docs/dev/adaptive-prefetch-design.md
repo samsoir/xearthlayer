@@ -1,5 +1,7 @@
 # Adaptive Tile-Based Prefetch System
 
+> **Successor proposed:** [Prefetch V4: streaming prefetch](prefetch-v4-streaming-design.md) (0.5.2) replaces this coordinator's cycle-based submission with a continuously fed, proximity-ranked stream, keeping the prefetch box, phases, filters and no-harm contract described here.
+
 **Technical Design Document**
 
 **Project**: XEarthLayer
