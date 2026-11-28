@@ -118,7 +118,7 @@ xearthlayer/src/vfs
 |  |── requestor.rs             # Neutral DDS-generation request pipeline (refactor)
 |  |── types.rs
 |  |── union.rs                 # Union filesystem trait
-|── backend.rs                  # MountBackend returns MountSession
+|── backend.rs                  # MountBackend returns MountSession; re-exports the macFUSE readout for diagnostics
 |── coalesce.rs
 |── filename.rs
 |── mod.rs
@@ -140,9 +140,9 @@ and moves to `common/core.rs` unchanged:
   exists so X-Plane falls back to it instead of a generated virtual DDS
 - while `lit_source.wants_dsf_hints()` is on (read once into `dsf_hints` in
   `with_lit_source`), `lookup` and `open` of a real `Earth nav
-  data/<block>/<tile>.dsf` call `lit_source.dsf_seen(lat, lon)`
-  `(dsf_tile_of_path)`. That's how the road service learns which DSFs X-Plane is
-  loading.
+  data/<block>/<tile>.dsf` call `lit_source.dsf_seen(lat, lon)`, the tile
+  parsed by `dsf_tile_of_path`. That's how the road service learns which DSFs
+  X-Plane is loading.
 
 The core is the sole emitter of the metrics the dashboard reads. In
 particular, per-read latency (`MetricEvent::FuseRead`, from which the daemon
@@ -203,7 +203,7 @@ runners provide `/dev/fuse` in their `ubuntu-latest` kernels, and CI installs
 
 For implementation on macOS, the live mount tests can run only on a user's
 machine. Hosted macOS runners cannot approve the FSKit extension ("macFUSE
-(local)") under File System Extenstions. Run via `make verify-macos`).
+(local)") under File System Extensions (run via `make verify-macos`).
 
 This means green CI exercises the `LinuxFuse` adapter; the `MacFuse` adapter is
 covered by `make verify-macos` and the regression flight, both run on a local
@@ -218,12 +218,24 @@ The manager builds the neutral OrthoUnionCore and mounts it via
 select_backend(), holding the live mount as Box<dyn MountSession> instead of a
 concrete SpawnedMountHandle.
 
+The mount flow in `manager/mounts.rs` becomes four seam calls in order —
+`recover_stale`, `prepare_mountpoint`, `mount`, `describe` — where today it
+is `recover_stale_fuse_mount`, a `cfg!`-passed `prepare_mount_folder`,
+`mount_spawned` naming fuse3 directly, and a `cfg!`-gated
+`log_macfuse_mount`. What that last one does today — waiting for the volume
+to appear in the mount table, reading the macFUSE version, checking the
+`fskit` flag and its three message cases — becomes the backend's `describe`
+implementation; the manager logs the lines it gets back and warns when a
+mount that just succeeded produced none. The two `cfg!` uses then have no
+platform facts left to test, which is the acceptance rule that `mounts.rs`
+contains no `cfg` and names no backend.
+
 ```text
              UnionFilesystem (implemented by OrthoUnionCore)
                                ▲
                          MountBackend
         ┌───────────────┬──────┴───────┬─────────────────┐
-    LinuxFuse        MacFuse         WinFsp            FsKit, <...>, <...>
+    LinuxFuse        MacFuse         WinFSP            FsKit, <...>, <...>
         └───────┬───────┘
     shared fuse3 translation
     + a small FusePlatform policy per OS
@@ -277,7 +289,7 @@ pub enum MountError {
 /// When a panic unwinds, `MountSession` `Drop` handles the unmounting and
 /// must not panic.
 pub trait MountBackend: Send + Sync {
-    // Ensure that a folder exists, creating it as necessary.
+    /// Ensure that a folder exists, creating it as necessary.
     fn prepare_mountpoint(&self, mountpoint: &Path) -> Result<(), MountError>;
     /// Mount `fs` according to `req`, returning a handle to the live mount.
     /// `fs` must arrive fully wired: past `Arc<dyn UnionFilesystem>` nothing
@@ -288,8 +300,16 @@ pub trait MountBackend: Send + Sync {
     /// Whether a stale mount at `mountpoint` was recovered. Synchronous, needs
     /// no runtime, and must not panic.
     fn recover_stale(&self, mountpoint: &Path) -> bool;
-    /// Backend-specific information about the mount.
-    fn describe(mountpoint: &Path) -> Vec(String);
+    /// Backend-specific information about the mount at `mountpoint`, as
+    /// human-readable lines for the mount log. The facts are read from the
+    /// OS mount table, never asked of the mount API, so any process gets the
+    /// same answer (#362); the macOS backend reports the macFUSE version and
+    /// how the volume is served (the `fskit` flag). Where the mount API can
+    /// return before the volume reaches the table (fskitd), the backend waits
+    /// for it inside this call — an empty answer therefore means "not visible
+    /// by the backend's deadline", which a caller that has just mounted
+    /// warns on. A backend with nothing to report returns empty.
+    fn describe(&self, mountpoint: &Path) -> Vec<String>;
 }
 ```
 
@@ -307,6 +327,19 @@ pub fn select_backend() -> Box<dyn MountBackend> {
     }
 }
 ```
+
+The seam also fronts the macFUSE readout (#362) — the host facts that
+`xearthlayer diagnostics` reports: bundle present, installed version,
+`MFMount.framework` present, macFUSE volumes in the mount table. It moves
+into the fuse3 backend with the rest of the mount-table code, but
+diagnostics runs with no mount and no backend selected, and must still name
+no backend. So `vfs/backend.rs` re-exports the readout and its types, and
+`diagnostics` imports them from `vfs::backend`: one door from outside `vfs/`
+into backend-owned code, opening onto the neutral seam only. The macFUSE
+types are re-exported as they are — no neutral stand-in type is invented and
+no platform branch is added; the readout already compiles on every host and
+its call sites pick the platform with `cfg!`, and Linux simply has no
+macFUSE facts to report.
 
 ```rust
 pub struct MountRequest {
@@ -354,7 +387,7 @@ backend without an equivalent ignores them.
 
 `fuse_platform.rs` holds the per-platform FUSE behavior and policy,
 consolidating the `cfg(target_os)` sites that are scattered inside `fuse/`. Its complete contents
-are the four decisions below; the shared fuse3 translation in `adapters.rs`
+are the five decisions below; the shared fuse3 translation in `adapters.rs`
 stays platform-neutral.
 
 | Policy decision | Linux | macOS |
@@ -370,7 +403,7 @@ are the adapter's decision, keyed on the `FsNode` variant: a `VirtualDds` node
 gets the platform's virtual-DDS flags from the policy, and `RealFile` and
 `Directory` nodes get none.
 
-`fuse_platform.rs` keeps its `#cfg(target_os)` — it is the one place in the
+`fuse_platform.rs` keeps its `#[cfg(target_os)]` — it is the one place in the
 crate that names a concrete backend.  The `FileAttr` constructor lives here
 too — no exception is needed, and none is possible: `FileAttr` has no
 `Default` and its platform fields are themselves `#[cfg]`-gated, so a
@@ -505,7 +538,7 @@ An unknown *inode* never reaches this surface: backends that carry inode
 tables answer ENOENT for inodes they cannot map, before the filesystem is
 consulted. That is a backend duty, not a contract case.
 
-Conformance suite should cover the three 0-handle cases, that a read against
+The conformance suite should cover the three 0-handle cases, that a read against
 a handle the filesystem never issued still serves the tile, and that
 `release(0)` is a no-op.
 
@@ -636,7 +669,7 @@ In addition:
       The Linux/macOS backend split (below) folds each cfg into the single backend
       it names; when that lands, delete this bullet.
   - no `crate::vfs::fuse3::` import outside `vfs/`
-  - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`
+  - `system/unmount.rs` moves into the fuse3 backend, so `panic.rs` and `mounts.rs` reach it only through `MountBackend`; `diagnostics` reaches the macFUSE readout only through the `vfs::backend` re-export, never through `vfs::fuse3`
   - Expect `night/*` and `runtime/request.rs` to churn on the rename: they import `DdsFilename`, `TextureKind` and `DdsResponse` from crate::fuse.
 
 The design should be further validated by the addition of any new backends,
